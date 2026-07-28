@@ -18,6 +18,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/szymonrychu/tatara-operator/internal/obs"
 )
 
 // scmHTTPClient is a shared http.Client with a sane timeout for all SCM REST
@@ -809,20 +811,51 @@ func (c *GitHub) ListReviews(ctx context.Context, repoURL, token string, number 
 // GitHub post crash-safe with a single marker, and why GitLab (N+1 calls) cannot
 // use the same scheme.
 //
+// Atomicity is also why the findings are pre-checked against the PR diff: the
+// same one-call-for-everything that makes the marker truthful makes ONE
+// unpostable finding fatal to the WHOLE round. So an unanchorable finding
+// degrades into the review body instead of being sent as a comment GitHub would
+// refuse - GitHub's equivalent of GitLab degrading a finding to a plain note.
+//
 // The response is the REVIEW object; it does NOT carry the created inline
 // comments. Their ids come from ListReviewComments, a second, separate read.
 func (c *GitHub) PostReview(ctx context.Context, repoURL, token string, number int, body string, findings []ReviewFinding) (string, error) {
+	owner, repo, err := ghOwnerRepo(repoURL)
+	if err != nil {
+		return "", err
+	}
+	resource := fmt.Sprintf("%s/%s#%d", owner, repo, number)
+	round, sha, _ := ParseReviewMarker(body)
+
+	// The new-side hunk ranges of the PR diff, read ONCE. Atomicity cuts both ways:
+	// ONE comment GitHub cannot anchor 422s the WHOLE review, and that 422 is
+	// TERMINAL (classifyReviewPostError), so the caller parks and an entire
+	// completed review round is discarded (#482). Every finding is therefore
+	// pre-checked here, exactly as GitLab.PostReview pre-checks its own (#394).
+	var hunks hunkIndex
+	if len(findings) > 0 {
+		files, ferr := c.prFiles(ctx, repoURL, token, number)
+		if ferr != nil {
+			return "", classifyReviewPostError(ferr)
+		}
+		hunks = ghBuildHunkIndex(files)
+	}
+
 	comments := make([]map[string]any, 0, len(findings))
-	for _, f := range findings {
-		if f.Line <= 0 {
-			// A finding with no line (a file-level finding, #398; the CR->scm bridge
-			// lowers a nil *int to 0) can NOT be a line-anchored review comment - GitHub
-			// 422s a line=0 comment. Post it as a file-level comment instead.
-			comments = append(comments, map[string]any{
-				"path":         f.Path,
-				"subject_type": "file",
-				"body":         f.Body,
-			})
+	degraded := make([]ReviewFinding, 0, len(findings))
+	for k, f := range findings {
+		// Unanchorable: no line at all (a file-level finding, #398; the CR->scm
+		// bridge lowers a nil *int to 0), a line outside every hunk, or a file with
+		// no patch (binary/too large). GitHub's create-review comments[] entries are
+		// DraftPullRequestReviewComment, which has NO subject_type field - sending
+		// one 422s the whole review - so a file-level finding cannot be expressed
+		// there at all and folds into the review body instead.
+		if !hunks.anchorable(f.Path, f.Line) {
+			slog.WarnContext(ctx, "github: review finding not anchorable inline; folding it into the review body",
+				"provider", "github", "action", "scm_post_review", "resource_id", resource,
+				"round", round, "sha", sha, "finding", k, "path", f.Path, "line", f.Line, "reason", "unanchorable")
+			obs.ReviewFindingDegraded("github", "unanchorable")
+			degraded = append(degraded, f)
 			continue
 		}
 		comments = append(comments, map[string]any{
@@ -834,11 +867,94 @@ func (c *GitHub) PostReview(ctx context.Context, repoURL, token string, number i
 	if len(comments) == 0 {
 		comments = nil
 	}
-	id, err := c.review(ctx, repoURL, token, number, reviewEventComment, body, comments)
+	id, err := c.review(ctx, repoURL, token, number, reviewEventComment, ghDegradeIntoBody(body, degraded), comments)
 	if err != nil {
 		return "", classifyReviewPostError(err)
 	}
+	slog.InfoContext(ctx, "github: review posted",
+		"provider", "github", "action", "scm_post_review", "resource_id", resource,
+		"round", round, "sha", sha, "findings_posted", len(comments), "findings_degraded", len(degraded),
+		"review_id", id)
 	return id, nil
+}
+
+// ghPRFile is one changed file of a PR. Patch is the file's unified diff, whose
+// @@ headers carry the new-side hunk ranges an inline comment can anchor to.
+// GitHub omits patch for binary and very large files; such a file has no
+// anchorable line and every finding on it degrades.
+type ghPRFile struct {
+	Filename string `json:"filename"`
+	Patch    string `json:"patch"`
+}
+
+// prFiles reads the PR's changed files ONCE. It is paginated: a PR with more than
+// 100 changed files whose later pages went unread would report every finding on
+// them as unanchorable and strip the review of its inline anchors.
+func (c *GitHub) prFiles(ctx context.Context, repoURL, token string, number int) ([]ghPRFile, error) {
+	owner, repo, err := ghOwnerRepo(repoURL)
+	if err != nil {
+		return nil, err
+	}
+	path := fmt.Sprintf("/repos/%s/%s/pulls/%d/files?per_page=100", owner, repo, number)
+	return ghDoPaged[ghPRFile](ctx, c.base(), path, token)
+}
+
+func ghBuildHunkIndex(files []ghPRFile) hunkIndex {
+	idx := make(hunkIndex, len(files))
+	for _, f := range files {
+		idx.addPatch(f.Filename, f.Patch)
+	}
+	return idx
+}
+
+// ghDegradeIntoBody appends the unanchorable findings to the review body. GitHub's
+// create-review is ONE atomic call, so the body IS the degrade target: it is the
+// only part of the post that has no anchoring constraint, and it keeps the round a
+// single call (and therefore keeps the round marker's "everything landed" meaning
+// truthful). This is GitHub's equivalent of GitLab degrading a finding to a plain
+// MR note. The caller's body - and the round marker it starts with - stays first
+// and untouched.
+func ghDegradeIntoBody(body string, degraded []ReviewFinding) string {
+	if len(degraded) == 0 {
+		return body
+	}
+	var b strings.Builder
+	b.WriteString(body)
+	b.WriteString("\n\n---\n\n### Findings that could not be anchored to this diff\n\n")
+	b.WriteString("GitHub can only attach an inline comment to a line inside the pull request diff. ")
+	b.WriteString("These findings point outside it (or carry no line), so they are reported here:\n")
+	for i, f := range degraded {
+		entry := "\n- **" + ghFindingLocation(f) + "**\n"
+		for _, line := range strings.Split(strings.TrimRight(f.Body, "\n"), "\n") {
+			entry += "  " + line + "\n"
+		}
+		if b.Len()+len(entry) > ghMaxReviewBodyBytes {
+			fmt.Fprintf(&b, "\n_%d more finding(s) omitted: the review body reached GitHub's size limit._\n",
+				len(degraded)-i)
+			break
+		}
+		b.WriteString(entry)
+	}
+	return b.String()
+}
+
+// ghMaxReviewBodyBytes bounds the folded body well inside GitHub's 65536-character
+// review-body limit. The CRD permits 16 KiB of review body plus 30 findings of
+// 8 KiB each (PendingReview / ReviewFinding), so an all-degraded round CAN exceed
+// that limit - and a body-too-long 422 is terminal exactly like the anchoring 422
+// this whole path exists to prevent. Dropping the tail of the degraded section
+// keeps the round landing; refusing the post would lose all of it.
+const ghMaxReviewBodyBytes = 60000
+
+func ghFindingLocation(f ReviewFinding) string {
+	switch {
+	case f.Path == "":
+		return "(no file)"
+	case f.Line > 0:
+		return fmt.Sprintf("%s:%d", f.Path, f.Line)
+	default:
+		return f.Path
+	}
 }
 
 // ListReviewComments is the SECOND read: GitHub's create-review response does
