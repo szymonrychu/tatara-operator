@@ -21,6 +21,7 @@ import (
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
+	"github.com/szymonrychu/tatara-operator/internal/queue"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
@@ -438,7 +439,11 @@ func TestReconcileStage_TriagingIsIdempotentAgainstAStaleCache(t *testing.T) {
 				return nil
 			}
 			return []string{repo.Spec.ProjectRef}
-		}).Build()
+		}).
+		// ensureTicket lists on this index; refining is a pod stage, so triaging's
+		// reconcileStage call reaches it now.
+		WithIndex(&tatarav1alpha1.QueuedEvent{}, queue.TaskRefIndex, queue.TaskRefIndexer).
+		Build()
 
 	r := &TaskReconciler{
 		Client: c, APIReader: c, Scheme: scheme,
@@ -585,7 +590,11 @@ func TestReconcileStage_DriftIsCounted(t *testing.T) {
 				return nil
 			}
 			return []string{repo.Spec.ProjectRef}
-		}).Build()
+		}).
+		// ensureTicket lists on this index; refining is a pod stage, so triaging's
+		// reconcileStage call reaches it now.
+		WithIndex(&tatarav1alpha1.QueuedEvent{}, queue.TaskRefIndex, queue.TaskRefIndexer).
+		Build()
 
 	r := &TaskReconciler{
 		Client: c, APIReader: c, Scheme: scheme,

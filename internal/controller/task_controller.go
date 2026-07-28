@@ -728,8 +728,12 @@ func (r *TaskReconciler) registerFieldIndexes(idx client.FieldIndexer) error {
 		}); err != nil {
 		return fmt.Errorf("index Repository.spec.projectRef: %w", err)
 	}
-	// Contract A.3: the mirror's four indexes (the fifth, queuedEventDedupKey,
-	// belongs to DispatcherReconciler, which owns the QueuedEvent controller).
+	// Contract A.3: the mirror's four indexes. An index is registered by its
+	// CONSUMER, not by whoever owns the GVK: queuedEventDedupKey lives on
+	// DispatcherReconciler because the dispatcher and the webhook read it, and
+	// QueuedEvent.spec.payload.taskRef lives HERE because ensureTicket is its
+	// only reader. Both are QueuedEvent indexes with different field names, so
+	// registering them from two reconcilers against one manager is fine.
 	// Dedup is an indexed lookup on issueKey/mrKey, NEVER a hashed Task name and
 	// NEVER a label selector - label VALUES reject ':' and '#'.
 	//
@@ -747,6 +751,9 @@ func (r *TaskReconciler) registerFieldIndexes(idx client.FieldIndexer) error {
 	}
 	if err := idx.IndexField(context.Background(), &tatarav1alpha1.Task{}, TaskDocumentsTasksIndex, TaskDocumentsTasksIndexer); err != nil {
 		return fmt.Errorf("index Task.documentsTasks: %w", err)
+	}
+	if err := idx.IndexField(context.Background(), &tatarav1alpha1.QueuedEvent{}, queue.TaskRefIndex, queue.TaskRefIndexer); err != nil {
+		return fmt.Errorf("index QueuedEvent.spec.payload.taskRef: %w", err)
 	}
 	return nil
 }

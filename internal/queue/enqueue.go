@@ -57,6 +57,12 @@ const (
 	// registered by DispatcherReconciler.SetupWithManager
 	// (internal/controller/queue_controller.go) - NEVER a label selector.
 	DedupKeyIndex = ".spec.dedupKey"
+
+	// TaskRefIndex is the field index key for QueuedEvent.Spec.Payload.TaskRef:
+	// "which admission tickets name this Task?". Registered by
+	// TaskReconciler.registerFieldIndexes (internal/controller/task_controller.go),
+	// which owns ensureTicket, this index's sole consumer.
+	TaskRefIndex = ".spec.payload.taskRef"
 )
 
 // DedupKeyIndexer is the client.IndexerFunc for DedupKeyIndex.
@@ -66,6 +72,16 @@ func DedupKeyIndexer(obj client.Object) []string {
 		return nil
 	}
 	return []string{q.Spec.DedupKey}
+}
+
+// TaskRefIndexer is the client.IndexerFunc for TaskRefIndex. A mint names no
+// Task and is indexed under nothing.
+func TaskRefIndexer(obj client.Object) []string {
+	q, ok := obj.(*tatarav1alpha1.QueuedEvent)
+	if !ok || q.Spec.Payload.TaskRef == "" {
+		return nil
+	}
+	return []string{q.Spec.Payload.TaskRef}
 }
 
 // fieldSelectorUnsupported reports whether a list error is "field label not

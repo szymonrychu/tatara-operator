@@ -8,6 +8,7 @@ import (
 	"unicode/utf8"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/queue"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -44,6 +45,7 @@ func newMirrorClient(t *testing.T, objs ...client.Object) client.Client {
 		WithIndex(&tatarav1alpha1.MergeRequest{}, MRKeyIndex, MRKeyIndexer).
 		WithIndex(&tatarav1alpha1.Task{}, TaskProjectRefIndex, TaskProjectRefIndexer).
 		WithIndex(&tatarav1alpha1.Task{}, TaskDocumentsTasksIndex, TaskDocumentsTasksIndexer).
+		WithIndex(&tatarav1alpha1.QueuedEvent{}, queue.TaskRefIndex, queue.TaskRefIndexer).
 		// The manager indexes Repository by spec.projectRef under this (misnamed)
 		// key; projectRepos lists on it, so a fake client without it cannot reach the
 		// pod path at all.
@@ -560,7 +562,7 @@ func TestSyncIssueOnDemand(t *testing.T) {
 	}
 }
 
-// TestIndexesRegistered asserts the FIVE contract A.3 field indexes are
+// TestIndexesRegistered asserts the SIX contract A.3 field indexes are
 // registered, by their EXACT contract names. Dedup is an indexed lookup on
 // issueKey/mrKey, never a hashed Task name and never a label selector (label
 // VALUES reject ':' and '#').
@@ -572,7 +574,7 @@ func TestIndexesRegistered(t *testing.T) {
 	if err := (&DispatcherReconciler{}).registerFieldIndexes(rec); err != nil {
 		t.Fatalf("DispatcherReconciler.registerFieldIndexes: %v", err)
 	}
-	for _, want := range []string{"issueKey", "mrKey", "projectRef", "documentsTasks", ".spec.dedupKey"} {
+	for _, want := range []string{"issueKey", "mrKey", "projectRef", "documentsTasks", ".spec.dedupKey", ".spec.payload.taskRef"} {
 		if !rec.names[want] {
 			t.Fatalf("field index %q was never registered; got %v", want, rec.names)
 		}
