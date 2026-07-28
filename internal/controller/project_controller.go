@@ -323,6 +323,14 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, scanErr
 	}
 
+	// Consume any standing resume signal BEFORE the refill pass, so a resume and
+	// the session it unblocks land in the SAME reconcile instead of waiting for
+	// the next wake.
+	if err := r.clearBrainstormPauseIfRequested(ctx, &project); err != nil {
+		r.Metrics.ReconcileResult("Project", "error")
+		return ctrl.Result{}, err
+	}
+
 	// EVENT-DRIVEN REFILL (design section 4, task O6). runScans owns the CRON
 	// path, gated on the schedule being due; this is the LEVEL-TRIGGERED pass
 	// that reacts to the Watches(&Issue{}) edge above - a maintainer verdict

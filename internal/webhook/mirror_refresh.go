@@ -46,6 +46,15 @@ func (s *Server) handleIssueClosed(ctx context.Context, w http.ResponseWriter, p
 		s.log.InfoContext(ctx, "issues: mirrored close; leader stops the task if live",
 			"action", "issue_closed_mirror", "project", proj.Name, "repository", repo.Name, "number", ev.Number)
 	}
+	// RESUME TRIGGER (maintainer close). Same signal as the comment trigger:
+	// a maintainer disposing of an item is engagement.
+	if tatarav1.IsMaintainer(&proj, repo, ev.ActorLogin) {
+		if rerr := controller.StampBrainstormResume(ctx, s.cfg.Client, s.cfg.Namespace, proj.Name,
+			controller.ResumeTriggerMaintainerClose); rerr != nil {
+			s.log.ErrorContext(ctx, "brainstorm resume failed", "project", proj.Name,
+				"number", ev.Number, "error", rerr)
+		}
+	}
 	s.accept(w, provider, ev.Kind, ev.Action, "accepted")
 }
 
@@ -247,6 +256,15 @@ func (s *Server) handleMRClosed(ctx context.Context, w http.ResponseWriter, prov
 	if s.stampMRState(ctx, &proj, repo, ev.Number, state) {
 		s.log.InfoContext(ctx, "mr: mirrored out-of-band close/merge; reconcile converges",
 			"action", "mr_closed_mirror", "project", proj.Name, "repository", repo.Name, "number", ev.Number, "state", state)
+	}
+	// RESUME TRIGGER (maintainer close). Same signal as the comment trigger:
+	// a maintainer disposing of an item is engagement.
+	if tatarav1.IsMaintainer(&proj, repo, ev.ActorLogin) {
+		if rerr := controller.StampBrainstormResume(ctx, s.cfg.Client, s.cfg.Namespace, proj.Name,
+			controller.ResumeTriggerMaintainerClose); rerr != nil {
+			s.log.ErrorContext(ctx, "brainstorm resume failed", "project", proj.Name,
+				"number", ev.Number, "error", rerr)
+		}
 	}
 	s.accept(w, provider, ev.Kind, ev.Action, "accepted")
 }

@@ -234,6 +234,17 @@ func (s *Server) handlePush(ctx context.Context, w http.ResponseWriter, provider
 		// (cron) kind in the redesign, not a per-merge webhook. handlePush now only
 		// marks the repo for re-ingest.
 
+		// RESUME TRIGGER (push). Identity-scoped: a head SHA the operator did not
+		// itself land re-opens a paused brainstorm. It compares against the
+		// operator's OWN merge record, never against ev.AuthorLogin (which is never
+		// populated for Kind:"push") and never against a commit message.
+		// Best-effort: a resume failure must not turn a delivered webhook into a
+		// 500 the forge will retry.
+		if rerr := controller.ResumeBrainstormOnPush(ctx, s.cfg.Client, s.cfg.Namespace, proj.Name, ev.HeadSHA); rerr != nil {
+			s.log.ErrorContext(ctx, "webhook push: brainstorm resume failed",
+				"provider", provider, "project", proj.Name, "repository", repo.Name, "error", rerr)
+		}
+
 		s.accept(w, provider, "push", ev.Action, "accepted")
 		return
 	}
@@ -755,6 +766,18 @@ func (s *Server) handleIssueComment(ctx context.Context, w http.ResponseWriter, 
 			"project", proj.Name, "issue_ref", ev.IssueRef, "author", ev.ActorLogin)
 		s.accept(w, provider, ev.Kind, ev.Action, "ignored")
 		return
+	}
+
+	// RESUME TRIGGER (maintainer comment). A maintainer engaging with ANY issue
+	// or MR is the human-disengagement signal inverted: the project is moving
+	// again. Authenticated actor only - IsMaintainer is closed by default and
+	// structurally excludes the bot.
+	if tatarav1.IsMaintainer(&proj, commentRepo, ev.ActorLogin) {
+		if rerr := controller.StampBrainstormResume(ctx, s.cfg.Client, s.cfg.Namespace, proj.Name,
+			controller.ResumeTriggerMaintainerComment); rerr != nil {
+			s.log.ErrorContext(ctx, "issue_comment: brainstorm resume failed",
+				"project", proj.Name, "issue_ref", ev.IssueRef, "error", rerr)
+		}
 	}
 
 	// General comment->task intake (OP6): every human comment on an issue OR an
