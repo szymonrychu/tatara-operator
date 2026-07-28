@@ -640,8 +640,8 @@ func TestOutcome_Clarify_ImplementRequiresApprovalOnEveryOwnedIssue(t *testing.T
 // approved is gated by THIS handler's verifyApprovalScope, which runs the
 // LIVE C.6 citation check per request. This test is what certifies that widening:
 // a Task standing at conversing gets NO credit for anything that happened
-// before it arrived there, so when the live grammar refuses, the Task goes
-// straight back to parked(identity-unverified) with no approval stamped.
+// before it arrived there, so when the live citation check refuses, the Task
+// goes straight back to parked(identity-unverified) with no approval stamped.
 //
 // It replaces TestOutcome_Conversing_ApprovalVerdictIsNeverConsulted, which
 // made the same assertion three times over an absent / zero-value /
@@ -653,7 +653,7 @@ func TestOutcome_Clarify_ImplementRequiresApprovalOnEveryOwnedIssue(t *testing.T
 // Note for accuracy: a clarify agent standing at conversing CAN move a Task
 // toward code execution, via decision=implement -> approved -> admission to
 // implementing - "cannot reach implementing directly" only ever described
-// the ONE edge, never the two-hop path through a GENUINE grammar pass.
+// the ONE edge, never the two-hop path through a GENUINE citation-check pass.
 func TestOutcome_Conversing_ImplementRefusedWhenLiveCitationCheckFails(t *testing.T) {
 	i1 := issueV2("tatara-operator", 291, "t1")
 	task := taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageConversing, "clarify")
@@ -917,6 +917,106 @@ func TestOutcome_Clarify_NoVerifierFailsClosed(t *testing.T) {
 		`{"kind":"clarify","payload":{"decision":"implement","reason":"trust me"}}`)
 	require.Equal(t, http.StatusOK, w.Code)
 	require.Equal(t, "identity-unverified", e.task(t, "t1").Status.StageReason)
+}
+
+// TestOutcome_Clarify_GrantIsAuditedWithTheApprover is the counterpart to the
+// refusal telemetry, and the asymmetry it closes is not cosmetic. A REFUSAL is
+// recorded twice (operator_approval_refused_total{reason} and an
+// action=approval_refused INFO line); the GRANT was recorded only as
+// action=submit_outcome, outcome=implement, issues=N, which names neither the
+// approver nor the comment. The only other record of who approved is
+// Issue.Status.Approval, and that is ONE slot overwritten by the next approval
+// on the same Issue - so without this line, "who released this change into
+// push-CD" becomes unanswerable the moment a second approval lands. This is the
+// most security-relevant business action in the system; hard rule 12 wants it at
+// INFO with structured fields.
+//
+// The field names are pinned deliberately: they are exactly the ones the deleted
+// controller-side writer used, so a log consumer written against either sees one
+// shape rather than two.
+func TestOutcome_Clarify_GrantIsAuditedWithTheApprover(t *testing.T) {
+	i1 := issueV2("tatara-operator", 291, "t1")
+	var logBuf bytes.Buffer
+	e := buildV2(t, v2Opts{writer: panicForge{},
+		logger:   slog.New(slog.NewJSONHandler(&logBuf, nil)),
+		approval: &fakeApproval{grant: map[string]bool{i1.Name: true}, needCitation: true}},
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"), i1)
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"clarify","payload":{"decision":"implement","reason":"maintainer said go ahead",`+
+			`"approvalCitations":[{"id":"1","quote":"go ahead"}]}}`)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, tatarav1alpha1.StageApproved, e.task(t, "t1").Status.Stage)
+
+	line := findLogLine(t, logBuf.Bytes(), "approval_verified")
+	require.Equal(t, "INFO", line["level"], "the approval grant must be an INFO business action")
+	require.Equal(t, i1.Name, line["issue"])
+	require.Equal(t, "t1", line["task"])
+	require.Equal(t, "maintainer", line["maintainer_login"],
+		"the audit line must name the APPROVER; that is the whole point of it")
+	require.Equal(t, "1", line["cited_comment_id"],
+		"the audit line must name the comment the approval was built from")
+	require.Equal(t, false, line["auto"])
+}
+
+// findLogLine returns the ONE JSON log record whose "action" field matches, and
+// fails if there is not exactly one. Asserting on a substring of the buffer
+// would pass on a line that carried the action but none of the fields, which is
+// precisely the failure this test exists to catch.
+func findLogLine(t *testing.T, buf []byte, action string) map[string]any {
+	t.Helper()
+	var found []map[string]any
+	for _, raw := range bytes.Split(bytes.TrimSpace(buf), []byte("\n")) {
+		if len(raw) == 0 {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal(raw, &rec); err != nil {
+			continue
+		}
+		if rec["action"] == action {
+			found = append(found, rec)
+		}
+	}
+	require.Len(t, found, 1, "want exactly one action=%s log line, got %d", action, len(found))
+	return found[0]
+}
+
+// TestOutcome_Clarify_AlreadyApprovedIssueNeedsNoFreshCitation exercises
+// verifyOneIssue's clause-2 idempotence THROUGH the handler. An Issue that
+// already carries evidence is approved - clause (2) asks whether every live
+// Issue CARRIES evidence, not whether it can be re-derived on this request -
+// which is what keeps the autoApproveTataraProposals evidence (no comment to
+// re-match) alive and stops a maintainer's later "thanks!" from revoking a grant
+// already given.
+//
+// It is also what makes fakeApproval's already-approved arm load-bearing rather
+// than a restatement nothing runs: the fake grants NOTHING here and demands a
+// citation, so if that arm is removed this request is refused and the Task parks.
+func TestOutcome_Clarify_AlreadyApprovedIssueNeedsNoFreshCitation(t *testing.T) {
+	approvedAt := metav1.NewTime(frozenNow.Add(-time.Hour))
+	i1 := issueV2("tatara-operator", 291, "t1", func(iss *tatarav1alpha1.Issue) {
+		iss.Status.Status = "approved"
+		iss.Status.Approval = &tatarav1alpha1.ApprovalEvidence{
+			Login: "maintainer-1", CommentID: "c-1", Phrase: "go ahead", CreatedAt: approvedAt,
+		}
+	})
+	e := buildV2(t, v2Opts{writer: panicForge{},
+		approval: &fakeApproval{grant: map[string]bool{}, needCitation: true}},
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"), i1)
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"clarify","payload":{"decision":"implement","reason":"already approved last turn"}}`)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, tatarav1alpha1.StageApproved, e.task(t, "t1").Status.Stage,
+		"an Issue that already carries evidence must not need a fresh citation")
+
+	got := e.issue(t, i1.Name).Status.Approval
+	require.NotNil(t, got)
+	require.Equal(t, "maintainer-1", got.Login, "the ORIGINAL approver must survive the re-verification")
+	require.Equal(t, "c-1", got.CommentID)
 }
 
 func TestOutcome_Clarify_DiscussParksAwaitingHuman(t *testing.T) {

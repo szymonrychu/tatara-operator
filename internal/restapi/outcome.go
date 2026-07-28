@@ -1346,6 +1346,20 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 			writeClientErr(o.w, err)
 			return
 		}
+		// THE GRANT NEEDS ITS OWN AUDIT LINE, and after step F this is the only
+		// place left that can emit one. Every REFUSAL is covered twice -
+		// operator_approval_refused_total{reason} AND action=approval_refused -
+		// while the grant had only action=submit_outcome,outcome=implement,
+		// which names no approver and no comment. Issue.Status.Approval is ONE
+		// slot, overwritten by the next approval on that Issue, so the
+		// durable record of WHO released a change into push-CD is destroyed by
+		// the next one; this line is the append-only trace. Field names are
+		// exactly those the deleted controller-side writer used, so a consumer
+		// built against either sees one shape.
+		s.log.InfoContext(ctx, "restapi: approval verified",
+			append(reqLogFields(o.r), "action", "approval_verified", "task", o.task.Name,
+				"issue", iss.Name, "maintainer_login", ev.Login,
+				"cited_comment_id", ev.CommentID, "auto", ev.Auto)...)
 	}
 	if !o.commit(func(t *tatarav1alpha1.Task) error {
 		if err := stage.Enter(t, mrs, tatarav1alpha1.StageApproved, "", s.now()); err != nil {
