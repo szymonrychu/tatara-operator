@@ -100,7 +100,7 @@ func TestEvictLongestIdleConversation(t *testing.T) {
 
 	r := newConversingCapacityFixture(t, proj, fresh, middle, stalest)
 
-	if err := r.enforceConversingCeiling(context.Background(), proj, now); err != nil {
+	if _, err := r.enforceConversingCeiling(context.Background(), proj, now); err != nil {
 		t.Fatalf("enforceConversingCeiling: %v", err)
 	}
 
@@ -126,6 +126,105 @@ func TestEvictLongestIdleConversation(t *testing.T) {
 	}
 }
 
+// TestEvictLongestIdleConversation_CapsOverflowPerPass is the CRITICAL 2
+// discrimination proof (2026-07-28 final review, second half): each
+// eviction runs StopWithHandoff, which blocks on real timers, and
+// ProjectReconciler runs MaxConcurrentReconciles=1 across every project - a
+// large overflow evicted serially in ONE call would wedge every project's
+// reconcile for hours. With 3 live conversations against a ceiling of 1
+// (overflow=2), a single pass must evict only the ONE longest-idle
+// conversation (maxConversingEvictionsPerPass) and signal the caller to
+// requeue soon for the rest, rather than evicting both in the same blocking
+// call. A second pass then converges the remainder.
+func TestEvictLongestIdleConversation_CapsOverflowPerPass(t *testing.T) {
+	now := time.Now()
+	proj := &tatarav1alpha1.Project{}
+	proj.Namespace = "tatara"
+	proj.Name = "infrastructure"
+	proj.Spec.MaxConversingPods = 1
+	proj.Spec.Agent.TurnTimeoutSeconds = 600
+
+	fresh := conversingTask("fresh", "infrastructure", now.Add(-1*time.Minute))
+	middle := conversingTask("middle", "infrastructure", now.Add(-10*time.Minute))
+	stalest := conversingTask("stalest", "infrastructure", now.Add(-40*time.Minute))
+
+	r := newConversingCapacityFixture(t, proj, fresh, middle, stalest)
+
+	requeue, err := r.enforceConversingCeiling(context.Background(), proj, now)
+	if err != nil {
+		t.Fatalf("enforceConversingCeiling (pass 1): %v", err)
+	}
+	if requeue <= 0 {
+		t.Fatalf("requeue = %v, want > 0 - overflow remains after the per-pass cap, the caller must re-drive soon", requeue)
+	}
+
+	evicted := 0
+	for _, tk := range []*tatarav1alpha1.Task{fresh, middle, stalest} {
+		var got tatarav1alpha1.Task
+		if err := r.Get(context.Background(), objectKeyOf(tk), &got); err != nil {
+			t.Fatalf("get %s: %v", tk.Name, err)
+		}
+		if got.Status.Stage == tatarav1alpha1.StageParked {
+			evicted++
+		}
+	}
+	if evicted != 1 {
+		t.Fatalf("evicted %d Tasks in one pass, want exactly 1 (maxConversingEvictionsPerPass) - an unbounded pass wedges MaxConcurrentReconciles=1 for hours", evicted)
+	}
+
+	// A second pass evicts the next-longest-idle survivor and finally
+	// converges (no more overflow, no further requeue asked for).
+	requeue, err = r.enforceConversingCeiling(context.Background(), proj, now)
+	if err != nil {
+		t.Fatalf("enforceConversingCeiling (pass 2): %v", err)
+	}
+	if requeue != 0 {
+		t.Fatalf("requeue = %v, want 0 - the overflow should be fully converged after the second pass", requeue)
+	}
+	var stillLive int
+	for _, tk := range []*tatarav1alpha1.Task{fresh, middle, stalest} {
+		var got tatarav1alpha1.Task
+		if err := r.Get(context.Background(), objectKeyOf(tk), &got); err != nil {
+			t.Fatalf("get %s: %v", tk.Name, err)
+		}
+		if got.Status.Stage == tatarav1alpha1.StageConversing {
+			stillLive++
+		}
+	}
+	if stillLive != 1 {
+		t.Fatalf("still conversing = %d after two passes, want exactly 1 (the ceiling)", stillLive)
+	}
+}
+
+// TestEnforceConversingCeiling_NilTasksFailsLoudInsteadOfPanicking is the M4
+// discrimination proof (2026-07-28 final review): project_controller.go's own
+// doc comment on the Tasks field claims "Nil ... is never dereferenced", but
+// enforceConversingCeiling used to call r.Tasks.conversingHandoffAndPark(...)
+// with no nil check at all - a nil r.Tasks (a misconfigured wiring, or a test
+// that never sets it) would panic the moment eviction was actually needed,
+// contradicting that claim. With overflow present and r.Tasks left nil, this
+// must return an error, not panic.
+func TestEnforceConversingCeiling_NilTasksFailsLoudInsteadOfPanicking(t *testing.T) {
+	now := time.Now()
+	proj := &tatarav1alpha1.Project{}
+	proj.Namespace = "tatara"
+	proj.Name = "infrastructure"
+	proj.Spec.MaxConversingPods = 1
+
+	fresh := conversingTask("fresh", "infrastructure", now.Add(-1*time.Minute))
+	stalest := conversingTask("stalest", "infrastructure", now.Add(-40*time.Minute))
+	c := newMirrorClient(t, proj, fresh, stalest)
+	r := &ProjectReconciler{Client: c, Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry())}
+
+	requeue, err := r.enforceConversingCeiling(context.Background(), proj, now)
+	if err == nil {
+		t.Fatal("enforceConversingCeiling with nil r.Tasks and overflow present returned no error - it must fail loud, not panic or silently no-op")
+	}
+	if requeue != 0 {
+		t.Fatalf("requeue = %v, want 0 on the nil-Tasks error path", requeue)
+	}
+}
+
 // Determinism (things-to-get-right #3): with two conversations idle since the
 // EXACT SAME whole second (the real collision shape - metav1.Time round-trips
 // at whole-second precision), eviction must not depend on the order the Tasks
@@ -148,7 +247,7 @@ func TestEvictLongestIdleConversationTieBreakIsDeterministic(t *testing.T) {
 			second := conversingTask(order[1], "infrastructure", tie)
 			r := newConversingCapacityFixture(t, proj.DeepCopy(), first, second)
 
-			if err := r.enforceConversingCeiling(context.Background(), proj, now); err != nil {
+			if _, err := r.enforceConversingCeiling(context.Background(), proj, now); err != nil {
 				t.Fatalf("enforceConversingCeiling: %v", err)
 			}
 

@@ -177,20 +177,31 @@ func (s *Server) deliverAgentComment(ctx context.Context, proj tatarav1.Project,
 		return
 	}
 
+	// trigger decides BOTH whether this round may open/wake a conversation AND
+	// whether it is even allowed into PendingEvents at all. A same-kind comment
+	// must never be queued: PendingEvents is what the conversing follow-up-turn
+	// check (reconcilePodStage, task_stage.go) drains on nothing but non-empty,
+	// so an unconditional enqueue here fed a live agent its own comment as a
+	// follow-up turn - the 2026-06 forty-comment loop, reproduced by this
+	// feature (2026-07-28 final review CRITICAL 1). The round is still counted
+	// either way; only the enqueue is gated.
+	trigger := controller.CrossKindTriggers(authorKind, reactingKind)
+
 	taskEv := tatarav1.TaskEvent{
 		At: metav1.Now(), Kind: kind, Repo: repo.Name, Number: ev.Number,
 		Author: ev.ActorLogin, Body: ev.CommentBody,
 	}
-	rounds, err := controller.AppendAgentTaskEvent(ctx, s.cfg.Client, task, taskEv)
+	rounds, err := controller.AppendAgentTaskEvent(ctx, s.cfg.Client, task, taskEv, trigger)
 	if err != nil {
 		s.log.ErrorContext(ctx, "pendingEvents: append agent task event failed", "error", err, "task", task.Name)
 		return
 	}
-	s.cfg.Metrics.SetBotRounds(proj.Name, float64(rounds))
 
-	if !controller.CrossKindTriggers(authorKind, reactingKind) {
+	if !trigger {
 		// Same-kind: refused BY CONSTRUCTION. The round is already counted above;
-		// nothing further happens - no conversing entry, no re-drive.
+		// nothing further happens - no conversing entry, no re-drive, and (as of
+		// the fix above) no queued event for a live pod to mistake for a fresh
+		// human turn.
 		s.log.InfoContext(ctx, "pendingEvents: agent comment landed same-kind; round counted, no trigger",
 			"action", "agent_comment_same_kind", "task", task.Name, "project", proj.Name,
 			"author_kind", authorKind, "reacting_kind", reactingKind, "bot_rounds", rounds)

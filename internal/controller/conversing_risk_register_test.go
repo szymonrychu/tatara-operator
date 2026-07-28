@@ -86,6 +86,63 @@ func TestRisk_AnAgentCommentNeverWakesItsOwnKind(t *testing.T) {
 	}
 }
 
+// RISK 2b (2026-07-28 final review CRITICAL 1): CrossKindTriggers alone is not
+// the whole guarantee - the webhook's deliverAgentComment used to call
+// AppendAgentTaskEvent (which queues the event into PendingEvents and, before
+// this fix, reset the idle clock) BEFORE consulting CrossKindTriggers, so a
+// same-kind comment was already queued by the time the same-kind refusal ran.
+// task_stage.go's conversing follow-up-turn check keys on nothing but
+// len(PendingEvents) > 0 - it cannot tell a genuine cross-kind wake from an
+// agent's own comment reflected back at it. This proves the fix at the
+// choke point itself: AppendAgentTaskEvent's enqueue parameter must gate the
+// append, and the function must never stamp ConversationLastEventAt at all
+// (only a genuine human comment, through AppendTaskEvent, may reset the idle
+// clock - task_types.go's own doc comment says so).
+func TestRisk_SameKindAgentEventNeverEntersPendingEventsOrResetsTheIdleClock(t *testing.T) {
+	before := metav1.NewTime(time.Now().Add(-30 * time.Minute).Truncate(time.Second))
+	task := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "t-risk2b", Namespace: testNS},
+		Spec:       tatarav1alpha1.TaskSpec{Kind: "review", ProjectRef: "p", Goal: "g"},
+		Status:     tatarav1alpha1.TaskStatus{ConversationLastEventAt: &before},
+	}
+	c := newMirrorClient(t, task)
+	ctx := context.Background()
+
+	ev := tatarav1alpha1.TaskEvent{Kind: "mr_comment", Repo: "r", Number: 1, Author: "tatara-bot", Body: "own comment, reflected"}
+	// enqueue=false is what a same-kind CrossKindTriggers()==false result must
+	// pass: reproduces the same-kind branch of deliverAgentComment.
+	rounds, err := AppendAgentTaskEvent(ctx, c, task, ev, false)
+	if err != nil {
+		t.Fatalf("AppendAgentTaskEvent: %v", err)
+	}
+	if rounds != 1 {
+		t.Fatalf("rounds = %d, want 1 - the round is still counted (D7)", rounds)
+	}
+	if len(task.Status.PendingEvents) != 0 {
+		t.Fatalf("SELF-LOOP: PendingEvents = %d, want 0 - a same-kind event must never reach the follow-up-turn check", len(task.Status.PendingEvents))
+	}
+	if task.Status.ConversationLastEventAt == nil || !task.Status.ConversationLastEventAt.Time.Equal(before.Time) {
+		t.Fatalf("IDLE CLOCK RESET BY A BOT EVENT: ConversationLastEventAt changed, want unchanged %s", before.Time)
+	}
+
+	// A CROSS-kind event (enqueue=true) DOES reach PendingEvents - that
+	// delivery is the whole point of D4 - but it must ALSO never reset the
+	// idle clock: only a human comment may.
+	rounds, err = AppendAgentTaskEvent(ctx, c, task, ev, true)
+	if err != nil {
+		t.Fatalf("AppendAgentTaskEvent (cross-kind): %v", err)
+	}
+	if rounds != 2 {
+		t.Fatalf("rounds = %d, want 2 (accumulates across the two calls)", rounds)
+	}
+	if len(task.Status.PendingEvents) != 1 {
+		t.Fatalf("cross-kind event was not queued: PendingEvents = %d, want 1", len(task.Status.PendingEvents))
+	}
+	if task.Status.ConversationLastEventAt == nil || !task.Status.ConversationLastEventAt.Time.Equal(before.Time) {
+		t.Fatalf("IDLE CLOCK RESET BY A CROSS-KIND BOT EVENT: ConversationLastEventAt changed, want unchanged %s", before.Time)
+	}
+}
+
 // RISK 3: laneOccupancy frees terminal/Conversation lifecycle tasks (e19bedb).
 // Conversation Tasks were counted against the per-repo concurrency lane FOREVER,
 // which with maxPerRepo=1 wedged mrScan/issueScan recovery entirely (lanes at

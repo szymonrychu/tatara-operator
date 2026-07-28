@@ -339,23 +339,33 @@ func (r *ProjectReconciler) driveUnparks(ctx context.Context, proj *tatarav1alph
 		maxOpen = 6
 	}
 
-	// HOISTED, once per pass, not once per Task (tatara-operator#368: this loop
-	// is paced BECAUSE an unindexed per-Task List across the full parked backlog
-	// hammered the apiserver before). Skipped entirely when nothing in this
+	// The List is HOISTED, once per pass, not once per Task (tatara-operator#368:
+	// this loop is paced BECAUSE an unindexed per-Task List across the full
+	// parked backlog hammered the apiserver before) - but unlike a plain
+	// boolean, the ANSWER is a BUDGET spent as this pass actually admits Tasks
+	// into conversing, not a single yes/no reused unconditionally for every
+	// candidate. A boolean computed once and handed to every parked Task in the
+	// batch let a bulk maintainer comment pass - the exact scenario
+	// UnparkInput.ActiveTasks' own doc names - push admissions well past the
+	// ceiling (e.g. 40 Tasks into conversing against a ceiling of 5): nothing
+	// decremented it as Tasks entered conversing (2026-07-28 final review
+	// CRITICAL 2). conversingRoomBudget is spent by exactly one per Task that
+	// actually lands on conversing, below, so this pass can never admit more
+	// than the ceiling has room for. Skipped entirely when nothing in this
 	// batch would ever consult it. A transient List error degrades to "no room"
 	// (always the SAFE fallback - see UnparkInput.ConversingHasRoom's own doc)
 	// rather than failing the whole pass closed for every OTHER park reason,
 	// which never asked the question in the first place.
-	conversingRoom := false
+	conversingRoomBudget := 0
 	for i := range tl.Items {
 		t := &tl.Items[i]
 		if t.Spec.ProjectRef == proj.Name && t.Status.Stage == tatarav1alpha1.StageParked && needsConversingRoom(t.Status.StageReason) {
-			room, roomErr := ConversingHasRoom(ctx, r.Client, proj)
-			if roomErr != nil {
-				log.FromContext(ctx).Error(roomErr, "unpark: conversing capacity check failed; treating this pass as no room",
+			live, listErr := countConversing(ctx, r.Client, proj)
+			if listErr != nil {
+				log.FromContext(ctx).Error(listErr, "unpark: conversing capacity check failed; treating this pass as no room",
 					"action", "unpark_conversing_room_error", "project", proj.Name)
-			} else {
-				conversingRoom = room
+			} else if ceiling := tatarav1alpha1.MaxConversingPods(proj); ceiling > len(live) {
+				conversingRoomBudget = ceiling - len(live)
 			}
 			break
 		}
@@ -376,6 +386,7 @@ func (r *ProjectReconciler) driveUnparks(ctx context.Context, proj *tatarav1alph
 		// cached) and can lag exactly the write this whole feature exists to survive.
 		// false here is the fallback ApplyUnpark uses for every OTHER stageReason,
 		// where GrammarPassed is ignored entirely.
+		conversingRoom := needsConversingRoom(t.Status.StageReason) && conversingRoomBudget > 0
 		target, decline, err := ApplyUnpark(ctx, r.Client, r.APIReader, proj, t, active, maxOpen, false, conversingRoom, now)
 		if err != nil {
 			log.FromContext(ctx).Error(err, "unpark: apply failed",
@@ -384,6 +395,13 @@ func (r *ProjectReconciler) driveUnparks(ctx context.Context, proj *tatarav1alph
 				firstErr = err
 			}
 			continue
+		}
+		if target == tatarav1alpha1.StageConversing && conversingRoomBudget > 0 {
+			// SPEND the budget: this Task actually landed on conversing this
+			// pass and now occupies one of the slots the room check above
+			// answered for. The next candidate in this same loop must see the
+			// remaining room, not the room this pass STARTED with.
+			conversingRoomBudget--
 		}
 		// GUARD declines are always anomalous (the live object had already
 		// drifted from what this pass believed was parked) and worth surfacing

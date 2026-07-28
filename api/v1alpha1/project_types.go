@@ -650,7 +650,12 @@ type ScmSpec struct {
 	//
 	// This field survived the task-centric redesign as dead config, referenced
 	// only by its own round-trip test. It is live again as of the conversing
-	// stage. Zero means ConversationIdleDefault (60 minutes).
+	// stage. Zero means ConversationIdleDefault (60 minutes). A non-zero value
+	// below ConversationIdleFloor (5 minutes) is CLAMPED to the floor: this
+	// value becomes the conversing stage's ENTIRE pod TTL (agent.PodTTLSeconds),
+	// and anything below PodReadyTimeout (5 minutes) TTL-stops the pod before
+	// it can ever become Ready - an unbounded pod-recreation loop with no
+	// podRecreations budget to stop it.
 	// +kubebuilder:default=60
 	// +kubebuilder:validation:Minimum=0
 	// +optional
@@ -688,12 +693,35 @@ func EffectiveApprovalPhrases(p *Project) []string {
 	return DefaultApprovalPhrases()
 }
 
+// ConversationIdleFloor is the minimum idle budget ConversationIdle ever
+// returns for a non-zero scm.conversationIdleMinutes. agent.PodTTLSeconds
+// resolves the conversing stage's ENTIRE pod TTL from this value (it IS the
+// pod's lifetime budget for that stage, unlike every other stage which uses
+// AgentPodTTLSeconds), and PodReadyTimeout is 5 minutes - so an unfloored
+// small value (conversationIdleMinutes: 1 gives a 60s TTL) TTL-stops the pod
+// before it can ever become Ready. ttlStop does not charge podRecreations
+// (task_stage.go), so that shape is unbounded pod churn with no budget to
+// stop it (2026-07-28 final review IMPORTANT 3). Matches
+// ScmSpec.AgentPodTTLSeconds' own +kubebuilder:validation:Minimum=300 floor,
+// which exists for the identical reason on the flat-TTL stages.
+//
+// This is a CLAMP, not a CRD Minimum on the field itself: zero is a load-bearing
+// sentinel for "use ConversationIdleDefault" (kubebuilder:validation:Minimum=0
+// on the field), and a schema Minimum=5 would reject that legitimate explicit
+// zero along with the genuinely-too-small values this guards against.
+const ConversationIdleFloor = 5 * time.Minute
+
 // ConversationIdle is the conversing stage's idle budget for p: the project's
 // scm.conversationIdleMinutes, or ConversationIdleDefault when it is unset or
-// non-positive. It is the ONE place the minutes-to-Duration conversion happens.
+// non-positive, floored at ConversationIdleFloor otherwise. It is the ONE
+// place the minutes-to-Duration conversion happens.
 func ConversationIdle(p *Project) time.Duration {
 	if p != nil && p.Spec.Scm != nil && p.Spec.Scm.ConversationIdleMinutes > 0 {
-		return time.Duration(p.Spec.Scm.ConversationIdleMinutes) * time.Minute
+		d := time.Duration(p.Spec.Scm.ConversationIdleMinutes) * time.Minute
+		if d < ConversationIdleFloor {
+			return ConversationIdleFloor
+		}
+		return d
 	}
 	return ConversationIdleDefault
 }
@@ -732,11 +760,22 @@ type ProjectSpec struct {
 	// +optional
 	AgentPodTTLSeconds int `json:"agentPodTTLSeconds,omitempty"`
 	// MaxConversingPods caps how many Tasks in this project may sit in the
-	// conversing stage at once. On reaching it, a new conversation EVICTS the
-	// longest-idle one: that Task takes a handoff turn and parks at
-	// awaiting-human, and it still works - it cold-spawns on its next comment.
-	// Zero means DefaultMaxConversingPods (5).
-	// +kubebuilder:default=5
+	// conversing stage at once. A conversing Task holds a live agent pod and
+	// therefore a REAL MaxConcurrentAgents slot for as long as the conversation
+	// stays open (queueTaskHoldsSlot counts it) - the two caps COMPOSE, so this
+	// one MUST stay strictly below MaxConcurrentAgents or a handful of chatty
+	// threads can occupy the project's entire agent concurrency and starve
+	// every implement/review/merge Task indefinitely (2026-07-28 final review
+	// IMPORTANT 1; see DefaultMaxConversingPods for the default-pair reasoning).
+	//
+	// Reaching the ceiling DECLINES a new conversation ("over-ceiling"; the
+	// event stays queued in PendingEvents and rides the Task's next turn) - it
+	// does NOT evict an existing one. Eviction is a separate, rarer path
+	// (enforceConversingCeiling, the project-reconcile backstop) that only
+	// fires once live conversations EXCEED the ceiling, which reaching it
+	// exactly never does.
+	// Zero means DefaultMaxConversingPods (2).
+	// +kubebuilder:default=2
 	// +kubebuilder:validation:Minimum=0
 	// +optional
 	MaxConversingPods int `json:"maxConversingPods,omitempty"`

@@ -19,7 +19,7 @@ const (
 	// conversation continues in the replacement.
 	ConversationIdleDefault = 60 * time.Minute
 	// DefaultMaxConversingPods is the per-project ceiling on simultaneously
-	// CONVERSING Tasks when a Project sets no maxConversingPods. Five.
+	// CONVERSING Tasks when a Project sets no maxConversingPods. Two.
 	//
 	// It is not a substitute for MaxConcurrentAgents and does not replace it: a
 	// conversing Task holds a real concurrency slot (conversing is neither
@@ -27,7 +27,15 @@ const (
 	// compose. This one exists because a conversation is CHEAP to start and LONG
 	// to hold, so without its own bound a handful of chatty threads would occupy
 	// every agent slot the project has.
-	DefaultMaxConversingPods = 5
+	//
+	// MUST STAY STRICTLY BELOW MaxConcurrentAgents' own default (3, see
+	// ProjectSpec.MaxConcurrentAgents): at 5 versus 3 the ceiling could never
+	// bind (three chatty conversations already saturate 100% of the project's
+	// agent concurrency before conversing's own cap does anything), starving
+	// every implement/review/merge Task indefinitely (2026-07-28 final review
+	// IMPORTANT 1). Two leaves at least one slot free for non-conversational
+	// work at the defaults.
+	DefaultMaxConversingPods = 2
 	// DeliveredRetention ages out a delivered Task (B.6/F.4, fix F1).
 	DeliveredRetention = 48 * time.Hour
 	// RejectedRetention ages out a rejected Task.

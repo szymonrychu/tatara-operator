@@ -215,6 +215,54 @@ func TestDriveUnparks_IdentityUnverifiedWithoutVerdictOpensConversationNeverImpl
 	}
 }
 
+// TestDriveUnparks_ConversingRoomBudgetCapsBulkReEntry is the CRITICAL 2
+// discrimination proof (2026-07-28 final review, first half): driveUnparks
+// used to hoist a single "has room" boolean ONCE per pass and reuse it,
+// unconditionally, for every parked Task in the batch - nothing decremented
+// it as Tasks actually entered conversing. A bulk maintainer comment pass
+// (UnparkInput.ActiveTasks' own doc names exactly this scenario) could
+// therefore push admissions well past the per-project conversing ceiling.
+// Four parked(awaiting-human) Tasks against a ceiling of 2 must never put
+// more than 2 into conversing in a single pass.
+func TestDriveUnparks_ConversingRoomBudgetCapsBulkReEntry(t *testing.T) {
+	proj := wfProject()
+	proj.Spec.MaxConversingPods = 2
+
+	names := []string{"a", "b", "c", "d"}
+	var objs []client.Object
+	for _, n := range names {
+		task := wfParkedTask("t-bulk-"+n, "clarify", stage.ReasonAwaitingHuman)
+		task.Status.PendingEvents = []tatarav1alpha1.TaskEvent{{
+			At: metav1.Now(), Kind: "issue_comment", Author: "human", Body: "go ahead",
+		}}
+		iss := &tatarav1alpha1.Issue{ObjectMeta: metav1.ObjectMeta{Name: "iss-bulk-" + n, Namespace: mdNS}}
+		iss.Status.State = "open"
+		iss.Status.Status = "new" // NOT approved: allApproved must stay false so this Task's
+		// re-entry consults ConversingHasRoom rather than jumping straight to implementing.
+		task.Status.IssueRefs = []string{iss.Name}
+		objs = append(objs, task, iss)
+	}
+	c := newMirrorClient(t, objs...)
+	r := &ProjectReconciler{Client: c, Scheme: c.Scheme(), Metrics: wfMetrics()}
+	if err := r.driveUnparks(context.Background(), proj, time.Now()); err != nil {
+		t.Fatalf("driveUnparks: %v", err)
+	}
+
+	conversing := 0
+	for _, n := range names {
+		got := mdGetTask(t, c, "t-bulk-"+n)
+		if got.Status.Stage == tatarav1alpha1.StageConversing {
+			conversing++
+		}
+	}
+	if conversing > proj.Spec.MaxConversingPods {
+		t.Fatalf("driveUnparks put %d Tasks into conversing in one pass against a ceiling of %d - the room budget was reused instead of spent", conversing, proj.Spec.MaxConversingPods)
+	}
+	if conversing == 0 {
+		t.Fatalf("driveUnparks put 0 Tasks into conversing - the room budget computation itself is broken, not just the cap")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // W1: GrammarVerifier is the PRODUCTION restapi.ApprovalVerifier. Before it was
 // wired, restapi.Config.Approval was nil and verifyApprovalScope failed closed on

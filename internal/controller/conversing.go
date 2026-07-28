@@ -184,25 +184,67 @@ func sortByIdleThenName(live []tatarav1alpha1.Task) {
 // simply queues behind ConversingHasRoom until one closes on its own. Evicting
 // a mid-turn pod to force room for a new conversation would thrash the busiest
 // projects hardest, which is worse than making the new conversation wait.
-func (r *ProjectReconciler) enforceConversingCeiling(ctx context.Context, proj *tatarav1alpha1.Project, now time.Time) error {
+//
+// maxConversingEvictionsPerPass BOUNDS how much of the overflow one call
+// evicts (2026-07-28 final review CRITICAL 2). Each eviction runs
+// StopWithHandoff, which blocks on real timers up to ~2*TurnTimeoutSeconds+60s
+// (about 61 minutes at the 1800s default) per Task, and ProjectReconciler runs
+// MaxConcurrentReconciles=1 ACROSS EVERY PROJECT - so evicting a large overflow
+// serially in one call (a bulk maintainer comment pass against a since-lowered
+// ceiling is exactly the shape that produces one) would wedge every project's
+// reconcile - driveUnparks, ReapTerminal, every gauge - for hours. Capped at 1:
+// the caller requeues quickly (conversingEvictionRequeue) whenever overflow
+// remains after the cap, so convergence spreads across several short passes
+// instead of one long blocking one.
+const maxConversingEvictionsPerPass = 1
+
+// conversingEvictionRequeue is how soon the caller re-drives
+// enforceConversingCeiling when this pass's eviction cap left overflow
+// remaining, so a large overflow converges in several short passes rather
+// than waiting for whatever cadence next triggers this Project's reconcile.
+const conversingEvictionRequeue = 5 * time.Second
+
+// enforceConversingCeiling returns a non-zero requeue duration when this
+// pass's per-pass eviction cap left overflow remaining: the caller should
+// requeue that soon rather than wait for Reconcile()'s own cadence.
+func (r *ProjectReconciler) enforceConversingCeiling(ctx context.Context, proj *tatarav1alpha1.Project, now time.Time) (time.Duration, error) {
 	live, err := countConversing(ctx, r.Client, proj)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if r.Metrics != nil {
 		r.Metrics.SetConversingPods(proj.Name, float64(len(live)))
 	}
 	ceiling := tatarav1alpha1.MaxConversingPods(proj)
 	if len(live) <= ceiling {
-		return nil
+		return 0, nil
+	}
+	// r.Tasks is the *TaskReconciler this eviction path hands off through
+	// (project_controller.go's own doc comment on the field says "Nil ... is
+	// never dereferenced" - a nil r.Tasks here would panic on the very next
+	// line, contradicting that claim; fail loud instead, 2026-07-28 final
+	// review M4).
+	if r.Tasks == nil {
+		err := fmt.Errorf("conversing: ceiling exceeded (%d live over %d) on project %s but no TaskReconciler is wired to evict through", len(live), ceiling, proj.Name)
+		log.FromContext(ctx).Error(err, "conversing: eviction skipped, TaskReconciler unwired",
+			"action", "conversing_evict_error", "project", proj.Name)
+		return 0, err
 	}
 	sortByIdleThenName(live)
 
+	overflow := len(live) - ceiling
+	evict := overflow
+	if evict > maxConversingEvictionsPerPass {
+		evict = maxConversingEvictionsPerPass
+	}
+
 	var firstErr error
-	for i := 0; i < len(live)-ceiling; i++ {
+	for i := 0; i < evict; i++ {
 		t := &live[i]
 		mrs, mErr := ownedMergeRequests(ctx, r.Client, t)
 		if mErr != nil {
+			log.FromContext(ctx).Error(mErr, "conversing: load owned MRs for eviction failed",
+				"action", "conversing_evict_error", "resource_id", t.Name, "project", proj.Name)
 			if firstErr == nil {
 				firstErr = mErr
 			}
@@ -220,7 +262,13 @@ func (r *ProjectReconciler) enforceConversingCeiling(ctx context.Context, proj *
 			}
 		}
 	}
-	return firstErr
+	if firstErr != nil {
+		return 0, firstErr
+	}
+	if evict < overflow {
+		return conversingEvictionRequeue, nil
+	}
+	return 0, nil
 }
 
 // conversingEntryStages is the CLOSED set of live stages a qualifying comment

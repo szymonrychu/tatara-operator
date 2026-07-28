@@ -28,7 +28,7 @@ func TestAppendAgentTaskEvent_AccumulatesAcrossConsecutiveRounds(t *testing.T) {
 
 	for i, want := range []int{1, 2, 3} {
 		ev := tatarav1alpha1.TaskEvent{Kind: "mr_comment", Repo: "r", Number: 1, Author: "tatara-bot", Body: "round"}
-		rounds, err := AppendAgentTaskEvent(ctx, c, task, ev)
+		rounds, err := AppendAgentTaskEvent(ctx, c, task, ev, true)
 		if err != nil {
 			t.Fatalf("round %d: AppendAgentTaskEvent: %v", i+1, err)
 		}

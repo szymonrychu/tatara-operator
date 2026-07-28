@@ -9,6 +9,7 @@ package webhook
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -38,37 +39,52 @@ func TestAgentCommentTriggersOnlyAcrossKinds(t *testing.T) {
 		// hasNonBotEvent gate), which a bot-authored event can never satisfy by
 		// construction, not by an extra check here.
 		wantConverse bool
-		// wantRoundBump: BotRounds increments and the event lands in
-		// pendingEvents. True whenever BOTH the author and the reacting Task are
-		// resolved - i.e. the Task is genuinely live AND the comment is a
-		// ledgered agent comment - regardless of whether it crosses kinds: D7
-		// counts every agent-authored round on a live conversation.
+		// wantRoundBump: BotRounds increments. True whenever BOTH the author and
+		// the reacting Task are resolved - i.e. the Task is genuinely live AND
+		// the comment is a ledgered agent comment - regardless of whether it
+		// crosses kinds: D7 counts every agent-authored round on a live
+		// conversation.
 		wantRoundBump bool
 		// wantSameKindDecline: the "same-kind" ConversingEntryDeclined reason
 		// fires - true only when both kinds resolved AND are EQUAL.
 		wantSameKindDecline bool
+		// wantPendingEvents: the comment lands in Task.status.PendingEvents.
+		// ONLY true when the kinds resolved AND differ (a genuine cross-kind
+		// wake) - never for same-kind, which must never queue the event at all
+		// (CRITICAL 1, 2026-07-28 final review): PendingEvents is exactly what
+		// the conversing follow-up-turn check (task_stage.go) drains on nothing
+		// but non-empty, so a queued same-kind event would feed a live agent its
+		// own comment as a follow-up turn.
+		wantPendingEvents int
 	}{
-		{name: "reviewing same-kind: no cross-kind trigger, round still counted",
+		{name: "reviewing same-kind: no cross-kind trigger, round still counted, event NEVER queued",
 			taskStage: tatarav1.StageReviewing, ledgerKind: stage.AgentReview,
-			wantConverse: false, wantRoundBump: true, wantSameKindDecline: true},
-		{name: "reviewing cross-kind: triggers a real conversing entry, round counted",
+			wantConverse: false, wantRoundBump: true, wantSameKindDecline: true, wantPendingEvents: 0},
+		{name: "reviewing cross-kind: triggers a real conversing entry, round counted, event queued",
 			taskStage: tatarav1.StageReviewing, ledgerKind: stage.AgentImplement,
-			wantConverse: true, wantRoundBump: true, wantSameKindDecline: false},
-		{name: "parked awaiting-human cross-kind: round counted, structurally cannot un-park off a bot event",
+			wantConverse: true, wantRoundBump: true, wantSameKindDecline: false, wantPendingEvents: 1},
+		{name: "parked awaiting-human cross-kind: round counted, event queued, structurally cannot un-park off a bot event",
 			taskStage: tatarav1.StageParked, taskReason: stage.ReasonAwaitingHuman, ledgerKind: stage.AgentReview,
-			wantConverse: false, wantRoundBump: true, wantSameKindDecline: false},
-		{name: "parked stage-deadline: not a live conversational state, no trigger, no round",
+			wantConverse: false, wantRoundBump: true, wantSameKindDecline: false, wantPendingEvents: 1},
+		{name: "parked stage-deadline: not a live conversational state, no trigger, no round, no queue",
 			taskStage: tatarav1.StageParked, taskReason: stage.ReasonStageDeadline, ledgerKind: stage.AgentReview,
-			wantConverse: false, wantRoundBump: false, wantSameKindDecline: false},
-		{name: "delivered: settled, no trigger, no round",
+			wantConverse: false, wantRoundBump: false, wantSameKindDecline: false, wantPendingEvents: 0},
+		{name: "delivered: settled, no trigger, no round, no queue",
 			taskStage: tatarav1.StageDelivered, ledgerKind: stage.AgentReview,
-			wantConverse: false, wantRoundBump: false, wantSameKindDecline: false},
-		{name: "reviewing with no ledger entry: FAILS CLOSED, no trigger, no round",
+			wantConverse: false, wantRoundBump: false, wantSameKindDecline: false, wantPendingEvents: 0},
+		{name: "reviewing with no ledger entry: FAILS CLOSED, no trigger, no round, no queue",
 			taskStage: tatarav1.StageReviewing, ledgerKind: "",
-			wantConverse: false, wantRoundBump: false, wantSameKindDecline: false},
-		{name: "parked identity-unverified cross-kind: round counted, but NEVER unparked - the only re-entry path runs the C.6 grammar, which a bot comment must never feed",
+			wantConverse: false, wantRoundBump: false, wantSameKindDecline: false, wantPendingEvents: 0},
+		{name: "parked identity-unverified cross-kind: round counted, event queued, but NEVER unparked - the only re-entry path runs the C.6 grammar, which a bot comment must never feed",
 			taskStage: tatarav1.StageParked, taskReason: stage.ReasonIdentityUnverified, ledgerKind: stage.AgentReview,
-			wantConverse: false, wantRoundBump: true, wantSameKindDecline: false},
+			wantConverse: false, wantRoundBump: true, wantSameKindDecline: false, wantPendingEvents: 1},
+		// A Task that STARTS the delivery already conversing is deliberately NOT a
+		// case here: wantConverse ("the Task reaches conversing as a DIRECT result
+		// of this delivery") is trivially true for it regardless of what the
+		// delivery does, since it never left conversing - that shape needs its own
+		// assertions (PendingEvents, ConversationLastEventAt), which
+		// TestAgentComment_ConversingSameKind_NoFollowUpTurnNoIdleReset below
+		// covers directly instead of forcing it into this table's abstraction.
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -100,8 +116,8 @@ func TestAgentCommentTriggersOnlyAcrossKinds(t *testing.T) {
 			if gotTask.Status.BotRounds != wantRounds {
 				t.Errorf("BotRounds = %d, want %d", gotTask.Status.BotRounds, wantRounds)
 			}
-			if gotGauge := testutil.ToFloat64(s.cfg.Metrics.BotRoundsGauge(proj.Name)); tc.wantRoundBump && gotGauge != float64(wantRounds) {
-				t.Errorf("operator_bot_rounds{%s} = %v, want %v", proj.Name, gotGauge, wantRounds)
+			if got := len(gotTask.Status.PendingEvents); got != tc.wantPendingEvents {
+				t.Errorf("len(PendingEvents) = %d, want %d - a same-kind agent comment must never reach a live pod as a follow-up turn", got, tc.wantPendingEvents)
 			}
 			wantSameKind := 0.0
 			if tc.wantSameKindDecline {
@@ -143,6 +159,63 @@ func TestAgentComment_SameKind_BreaksSelfLoop(t *testing.T) {
 	}
 	if gotTask.Status.Stage != tatarav1.StageReviewing {
 		t.Fatalf("stage = %q, want unchanged (reviewing)", gotTask.Status.Stage)
+	}
+	if len(gotTask.Status.PendingEvents) != 0 {
+		t.Fatalf("pendingEvents = %d, want 0 - a same-kind comment must never be queued at all", len(gotTask.Status.PendingEvents))
+	}
+}
+
+// TestAgentComment_ConversingSameKind_NoFollowUpTurnNoIdleReset is the
+// CRITICAL 1 discrimination proof (2026-07-28 final review): a LIVE conversing
+// Task's own agent posting its own comment must not (a) land in PendingEvents
+// - the only thing task_stage.go's conversing follow-up-turn check consults,
+// so a queued same-kind event feeds the live pod its own comment as a further
+// turn - and must not (b) reset ConversationLastEventAt, the conversing idle
+// clock's ONLY base: resetting it on a self-authored round would keep a
+// self-looping conversation permanently "not idle" and never release its
+// concurrency slot, with no absolute lifetime ceiling by design (D6, which
+// assumes the clock is real).
+//
+// This is the exact shape of the 2026-06 forty-duplicate-comment incident:
+// task_types.go's own doc comment says the clock is re-stamped "on every
+// non-bot event" - this test proves the code now matches that, where the
+// unfixed code queued the event and reset the clock on every pass.
+func TestAgentComment_ConversingSameKind_NoFollowUpTurnNoIdleReset(t *testing.T) {
+	before := metav1.NewTime(time.Now().Add(-30 * time.Minute).Truncate(time.Second))
+	task := peTask("t-conversing-selfloop", tatarav1.StageConversing, "")
+	task.Status.ConversationLastEventAt = &before
+	comments := []tatarav1.Comment{
+		// AgentClarify is the reacting kind conversing resolves to
+		// (stage.AgentKindFor(StageConversing)) - so this is the clarify agent's
+		// OWN comment landing back on its own live conversation.
+		{ExternalID: "42", Author: "tatara-bot", IsBot: true, AgentKind: stage.AgentClarify, CreatedAt: metav1.Now()},
+	}
+	iss := peIssue(7, task, comments...)
+	task.Status.IssueRefs = []string{iss.Name}
+	proj := peProject("tatara-bot", "maintainer")
+	c := peClient(t, proj, peRepo(), task, iss)
+	s := peServer(c, &stubSpiller{}, nil)
+
+	ev := scm.WebhookEvent{
+		IsComment: true, IssueRef: "o/r#7", Number: 7,
+		ActorLogin: "tatara-bot", CommentID: 42, CommentBody: "clarify's own comment, echoed back",
+	}
+	s.deliverAgentComment(context.Background(), *proj, peRepo(), ev)
+
+	gotTask := getPETask(t, c, task.Name)
+	if len(gotTask.Status.PendingEvents) != 0 {
+		t.Fatalf("SELF-LOOP: pendingEvents = %d, want 0 - the live pod would take this as a follow-up turn on its own comment", len(gotTask.Status.PendingEvents))
+	}
+	if gotTask.Status.ConversationLastEventAt == nil || !gotTask.Status.ConversationLastEventAt.Time.Equal(before.Time) {
+		got := "nil"
+		if gotTask.Status.ConversationLastEventAt != nil {
+			got = gotTask.Status.ConversationLastEventAt.String()
+		}
+		t.Fatalf("IDLE CLOCK RESET BY A BOT EVENT: ConversationLastEventAt = %s, want unchanged %s - the idle backstop is disabled for exactly this loop shape", got, before.Time)
+	}
+	// The round is still counted (D7): observation only, never acted on.
+	if gotTask.Status.BotRounds != 1 {
+		t.Fatalf("BotRounds = %d, want 1 - the round must still be counted even though nothing else fires", gotTask.Status.BotRounds)
 	}
 }
 

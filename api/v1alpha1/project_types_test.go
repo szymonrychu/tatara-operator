@@ -421,6 +421,16 @@ func TestConversationIdle(t *testing.T) {
 			proj: &v1alpha1.Project{Spec: v1alpha1.ProjectSpec{Scm: &v1alpha1.ScmSpec{ConversationIdleMinutes: 5}}},
 			want: 5 * time.Minute,
 		},
+		{
+			// 2026-07-28 final review IMPORTANT 3: this value drives
+			// agent.PodTTLSeconds directly for the conversing stage - unfloored,
+			// 1 minute gives a 60s pod TTL against a 5-minute PodReadyTimeout,
+			// which TTL-stops the pod before it can ever become Ready, and
+			// ttlStop charges no podRecreations budget against that loop.
+			name: "a value below ConversationIdleFloor is clamped up to the floor",
+			proj: &v1alpha1.Project{Spec: v1alpha1.ProjectSpec{Scm: &v1alpha1.ScmSpec{ConversationIdleMinutes: 1}}},
+			want: v1alpha1.ConversationIdleFloor,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

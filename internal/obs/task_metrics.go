@@ -339,12 +339,31 @@ func (m *OperatorMetrics) ConversingClosedCounter(project, cause string) prometh
 	return m.conversingClosedTotal.WithLabelValues(project, cause)
 }
 
-// SetBotRounds sets operator_bot_rounds for one project.
+// SetBotRounds sets operator_bot_rounds for one project. The ONE caller is
+// updateBotRoundsGauge's periodic per-project-maximum recompute
+// (project_controller.go): a webhook-side imperative write here used to be
+// last-writer-wins across every Task in a project (the gauge carries no task
+// label) and was never revisited when a streak ended, so it latched at
+// whatever bot-authored event happened to land last, forever - defeating the
+// help text's own "highest" claim (2026-07-28 final review IMPORTANT 5). The
+// periodic recompute is the single source of truth now.
 func (m *OperatorMetrics) SetBotRounds(project string, n float64) {
 	if m == nil || m.botRounds == nil {
 		return
 	}
 	m.botRounds.WithLabelValues(project).Set(n)
+}
+
+// ResetBotRounds clears every operator_bot_rounds series. Called at the start
+// of each updateBotRoundsGauge pass so a project whose live max has fallen
+// (every conversation resolved, or the highest-round Task's streak was reset
+// by a human comment) reads its current true value instead of retaining a
+// stale high-water mark.
+func (m *OperatorMetrics) ResetBotRounds() {
+	if m == nil || m.botRounds == nil {
+		return
+	}
+	m.botRounds.Reset()
 }
 
 // BotRoundsGauge returns the operator_bot_rounds gauge for a project.
