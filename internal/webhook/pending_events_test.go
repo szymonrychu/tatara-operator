@@ -264,9 +264,9 @@ func TestDeliverPendingEvent_NoOwningTask_MirrorsOnlyNoEnqueue(t *testing.T) {
 //
 // The body is the exact literal the C.6 wordlist still accepts, on purpose:
 // that is what the deleted limb turned into an un-park straight to
-// implementing. The shared path reads the DURABLE verdict instead
-// (grammarPassedFor), this Task has none, and a human who said something with
-// no verdict behind it is a conversation, not a decision.
+// implementing. As of step B the shared path feeds stage.Unpark no grammar
+// verdict at all, so the same literal is just a human saying something - a
+// conversation, not a decision.
 func TestDeliverPendingEvent_IdentityUnverifiedUsesCommentUnpark(t *testing.T) {
 	task := peTask("t-parked-shared", tatarav1.StageParked, stage.ReasonIdentityUnverified)
 	iss := peIssue(7, task)

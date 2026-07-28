@@ -371,12 +371,16 @@ func (s *Server) resolveOwningTask(ctx context.Context, proj *tatarav1.Project,
 //
 // identity-unverified used to have a bespoke limb of its own here, on the
 // reasoning that it needed a re-run grammar the shared path could not compute.
-// It did not: ApplyUnpark resolves the same answer off the DURABLE
-// Task.status.approvalVerdict (grammarPassedFor), and it is strictly better on
-// the axis that limb existed for - its in-loop Get uses the uncached APIReader,
-// which is exactly the read that lost the 2026-07-27 cache race. One path, one
-// maxOpenTasks re-check at re-entry (H8: a promotion is not a mint), one set of
-// decline metrics. The project-reconcile driveUnparks loop backstops this.
+// It did not need one at all: no grammar verdict feeds stage.Unpark any more,
+// so a non-bot comment on a parked(identity-unverified) Task opens a
+// CONVERSATION (conversing, room permitting) and the approval decision itself
+// happens later, live, in restapi's verifyApprovalScope on a
+// submit_outcome(decision=implement). The shared path is also strictly better
+// on the axis that limb existed for: its in-loop Get uses the uncached
+// APIReader, which is exactly the read that lost the 2026-07-27 cache race. One
+// path, one maxOpenTasks re-check at re-entry (H8: a promotion is not a mint),
+// one set of decline metrics. The project-reconcile driveUnparks loop backstops
+// this.
 func (s *Server) driveCommentUnpark(ctx context.Context, proj *tatarav1.Project, task *tatarav1.Task) {
 	active, err := controller.CountActiveTasks(ctx, s.cfg.Client, proj)
 	if err != nil {
@@ -403,7 +407,7 @@ func (s *Server) driveCommentUnpark(ctx context.Context, proj *tatarav1.Project,
 			conversingRoom = room
 		}
 	}
-	target, decline, err := controller.ApplyUnpark(ctx, s.cfg.Client, s.cfg.APIReader, proj, task, active, maxOpen, false, conversingRoom, time.Now())
+	target, decline, err := controller.ApplyUnpark(ctx, s.cfg.Client, s.cfg.APIReader, proj, task, active, maxOpen, conversingRoom, time.Now())
 	if err != nil {
 		s.log.ErrorContext(ctx, "pendingEvents: comment-driven unpark failed", "error", err, "task", task.Name)
 		return

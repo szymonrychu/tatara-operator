@@ -425,12 +425,14 @@ type TaskEvent struct {
 // at the moment the fast path establishes it, so a fast path that then loses a
 // cache race costs a DELAY rather than a permanent stall.
 //
-// It is evidence of a PAST pass, not a licence: the backstop still re-checks
-// every owned Issue's live approval state before re-entering implementing, AND
-// scopes the verdict to the CURRENT park - a verdict stamped before the Task's
-// current StageEnteredAt is treated as stale and refused, so an approval
-// consumed by an earlier park can never satisfy a later, unrelated one
-// (grammarPassedFor, internal/controller/unpark.go).
+// IT IS INERT AS OF agent-judged-approval-gate STEP B, and the type is deleted
+// in step D. Nothing writes it (step A removed the webhook limb that did) and
+// nothing reads it (step B removed grammarPassedFor, internal/controller/unpark.go),
+// because the design it served - a record of a PAST grammar pass, re-used by a
+// later un-park - is the thing that sequence exists to remove. The approval
+// decision is now taken live, per submit_outcome(decision=implement), by
+// restapi's verifyApprovalScope against a Task with a running pod. Do not wire
+// a new reader or writer to it.
 type ApprovalVerdict struct {
 	// At is when the grammar passed.
 	At metav1.Time `json:"at"`
@@ -551,10 +553,9 @@ type TaskStatus struct {
 	// from a pre-implement stage cannot auto-escalate straight into implementing.
 	// +optional
 	ParkedFromStage string `json:"parkedFromStage,omitempty"`
-	// ApprovalVerdict is the durable C.6 grammar pass (see ApprovalVerdict). It is
-	// written by the webhook fast path the moment the grammar passes, and read by
-	// the periodic driveUnparks backstop, which cannot re-run the grammar itself.
-	// Nil means no approving comment has ever been verified for this Task.
+	// ApprovalVerdict WAS the durable grammar pass (see ApprovalVerdict). It has
+	// no writer and no reader as of agent-judged-approval-gate step B, and the
+	// field is deleted in step D; only historical CRs still carry a value.
 	// +optional
 	ApprovalVerdict *ApprovalVerdict `json:"approvalVerdict,omitempty"`
 	// ConversationLastEventAt is the IDLE CLOCK BASE for the conversing stage. It
