@@ -51,6 +51,18 @@ func TestTicketToTask(t *testing.T) {
 			obj:  &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: testNS}},
 			want: "",
 		},
+		{
+			// EnqueueRequestsFromMapFunc.Update calls the map func on BOTH
+			// ObjectOld and ObjectNew (enqueue_mapped.go): a Queued->Admitted
+			// transition runs ticketToTask once with the OLD (still Queued)
+			// object even though the predicate already gated the pair. If the
+			// map func's own guard does not also check state, this old-object
+			// call produces a request (and a wake count, and a log line) for a
+			// ticket that is not actually admitted.
+			name: "a ticket still in Queued state maps to nothing",
+			obj:  ticketQE("task-abc", tatarav1alpha1.QueueStateQueued),
+			want: "",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

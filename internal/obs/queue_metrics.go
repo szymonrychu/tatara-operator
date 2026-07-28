@@ -54,7 +54,7 @@ func newQueueMetrics(reg prometheus.Registerer) *queueMetrics {
 		// wake is lost again and admission is back on the 5m backstop.
 		admissionWakeTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_admission_wake_total",
-			Help: "Task reconciles woken by an admission ticket reaching Admitted, by pool class and agent kind.",
+			Help: "Task reconcile enqueues from an admission ticket reaching Admitted, by pool class and agent kind.",
 		}, []string{"class", "agent_kind"}),
 	}
 	reg.MustRegister(

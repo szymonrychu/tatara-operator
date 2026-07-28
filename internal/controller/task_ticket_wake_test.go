@@ -109,7 +109,10 @@ func TestAdmittedTicketWakesTaskReconcile(t *testing.T) {
 			"without this edge the pod waits a full admissionRequeue (%s)", timeout, admissionRequeue)
 	}
 
-	if got := testutil.ToFloat64(metrics.AdmissionWakeCounter(tatarav1alpha1.QueueClassNormal, "review")); got < 1 {
-		t.Fatalf("operator_admission_wake_total was not incremented by the wake; got %v", got)
+	// Exactly 1, not merely "at least one": EnqueueRequestsFromMapFunc.Update
+	// runs the map func on both ObjectOld and ObjectNew, so a guard that
+	// forgets to check Status.State would double-count this single admission.
+	if got := testutil.ToFloat64(metrics.AdmissionWakeCounter(tatarav1alpha1.QueueClassNormal, "review")); got != 1 {
+		t.Fatalf("operator_admission_wake_total = %v, want exactly 1 for one admission", got)
 	}
 }

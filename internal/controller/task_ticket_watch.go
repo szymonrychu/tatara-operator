@@ -31,9 +31,19 @@ import (
 // count a wake. Counting from the predicate would be a side effect inside a
 // filter; counting from ensureTicket would be level-triggered and would keep
 // counting for as long as the ticket reads Admitted.
+//
+// The Status.State == Admitted check below is NOT redundant with
+// ticketAdmittedPredicate, even though the predicate already gates the events
+// that reach here. handler.EnqueueRequestsFromMapFunc's Update path
+// (enqueue_mapped.go) calls this map func once with evt.ObjectOld and once
+// with evt.ObjectNew, and dedups only the resulting *enqueue* against an
+// in-flight reqs set - the map func BODY still runs twice, once against the
+// OLD (still Queued) object. Without this check that second call would count a
+// wake and log "admitted" for a ticket that has not been admitted. Do not
+// simplify this away as redundant with the predicate.
 func (r *TaskReconciler) ticketToTask(ctx context.Context, obj client.Object) []reconcile.Request {
 	q, ok := obj.(*tatarav1alpha1.QueuedEvent)
-	if !ok || !queue.IsAdmissionTicket(q) {
+	if !ok || !queue.IsAdmissionTicket(q) || q.Status.State != tatarav1alpha1.QueueStateAdmitted {
 		return nil
 	}
 	if r.Metrics != nil {
