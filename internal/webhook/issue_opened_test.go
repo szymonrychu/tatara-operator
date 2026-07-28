@@ -371,10 +371,11 @@ func TestIssueOpened_BoundedCacheLagMintsOnceAndConsumesTheMarker(t *testing.T) 
 
 	h := newServerWithReader(cachedClient, liveReader)
 
-	// postIssueOpened asserts 202 itself. Before MarkWebhookOriginated read
-	// through the uncached reader (finding 1/3), this budget was enough to also
-	// fail Mark's own Get, producing the worse defect: a 500 downstream of an
-	// already-successful mark and mint, with the marker left stamped forever.
+	// postIssueOpened asserts 202 itself. This stays 202 regardless of which
+	// reader MarkWebhookOriginated uses (see the doc comment above): swapping
+	// Server.reader() back to the cached client leaves every TestIssueOpened
+	// case, including this one, green - objbudget.FitIssue's own pre-existing
+	// backoff absorbs this same bounded lag budget on the create path.
 	postIssueOpened(t, h, "lagproj2", secretVal, issueOpenedBy("opened", "alice", 9))
 
 	var tl tatarav1.TaskList

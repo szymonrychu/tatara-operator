@@ -147,7 +147,11 @@ func IsOrphanIssue(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository
 // The parked branch is what makes the ownership invariant affordable across a
 // 150-issue backlog: without it the post-cutover sweep mints 150 ACTIVE Tasks
 // that queue against 3 agent slots and spend 17-100 pod-hours re-triaging an
-// already-triaged backlog.
+// already-triaged backlog. The trusted-human-author clause below VOIDS that
+// affordability guarantee for the slice of the backlog authored by a listed
+// maintainer or reporter - see that clause's own paragraph for the measured
+// cost, which is small and bounded, not the same order of magnitude as an
+// unqualified 150-issue re-triage.
 //
 // THE TATARA-PARKED CLAUSE READS TASK HISTORY, NOT A COMMENT (fix M25). Keying
 // "active vs parked" on "does the bot have the last word" rested on a BEST-EFFORT
@@ -183,23 +187,45 @@ func IsOrphanIssue(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository
 // the marker only decides ACTIVE-vs-backlog for an issue NOBODY has parked. The
 // belt to that brace is that the marker is CONSUMED by the mint that reads it.
 //
-// THE TRUSTED-HUMAN-AUTHOR CLAUSE is the third position and it is not
-// negotiable: AFTER tatara-parked (an explicit human park still wins over the
-// author's standing) and BEFORE the marker (so it does not depend on webhook
-// delivery at all). It states the intended rule directly - a new issue from a
-// maintainer or reporter starts a clarify agent - and it is deliberately
-// NARROWER than IsTrustedAuthor: it excludes the project's own bot login.
-// IsTrustedAuthor documents the bot as a trusted insider (logins.go), and used
-// verbatim here it would mint every bot-authored orphan issue ACTIVE too -
-// including an abandoned brainstorm proposal issue whose Task was reaped and
-// whose Issue CR lost its controller owner along with it. ClassifyPR clause 2
-// (below) exists because the identical property bit on the PR side:
-// prInReactionScope returns true immediately for IsTrustedAuthor, so a
-// bot-authored PR sailed through the label gate too. This clause closes the
-// issue-side twin of that hole up front instead of discovering it in
-// production. It is also what makes the sweep a genuine BACKSTOP: a totally
-// lost webhook delivery still results in an ACTIVE Task on the next scan
-// instead of a silently parked one.
+// THE TRUSTED-HUMAN-AUTHOR CLAUSE. The only ordering fact that is pinned and
+// load-bearing is AFTER tatara-parked: an explicit human park still wins over
+// the author's standing (TestMintStage/PRECEDENCE:_tatara-parked_BEATS_a_trusted_author).
+// It is NOT pinned "before the marker" or before humanHasLastWord, and do not
+// claim it is: this clause, webhookOriginated and humanHasLastWord all return
+// the identical (StageTriaging, ""), so their relative order among themselves
+// has ZERO observable effect on any test or any real mint - moving this
+// clause to the last position, after both, leaves every MintStage case green.
+// It is written first only because it is cheapest to evaluate and it is the
+// one that removes the webhook-delivery dependency entirely, not because
+// anything downstream of tatara-parked depends on seeing it before the others.
+//
+// It states the intended rule directly - a new issue from a maintainer or
+// reporter starts a clarify agent - and it is deliberately NARROWER than
+// IsTrustedAuthor: it excludes the project's own bot login. IsTrustedAuthor
+// documents the bot as a trusted insider (logins.go), and used verbatim here
+// it would mint every bot-authored orphan issue ACTIVE too - including an
+// abandoned brainstorm proposal issue whose Task was reaped and whose Issue CR
+// lost its controller owner along with it. ClassifyPR clause 2 exists because
+// the identical property bit on the PR side: prInReactionScope returns true
+// immediately for IsTrustedAuthor, so a bot-authored PR sailed through the
+// label gate too. This clause closes the issue-side twin of that hole up
+// front instead of discovering it in production. It is also what makes the
+// sweep a genuine BACKSTOP: a totally lost webhook delivery still results in
+// an ACTIVE Task on the next scan instead of a silently parked one.
+//
+// THE MEASURED COST, because "affordable" above is a claim that needs a
+// number and not a guess. On 2026-07-28, 6 orphan open Issue CRs were
+// sweep-eligible cluster-wide (tatara 4, infrastructure 1, mtg 1) - the entire
+// immediate population this clause exposes to an unconditional mint. 153
+// Tasks were parked, 27 of them stage-reason backlog-sweep; every one of those
+// 27 retains a controller owner (fix H13 does not release ownership on a
+// backlog park), so IsOrphanIssue is false for it and it does NOT re-mint
+// until the reaper eventually releases it - the cost is spread over time, not
+// paid at once on this change landing. A trusted human's backlog issue costs
+// exactly ONE clarify pod, ONCE: once that pod's Task parks again, the
+// reaper's tatara-parked stamp (the OUTERMOST gate, above) makes the park
+// PERMANENT, so the same issue is never re-minted a second time. Per-pass
+// exposure is further bounded by maxNewTasksPerSweep and maxOpenTasks.
 func MintStage(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, iss scm.Issue, webhookOriginated bool) (string, string) {
 	if hasLabel(iss.Labels, TataraParkedLabel) {
 		return tatarav1alpha1.StageParked, stage.ReasonBacklogSweep

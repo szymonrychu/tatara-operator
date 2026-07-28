@@ -209,8 +209,12 @@ func TestOrphanIssuePredicate(t *testing.T) {
 	}
 }
 
-// TestMintStage pins the TWO mint stages and, above all, THE ORDER OF THE
-// CLAUSES.
+// TestMintStage pins the TWO mint stages and the ONE load-bearing ordering
+// fact: tatara-parked beats every other clause. It does NOT pin an order among
+// the remaining clauses (trusted-human-author, webhookOriginated,
+// humanHasLastWord) - they all return the identical (StageTriaging, ""), so
+// their relative order has zero observable effect and no case here depends on
+// it.
 //
 // The tatara-parked LABEL READ is safe where fix 16's forbidden one is not: it
 // decides COST (do we spend a pod on this issue now?), never AUTHORITY (may this
@@ -218,22 +222,26 @@ func TestOrphanIssuePredicate(t *testing.T) {
 // PARKED - it fails SAFE. Forging an approval label would buy them prod. Do not
 // generalise one rule into the other.
 //
-// THE TRUSTED-AUTHOR CLAUSE sits between the two: AFTER tatara-parked, so an
-// explicit human park still wins over the author's standing; BEFORE the webhook
-// marker, so a maintainer's issue starts an agent even when the delivery was
-// lost outright and no marker was ever stamped. That is what makes the sweep a
-// genuine backstop rather than one that parks the work it was meant to rescue.
+// THE TRUSTED-AUTHOR CLAUSE's only pinned relationship to anything else is
+// AFTER tatara-parked: an explicit human park still wins over the author's
+// standing. It does not depend on webhookOriginated or humanHasLastWord at
+// all - a maintainer's issue starts an agent even when the delivery was lost
+// outright and no marker was ever stamped, regardless of where in the
+// function this clause happens to sit relative to those two. That is what
+// makes the sweep a genuine backstop rather than one that parks the work it
+// was meant to rescue.
 //
 // The clause is NARROWED to a trusted HUMAN, not IsTrustedAuthor verbatim.
 // IsTrustedAuthor documents the project's own bot login as a trusted insider
 // (api/v1alpha1/logins.go:61), and taken literally the clause would mint every
 // bot-authored orphan issue ACTIVE too - including an abandoned brainstorm
 // proposal issue whose Task was reaped and whose Issue CR lost its controller
-// owner in the process. ClassifyPR clause 2 (sweep.go, ~line 413) exists
-// because the identical property bit on the PR side: prInReactionScope returns
-// true immediately for IsTrustedAuthor, and the bot is documented as trusted
-// there too. That precedent is why this clause excludes the bot explicitly
-// rather than repeating the mistake on the issue side.
+// owner in the process. ClassifyPR clause 2 (internal/controller/sweep.go,
+// lines 513-516; ClassifyPR itself starts at line 507) exists because the
+// identical property bit on the PR side: prInReactionScope returns true
+// immediately for IsTrustedAuthor, and the bot is documented as trusted there
+// too. That precedent is why this clause excludes the bot explicitly rather
+// than repeating the mistake on the issue side.
 func TestMintStage(t *testing.T) {
 	base := sweepProject("mint-proj")
 	repo := sweepRepo("mint-proj")
@@ -1526,6 +1534,47 @@ func TestSweepCutoverBacklogStillParksWithZeroPods(t *testing.T) {
 	if len(pods.Items) != 0 {
 		t.Fatalf("pods = %d, want 0: a %d-issue cutover backlog must cost ZERO pod-hours",
 			len(pods.Items), backlog)
+	}
+}
+
+// TestSweepCutoverBacklogFromATrustedMaintainerMintsActiveInstead is the
+// SIBLING the test above must not be read alone: it certifies the property the
+// trusted-human-author clause deliberately VOIDS. TestSweepCutoverBacklogStill-
+// ParksWithZeroPods only reads as "a backlog costs zero pod-hours" because
+// sweepProject sets no maintainer or reporter logins; give the same 40-issue
+// shape a maintainer allowlist that names the author and every one of those 40
+// issues mints ACTIVE instead, because IsTrustedAuthor stops needing a webhook
+// marker or a comment thread to trust "alice". The measured real-world cost of
+// this (MintStage's doc comment, and MEMORY.md) is 6 orphan issues cluster-wide
+// on 2026-07-28, ONE clarify pod per issue, ONCE - not 40 pods on every pass.
+func TestSweepCutoverBacklogFromATrustedMaintainerMintsActiveInstead(t *testing.T) {
+	const backlog = 40
+	proj := sweepProject("cutover-trusted-proj")
+	proj.Spec.MaxNewTasksPerSweep = backlog // one pass, whole backlog
+	proj.Spec.MaxOpenTasks = backlog        // every mint here is ACTIVE, unlike the parked sibling: it competes for the same budget
+	proj.Spec.Scm.MaintainerLogins = []string{"alice"}
+	repo := sweepRepo("cutover-trusted-proj")
+	c := newMirrorClient(t, proj, repo, mdSecret())
+
+	rd := &sweepReader{content: map[int]scm.IssueContent{}}
+	for n := 1; n <= backlog; n++ {
+		rd.issues = append(rd.issues, scm.IssueRef{
+			Repo: "szymonrychu/tatara-operator", Number: n, Author: "alice", State: "open",
+		})
+		rd.content[n] = scm.IssueContent{Title: "old bug", Body: "from before the cutover"}
+	}
+
+	runSweep(t, c, proj, repo, rd)
+
+	tasks := sweepTasks(t, c, proj.Name)
+	if len(tasks) != backlog {
+		t.Fatalf("tasks = %d, want %d", len(tasks), backlog)
+	}
+	for i := range tasks {
+		if tasks[i].Spec.InitialStage != tatarav1alpha1.StageTriaging || tasks[i].Spec.InitialStageReason != "" {
+			t.Fatalf("task %s initialStage = %q/%q, want triaging/\"\": a trusted maintainer's backlog issue mints ACTIVE",
+				tasks[i].Name, tasks[i].Spec.InitialStage, tasks[i].Spec.InitialStageReason)
+		}
 	}
 }
 
