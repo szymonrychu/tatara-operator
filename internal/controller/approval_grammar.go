@@ -5,10 +5,8 @@ package controller
 import (
 	"context"
 	"fmt"
-	"regexp"
 	"strings"
 	"time"
-	"unicode"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -72,118 +70,6 @@ const (
 	ApprovalRefusedEvidenceReplayed = "evidence-replayed"
 )
 
-var (
-	// approvalFenceRe opens/closes a fenced code block. A phrase inside a fence
-	// is a QUOTATION of the grammar, not an utterance of it.
-	approvalFenceRe = regexp.MustCompile("^\\s*(```|~~~)")
-	// approvalQuoteRe is a markdown block quote: quoting the bot's own park
-	// comment back at it must not approve.
-	approvalQuoteRe = regexp.MustCompile(`^\s*>`)
-	// approvalShortcodeRe strips TRAILING emoji shortcodes (":rocket:").
-	approvalShortcodeRe = regexp.MustCompile(`(?:\s*:[a-z0-9_+-]+:)+\s*$`)
-)
-
-// isApprovalEmojiRune reports whether r is a trailing decoration rather than
-// text: emoji planes, the symbol/arrow/dingbat blocks, and the joiners.
-func isApprovalEmojiRune(r rune) bool {
-	switch {
-	case r >= 0x1F000 && r <= 0x1FAFF:
-		return true
-	case r >= 0x2190 && r <= 0x2BFF:
-		return true
-	case r == 0xFE0F || r == 0x200D || r == 0x20E3:
-		return true
-	}
-	return false
-}
-
-// stripApprovalEmphasis removes the markdown emphasis delimiters (* _ `) that
-// wrap a run (fix L3-13). It is NOT cosmetic: "**LGTM**" is how humans actually
-// write the single most common approval token, and without this it fails the
-// anchor and drops the Task into the identity-unverified dead end. An
-// intra-word underscore (snake_case) is kept: it is text, not emphasis.
-func stripApprovalEmphasis(s string) string {
-	runes := []rune(s)
-	var b strings.Builder
-	for i, r := range runes {
-		if r != '*' && r != '_' && r != '`' {
-			b.WriteRune(r)
-			continue
-		}
-		if r == '_' && i > 0 && i < len(runes)-1 &&
-			isApprovalWordRune(runes[i-1]) && isApprovalWordRune(runes[i+1]) {
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
-}
-
-func isApprovalWordRune(r rune) bool {
-	return unicode.IsLetter(r) || unicode.IsDigit(r)
-}
-
-// normalizeApprovalLines is the C.6 clause (c) normalisation, in the contract's
-// order: lowercase, strip fenced code blocks, strip quoted lines, strip
-// markdown emphasis, strip trailing emoji and trailing whitespace.
-func normalizeApprovalLines(body string) []string {
-	var out []string
-	inFence := false
-	for _, raw := range strings.Split(strings.ToLower(body), "\n") {
-		line := strings.TrimRight(raw, "\r")
-		if approvalFenceRe.MatchString(line) {
-			inFence = !inFence
-			continue
-		}
-		if inFence || approvalQuoteRe.MatchString(line) {
-			continue
-		}
-		line = stripApprovalEmphasis(line)
-		line = trimApprovalTrailer(line)
-		line = approvalShortcodeRe.ReplaceAllString(line, "")
-		line = trimApprovalTrailer(line)
-		out = append(out, line)
-	}
-	return out
-}
-
-func trimApprovalTrailer(s string) string {
-	return strings.TrimRightFunc(s, func(r rune) bool {
-		return unicode.IsSpace(r) || isApprovalEmojiRune(r)
-	})
-}
-
-// MatchesApprovalPhrase is the ANCHORED WHOLE-LINE matcher (C.6 clause c,
-// USER DECISION D-B). SOME LINE of the normalised body must match
-// ^\s*(<phrase>)[\s.!]*$: the comment must CONSIST OF the phrase, not contain
-// it. It returns the matched phrase EXACTLY as the project configured it (it is
-// what lands in ApprovalEvidence.Phrase).
-//
-// The phrase is quoted with regexp.QuoteMeta before interpolation: a project may
-// configure a phrase carrying regex metacharacters and that must not become an
-// injection into the operator's own gate.
-func MatchesApprovalPhrase(body string, phrases []string) (string, bool) {
-	lines := normalizeApprovalLines(body)
-	if len(lines) == 0 {
-		return "", false
-	}
-	for _, phrase := range phrases {
-		norm := strings.ToLower(strings.TrimSpace(phrase))
-		if norm == "" {
-			continue
-		}
-		re, err := regexp.Compile(`^\s*(` + regexp.QuoteMeta(norm) + `)[\s.!]*$`)
-		if err != nil {
-			continue
-		}
-		for _, line := range lines {
-			if re.MatchString(line) {
-				return phrase, true
-			}
-		}
-	}
-	return "", false
-}
-
 // ApprovalPassed reports whether EVERY live owned Issue carries evidence.
 //
 // THE EMPTY SET IS NOT A LICENCE: an evidence map with no entries - a Task
@@ -199,32 +85,6 @@ func ApprovalPassed(evidence map[string]*tatarav1alpha1.ApprovalEvidence) bool {
 		}
 	}
 	return true
-}
-
-// ApprovalRefusedComment renders the comment the operator posts on an Issue
-// whose approval could not be verified, naming what the OPERATOR could not
-// establish. It never says what wording to use: there is no wordlist any more,
-// and telling a human to type a magic phrase is exactly the failure this
-// redesign removes. It is BOT-authored, so it can never un-park the Task it
-// parked (E.3 enqueue filter + F.6).
-func ApprovalRefusedComment(reason string) string {
-	var missing string
-	switch reason {
-	case ApprovalRefusedNoMaintainer:
-		missing = "no maintainer has commented on this thread"
-	case ApprovalRefusedNoCitation:
-		missing = "a maintainer has commented, but nothing on this thread was cited as an approval"
-	case ApprovalRefusedCitationNotMaintainer:
-		missing = "the cited comment is not a maintainer's comment on this issue"
-	case ApprovalRefusedQuoteAbsent:
-		missing = "the cited wording does not appear in the comment it was attributed to"
-	case ApprovalRefusedEvidenceReplayed:
-		missing = "the cited comment was already used to approve this issue once"
-	default:
-		missing = "the approval could not be verified"
-	}
-	return fmt.Sprintf("tatara: I am not starting work on this yet - %s. "+
-		"A maintainer can approve it by saying so in a comment on this issue.", missing)
 }
 
 // approvalInScope is C.6 clause (2), narrowed to LIVE issues (fix L3-14): a
@@ -496,9 +356,9 @@ func VerifyApproval(ctx context.Context, c client.Client, sp objbudget.Spiller,
 	return evidence, err
 }
 
-// VerifyApprovalDetailed is VerifyApproval plus the per-issue refusal reason the
-// operator's park comment names (ApprovalRefusedComment). The evidence map has an
-// entry for every LIVE owned Issue; a nil value is a refusal.
+// VerifyApprovalDetailed is VerifyApproval plus the per-issue refusal reason -
+// one of the ApprovalRefused* constants above. The evidence map has an entry for
+// every LIVE owned Issue; a nil value is a refusal.
 //
 // citations are the agent's approval citations for THIS verification, applied to
 // every live owned Issue - the same set restapi's verifyApprovalScope offers each

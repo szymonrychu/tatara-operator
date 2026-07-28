@@ -2,7 +2,6 @@ package controller
 
 import (
 	"context"
-	"strings"
 	"testing"
 	"time"
 
@@ -746,33 +745,27 @@ func TestVerifyApprovalEmptySetIsNotALicence(t *testing.T) {
 	}
 }
 
-// TestVerifyApprovalRefusalNamesWhatWasMissing: the park comment the operator
-// posts on a refusal names what the OPERATOR could not establish, and every
-// refusal reason renders its own distinct message. It must NOT instruct the human
-// to type a magic phrase: there is no wordlist any more, and that instruction was
-// the failure this redesign removes. It is BOT-authored, so it can never un-park
-// the Task (E.3 enqueue filter + F.6).
-func TestVerifyApprovalRefusalNamesWhatWasMissing(t *testing.T) {
-	seen := map[string]string{}
+// TestVerifyApprovalRefusalReasonsAreDistinct: the five refusal reasons the
+// operator can return name what the OPERATOR could not establish, and each is its
+// own distinct label - they are the `reason` label on
+// operator_approval_refused_total, so a collision would merge two failure modes
+// into one unreadable series. None of them says what wording to use: there is no
+// wordlist any more, and telling a human to type a magic phrase was the failure
+// this redesign removes.
+func TestVerifyApprovalRefusalReasonsAreDistinct(t *testing.T) {
+	seen := map[string]bool{}
 	for _, reason := range []string{
 		ApprovalRefusedNoMaintainer, ApprovalRefusedNoCitation,
 		ApprovalRefusedCitationNotMaintainer, ApprovalRefusedQuoteAbsent,
 		ApprovalRefusedEvidenceReplayed,
 	} {
-		msg := ApprovalRefusedComment(reason)
-		if msg == "" {
-			t.Fatalf("refusal %q rendered an EMPTY comment", reason)
+		if reason == "" {
+			t.Fatal("a refusal reason is EMPTY")
 		}
-		if other, dup := seen[msg]; dup {
-			t.Fatalf("refusals %q and %q render the SAME comment", reason, other)
+		if seen[reason] {
+			t.Fatalf("refusal reason %q is duplicated", reason)
 		}
-		seen[msg] = reason
-		if strings.Contains(msg, "CONSISTS OF") {
-			t.Fatalf("refusal %q still tells the human to type a magic phrase: %q", reason, msg)
-		}
-	}
-	if got := ApprovalRefusedComment("something-unmapped"); got == "" {
-		t.Fatal("an unmapped reason rendered an EMPTY comment")
+		seen[reason] = true
 	}
 }
 
