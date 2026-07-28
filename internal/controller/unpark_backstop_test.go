@@ -271,7 +271,7 @@ func TestUnparkFires_AgreesWithApplyUnparkOnConversingHasRoom(t *testing.T) {
 	task.Status.Stage = tatarav1alpha1.StageParked
 	task.Status.StageReason = stage.ReasonIdentityUnverified
 	task.Status.StageEnteredAt = &metav1.Time{Time: time.Now().Add(-time.Hour)}
-	// GrammarPassed is unset by both builders now, so room is the only variable.
+	// There is no verdict field on UnparkInput any more, so room is the only variable.
 	task.Status.PendingEvents = []tatarav1alpha1.TaskEvent{{
 		At: metav1.Now(), Kind: "issue_comment", Author: "szymonrychu", Body: "not the magic phrase",
 	}}

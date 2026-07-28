@@ -421,9 +421,10 @@ func (s *Server) driveCommentUnpark(ctx context.Context, proj *tatarav1.Project,
 		// just asked to act on, so a silent decline here is exactly what hid the
 		// cache-lag race (fresh.Status.PendingEvents read stale-empty) for a full
 		// day with zero errors and zero "unparked" logs to explain the silence.
-		// Both GUARD and RULE declines are logged here (unlike driveUnparks,
-		// which only surfaces GUARD): this fires once, in direct reaction to a
-		// human action, where silence - of either kind - is anomalous.
+		// Both GUARD and RULE declines are logged here (driveUnparks surfaces
+		// only GUARD plus the one no-conversing-room rule decline): this fires
+		// once, in direct reaction to a human action, where silence - of either
+		// kind - is anomalous.
 		s.log.InfoContext(ctx, "pendingEvents: comment-driven unpark declined",
 			"action", "pending_event_unpark_declined", "task", task.Name, "stage_reason", task.Status.StageReason,
 			"decline_kind", string(decline))

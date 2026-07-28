@@ -1261,8 +1261,8 @@ func (r *ProjectReconciler) deleteReapedTask(ctx context.Context, proj *tatarav1
 // gone: identity-unverified now goes through ApplyUnpark like every other
 // comment-driven reason.
 //
-// TEN fields, SET BY BOTH builders, off the same helpers - no divergence
-// possible without an eleventh appearing and only one builder threading it,
+// NINE fields, SET BY BOTH builders, off the same helpers - no divergence
+// possible without a tenth appearing and only one builder threading it,
 // which is exactly the diff this audit exists to make obvious:
 //   - Task, Now: always required.
 //   - Issues: read by ReasonAwaitingHuman (non-review kind, via
