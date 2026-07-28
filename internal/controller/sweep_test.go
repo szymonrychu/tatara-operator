@@ -729,21 +729,21 @@ func TestTaskForBranch(t *testing.T) {
 	// taskForBranch needs no SCMReader, so Metrics is the only field it touches.
 	r := &ProjectReconciler{Client: c, Scheme: c.Scheme(), Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry())}
 
-	got, err := r.taskForBranch(ctx, proj, agent.TaskBranch(numbered))
+	got, err := r.taskForBranch(ctx, proj, agent.TaskBranch(numbered), "")
 	if err != nil || got == nil || got.Name != numbered.Name {
 		t.Fatalf("taskForBranch(numbered) = %v, %v, want %s", got, err, numbered.Name)
 	}
-	got, err = r.taskForBranch(ctx, proj, agent.TaskBranch(fallback))
+	got, err = r.taskForBranch(ctx, proj, agent.TaskBranch(fallback), "")
 	if err != nil || got == nil || got.Name != fallback.Name {
 		t.Fatalf("taskForBranch(fallback) = %v, %v, want %s", got, err, fallback.Name)
 	}
-	got, err = r.taskForBranch(ctx, proj, "tatara/task-does-not-exist")
+	got, err = r.taskForBranch(ctx, proj, "tatara/task-does-not-exist", "")
 	if err != nil || got != nil {
 		t.Fatalf("taskForBranch(unknown) = %v, %v, want nil, nil", got, err)
 	}
 	// crossProject's branch resolves to nil when queried against `proj`, not
 	// `other`: a same-named branch in a sibling project must never leak in.
-	got, err = r.taskForBranch(ctx, proj, agent.TaskBranch(crossProject))
+	got, err = r.taskForBranch(ctx, proj, agent.TaskBranch(crossProject), "")
 	if err != nil || got != nil {
 		t.Fatalf("taskForBranch(cross-project) = %v, %v, want nil, nil", got, err)
 	}
@@ -2082,5 +2082,250 @@ func TestClearWebhookOriginatedRetriesNotFoundFromTheCache(t *testing.T) {
 	}
 	if _, ok := iss.Annotations[AnnWebhookOriginated]; ok {
 		t.Fatal("the marker is still set: ClearWebhookOriginated must have spent it despite the lagging cache")
+	}
+}
+
+// collidingSource is one source issue shared by two Tasks. It is the whole
+// point of the collision tests below: agent.TaskBranch keys on
+// (branchKind, source.number, title slug), NOT on the Task's own name.
+func collidingSource() *tatarav1alpha1.TaskSource {
+	return &tatarav1alpha1.TaskSource{
+		Provider: "github",
+		IssueRef: "https://github.com/szymonrychu/tatara-operator/issues/26",
+		Number:   26,
+	}
+}
+
+// claimedMR builds a MergeRequest CR already controller-owned by task, the way
+// a prior adoption leaves it.
+func claimedMR(t *testing.T, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository,
+	number int, task *tatarav1alpha1.Task) *tatarav1alpha1.MergeRequest {
+
+	t.Helper()
+	mr := &tatarav1alpha1.MergeRequest{
+		ObjectMeta: metav1.ObjectMeta{Name: tatarav1alpha1.MergeRequestName(repo.Name, number), Namespace: testNS},
+		Spec: tatarav1alpha1.MergeRequestSpec{
+			ProjectRef: proj.Name, RepositoryRef: repo.Name, Number: number,
+			URL: "https://github.com/szymonrychu/tatara-operator/pull/1358",
+		},
+	}
+	own.AddPlainOwner(mr, task)
+	if err := own.HandOverController(mr, nil, task); err != nil {
+		t.Fatalf("test setup: hand over controller to %s: %v", task.Name, err)
+	}
+	return mr
+}
+
+// TestSweepBranchCollisionAdoptsIntoTheClaimingTask is issue #477's ACTUAL
+// mechanism, reproduced.
+//
+// agent.TaskBranch is NOT unique per Task. For a Task with source.number > 0 it
+// is tatara/<branchKind>-<number>[-<slug>], and branchKind COLLAPSES review,
+// brainstorm, clarify and refine into "chore" - so two clarify Tasks on the SAME
+// source issue carry the SAME head branch. That is live in prod:
+// infrastructure-clarify-2026-07-26-t9n9n and infrastructure-clarify-2026-07-27-gtwgp
+// both resolve to tatara/chore-26, and mr-helmfile-1358 is controller-owned by
+// the latter.
+//
+// taskForBranch returned the FIRST match in list order, so the sweep picked the
+// Task that does NOT own the MR, ClassifyPR said PRAdopt, and ownMergeRequest
+// refused with "already has controller owner <other>". That is a hard per-item
+// sweep error, re-attempted byte-identically on every 4h pass for as long as
+// both Tasks exist. The MR's controller owner is the disambiguator.
+func TestSweepBranchCollisionAdoptsIntoTheClaimingTask(t *testing.T) {
+	proj := sweepProject("collide-proj")
+	repo := sweepRepo("collide-proj")
+
+	// decoy is inserted FIRST (the fake client's tracker preserves insertion
+	// order) and is parked: exactly the arbitrary pick the scan-and-return-first
+	// lookup made in prod.
+	decoy := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "collide-proj-clarify-2026-07-26-aaaaa", Namespace: testNS},
+		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: proj.Name, Kind: "clarify", Goal: "g", Source: collidingSource()},
+	}
+	decoy.Status.Stage = tatarav1alpha1.StageParked
+	claimant := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "collide-proj-clarify-2026-07-27-zzzzz", Namespace: testNS},
+		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: proj.Name, Kind: "clarify", Goal: "g", Source: collidingSource()},
+	}
+	claimant.Status.Stage = tatarav1alpha1.StageImplementing
+	if agent.TaskBranch(decoy) != agent.TaskBranch(claimant) {
+		t.Fatalf("setup: branches must COLLIDE, got %q and %q", agent.TaskBranch(decoy), agent.TaskBranch(claimant))
+	}
+
+	mr := claimedMR(t, proj, repo, 1358, claimant)
+	c := newMirrorClient(t, proj, repo, decoy, claimant, mr)
+	rd := &sweepReader{prs: []scm.PRRef{{
+		Repo: "szymonrychu/tatara-operator", HeadRepo: "szymonrychu/tatara-operator",
+		Number: 1358, Author: "tatara-bot", HeadBranch: agent.TaskBranch(claimant), HeadSHA: "deadbeef",
+	}}}
+
+	// Pre-fix this returns "intake: own mergerequest mr-tatara-operator-1358:
+	// ... already has controller owner collide-proj-clarify-2026-07-27-zzzzz".
+	runSweep(t, c, proj, repo, rd)
+
+	var fresh tatarav1alpha1.MergeRequest
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: mr.Name}, &fresh); err != nil {
+		t.Fatalf("get mergerequest CR: %v", err)
+	}
+	if got, ok := own.ControllerOwner(&fresh); !ok || got != claimant.Name {
+		t.Fatalf("MR controller owner = %q/%v, want %q (the sweep must never steal)", got, ok, claimant.Name)
+	}
+	var freshClaimant, freshDecoy tatarav1alpha1.Task
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: claimant.Name}, &freshClaimant); err != nil {
+		t.Fatalf("get claimant: %v", err)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: decoy.Name}, &freshDecoy); err != nil {
+		t.Fatalf("get decoy: %v", err)
+	}
+	if len(freshClaimant.Status.MRRefs) != 1 || freshClaimant.Status.MRRefs[0] != mr.Name {
+		t.Fatalf("claimant mrRefs = %v, want [%s]", freshClaimant.Status.MRRefs, mr.Name)
+	}
+	if len(freshDecoy.Status.MRRefs) != 0 {
+		t.Fatalf("decoy mrRefs = %v, want none: the MR belongs to the Task that owns it", freshDecoy.Status.MRRefs)
+	}
+}
+
+// TestTaskForBranchPrefersTheClaimingTask pins the collision tie-break directly
+// (issue #477). Two Tasks on one branch: the MR's controller owner wins when it
+// is named, and with no claim the answer is deterministic - still-pushing beats
+// finished, newest beats oldest - so it can never depend on list order.
+func TestTaskForBranchPrefersTheClaimingTask(t *testing.T) {
+	ctx := context.Background()
+	proj := sweepProject("prefer-proj")
+
+	older := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "prefer-proj-clarify-a", Namespace: testNS,
+			CreationTimestamp: metav1.NewTime(time.Date(2026, 7, 26, 0, 0, 0, 0, time.UTC)),
+		},
+		Spec: tatarav1alpha1.TaskSpec{ProjectRef: proj.Name, Kind: "clarify", Goal: "g", Source: collidingSource()},
+	}
+	older.Status.Stage = tatarav1alpha1.StageParked
+	newer := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "prefer-proj-clarify-b", Namespace: testNS,
+			CreationTimestamp: metav1.NewTime(time.Date(2026, 7, 27, 0, 0, 0, 0, time.UTC)),
+		},
+		Spec: tatarav1alpha1.TaskSpec{ProjectRef: proj.Name, Kind: "clarify", Goal: "g", Source: collidingSource()},
+	}
+	newer.Status.Stage = tatarav1alpha1.StageImplementing
+	// Finished, and the NEWEST of the three: it must still lose to a Task that
+	// can still push, or the sweep would adopt a live PR into a dead Task.
+	dead := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "prefer-proj-clarify-c", Namespace: testNS,
+			CreationTimestamp: metav1.NewTime(time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC)),
+		},
+		Spec: tatarav1alpha1.TaskSpec{ProjectRef: proj.Name, Kind: "clarify", Goal: "g", Source: collidingSource()},
+	}
+	dead.Status.Stage = tatarav1alpha1.StageDelivered
+
+	c := newMirrorClient(t, proj, older, newer, dead)
+	r := &ProjectReconciler{Client: c, Scheme: c.Scheme(), Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry())}
+	branch := agent.TaskBranch(newer)
+
+	// The claim wins outright, even against a newer sibling.
+	got, err := r.taskForBranch(ctx, proj, branch, older.Name)
+	if err != nil || got == nil || got.Name != older.Name {
+		t.Fatalf("taskForBranch(claimed by %s) = %v, %v, want %s", older.Name, got, err, older.Name)
+	}
+	// A claim naming a Task that does NOT share this branch falls back to the
+	// deterministic pick rather than resolving to nothing.
+	got, err = r.taskForBranch(ctx, proj, branch, "prefer-proj-takeover-elsewhere")
+	if err != nil || got == nil || got.Name != newer.Name {
+		t.Fatalf("taskForBranch(foreign claim) = %v, %v, want %s", got, err, newer.Name)
+	}
+	// No claim at all: newest still-pushing, NOT the newest overall (dead).
+	got, err = r.taskForBranch(ctx, proj, branch, "")
+	if err != nil || got == nil || got.Name != newer.Name {
+		t.Fatalf("taskForBranch(unclaimed) = %v, %v, want %s", got, err, newer.Name)
+	}
+}
+
+// TestClassifyPRClaimedByAnotherTask pins clause 1b: adoptable BY SHAPE but the
+// mirror is already controller-owned elsewhere, so the adoption could only ever
+// fail (ownMergeRequest never steals). PRClaimed, not PRAdopt and not an error.
+func TestClassifyPRClaimedByAnotherTask(t *testing.T) {
+	proj := sweepProject("claim-proj")
+	repo := sweepRepo("claim-proj")
+	owner := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "claim-proj-clarify-owner", Namespace: testNS},
+		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: proj.Name, Kind: "clarify", Goal: "g"},
+	}
+	other := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "claim-proj-clarify-other", Namespace: testNS},
+		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: proj.Name, Kind: "clarify", Goal: "g"},
+	}
+	pr := scm.PRRef{
+		Repo: "szymonrychu/tatara-operator", HeadRepo: "szymonrychu/tatara-operator",
+		Number: 7, Author: "tatara-bot", HeadBranch: agent.TaskBranch(owner),
+	}
+
+	if got := ClassifyPR(proj, repo, pr, owner, nil); got != PRAdopt {
+		t.Fatalf("no mirror yet: ClassifyPR = %q, want %q", got, PRAdopt)
+	}
+	if got := ClassifyPR(proj, repo, pr, owner, claimedMR(t, proj, repo, 7, owner)); got != PRAdopt {
+		t.Fatalf("owner already owns it: ClassifyPR = %q, want %q (adoption stays idempotent)", got, PRAdopt)
+	}
+	if got := ClassifyPR(proj, repo, pr, owner, claimedMR(t, proj, repo, 7, other)); got != PRClaimed {
+		t.Fatalf("claimed by %s: ClassifyPR = %q, want %q", other.Name, got, PRClaimed)
+	}
+}
+
+// TestSweepClaimedPRIsSkippedNotErrored is issue #477's ERROR-trickle half, end
+// to end. The claiming Task is on a DIFFERENT branch (a mid-flight takeover
+// hand-over), so taskForBranch cannot disambiguate and clause 1b is the net
+// that catches it. The pass must come back CLEAN - counted on
+// operator_sweep_skipped_total, absent from operator_sweep_errors_total - and
+// it must not steal the MR.
+func TestSweepClaimedPRIsSkippedNotErrored(t *testing.T) {
+	proj := sweepProject("skip-proj")
+	repo := sweepRepo("skip-proj")
+	branchTask := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "skip-proj-clarify-branch", Namespace: testNS},
+		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: proj.Name, Kind: "clarify", Goal: "g"},
+	}
+	branchTask.Status.Stage = tatarav1alpha1.StageParked
+	claimant := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "skip-proj-takeover-claimant", Namespace: testNS},
+		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: proj.Name, Kind: "takeover", Goal: "g"},
+	}
+	claimant.Status.Stage = tatarav1alpha1.StageMerging
+	if agent.TaskBranch(branchTask) == agent.TaskBranch(claimant) {
+		t.Fatal("setup: the claimant must be on a DIFFERENT branch for clause 1b to be the net")
+	}
+
+	mr := claimedMR(t, proj, repo, 209, claimant)
+	c := newMirrorClient(t, proj, repo, branchTask, claimant, mr)
+	rd := &sweepReader{prs: []scm.PRRef{{
+		Repo: "szymonrychu/tatara-operator", HeadRepo: "szymonrychu/tatara-operator",
+		Number: 209, Author: "tatara-bot", HeadBranch: agent.TaskBranch(branchTask), HeadSHA: "cafe",
+	}}}
+
+	errsBefore := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues(proj.Name, SweepActivity, "adopt_pr"))
+	skipsBefore := testutil.ToFloat64(obs.SweepSkippedTotal.WithLabelValues(proj.Name, SweepActivity, SweepSkipMRClaimed))
+
+	runSweep(t, c, proj, repo, rd) // pre-fix: a hard "already has controller owner" error
+
+	if got := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues(proj.Name, SweepActivity, "adopt_pr")); got != errsBefore {
+		t.Fatalf("adopt_pr errors = %v, want %v: an already-claimed MR is a skip, not a fault", got, errsBefore)
+	}
+	if got := testutil.ToFloat64(obs.SweepSkippedTotal.WithLabelValues(proj.Name, SweepActivity, SweepSkipMRClaimed)); got != skipsBefore+1 {
+		t.Fatalf("skips = %v, want %v: the skip must still be COUNTED", got, skipsBefore+1)
+	}
+	var fresh tatarav1alpha1.MergeRequest
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: mr.Name}, &fresh); err != nil {
+		t.Fatalf("get mergerequest CR: %v", err)
+	}
+	if got, ok := own.ControllerOwner(&fresh); !ok || got != claimant.Name {
+		t.Fatalf("MR controller owner = %q/%v, want %q", got, ok, claimant.Name)
+	}
+	var freshBranchTask tatarav1alpha1.Task
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: branchTask.Name}, &freshBranchTask); err != nil {
+		t.Fatalf("get branch task: %v", err)
+	}
+	if len(freshBranchTask.Status.MRRefs) != 0 {
+		t.Fatalf("branch task mrRefs = %v, want none", freshBranchTask.Status.MRRefs)
 	}
 }

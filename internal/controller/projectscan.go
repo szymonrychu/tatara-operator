@@ -1417,8 +1417,17 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 		if dueRepos, soonestSweep, ok := r.reposDueForScan(proj, "issueScan", repos, now); ok {
 			if len(dueRepos) > 0 {
 				if serr := r.SweepProject(ctx, proj, reader, dueRepos, nil, SweepActivity); serr != nil {
-					l.Error(serr, "scan: sweep failed",
-						"action", "scan_sweep_error", "resource_id", proj.Name, "activity", SweepActivity)
+					// RE-REPORT ONLY, hence V(1) (issue #477). SweepProject has
+					// ALREADY logged this error at ERROR and metered it on
+					// operator_sweep_errors_total - every per-item failure through
+					// fail(), and the list_tasks hard failure at its own return.
+					// Logging it again at ERROR under a SECOND msg turned one fault
+					// into two ERROR lines with the same err and reconcileID, which
+					// the by-msg ERROR-rate alert then counted as two independent
+					// alert instances.
+					l.V(1).Info("scan: sweep returned an error (already logged and metered by the sweep)",
+						"action", "scan_sweep_error", "resource_id", proj.Name,
+						"activity", SweepActivity, "error", serr.Error())
 				}
 				if serr := r.stampScan(ctx, proj, "issueScan"); serr != nil {
 					l.Error(serr, "scan: persist sweep stamp failed",
