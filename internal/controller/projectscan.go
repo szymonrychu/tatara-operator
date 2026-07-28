@@ -528,18 +528,16 @@ func (r *ProjectReconciler) stampScan(ctx context.Context, proj *tatarav1alpha1.
 	return nil
 }
 
-// brainstorm runs one brainstorm refill decision at PROJECT scope. trigger is
-// TriggerCron (the schedule backstop, which also resets the skip breaker) or
-// TriggerEvent (a maintainer verdict landed on a proposal Issue). It returns
+// brainstorm runs one brainstorm refill decision at PROJECT scope. It returns
 // whether a brainstorm QueuedEvent was created.
 //
 // The backlog level is read from Issue CRs in etcd, never from the forge: see
 // proposalPending. Concurrency is unchanged at one brainstorm Task per project -
-// only the TRIGGER and the QUOTA changed. BrainstormActivity.MaxPerCycle stays
-// deprecated and ignored.
+// only the QUOTA changed. BrainstormActivity.MaxPerCycle stays deprecated and
+// ignored.
 func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1.Project,
 	reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task,
-	act tatarav1alpha1.BrainstormActivity, trigger string) bool {
+	act tatarav1alpha1.BrainstormActivity) bool {
 
 	l := log.FromContext(ctx)
 	start := time.Now()
@@ -547,7 +545,7 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 	issues, err := r.projectProposalIssues(ctx, proj)
 	if err != nil {
 		l.Error(err, "brainstorm: list proposal issues",
-			"action", "scan_brainstorm_error", "resource_id", proj.Name, "trigger", trigger)
+			"action", "scan_brainstorm_error", "resource_id", proj.Name)
 		return false
 	}
 	// The bot login is the authorship anchor the forgeable body-marker fallback
@@ -581,7 +579,7 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 	target := act.ResolveTarget()
 	deficit := brainstormDeficit(target, pending, inflight)
 	quota, refill, reason := brainstormRefillDecision(act, pending, inflight,
-		proj.Status.BrainstormConsecutiveSkips, trigger)
+		proj.Status.BrainstormPausedAt != nil)
 
 	// SHORT-CIRCUIT BEFORE THE SCM FAN-OUT. Everything past the !refill branch
 	// below reads the forge per repo: ListOpenIssues, then gatherRepoCIState
@@ -616,7 +614,7 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 		case qerr != nil:
 			l.Error(fmt.Errorf("brainstorm: check queued event for %s: %w", proj.Name, qerr),
 				"brainstorm: queued-event check failed",
-				"action", "scan_brainstorm_error", "resource_id", proj.Name, "trigger", trigger)
+				"action", "scan_brainstorm_error", "resource_id", proj.Name)
 			refill, reason = false, "queued-check-failed"
 		case queued:
 			refill, reason = false, "already-queued"
@@ -624,36 +622,17 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 	}
 
 	if !refill {
-		// O6 review Important 2: the EVENT trigger runs this decision on every
-		// reconcile of a brainstorm-enabled project (tens-of-seconds cadence),
-		// not just on a due cron tick like the pre-O6 code - so a healthy
-		// at-target project logging this "no refill" line at INFO would emit it
-		// continuously, the exact anti-pattern O4's review already deleted from
-		// projectProposalIssues. The CRON path still fires at most once per
-		// schedule period, so it keeps the INFO level; the EVENT path drops to
-		// V(1) (debug).
-		logSkip := l.Info
-		if trigger == TriggerEvent {
-			logSkip = l.V(1).Info
-		}
-		// BrainstormBreakerTrip is deliberately NOT incremented here: this branch
-		// re-evaluates on every event-triggered reconcile of a brainstorm-enabled
-		// project (tens-of-seconds cadence, see the V(1) drop above), so while the
-		// breaker stays tripped this "reason" is identical across many consecutive
-		// passes. A counter driven from it would climb continuously for as long as
-		// the breaker stays tripped, which is "is tripped", not "trips" - useless
-		// for alerting. The actual trip event - BrainstormConsecutiveSkips crossing
-		// its threshold - only ever happens where that field is incremented
-		// (bumpBrainstormSkips, internal/restapi/outcome.go), which is the one
-		// place this reconcile-repeated evaluation cannot be mistaken for a fresh
-		// trip; that is where BrainstormBreakerTrip is actually counted.
+		// This decision now runs on EVERY reconcile of a brainstorm-enabled
+		// project (tens-of-seconds cadence), never on a due cron tick, so the
+		// steady-state "no refill" line is V(1) unconditionally. At INFO a
+		// healthy at-target or correctly-paused project would emit it
+		// continuously.
 		r.Metrics.SetBrainstormTarget(proj.Name, float64(target))
 		r.Metrics.SetBrainstormPending(proj.Name, float64(pending))
-		logSkip("brainstorm: no refill this pass",
+		l.V(1).Info("brainstorm: no refill this pass",
 			"action", "scan_brainstorm_skipped", "resource_id", proj.Name,
 			"target", target, "pending", pending, "inflight", inflight,
-			"deficit", deficit, "trigger", trigger, "reason", reason,
-			"consecutive_skips", proj.Status.BrainstormConsecutiveSkips)
+			"deficit", deficit, "reason", reason)
 		return false
 	}
 
@@ -676,16 +655,16 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 		l.Info("brainstorm: refill decided but no event enqueued",
 			"action", "scan_brainstorm_not_enqueued", "resource_id", proj.Name,
 			"target", target, "pending", pending, "inflight", inflight,
-			"deficit", deficit, "quota", quota, "trigger", trigger)
+			"deficit", deficit, "quota", quota)
 		return false
 	}
 	r.Metrics.SetBrainstormTarget(proj.Name, float64(target))
 	r.Metrics.SetBrainstormPending(proj.Name, float64(pending))
-	r.Metrics.BrainstormRefill(proj.Name, trigger)
+	r.Metrics.BrainstormRefill(proj.Name)
 	l.Info("brainstorm: refill dispatched",
 		"action", "scan_brainstorm", "resource_id", proj.Name,
 		"target", target, "pending", pending, "inflight", inflight,
-		"deficit", deficit, "quota", quota, "trigger", trigger,
+		"deficit", deficit, "quota", quota,
 		"duration_ms", time.Since(start).Milliseconds())
 	return true
 }
@@ -1519,16 +1498,7 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 					}
 				}
 				if proceed {
-					r.brainstorm(ctx, proj, reader, repos, existing, cronSpec.Brainstorm, TriggerCron)
-					// The cron tick is the ONLY thing that re-enables the event-driven
-					// refill path after the skip breaker trips. Reset unconditionally,
-					// refill or not: a dry spell must cost one session per cron period,
-					// never wedge brainstorm permanently.
-					if rerr := r.resetBrainstormSkips(ctx, proj); rerr != nil {
-						l.Error(rerr, "scan: reset brainstorm skip breaker",
-							"action", "scan_stamp_error", "resource_id", proj.Name, "activity", "brainstorm")
-						obs.SweepErrorsTotal.WithLabelValues(proj.Name, "brainstorm", "skip_reset_failed").Inc()
-					}
+					r.brainstorm(ctx, proj, reader, repos, existing, cronSpec.Brainstorm)
 					if serr := r.stampScan(ctx, proj, "brainstorm"); serr != nil {
 						l.Error(serr, "scan: persist brainstorm stamp failed",
 							"action", "scan_stamp_error", "resource_id", proj.Name, "activity", "brainstorm")

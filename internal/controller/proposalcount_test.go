@@ -303,31 +303,36 @@ func TestBrainstormDeficit(t *testing.T) {
 	}
 }
 
+// The control law after the breaker's retirement: paused BEATS a positive
+// deficit, at-target clamps, and there is no trigger-dependent branch left to
+// test - the cron path and the event path are the same path now.
 func TestBrainstormRefillDecision(t *testing.T) {
 	target := func(n int) tatarav1alpha1.BrainstormActivity {
 		v := n
 		return tatarav1alpha1.BrainstormActivity{TargetOpenProposals: &v}
 	}
 	tests := []struct {
-		name                     string
-		act                      tatarav1alpha1.BrainstormActivity
-		pending, inflight, skips int
-		trigger                  string
-		wantQuota                int
-		wantRefill               bool
-		wantReason               string
+		name              string
+		act               tatarav1alpha1.BrainstormActivity
+		pending, inflight int
+		paused            bool
+		wantQuota         int
+		wantRefill        bool
+		wantReason        string
 	}{
-		{"empty backlog on an event", target(3), 0, 0, 0, "event", 3, true, ""},
-		{"at target on an event", target(3), 3, 0, 0, "event", 0, false, "at-target"},
-		{"in flight on an event", target(3), 0, 1, 0, "event", 2, true, ""},
-		{"breaker tripped suppresses the event path", target(3), 0, 0, 3, "event", 0, false, "breaker-tripped"},
-		{"breaker below threshold does not suppress", target(3), 0, 0, 2, "event", 3, true, ""},
-		{"a cron tick ignores the breaker", target(3), 0, 0, 9, "cron", 3, true, ""},
-		{"a large target is clamped to the submit_outcome ceiling", target(20), 0, 0, 0, "cron", 5, true, ""},
+		{"empty backlog refills to target", target(3), 0, 0, false, 3, true, ""},
+		{"at target", target(3), 3, 0, false, 0, false, "at-target"},
+		{"over target never refills and never closes", target(3), 5, 0, false, 0, false, "at-target"},
+		{"an in-flight session counts toward the target", target(3), 0, 1, false, 2, true, ""},
+		{"paused beats an empty backlog", target(3), 0, 0, true, 0, false, "paused"},
+		{"paused beats a partial deficit", target(3), 1, 0, true, 0, false, "paused"},
+		{"paused and at target still reads paused", target(3), 3, 0, true, 0, false, "paused"},
+		{"an explicit target of 0 disables refill", target(0), 0, 0, false, 0, false, "at-target"},
+		{"a large target is clamped to the submit_outcome ceiling", target(20), 0, 0, false, 5, true, ""},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			quota, refill, reason := brainstormRefillDecision(tc.act, tc.pending, tc.inflight, tc.skips, tc.trigger)
+			quota, refill, reason := brainstormRefillDecision(tc.act, tc.pending, tc.inflight, tc.paused)
 			if quota != tc.wantQuota || refill != tc.wantRefill || reason != tc.wantReason {
 				t.Fatalf("brainstormRefillDecision = (%d, %v, %q), want (%d, %v, %q)",
 					quota, refill, reason, tc.wantQuota, tc.wantRefill, tc.wantReason)

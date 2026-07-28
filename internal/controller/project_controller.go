@@ -329,14 +329,9 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// logged that failure at ERROR (scan_reader_error), so this simply skips
 	// rather than re-attempting and re-logging the identical failure (O6
 	// review Minor 4).
-	//
-	// The skip breaker gates ONLY this path (brainstormRefillDecision checks
-	// trigger == TriggerEvent); the cron tick above ignores it and is the
-	// thing that resets it, so a genuinely dry idea space still costs at most
-	// one session per cron period even if every event wake gets suppressed.
 	if cron := brainstormCronSpec(&project); cron != nil && cron.Enabled {
 		if scanRdr != nil {
-			r.brainstorm(ctx, &project, scanRdr, scanRepos, scanExisting, *cron, TriggerEvent)
+			r.brainstorm(ctx, &project, scanRdr, scanRepos, scanExisting, *cron)
 		}
 		// The periodic resync is the BACKSTOP poll interval for a lost watch
 		// event, not the workqueue's error rate limiter (reconcile.Result

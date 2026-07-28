@@ -28,13 +28,13 @@ func isBrainstormTask(t *tatarav1alpha1.Task) bool {
 // reconcile is in error backoff and the next self-requeue is pushed out
 // further than 30s.
 //
-// It does NOT rescue the five-consecutive-skips regime either:
-// brainstormRefillDecision (proposalcount.go) trips its skip breaker for
-// trigger==TriggerEvent once consecutiveSkips >= maxSkips (default 3), the
-// exact trigger this edge routes through - so from skip 3 onward this wake is
-// suppressed by the same breaker it would be motivated by fixing. Only the
-// CRON tick resets that breaker; the skip breaker, not this edge, governs the
-// five-consecutive-skips symptom.
+// This edge is now LOAD-BEARING. Before the breaker's retirement it routed
+// through the event-driven refill path, which brainstormRefillDecision
+// suppressed once consecutiveSkips >= maxSkips (default 3) - so from skip 3
+// onward the wake was suppressed by the same breaker it was built to work
+// around, INERT in exactly the regime it existed for. With the breaker gone
+// this wake fires the next session directly: from zero proposals at target=3,
+// three sessions run back to back with no cron tick at all.
 //
 //	Update  admit iff isBrainstorm && !TaskDone(old) && TaskDone(new)
 //	Delete  admit iff isBrainstorm && !TaskDone(obj)   (an in-flight cycle's slot is freed)

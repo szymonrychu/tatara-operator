@@ -195,11 +195,6 @@ func (in *BrainstormActivity) DeepCopyInto(out *BrainstormActivity) {
 		*out = new(int)
 		**out = **in
 	}
-	if in.MaxConsecutiveSkips != nil {
-		in, out := &in.MaxConsecutiveSkips, &out.MaxConsecutiveSkips
-		*out = new(int)
-		**out = **in
-	}
 	if in.Sources != nil {
 		in, out := &in.Sources, &out.Sources
 		*out = make([]string, len(*in))

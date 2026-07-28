@@ -6,8 +6,6 @@ import (
 	"strings"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -204,36 +202,6 @@ func (r *ProjectReconciler) projectProposalIssues(ctx context.Context, proj *tat
 	return out, nil
 }
 
-// resetBrainstormSkips zeroes the skip breaker. The cron tick is the ONLY thing
-// that re-enables the event-driven refill path after the breaker trips, so this
-// is the liveness guarantee of the whole design: a dry idea space costs one
-// session per cron period instead of wedging brainstorm forever.
-func (r *ProjectReconciler) resetBrainstormSkips(ctx context.Context, proj *tatarav1alpha1.Project) error {
-	if proj.Status.BrainstormConsecutiveSkips == 0 {
-		return nil
-	}
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh := &tatarav1alpha1.Project{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: proj.Namespace, Name: proj.Name}, fresh); err != nil {
-			return fmt.Errorf("brainstorm: get project %s: %w", proj.Name, err)
-		}
-		if fresh.Status.BrainstormConsecutiveSkips == 0 {
-			proj.Status.BrainstormConsecutiveSkips = 0
-			return nil
-		}
-		fresh.Status.BrainstormConsecutiveSkips = 0
-		proj.Status.BrainstormConsecutiveSkips = 0
-		return r.Status().Update(ctx, fresh)
-	})
-}
-
-// TriggerEvent and TriggerCron name the two refill paths. They are the value of
-// the "trigger" log field and the operator_brainstorm_refill_total label.
-const (
-	TriggerEvent = "event"
-	TriggerCron  = "cron"
-)
-
 // brainstormDeficit is the control law:
 //
 //	deficit = max(0, target - pending - inflight)
@@ -249,21 +217,29 @@ func brainstormDeficit(target, pending, inflight int) int {
 	return max(target-pending-inflight, 0)
 }
 
-// brainstormRefillDecision applies the control law plus the skip circuit
-// breaker. quota is the number of proposals the session may file, clamped to
-// [1, MaxProposalsPerOutcome] when refill is true. reason is "" when refilling,
-// otherwise the log-and-metric reason the cycle was suppressed.
+// brainstormRefillDecision is the whole control law. quota is the number of
+// proposals the session may file, clamped to [1, MaxProposalsPerOutcome] when
+// refill is true. reason is "" when refilling, otherwise the log-and-metric
+// reason the cycle was suppressed.
 //
-// The breaker suppresses ONLY the event path. The cron tick is the backstop that
-// repairs the backlog after a dropped event or a tripped breaker, and it resets
-// the counter, so a genuinely dry idea space costs one session per cron period
-// instead of one per reconcile.
+// There is no trigger-dependent branch and no circuit breaker any more. The
+// breaker suppressed the EVENT path once consecutiveSkips crossed a threshold
+// and ONLY a cron tick reset it, which made the two mechanisms load-bearing for
+// each other: the breaker wedged the fast path and the cron was the only
+// unwedge. Worse, it counted CORRECT behaviour - an agent reporting "nothing
+// worth proposing" - toward a brake, so a working system switched its own fast
+// path off. Pause is now an explicit state an agent asks for (action=exhausted,
+// internal/restapi/outcome.go) and five triggers clear (brainstorm_resume.go),
+// not an inference from a counter.
+//
+// paused is proj.Status.BrainstormPausedAt != nil at the call site. It is
+// passed as a bool rather than the Project so this stays a pure function with a
+// table test.
 func brainstormRefillDecision(act tatarav1alpha1.BrainstormActivity,
-	pending, inflight, consecutiveSkips int, trigger string) (quota int, refill bool, reason string) {
+	pending, inflight int, paused bool) (quota int, refill bool, reason string) {
 
-	if maxSkips := act.ResolveMaxConsecutiveSkips(); trigger == TriggerEvent &&
-		maxSkips > 0 && consecutiveSkips >= maxSkips {
-		return 0, false, "breaker-tripped"
+	if paused {
+		return 0, false, "paused"
 	}
 	deficit := brainstormDeficit(act.ResolveTarget(), pending, inflight)
 	if deficit <= 0 {

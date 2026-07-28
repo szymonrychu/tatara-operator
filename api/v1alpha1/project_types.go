@@ -452,12 +452,6 @@ type BrainstormActivity struct {
 	// DefaultHistoryWindow. An explicit 0 omits the block.
 	// +optional
 	HistoryWindow *int `json:"historyWindow,omitempty"`
-	// MaxConsecutiveSkips is the circuit-breaker threshold. After this many
-	// consecutive brainstorm sessions ending in action=skip, the EVENT-driven
-	// refill path is suppressed until a cron tick resets the counter. Unset uses
-	// DefaultMaxConsecutiveSkips. An explicit 0 means the breaker never trips.
-	// +optional
-	MaxConsecutiveSkips *int `json:"maxConsecutiveSkips,omitempty"`
 	// StaleProposalDays configures the staleness reaper that auto-closes
 	// bot-authored proposals with no human engagement (no human comment, no live
 	// work) for at least that many days, clearing dead proposals out of the
@@ -480,7 +474,6 @@ type BrainstormActivity struct {
 const (
 	DefaultTargetOpenProposals = 3
 	DefaultHistoryWindow       = 20
-	DefaultMaxConsecutiveSkips = 3
 	// MaxProposalsPerOutcome mirrors the submit_outcome schema ceiling enforced
 	// in internal/restapi/outcome.go. The quota is clamped to it so a large
 	// targetOpenProposals cannot instruct an obedient agent to emit a payload
@@ -508,14 +501,6 @@ func (a BrainstormActivity) ResolveHistoryWindow() int {
 		return max(*a.HistoryWindow, 0)
 	}
 	return DefaultHistoryWindow
-}
-
-// ResolveMaxConsecutiveSkips resolves the breaker threshold. 0 disables it.
-func (a BrainstormActivity) ResolveMaxConsecutiveSkips() int {
-	if a.MaxConsecutiveSkips != nil {
-		return max(*a.MaxConsecutiveSkips, 0)
-	}
-	return DefaultMaxConsecutiveSkips
 }
 
 // RefineActivity configures the cron-cycle refiner pre-step.

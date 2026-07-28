@@ -5840,13 +5840,6 @@ spec:
                               brainstorm pod's turn-0 bundle as the <proposal_history> block. Unset uses
                               DefaultHistoryWindow. An explicit 0 omits the block.
                             type: integer
-                          maxConsecutiveSkips:
-                            description: |-
-                              MaxConsecutiveSkips is the circuit-breaker threshold. After this many
-                              consecutive brainstorm sessions ending in action=skip, the EVENT-driven
-                              refill path is suppressed until a cron tick resets the counter. Unset uses
-                              DefaultMaxConsecutiveSkips. An explicit 0 means the breaker never trips.
-                            type: integer
                           maxOpenProposals:
                             default: 5
                             description: |-

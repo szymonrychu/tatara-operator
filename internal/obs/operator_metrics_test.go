@@ -1633,18 +1633,14 @@ func TestBrainstormMetrics(t *testing.T) {
 	m := NewOperatorMetrics(prometheus.NewRegistry())
 	m.SetBrainstormTarget("demo", 3)
 	m.SetBrainstormPending("demo", 1)
-	m.BrainstormRefill("demo", "event")
-	m.BrainstormRefill("demo", "cron")
-	m.BrainstormRefill("demo", "cron")
-	m.BrainstormBreakerTrip("demo")
+	m.BrainstormRefill("demo")
+	m.BrainstormRefill("demo")
 	m.BrainstormQuotaTruncated("demo", 2)
 	m.BrainstormQuotaTruncated("demo", 0) // a no-op drop must not move the counter
 
 	require.Equal(t, 3.0, testutil.ToFloat64(m.brainstormTarget.WithLabelValues("demo")))
 	require.Equal(t, 1.0, testutil.ToFloat64(m.brainstormPending.WithLabelValues("demo")))
-	require.Equal(t, 1.0, testutil.ToFloat64(m.brainstormRefillTotal.WithLabelValues("demo", "event")))
-	require.Equal(t, 2.0, testutil.ToFloat64(m.brainstormRefillTotal.WithLabelValues("demo", "cron")))
-	require.Equal(t, 1.0, testutil.ToFloat64(m.brainstormBreakerTripTotal.WithLabelValues("demo")))
+	require.Equal(t, 2.0, testutil.ToFloat64(m.brainstormRefillTotal.WithLabelValues("demo")))
 	require.Equal(t, 2.0, testutil.ToFloat64(m.brainstormQuotaTruncatedTotal.WithLabelValues("demo")))
 }
 
@@ -1655,8 +1651,7 @@ func TestBrainstormMetricsAreNilSafe(t *testing.T) {
 	require.NotPanics(t, func() {
 		m.SetBrainstormTarget("demo", 3)
 		m.SetBrainstormPending("demo", 1)
-		m.BrainstormRefill("demo", "event")
-		m.BrainstormBreakerTrip("demo")
+		m.BrainstormRefill("demo")
 		m.BrainstormQuotaTruncated("demo", 1)
 	})
 }

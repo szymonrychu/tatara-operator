@@ -51,7 +51,6 @@ type OperatorMetrics struct {
 	brainstormTarget              *prometheus.GaugeVec
 	brainstormPending             *prometheus.GaugeVec
 	brainstormRefillTotal         *prometheus.CounterVec
-	brainstormBreakerTripTotal    *prometheus.CounterVec
 	brainstormQuotaTruncatedTotal *prometheus.CounterVec
 	turnTimeoutTotal              *prometheus.CounterVec
 	ingestJobTotal                *prometheus.CounterVec
@@ -195,11 +194,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		}, []string{"project"}),
 		brainstormRefillTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_brainstorm_refill_total",
-			Help: "Brainstorm refills dispatched, by trigger (event = a maintainer verdict landed on a proposal Issue; cron = the schedule backstop).",
-		}, []string{"project", "trigger"}),
-		brainstormBreakerTripTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "operator_brainstorm_breaker_trip_total",
-			Help: "Times the consecutive-skip circuit breaker suppressed an event-driven refill. A rising value means the idea space is proven dry; the cron tick resets it.",
+			Help: "Brainstorm refills dispatched per project. There is no `trigger` label any more: since the cron path was retired there is exactly one refill path, the level-triggered reconcile pass.",
 		}, []string{"project"}),
 		brainstormQuotaTruncatedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_brainstorm_quota_truncated_total",
@@ -500,7 +495,6 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.brainstormTarget,
 		m.brainstormPending,
 		m.brainstormRefillTotal,
-		m.brainstormBreakerTripTotal,
 		m.brainstormQuotaTruncatedTotal,
 		m.turnTimeoutTotal,
 		m.ingestJobTotal,
@@ -943,31 +937,12 @@ func (m *OperatorMetrics) SetBrainstormPending(project string, n float64) {
 	m.brainstormPending.WithLabelValues(project).Set(n)
 }
 
-// BrainstormRefill counts one dispatched refill by trigger (event|cron).
-func (m *OperatorMetrics) BrainstormRefill(project, trigger string) {
+// BrainstormRefill counts one dispatched refill.
+func (m *OperatorMetrics) BrainstormRefill(project string) {
 	if m == nil {
 		return
 	}
-	m.brainstormRefillTotal.WithLabelValues(project, trigger).Inc()
-}
-
-// BrainstormBreakerTrip counts one skip-breaker TRIP: the consecutive-skip
-// counter crossing its configured threshold. Call this only at the crossing,
-// never on every pass the breaker stays tripped - the latter is "is tripped",
-// not "trips", and is useless for alerting (a monotonic counter that never
-// stops climbing while healthy-but-dry looks identical to one climbing
-// because something is actually wrong).
-func (m *OperatorMetrics) BrainstormBreakerTrip(project string) {
-	if m == nil {
-		return
-	}
-	m.brainstormBreakerTripTotal.WithLabelValues(project).Inc()
-}
-
-// BrainstormBreakerTripCounter returns the counter for project for test
-// assertions.
-func (m *OperatorMetrics) BrainstormBreakerTripCounter(project string) prometheus.Counter {
-	return m.brainstormBreakerTripTotal.WithLabelValues(project)
+	m.brainstormRefillTotal.WithLabelValues(project).Inc()
 }
 
 // BrainstormQuotaTruncated counts proposals dropped by quota truncation.
