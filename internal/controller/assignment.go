@@ -117,9 +117,14 @@ func agentJob(agentKind string) string {
 			"a restatement of it. Pull the full project Task index on demand with " +
 			"`task_context(index=true)`.\n\n" +
 			"Your session quota is stated in the <goal> element. End with " +
-			"`submit_outcome(kind=brainstorm, action=propose)` carrying at most that many ideas, or " +
-			"`submit_outcome(kind=brainstorm, action=skip)` when there is nothing novel. `skip` is a " +
-			"correct and common answer; a made-up proposal is not." +
+			"`submit_outcome(kind=brainstorm, action=propose)` carrying at most that many ideas; " +
+			"`submit_outcome(kind=brainstorm, action=skip, reason=...)` when THIS cycle found nothing " +
+			"but the idea space is not dry - expect something next time; or " +
+			"`submit_outcome(kind=brainstorm, action=exhausted, reason=...)` when nothing is worth " +
+			"proposing until the project itself moves. `skip` costs one more session soon; " +
+			"`exhausted` PAUSES brainstorming for this project until a real change lands, and one " +
+			"report is enough - use it when you have re-derived that there is nothing to add from live " +
+			"data and expect that to hold. `skip` is a correct and common answer; a made-up proposal is not." +
 			promptguidance.ToolingNoteGuidance
 
 	case stage.AgentClarify:

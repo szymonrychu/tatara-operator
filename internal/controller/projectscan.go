@@ -794,8 +794,12 @@ func brainstormGoalProject(slugs []string, repoStateCtx string, guidance string,
 		"proposing. See the `tatara-code-quality-proposal` skill.\n\n" +
 		stateBlock + "\n\n" +
 		"EARLY EXIT (do this FIRST, cheaply): scan the ISSUES / OPEN MRs / MAIN HEALTH state above. If nothing clears " +
-		"the bar for a genuinely novel, high-leverage proposal this cycle, emit " +
-		"`submit_outcome(action=skip, reason=...)` and STOP. Silence over noise.\n\n" +
+		"the bar for a genuinely novel, high-leverage proposal THIS cycle but the idea space is not dry, emit " +
+		"`submit_outcome(action=skip, reason=...)` and STOP - expect something next time. If instead you have " +
+		"re-derived that there is nothing worth proposing until the project itself moves, emit " +
+		"`submit_outcome(action=exhausted, reason=...)` and STOP: this PAUSES brainstorming for the project " +
+		"until a real change lands, so use it only when you mean it to hold, not merely for this cycle. " +
+		"Silence over noise.\n\n" +
 		"NEW-IDEAS-ONLY CONTRACT - follow exactly ONE path:\n" +
 		"1. If the best idea DUPLICATES an existing open issue above: do NOT propose. Finish with a one-line note " +
 		"naming the duplicate. Do NOT comment on it.\n" +
