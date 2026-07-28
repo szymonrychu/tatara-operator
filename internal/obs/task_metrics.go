@@ -76,7 +76,7 @@ func newTaskMetrics(reg prometheus.Registerer) *taskMetrics {
 		}, []string{"stageReason", "kind"}),
 		conversingPods: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "operator_conversing_pods",
-			Help: "Tasks currently in the conversing stage, by project. It is the live reading of the per-project ceiling (Project.spec.maxConversingPods, default 5).",
+			Help: "Tasks currently in the conversing stage, by project. It is the live reading of the per-project ceiling (Project.spec.maxConversingPods, default 2).",
 		}, []string{"project"}),
 		conversingEntryDeclined: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_conversing_entry_declined_total",
