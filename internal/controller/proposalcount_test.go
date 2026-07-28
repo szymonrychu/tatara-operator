@@ -2,6 +2,7 @@ package controller
 
 import (
 	"testing"
+	"time"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -332,11 +333,127 @@ func TestBrainstormRefillDecision(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			quota, refill, reason := brainstormRefillDecision(tc.act, tc.pending, tc.inflight, tc.paused)
+			// lastBrainstorm=nil: no session has ever been dispatched, so the
+			// cooldown gate (TestBrainstormRefillDecision_CooldownGate below)
+			// never applies here - this table is exclusively about the
+			// paused/deficit law.
+			quota, refill, reason := brainstormRefillDecision(tc.act, tc.pending, tc.inflight, tc.paused, time.Now(), nil)
 			if quota != tc.wantQuota || refill != tc.wantRefill || reason != tc.wantReason {
 				t.Fatalf("brainstormRefillDecision = (%d, %v, %q), want (%d, %v, %q)",
 					quota, refill, reason, tc.wantQuota, tc.wantRefill, tc.wantReason)
 			}
 		})
+	}
+}
+
+// TestBrainstormRefillDecision_CooldownGate is C2's brake: an explicit
+// minimum wall-clock interval between two brainstorm SESSIONS, independent of
+// the `exhausted` LLM judgment call and independent of whether the prior
+// session proposed, skipped, or was paused. It must (a) never block the
+// FIRST session (lastBrainstorm == nil), (b) block a second session that
+// falls inside the floor with the distinct "cooling-down" reason, and (c)
+// let it through again once the floor has elapsed.
+func TestBrainstormRefillDecision_CooldownGate(t *testing.T) {
+	target3 := 3
+	act := tatarav1alpha1.BrainstormActivity{TargetOpenProposals: &target3, MinSessionIntervalMinutes: 10}
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name           string
+		lastBrainstorm *time.Time
+		wantQuota      int
+		wantRefill     bool
+		wantReason     string
+	}{
+		{
+			name:           "no prior session never blocks the first one",
+			lastBrainstorm: nil,
+			wantQuota:      3, wantRefill: true, wantReason: "",
+		},
+		{
+			name:           "a session one minute ago is inside the floor",
+			lastBrainstorm: timePtr(now.Add(-1 * time.Minute)),
+			wantQuota:      0, wantRefill: false, wantReason: "cooling-down",
+		},
+		{
+			name:           "a session nine minutes fifty-nine seconds ago is still inside the floor",
+			lastBrainstorm: timePtr(now.Add(-(10*time.Minute - time.Second))),
+			wantQuota:      0, wantRefill: false, wantReason: "cooling-down",
+		},
+		{
+			name:           "a session exactly at the floor is no longer gated",
+			lastBrainstorm: timePtr(now.Add(-10 * time.Minute)),
+			wantQuota:      3, wantRefill: true, wantReason: "",
+		},
+		{
+			name:           "a session well past the floor is not gated",
+			lastBrainstorm: timePtr(now.Add(-1 * time.Hour)),
+			wantQuota:      3, wantRefill: true, wantReason: "",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			quota, refill, reason := brainstormRefillDecision(act, 0, 0, false, now, tc.lastBrainstorm)
+			if quota != tc.wantQuota || refill != tc.wantRefill || reason != tc.wantReason {
+				t.Fatalf("brainstormRefillDecision = (%d, %v, %q), want (%d, %v, %q)",
+					quota, refill, reason, tc.wantQuota, tc.wantRefill, tc.wantReason)
+			}
+		})
+	}
+}
+
+// TestBrainstormRefillDecision_CooldownDisabledByNegativeInterval: a negative
+// MinSessionIntervalMinutes is the explicit opt-out (mirrors
+// StaleProposalDays), so even a session one second ago must not gate.
+func TestBrainstormRefillDecision_CooldownDisabledByNegativeInterval(t *testing.T) {
+	target3 := 3
+	act := tatarav1alpha1.BrainstormActivity{TargetOpenProposals: &target3, MinSessionIntervalMinutes: -1}
+	now := time.Now()
+	last := now.Add(-1 * time.Second)
+	quota, refill, reason := brainstormRefillDecision(act, 0, 0, false, now, &last)
+	if !refill || quota != 3 || reason != "" {
+		t.Fatalf("brainstormRefillDecision = (%d, %v, %q), want refill with no cooldown gate", quota, refill, reason)
+	}
+}
+
+// TestBrainstormRefillDecision_PausedBeatsCooldownReason: paused is checked
+// first, so a paused-and-cooling-down project reports "paused", the more
+// actionable of the two reasons for a human reading status.
+func TestBrainstormRefillDecision_PausedBeatsCooldownReason(t *testing.T) {
+	target3 := 3
+	act := tatarav1alpha1.BrainstormActivity{TargetOpenProposals: &target3, MinSessionIntervalMinutes: 10}
+	now := time.Now()
+	last := now.Add(-1 * time.Minute)
+	quota, refill, reason := brainstormRefillDecision(act, 0, 0, true, now, &last)
+	if refill || quota != 0 || reason != "paused" {
+		t.Fatalf("brainstormRefillDecision = (%d, %v, %q), want (0, false, \"paused\")", quota, refill, reason)
+	}
+}
+
+func timePtr(t time.Time) *time.Time { return &t }
+
+// TestBrainstormPausedLogDue is I5's pacing gate: a paused project's "no
+// refill this pass" line must be visible at INFO, but not on every ~30s
+// event-driven reconcile pass. It fires once, then holds off for
+// brainstormResyncInterval, then fires again - and two DIFFERENT projects
+// never throttle each other.
+func TestBrainstormPausedLogDue(t *testing.T) {
+	r := &ProjectReconciler{}
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+
+	if !r.brainstormPausedLogDue("p1", now) {
+		t.Fatal("first call for a project must be due")
+	}
+	if r.brainstormPausedLogDue("p1", now.Add(1*time.Minute)) {
+		t.Fatal("a second call one minute later must be suppressed")
+	}
+	if r.brainstormPausedLogDue("p1", now.Add(brainstormResyncInterval-time.Second)) {
+		t.Fatal("a call one second short of the resync interval must still be suppressed")
+	}
+	if !r.brainstormPausedLogDue("p1", now.Add(brainstormResyncInterval)) {
+		t.Fatal("a call at the resync interval must be due again")
+	}
+	if !r.brainstormPausedLogDue("p2", now.Add(1*time.Minute)) {
+		t.Fatal("a different project must not be throttled by p1's pacing")
 	}
 }

@@ -65,8 +65,10 @@ func TestBrainstormEnqueuesDespiteQueuedAutonomousCount(t *testing.T) {
 	// Backdate LastBrainstorm so the * * * * * schedule fires immediately.
 	// The project was just created, so CreationTimestamp is recent; the cron's
 	// next-fire would be in the next minute, making due=false. Stamp with a
-	// 2-minute-ago time so next-fire is in the past.
-	past := metav1.NewTime(time.Now().Add(-2 * time.Minute))
+	// 30-minute-ago time so next-fire is in the past AND well outside C2's
+	// DefaultBrainstormMinSessionIntervalMinutes cooldown floor (this test
+	// targets the budget gate, not the cooldown gate).
+	past := metav1.NewTime(time.Now().Add(-30 * time.Minute))
 	proj.Status.LastBrainstorm = &past
 	// Stamp LastRefine to now (after the brainstorm due-base) so the refine
 	// pre-scan barrier (merged onto the brainstorm tick) is already satisfied

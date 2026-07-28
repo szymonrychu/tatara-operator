@@ -528,6 +528,21 @@ func (r *ProjectReconciler) stampScan(ctx context.Context, proj *tatarav1alpha1.
 	return nil
 }
 
+// brainstormPausedLogDue reports whether the paused-project INFO log
+// (I5 fix round) is due for proj, and if so marks it logged at now. Paced at
+// brainstormResyncInterval per project via lastBrainstormPausedLogged, the
+// same lazy-init-map idiom as lastDriveUnparks/lastComputeProjectCounts.
+func (r *ProjectReconciler) brainstormPausedLogDue(project string, now time.Time) bool {
+	if last, ok := r.lastBrainstormPausedLogged[project]; ok && now.Sub(last) < brainstormResyncInterval {
+		return false
+	}
+	if r.lastBrainstormPausedLogged == nil {
+		r.lastBrainstormPausedLogged = map[string]time.Time{}
+	}
+	r.lastBrainstormPausedLogged[project] = now
+	return true
+}
+
 // brainstorm runs one brainstorm refill decision at PROJECT scope. It returns
 // whether a brainstorm QueuedEvent was created.
 //
@@ -578,8 +593,13 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 
 	target := act.ResolveTarget()
 	deficit := brainstormDeficit(target, pending, inflight)
+	var lastBrainstorm *time.Time
+	if proj.Status.LastBrainstorm != nil {
+		t := proj.Status.LastBrainstorm.Time
+		lastBrainstorm = &t
+	}
 	quota, refill, reason := brainstormRefillDecision(act, pending, inflight,
-		proj.Status.BrainstormPausedAt != nil)
+		proj.Status.BrainstormPausedAt != nil, time.Now(), lastBrainstorm)
 
 	// SHORT-CIRCUIT BEFORE THE SCM FAN-OUT. Everything past the !refill branch
 	// below reads the forge per repo: ListOpenIssues, then gatherRepoCIState
@@ -622,14 +642,22 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 	}
 
 	if !refill {
-		// This decision now runs on EVERY reconcile of a brainstorm-enabled
-		// project (tens-of-seconds cadence), never on a due cron tick, so the
-		// steady-state "no refill" line is V(1) unconditionally. At INFO a
-		// healthy at-target or correctly-paused project would emit it
-		// continuously.
+		// This decision runs on EVERY reconcile of a brainstorm-enabled project
+		// (tens-of-seconds cadence via the event-driven wake) AND on every due
+		// cron tick (runScans below still calls brainstorm() on schedule - the
+		// cron path was never retired), so a healthy at-target project would
+		// emit this continuously at V(1) - and so would a paused one, UNLESS
+		// paced: reason=="paused" logs at INFO instead, but only once per
+		// brainstormResyncInterval per project (I5 fix round), so a paused
+		// project stays visible at INFO without spamming every ~30s pass. Every
+		// other reason (including "at-target") stays V(1) unconditionally.
 		r.Metrics.SetBrainstormTarget(proj.Name, float64(target))
 		r.Metrics.SetBrainstormPending(proj.Name, float64(pending))
-		l.V(1).Info("brainstorm: no refill this pass",
+		logLevel := l.V(1)
+		if reason == "paused" && r.brainstormPausedLogDue(proj.Name, start) {
+			logLevel = l
+		}
+		logLevel.Info("brainstorm: no refill this pass",
 			"action", "scan_brainstorm_skipped", "resource_id", proj.Name,
 			"target", target, "pending", pending, "inflight", inflight,
 			"deficit", deficit, "reason", reason)

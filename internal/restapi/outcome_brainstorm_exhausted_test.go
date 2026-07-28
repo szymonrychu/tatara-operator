@@ -2,13 +2,19 @@ package restapi_test
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"testing"
+	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/obs"
 )
 
 // exhausted is the THIRD brainstorm outcome action: "nothing worth proposing
@@ -53,6 +59,11 @@ func TestBrainstormExhaustedRequiresAReason(t *testing.T) {
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
 		`{"kind":"brainstorm","payload":{"action":"exhausted","reason":"   "}}`)
 	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	// Assert the BODY, not just the status code: pre-fix code also 400s on
+	// action=bad-action (TestBrainstormRejectsAnUnknownAction), so a bare
+	// status-code check here passes against code that never validates
+	// exhausted's reason at all (review finding I6).
+	require.Contains(t, w.Body.String(), "action=exhausted requires a non-empty reason")
 	require.Nil(t, e.project(t, "tatara").Status.BrainstormPausedAt)
 }
 
@@ -87,4 +98,39 @@ func TestBrainstormProposeClearsAnExistingPause(t *testing.T) {
 	require.Nil(t, e.project(t, "tatara").Status.BrainstormPausedAt,
 		"a productive session clears the pause")
 	require.Empty(t, e.project(t, "tatara").Status.BrainstormPauseReason)
+}
+
+// TestBrainstormExhaustedFailsClosedWhenThePauseStampFails is I1's fix round
+// proof. Before the fix, the Task committed to Delivered FIRST and the pause
+// stamp ran best-effort AFTER: a failed stamp still returned 200, the Task
+// was already terminal so nothing ever retried, and the project fell
+// straight back into C2's busy-loop with the one brake that exists for it
+// silently lost. The fix reorders the write: stamp the pause BEFORE
+// committing the Task, and fail the WHOLE request (500) if the stamp fails,
+// so the agent's outcome submission retries and neither half is left
+// half-done.
+func TestBrainstormExhaustedFailsClosedWhenThePauseStampFails(t *testing.T) {
+	metrics := obs.NewOperatorMetrics(prometheus.NewRegistry())
+	funcs := interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string,
+			obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			if _, ok := obj.(*tatarav1alpha1.Project); ok && subResourceName == "status" {
+				return fmt.Errorf("injected: project status update failed")
+			}
+			return c.SubResource(subResourceName).Update(ctx, obj, opts...)
+		},
+	}
+	task := taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StageBrainstorming, "brainstorm")
+	e := buildV2WithCooldownAndInterceptor(t, metrics, 0, func() time.Time { return frozenNow }, funcs,
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"), task)
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"brainstorm","payload":{"action":"exhausted","reason":"every open lane is blocked on a human decision"}}`)
+	require.Equal(t, http.StatusInternalServerError, w.Code, w.Body.String(),
+		"a failed pause stamp must fail the whole request, not just log-and-continue")
+	require.Equal(t, tatarav1alpha1.StageBrainstorming, e.task(t, "t1").Status.Stage,
+		"the Task must stay non-terminal so the agent's retry can land the pause; "+
+			"committing to Delivered first is exactly the fail-open bug this test pins")
+	require.Nil(t, e.project(t, "tatara").Status.BrainstormPausedAt,
+		"the failed write must not leave a half-applied pause")
 }

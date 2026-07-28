@@ -1459,6 +1459,31 @@ func (o *outcomeCtx) brainstorm(p brainstormPayload) {
 	}
 
 	if p.Action == "skip" || p.Action == "exhausted" {
+		// A skip stamps NOTHING: it is "nothing this cycle", it is transient, and
+		// it has no scheduling consequence at all. Only exhausted - "nothing worth
+		// proposing until the project moves" - pauses, and ONE is enough.
+		//
+		// THE PAUSE STAMP RUNS BEFORE THE COMMIT AND FAILS CLOSED (I1 fix round).
+		// It used to run best-effort AFTER the Task committed to Delivered: a
+		// failed write still returned 200, the Task was already terminal so
+		// nothing ever retried it, and the project fell straight back into C2's
+		// busy loop with the one brake that exists for it silently lost. Losing a
+		// pause costs the whole braking mechanism, unlike losing a skip's (deleted)
+		// counter increment, which cost nothing - so unlike a plain best-effort
+		// side write, this one must hold up the whole outcome: fail here, and the
+		// Task stays non-terminal so the agent's retry of this SAME idempotent
+		// outcome lands both halves together.
+		if p.Action == "exhausted" {
+			if err := s.stampBrainstormPause(ctx, o.proj.Name, p.Reason); err != nil {
+				s.log.ErrorContext(ctx, "restapi: stamping the brainstorm pause failed; agent must retry",
+					append(reqLogFields(o.r), "task", o.task.Name, "project", o.proj.Name, "error", err)...)
+				writeError(o.w, http.StatusInternalServerError, "internal error")
+				return
+			}
+			s.log.InfoContext(ctx, "restapi: brainstorm paused on an exhausted verdict",
+				append(reqLogFields(o.r), "action", "brainstorm_paused", "task", o.task.Name,
+					"project", o.proj.Name, "reason", p.Reason)...)
+		}
 		// documentedBy stays EMPTY (fix 25): a brainstorm that correctly says
 		// "nothing novel" must not spawn a docs pod, a docs PR about nothing, a
 		// review, a merge and a release.
@@ -1470,21 +1495,6 @@ func (o *outcomeCtx) brainstorm(p brainstormPayload) {
 			return nil
 		}) {
 			return
-		}
-		// A skip stamps NOTHING: it is "nothing this cycle", it is transient, and
-		// it has no scheduling consequence at all. Only exhausted - "nothing worth
-		// proposing until the project moves" - pauses, and ONE is enough.
-		if p.Action == "exhausted" {
-			// Best-effort: losing a whole agent session over a status write is the
-			// wrong trade, so a failure here is logged, never surfaced to the agent.
-			if err := s.stampBrainstormPause(ctx, o.proj.Name, p.Reason); err != nil {
-				s.log.ErrorContext(ctx, "restapi: stamping the brainstorm pause failed",
-					append(reqLogFields(o.r), "task", o.task.Name, "project", o.proj.Name, "error", err)...)
-			} else {
-				s.log.InfoContext(ctx, "restapi: brainstorm paused on an exhausted verdict",
-					append(reqLogFields(o.r), "action", "brainstorm_paused", "task", o.task.Name,
-						"project", o.proj.Name, "reason", p.Reason)...)
-			}
 		}
 		o.ok(p.Action)
 		return

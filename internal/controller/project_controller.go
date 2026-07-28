@@ -190,6 +190,17 @@ type ProjectReconciler struct {
 	lastComputeProjectCounts map[string]time.Time
 	lastResumeNoReentryParks map[string]time.Time
 	lastReapTerminal         map[string]time.Time
+
+	// lastBrainstormPausedLogged paces brainstorm()'s "no refill this pass"
+	// line at INFO (rather than V(1)) for reason=="paused", once per
+	// brainstormResyncInterval per project (I5 fix round). A paused project
+	// must be log-visible at INFO somewhere besides the one-shot pause-stamp
+	// line in outcome.go, but the decision itself now runs on every ~30s
+	// event-driven pass, so logging it at INFO unconditionally would be the
+	// exact continuous-line-at-INFO problem this same package already avoids
+	// for "at-target" via V(1). Keyed per project, same idiom as
+	// lastDriveUnparks.
+	lastBrainstormPausedLogged map[string]time.Time
 }
 
 // +kubebuilder:rbac:groups=tatara.dev,resources=projects,verbs=get;list;watch;create;update;patch;delete
@@ -331,7 +342,23 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// review Minor 4).
 	if cron := brainstormCronSpec(&project); cron != nil && cron.Enabled {
 		if scanRdr != nil {
-			r.brainstorm(ctx, &project, scanRdr, scanRepos, scanExisting, *cron)
+			// Stamp Status.LastBrainstorm whenever THIS path actually dispatches a
+			// session (C2 fix round): the event-driven wake used to never touch it
+			// at all, so the new cooldown gate in brainstormRefillDecision had
+			// nothing durable to read between events, and a skip (which files no
+			// Issue, leaves the deficit positive, and wakes this same path
+			// immediately via brainstormCycleFinishedPredicate) could otherwise
+			// re-dispatch back to back bounded only by the 30s self-requeue.
+			// Best-effort: losing this stamp costs one cooldown window, not
+			// correctness, so it is logged and tolerated rather than failing the
+			// reconcile - matching stampScan's own cron-path callers.
+			if created := r.brainstorm(ctx, &project, scanRdr, scanRepos, scanExisting, *cron); created {
+				if serr := r.stampScan(ctx, &project, "brainstorm"); serr != nil {
+					l.Error(serr, "scan: persist brainstorm stamp failed (event-driven refill)",
+						"action", "scan_stamp_error", "resource_id", project.Name, "activity", "brainstorm")
+					obs.SweepErrorsTotal.WithLabelValues(project.Name, "brainstorm", "stamp_failed").Inc()
+				}
+			}
 		}
 		// The periodic resync is the BACKSTOP poll interval for a lost watch
 		// event, not the workqueue's error rate limiter (reconcile.Result
@@ -852,9 +879,12 @@ func projectControllerBuilder(mgr ctrl.Manager) *builder.Builder {
 	// never fires for it. See brainstormChainEdge for the real rationale (an
 	// immediate wake plus bypassing the workqueue's rate limiter under error
 	// backoff, NOT a 15m wait avoided - Project already self-requeues every 30s
-	// via defaultUnparkDriveInterval) and for why the skip breaker, not this
-	// edge, governs the five-consecutive-skips regime. In particular, do NOT add
-	// GenerationChangedPredicate to it.
+	// via defaultUnparkDriveInterval). The skip breaker this edge used to route
+	// around is GONE (retired for a pure level law); what now governs a project
+	// that skips repeatedly is brainstormRefillDecision's cooldown gate
+	// (proposalcount.go, C2 fix round) - a durable per-project minimum interval
+	// between sessions, not a consecutive-skip counter. In particular, do NOT
+	// add GenerationChangedPredicate to it.
 	bld = brainstormChainEdge(bld)
 	// MaxConcurrentReconciles: 1 is explicit here; scan dedup/cap logic assumes
 	// serialised reconciles per kind.

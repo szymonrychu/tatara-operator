@@ -194,7 +194,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		}, []string{"project"}),
 		brainstormRefillTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_brainstorm_refill_total",
-			Help: "Brainstorm refills dispatched per project. There is no `trigger` label any more: since the cron path was retired there is exactly one refill path, the level-triggered reconcile pass.",
+			Help: "Brainstorm refills dispatched per project. The trigger label is gone: the cron tick and the event wake now run the same level-triggered decision.",
 		}, []string{"project"}),
 		brainstormQuotaTruncatedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_brainstorm_quota_truncated_total",

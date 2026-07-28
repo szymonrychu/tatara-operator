@@ -28,13 +28,22 @@ func isBrainstormTask(t *tatarav1alpha1.Task) bool {
 // reconcile is in error backoff and the next self-requeue is pushed out
 // further than 30s.
 //
-// This edge is now LOAD-BEARING. Before the breaker's retirement it routed
-// through the event-driven refill path, which brainstormRefillDecision
-// suppressed once consecutiveSkips >= maxSkips (default 3) - so from skip 3
-// onward the wake was suppressed by the same breaker it was built to work
-// around, INERT in exactly the regime it existed for. With the breaker gone
-// this wake fires the next session directly: from zero proposals at target=3,
-// three sessions run back to back with no cron tick at all.
+// This edge is now LOAD-BEARING, and its two consumers see it very
+// differently. From zero proposals at target=3, three PROPOSE sessions run
+// back to back with no cron tick at all - intended, that is the refill doing
+// its job. But a SKIP is the case this edge exists for, and a skip is
+// exactly as effective at raising the wake as a propose is: it files no
+// Issue, so the deficit this edge reacts to stays positive, and with no
+// further brake this wake would fire the next session immediately, then the
+// next, then the next - a busy loop bounded only by the 30s self-requeue.
+// Before the breaker's retirement this could not happen: the event-driven
+// refill path was itself suppressed once consecutiveSkips >= maxSkips
+// (default 3), so the breaker capped it. With the breaker gone, the cap is
+// now brainstormRefillDecision's cooldown gate (proposalcount.go,
+// MinSessionIntervalMinutes, C2 fix round): a durable per-project minimum
+// interval between sessions that applies identically whether the prior
+// session proposed, skipped, or was paused - not a counter of HOW the
+// session ended.
 //
 //	Update  admit iff isBrainstorm && !TaskDone(old) && TaskDone(new)
 //	Delete  admit iff isBrainstorm && !TaskDone(obj)   (an in-flight cycle's slot is freed)

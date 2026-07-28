@@ -5854,6 +5854,23 @@ spec:
                               hard-caps brainstorm at one Task per project per cycle regardless of this value.
                               Setting it has no effect. See MEMORY.md for rationale.
                             type: integer
+                          minSessionIntervalMinutes:
+                            description: |-
+                              MinSessionIntervalMinutes floors the wall-clock gap between two
+                              brainstorm SESSIONS for this project, regardless of which path
+                              dispatched the prior one (a due cron tick or the event-driven wake).
+                              This is a RATE LIMIT, not a breaker: it only delays a refill until the
+                              floor has elapsed, it never suppresses one permanently and it never
+                              inspects why the prior session ended (a skip and a propose are throttled
+                              identically). It exists because a skip files no Issue, so the backlog
+                              deficit the event-driven wake reacts to stays positive and the wake
+                              fires again immediately - with no floor, the only remaining brake was
+                              the LLM's own `exhausted` judgment call, which must not be the sole
+                              defense against a busy-loop. Semantics mirror StaleProposalDays: a
+                              POSITIVE value sets an explicit floor in minutes; the UNSET default (0)
+                              enables the floor at DefaultBrainstormMinSessionIntervalMinutes; a
+                              NEGATIVE value is the explicit opt-out that disables the floor entirely.
+                            type: integer
                           schedule:
                             pattern: ^$|^(\S+\s+){4}\S+$
                             type: string

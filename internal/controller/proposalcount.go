@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -229,17 +230,37 @@ func brainstormDeficit(target, pending, inflight int) int {
 // unwedge. Worse, it counted CORRECT behaviour - an agent reporting "nothing
 // worth proposing" - toward a brake, so a working system switched its own fast
 // path off. Pause is now an explicit state an agent asks for (action=exhausted,
-// internal/restapi/outcome.go) and five triggers clear (brainstorm_resume.go),
-// not an inference from a counter.
+// internal/restapi/outcome.go) and five triggers clear (Task 4), not an
+// inference from a counter.
 //
 // paused is proj.Status.BrainstormPausedAt != nil at the call site. It is
 // passed as a bool rather than the Project so this stays a pure function with a
 // table test.
+//
+// THE COOLDOWN GATE (C2 fix round). paused/exhausted is LLM judgment and must
+// not be the only defense against a busy loop: a skip files no Issue, so the
+// deficit this law reacts to stays positive, the Task still reaches a terminal
+// stage, the brainstormCycleFinishedPredicate wake fires immediately, and this
+// law would recompute the same positive deficit and refill again - with no
+// floor, back to back, bounded only by the 30s self-requeue. now/lastBrainstorm
+// give this a durable, trigger-agnostic floor: when a prior session is known
+// (lastBrainstorm != nil) and less than act.ResolveMinSessionInterval() has
+// elapsed since it, refill is refused with the distinct reason "cooling-down"
+// so it is observable apart from "paused" and "at-target". lastBrainstorm==nil
+// (no session has ever run) never gates - the floor delays the NEXT session,
+// it does not hold up the first one. This is a RATE LIMIT, not a breaker: it
+// never inspects why the prior session ended and it never suppresses
+// permanently, only until the floor elapses.
 func brainstormRefillDecision(act tatarav1alpha1.BrainstormActivity,
-	pending, inflight int, paused bool) (quota int, refill bool, reason string) {
+	pending, inflight int, paused bool, now time.Time, lastBrainstorm *time.Time) (quota int, refill bool, reason string) {
 
 	if paused {
 		return 0, false, "paused"
+	}
+	if lastBrainstorm != nil {
+		if minInterval := act.ResolveMinSessionInterval(); minInterval > 0 && now.Sub(*lastBrainstorm) < minInterval {
+			return 0, false, "cooling-down"
+		}
 	}
 	deficit := brainstormDeficit(act.ResolveTarget(), pending, inflight)
 	if deficit <= 0 {

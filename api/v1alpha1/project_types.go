@@ -465,6 +465,22 @@ type BrainstormActivity struct {
 	// +kubebuilder:validation:items:Enum=docs;memory;internet
 	// +optional
 	Sources []string `json:"sources,omitempty"`
+	// MinSessionIntervalMinutes floors the wall-clock gap between two
+	// brainstorm SESSIONS for this project, regardless of which path
+	// dispatched the prior one (a due cron tick or the event-driven wake).
+	// This is a RATE LIMIT, not a breaker: it only delays a refill until the
+	// floor has elapsed, it never suppresses one permanently and it never
+	// inspects why the prior session ended (a skip and a propose are throttled
+	// identically). It exists because a skip files no Issue, so the backlog
+	// deficit the event-driven wake reacts to stays positive and the wake
+	// fires again immediately - with no floor, the only remaining brake was
+	// the LLM's own `exhausted` judgment call, which must not be the sole
+	// defense against a busy-loop. Semantics mirror StaleProposalDays: a
+	// POSITIVE value sets an explicit floor in minutes; the UNSET default (0)
+	// enables the floor at DefaultBrainstormMinSessionIntervalMinutes; a
+	// NEGATIVE value is the explicit opt-out that disables the floor entirely.
+	// +optional
+	MinSessionIntervalMinutes int `json:"minSessionIntervalMinutes,omitempty"`
 }
 
 // Brainstorm backlog defaults. They live here, not at the kubebuilder-default
@@ -479,6 +495,11 @@ const (
 	// targetOpenProposals cannot instruct an obedient agent to emit a payload
 	// the operator will refuse with a 400.
 	MaxProposalsPerOutcome = 5
+	// DefaultBrainstormMinSessionIntervalMinutes is the floor MinSessionIntervalMinutes
+	// resolves to when unset: generous enough that a healthy project refills at most
+	// a few times an hour, finite enough that a genuinely short backlog still drains
+	// promptly. See MinSessionIntervalMinutes for the full rationale.
+	DefaultBrainstormMinSessionIntervalMinutes = 12
 )
 
 // ResolveTarget resolves the backlog target: the explicit field, else the
@@ -501,6 +522,21 @@ func (a BrainstormActivity) ResolveHistoryWindow() int {
 		return max(*a.HistoryWindow, 0)
 	}
 	return DefaultHistoryWindow
+}
+
+// ResolveMinSessionInterval resolves the floor between two brainstorm
+// sessions. Semantics mirror StaleProposalDays: positive is an explicit
+// floor, zero (unset) is the default floor, negative disables it (0
+// duration, i.e. no gate).
+func (a BrainstormActivity) ResolveMinSessionInterval() time.Duration {
+	switch {
+	case a.MinSessionIntervalMinutes > 0:
+		return time.Duration(a.MinSessionIntervalMinutes) * time.Minute
+	case a.MinSessionIntervalMinutes < 0:
+		return 0
+	default:
+		return DefaultBrainstormMinSessionIntervalMinutes * time.Minute
+	}
 }
 
 // RefineActivity configures the cron-cycle refiner pre-step.

@@ -10,12 +10,14 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // emptyReader is a reader whose repos have no open forge issues. The backlog
@@ -272,20 +274,91 @@ func TestBrainstormQueuedEventSkipsTheForgeFanOut(t *testing.T) {
 // A paused project files nothing however large its deficit. This is the
 // scheduling half of the exhausted contract; the API half is
 // TestBrainstormExhaustedStampsThePause (internal/restapi).
+//
+// The pause is set directly on the in-memory proj passed to r.brainstorm(),
+// which is the only copy the function ever reads (no internal re-Get) - a
+// round-trip Status().Update here would prove nothing about r.brainstorm()'s
+// own read and was dropped (review finding I6: it used to write via
+// k8sClient.Status().Update and then pass this SAME already-mutated proj,
+// so the write was unexercised theatre).
 func TestBrainstormPausedProjectRefillsNothing(t *testing.T) {
 	ctx := context.Background()
 	proj, repos := seedBrainstormProject(t, "bs-tgt-paused", []string{"o/r1"}, ptrInt(3))
 	now := metav1.Now()
 	proj.Status.BrainstormPausedAt = &now
 	proj.Status.BrainstormPauseReason = "every lane is blocked on a human"
-	if err := k8sClient.Status().Update(ctx, proj); err != nil {
-		t.Fatalf("stamp pause: %v", err)
-	}
 	r := newScanReconciler(emptyReader("o/r1"))
 
 	if created := r.brainstorm(ctx, proj, emptyReader("o/r1"), repos, nil,
 		proj.Spec.Scm.Cron.Brainstorm); created {
 		t.Fatal("a paused project must not dispatch a refill")
+	}
+}
+
+// TestBrainstormCooldownGateSuppressesASecondSessionThenReleases is C2's
+// integration proof through the real wiring (not just the pure
+// brainstormRefillDecision table): a project whose backlog stays in deficit
+// (deficit=3, nothing pending) gets its FIRST session through unthrottled,
+// but a session dispatched moments ago - the durable Status.LastBrainstorm
+// stamp, round-tripped through etcd exactly as the event-driven Reconcile
+// path (project_controller.go) now writes it after a real dispatch - blocks
+// a second one until the configured floor elapses.
+func TestBrainstormCooldownGateSuppressesASecondSessionThenReleases(t *testing.T) {
+	ctx := context.Background()
+	proj, repos := seedBrainstormProject(t, "bs-tgt-cooldown", []string{"o/r1"}, ptrInt(3))
+	proj.Spec.Scm.Cron.Brainstorm.MinSessionIntervalMinutes = 10
+	if err := k8sClient.Update(ctx, proj); err != nil {
+		t.Fatalf("set MinSessionIntervalMinutes: %v", err)
+	}
+	r := newScanReconciler(emptyReader("o/r1"))
+
+	// First session: no prior stamp anywhere, so the floor must not block it.
+	if created := r.brainstorm(ctx, proj, emptyReader("o/r1"), repos, nil,
+		proj.Spec.Scm.Cron.Brainstorm); !created {
+		t.Fatal("want the first session dispatched; the floor must never block session one")
+	}
+
+	// Delete the QueuedEvent the first session enqueued: this test isolates the
+	// cooldown gate, not the separate already-queued dedup guard that a real
+	// Task admission would otherwise clear (out of scope here).
+	for _, qe := range listBrainstormQEs(t, proj.Name) {
+		if err := k8sClient.Delete(ctx, &qe); err != nil {
+			t.Fatalf("delete brainstorm QE: %v", err)
+		}
+	}
+
+	// Durably stamp LastBrainstorm one minute ago (well inside the 10-minute
+	// floor) via a real Status().Update round-trip, then re-Get so the next
+	// call reads it exactly like a fresh reconcile would - this is the part
+	// that must be durable across operator replicas/restarts, not in-memory.
+	recent := metav1.NewTime(time.Now().Add(-1 * time.Minute))
+	proj.Status.LastBrainstorm = &recent
+	if err := k8sClient.Status().Update(ctx, proj); err != nil {
+		t.Fatalf("stamp LastBrainstorm: %v", err)
+	}
+	fresh := &tatarav1alpha1.Project{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: proj.Name}, fresh); err != nil {
+		t.Fatalf("re-get project: %v", err)
+	}
+
+	if created := r.brainstorm(ctx, fresh, emptyReader("o/r1"), repos, nil,
+		fresh.Spec.Scm.Cron.Brainstorm); created {
+		t.Fatal("a session one minute after the last one must be gated by the 10-minute floor")
+	}
+
+	// Past the floor: a stamp from 11 minutes ago must release the gate again -
+	// this is the "delays, never suppresses permanently" property.
+	past := metav1.NewTime(time.Now().Add(-11 * time.Minute))
+	fresh.Status.LastBrainstorm = &past
+	if err := k8sClient.Status().Update(ctx, fresh); err != nil {
+		t.Fatalf("stamp older LastBrainstorm: %v", err)
+	}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: proj.Name}, fresh); err != nil {
+		t.Fatalf("re-get project: %v", err)
+	}
+	if created := r.brainstorm(ctx, fresh, emptyReader("o/r1"), repos, nil,
+		fresh.Spec.Scm.Cron.Brainstorm); !created {
+		t.Fatal("a session past the 10-minute floor must be allowed again")
 	}
 }
 

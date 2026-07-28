@@ -41,9 +41,13 @@ func seedRefineProject(t *testing.T, name string) *tatarav1alpha1.Project {
 	if err := k8sClient.Create(ctx, proj); err != nil {
 		t.Fatalf("create project %s: %v", name, err)
 	}
-	// Stamp both LastIssueScan and LastBrainstorm 2 minutes in the past so the
+	// Stamp both LastIssueScan and LastBrainstorm in the past so the
 	// every-minute schedules are immediately due on the first reconcile.
-	past := metav1.NewTime(time.Now().Add(-2 * time.Minute))
+	// Backdated well past DefaultBrainstormMinSessionIntervalMinutes (C2's
+	// cooldown floor) so these refine-barrier tests are not incidentally
+	// gated by it - that gate is exercised by its own dedicated tests, not
+	// this shared fixture.
+	past := metav1.NewTime(time.Now().Add(-30 * time.Minute))
 	proj.Status.LastIssueScan = &past
 	proj.Status.LastBrainstorm = &past
 	if err := k8sClient.Status().Update(ctx, proj); err != nil {
