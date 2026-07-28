@@ -180,6 +180,19 @@ func (r *TaskReconciler) reconcileClocks(ctx context.Context, proj *tatarav1alph
 		// own advance costs at most one illegal-edge counter, never a double
 		// transition.
 		if edge, ready := reviewAdvanceEdge(task, mrs, maxReviewRounds(proj)); ready {
+			// The SAME red-CI gate the edge-triggered advance applies (issue #476).
+			// This backstop is the path that actually runs when the one-shot advance
+			// errored out - including when it errored out ON this very gate - so a
+			// guard only on the primary path would be a guard the retry walks past.
+			if edge.To == tatarav1alpha1.StageMerging {
+				red, cerr := ciRedAtReviewedHead(ctx, r.Client, r.SCMFor, r.Metrics, proj, mrs)
+				if cerr != nil {
+					return ctrl.Result{}, true, cerr
+				}
+				if red != nil {
+					return ctrl.Result{}, true, enterCIRed(ctx, r.Client, r.spiller(proj), r.Metrics, task, mrs, red, now)
+				}
+			}
 			l.Info("review handoff re-driven: the deferred advance had not fired; advancing off reviewing",
 				"action", "handoff_redriven", "resource_id", task.Name, "stage", task.Status.Stage,
 				"to", edge.To, "reason", edge.Reason, "kind", task.Spec.Kind)

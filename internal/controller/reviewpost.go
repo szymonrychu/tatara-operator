@@ -317,6 +317,18 @@ func (d *StageDriver) advanceAfterReview(ctx context.Context, proj *tatarav1alph
 	if !ready {
 		return nil
 	}
+	// THE RED-CI GATE (issue #476). An approve is a statement about the code, not
+	// about the checks. Promoting a red change into POD-LESS merging costs the
+	// whole 4h budget and re-discovers a verdict that was already final.
+	if edge.To == tatarav1alpha1.StageMerging {
+		red, cerr := ciRedAtReviewedHead(ctx, d.Client, d.SCMFor, d.Metrics, proj, mrs)
+		if cerr != nil {
+			return cerr
+		}
+		if red != nil {
+			return enterCIRed(ctx, d.Client, d.spiller(proj), d.Metrics, task, mrs, red, d.now())
+		}
+	}
 	log.FromContext(ctx).Info("review: task advancing off reviewing",
 		"action", "review_advance", "resource_id", task.Name,
 		"to", edge.To, "reason", edge.Reason, "kind", task.Spec.Kind)

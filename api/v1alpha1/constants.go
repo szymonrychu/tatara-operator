@@ -93,6 +93,10 @@ const (
 	// MaxHeadMoveReentries bounds the head-moving re-entry cycle; the FOURTH
 	// cycle is refused (fix M3-9).
 	MaxHeadMoveReentries = 3
+	// MaxCIRedReentries bounds the red-CI re-entry cycle (issue #476): a red
+	// required check routes the Task back to implementing so the agent can fix
+	// it, and the FOURTH lap is refused at failed(ci-blocked).
+	MaxCIRedReentries = 3
 	// MaxHumanReviewRounds bounds the reviewing<->parked(awaiting-human) cycle
 	// on kind=review Tasks (fix V7-9). NOT bounded by AgentSpec.MaxReviewRounds
 	// - that counter only moves on request_changes.

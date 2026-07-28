@@ -270,6 +270,16 @@ spec:
                   comments - and nothing was counting, so a human found it by reading the
                   thread. operator_bot_rounds is its fleet-wide view.
                 type: integer
+              ciRedReentries:
+                description: |-
+                  CIRedReentries bounds the FIFTH cycle: the red-CI bounce back to
+                  implementing (issue #476). A DETERMINISTICALLY red required check on the
+                  reviewed head can never merge, so the Task is routed back to the agent that
+                  can fix it instead of being promoted into merging (or left there polling a
+                  verdict that will never change until the 4h budget parks it). Like every
+                  other bounce it spawns pods, so it gets a counter.
+                  Cap 3 -> failed(ci-blocked).
+                type: integer
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current
