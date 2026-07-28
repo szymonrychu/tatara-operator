@@ -1267,7 +1267,11 @@ func (r *ProjectReconciler) deleteReapedTask(ctx context.Context, proj *tatarav1
 //   - BotLogin: set by both. Read by hasNonBotEvent in every comment-driven
 //     reason (backlog-sweep, awaiting-human, identity-unverified, handoff-stalled).
 //   - GrammarPassed: set by both, via grammarPassedFor off the durable verdict.
-//     Read ONLY by ReasonIdentityUnverified.
+//     Read ONLY by ReasonIdentityUnverified. Constant false for now: no
+//     production writer of Task.status.approvalVerdict exists between step A
+//     and step F of the agent-judged-approval-gate sequence, so both builders
+//     agree on false and this field cannot be the source of a divergence until
+//     step F lands.
 //   - ConversingHasRoom: set by both as of the CRITICAL 1 fix above. Read by
 //     ReasonAwaitingHuman and ReasonIdentityUnverified.
 //   - MaxTurnsPerTask: set by both (as of NEW-1). Read ONLY by ReasonNoOutcome.

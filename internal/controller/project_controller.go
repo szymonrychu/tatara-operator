@@ -388,13 +388,19 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// THE F.6 RE-ENTRY DRIVER (fix W3). Applies stage.Unpark to every parked Task
 	// whose reason has a re-entry rule - time-based merge/deploy/no-outcome plus
 	// the comment-driven awaiting-human/backlog-sweep/identity-unverified backstop.
-	// identity-unverified is INCLUDED: its grammar verdict is durable
+	// identity-unverified is INCLUDED: its grammar verdict is meant to be durable
 	// (Task.status.approvalVerdict), so this loop re-derives the rest from live
-	// state rather than needing the webhook's one shot to have won its cache race.
-	// Paced independently of Reconcile()'s other
-	// drivers (tatara-operator#368: an unrelated 10s-or-faster forced cadence was
-	// hammering this path across the full parked backlog every single pass). A
-	// persist failure requeues.
+	// state rather than needing the webhook's one shot to have won its cache
+	// race. READ THIS BEFORE RELYING ON THAT: between step A and step F of the
+	// agent-judged-approval-gate sequence there is NO PRODUCTION WRITER of
+	// Task.status.approvalVerdict at all (the webhook limb that wrote it was
+	// deleted in step A; the new gate starts writing it in step F). Until step F
+	// lands, grammarPassedFor returns false for every Task in the cluster, so
+	// this loop can only ever move a parked(identity-unverified) Task to
+	// conversing, never to implementing. Paced independently of Reconcile()'s
+	// other drivers (tatara-operator#368: an unrelated 10s-or-faster forced
+	// cadence was hammering this path across the full parked backlog every
+	// single pass). A persist failure requeues.
 	unparkRequeue, unparkErr := r.driveUnparksPaced(ctx, &project, time.Now())
 	if unparkErr != nil {
 		r.Metrics.ReconcileResult("Project", "error")

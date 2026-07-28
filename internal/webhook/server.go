@@ -48,11 +48,10 @@ type Config struct {
 	// Spiller is the A.7 byte-budget eviction sink (internal/memclient in
 	// production). Required for the task-centric pendingEvents path (E.3): the
 	// webhook mirrors comments onto Issue/MergeRequest CRs and re-syncs an owned
-	// Issue's thread on demand, both of which go
-	// through the objbudget.Fit* guard. A nil Spiller degrades gracefully: the
-	// mirror/sync side effects are skipped (logged at ERROR) and the
-	// A nil Spiller degrades gracefully: the mirror side effects are skipped and
-	// logged at ERROR.
+	// Issue's thread on demand, both of which go through the objbudget.Fit*
+	// guard. A nil Spiller degrades gracefully: both side effects are skipped
+	// and logged at ERROR, and the comment still reaches the owning Task's
+	// pendingEvents.
 	Spiller objbudget.Spiller
 	// SpillerFor resolves the A.7 spill client PER PROJECT (the tatara-memory
 	// endpoint is per-project). Production wires it (fix W1); it takes precedence

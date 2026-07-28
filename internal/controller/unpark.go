@@ -53,13 +53,27 @@ import (
 // anything either.
 //
 // A Task with no verdict, or only a stale one, declines with grammar-not-passed
-// and stays exactly where it is. ONE CARVE-OUT: under
+// and stays exactly where it is.
+//
+// ONE CARVE-OUT, AND IT IS CURRENTLY UNREACHABLE. Under
 // Project.spec.AutoApproveTataraProposals, a bot-authored, anchor-verified
 // proposal with ZERO maintainer comments auto-approves (autoApproveApplies /
-// autoApprovalEvidence, approval_grammar.go) and the approval gate records that
-// as a verdict with Author=AutoApproveLogin and no CommentExternalID - not
-// a gap this driver introduces. Outside that flag, there is no path here that
-// re-enters implementing without a recorded maintainer approval.
+// autoApprovalEvidence, approval_grammar.go) and is recorded as a verdict with
+// Author=AutoApproveLogin and no CommentExternalID - a deliberate, narrowly
+// gated exception, not a gap this driver introduces. Between step A and step F
+// of the agent-judged-approval-gate sequence it cannot fire at all, and the
+// consequence is worse than "no auto-approval": such a proposal has NO re-entry
+// whatsoever. autoApproveApplies is reached only through
+// VerifyApprovalDetailed, whose one surviving production caller is restapi's
+// submit_outcome scope check (internal/restapi/outcome.go) - which needs a pod,
+// which a parked Task does not have. Every OTHER way out of
+// parked(identity-unverified) requires hasNonBotEvent, i.e. a human comment,
+// and the carve-out's defining condition is ZERO maintainer comments. So an
+// auto-approvable proposal parked here strands until ParkRetention reaps it.
+// Step F restores the writer and closes this.
+//
+// Outside that flag, there is no path here that re-enters implementing without
+// a recorded maintainer approval.
 
 // UnparkDecline classifies WHY ApplyUnpark refused to re-enter (target==""),
 // so callers can tell an anomalous drift bail from a normal steady-state
@@ -323,7 +337,10 @@ func NeedsConversingRoom(stageReason string) bool {
 // driveUnparks applies stage.Unpark to every parked Task in proj whose park
 // reason has an F.6 re-entry rule, INCLUDING identity-unverified: the grammar
 // verdict it needs comes from the durable Task.status.approvalVerdict (see the
-// file header), never re-evaluated here. activeTasks is computed ONCE and then
+// file header), never re-evaluated here. NOTE that no production writer of that
+// field exists between step A and step F of the agent-judged-approval-gate
+// sequence, so for now identity-unverified always arrives here with
+// GrammarPassed=false and conversing is its only reachable target. activeTasks is computed ONCE and then
 // advanced as each Task re-enters an active stage, so a bulk re-entry never
 // exceeds maxOpenTasks (H8).
 func (r *ProjectReconciler) driveUnparks(ctx context.Context, proj *tatarav1alpha1.Project, now time.Time) error {

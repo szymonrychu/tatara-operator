@@ -447,9 +447,14 @@ func (s *Server) syncOwnedIssueThread(ctx context.Context, proj *tatarav1.Projec
 	key := controller.IssueKey(repoRef, number)
 	fail := func(msg string, err error) {
 		obs.MirrorWriteDroppedTotal.WithLabelValues(proj.Name, "Issue", "issue_sync").Inc()
-		s.log.ErrorContext(ctx, "pendingEvents: "+msg+"; the cited comment may not be visible to the gate",
-			"action", "pending_event_issue_sync_failed", "error", err,
-			"task", task.Name, "project", proj.Name, "issue", key)
+		attrs := []any{"action", "pending_event_issue_sync_failed",
+			"task", task.Name, "project", proj.Name, "issue", key}
+		if err != nil {
+			// The no-Spiller branch has no error to report; an "error": null field
+			// on a JSON log line reads like a nil deref that was swallowed.
+			attrs = append(attrs, "error", err)
+		}
+		s.log.ErrorContext(ctx, "pendingEvents: "+msg+"; the cited comment may not be visible to the gate", attrs...)
 	}
 	sp := s.cfg.SpillerFor(proj)
 	if sp == nil {
