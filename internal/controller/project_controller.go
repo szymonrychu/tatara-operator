@@ -826,7 +826,7 @@ func (r *ProjectReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.APIReader == nil {
 		r.APIReader = mgr.GetAPIReader()
 	}
-	return ctrl.NewControllerManagedBy(mgr).
+	bld := ctrl.NewControllerManagedBy(mgr).
 		For(&tataradevv1alpha1.Project{}).
 		Owns(&corev1.Secret{}).
 		Owns(&cnpgv1.Cluster{}).
@@ -843,7 +843,13 @@ func (r *ProjectReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// into a Project reconcile.
 		Watches(&tataradevv1alpha1.Issue{},
 			handler.EnqueueRequestsFromMapFunc(issueToProject),
-			builder.WithPredicates(proposalVerdictPredicate())).
+			builder.WithPredicates(proposalVerdictPredicate()))
+	// THE BRAINSTORM CHAIN. A cycle that SKIPS writes no Issue, so the edge above
+	// never fires for it and the refill waited out the 15m resync - five times in
+	// a row for project mtg in 2026-07. See brainstormChainEdge; in particular, do
+	// NOT add GenerationChangedPredicate to it.
+	bld = brainstormChainEdge(bld)
+	return bld.
 		// MaxConcurrentReconciles: 1 is explicit here; scan dedup/cap logic
 		// assumes serialised reconciles per kind.
 		WithOptions(ctrlcontroller.Options{MaxConcurrentReconciles: 1}).
