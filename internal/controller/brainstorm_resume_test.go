@@ -16,6 +16,13 @@ import (
 // all. This is the case most likely to regress silently - a paused project that
 // quietly un-pauses every night on the doc batch looks exactly like a working
 // system until the token bill arrives.
+//
+// The name still says only what it has always said - documentation and
+// pin-bump Tasks are excluded - because that half of the table is the one
+// that must never silently regress. clarify, incident and takeover are
+// asserted TRUE in the same table (a merged MR for any of them lands real
+// code, so the project moved), so an eighth kind added later still fails
+// this test instead of picking a silent default, on either side of the line.
 func TestBrainstormResumeKindExcludesDocumentationAndPinBumpTasks(t *testing.T) {
 	// Task.Spec.Kind is a CLOSED CRD enum (task_types.go): brainstorm, incident,
 	// clarify, refine, review, documentation, takeover. Every value is listed
@@ -27,11 +34,11 @@ func TestBrainstormResumeKindExcludesDocumentationAndPinBumpTasks(t *testing.T) 
 	}{
 		{"clarify", true},  // the full proposal-to-implementation lifecycle
 		{"incident", true}, // an incident fix landing IS the project moving
+		{"takeover", true}, // a takeover MR lands real code - the project moved
 		{"documentation", false},
 		{"refine", false},
 		{"review", false},
 		{"brainstorm", false},
-		{"takeover", false},
 		{"", false},
 		{"implement", false}, // an AGENT kind, never a Task.Spec.Kind
 	}

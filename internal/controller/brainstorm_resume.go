@@ -33,14 +33,20 @@ const (
 // convention "will be missed by tools". The doc-sync exclusion falls out of the
 // Kind field rather than out of parsing what a commit says about itself.
 //
-// The allowlist is deliberately narrow. clarify is the full
-// proposal-to-implementation lifecycle (the "implement" of the design table -
-// note that implement is an AGENT kind, Task.Status.AgentKind, and never a
-// Task.Spec.Kind), and incident is a fix landing. documentation, refine, review,
-// brainstorm and takeover are not.
+// The allowlist is deliberately narrow, but not narrow on the axis it looks
+// narrow on: it is "did an MR merge for this Task land real code", not "is
+// this an implement-shaped Task". clarify is the full proposal-to-implementation
+// lifecycle (the "implement" of the design table - note that implement is an
+// AGENT kind, Task.Status.AgentKind, and never a Task.Spec.Kind), and incident
+// is a fix landing. takeover is included for the SAME reason: a takeover Task
+// lands real code changes on behalf of real task work, so the project moved,
+// exactly as much as a clarify or incident merge does - do not "simplify" it
+// back out. documentation, refine and review are not: they are housekeeping
+// kinds whose merges do not represent the project moving on its own idea
+// space, documentation above all (see the regression test).
 func brainstormResumeKind(kind string) bool {
 	switch kind {
-	case "clarify", "incident":
+	case "clarify", "incident", "takeover":
 		return true
 	}
 	return false
