@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -155,6 +156,87 @@ func TestDriveUnparks_IdentityUnverifiedOpensConversationNeverImplementing(t *te
 	if fresh.Status.Stage != tatarav1alpha1.StageConversing {
 		t.Fatalf("stage = %s, want conversing: a human comment on a parked identity-unverified Task opens a conversation", fresh.Status.Stage)
 	}
+	// Folded in from wiring_fixes_test.go's duplicate of this test (step C).
+	// The pre-Task-9 version there asserted the decline counter was 1 - "the
+	// SPECIFIC decline, not just stayed parked". This pass does not decline at
+	// all, so the counter must be 0; asserted explicitly so a regression that
+	// made it decline again fails LOUDLY on the counter rather than silently
+	// passing the stage check by accident. The label it names is
+	// no-conversing-room, the ONLY decline this arm can still produce once a
+	// human comment is present (step C retired grammar-not-passed, which was a
+	// misnomer for a capacity refusal).
+	if n := testutil.ToFloat64(r.Metrics.UnparkDeclinedCounter(stage.ReasonIdentityUnverified, string(DeclineNoConversingRoom))); n != 0 {
+		t.Fatalf("operator_unpark_declined_total{identity-unverified,no-conversing-room} = %v, want 0: this pass entered conversing, it did not decline", n)
+	}
+}
+
+// TestDriveUnparks_IdentityUnverifiedDeclinesNoConversingRoom is D1's other
+// half: the SAME Task and the same human comment, but the project is at its
+// conversing ceiling. It must STAY PARKED with its pendingEvent retained, and
+// the refusal must be named no-conversing-room - not the grammar-not-passed
+// misnomer it wore between step A and step C, and not a silent target=="" with
+// nothing recorded anywhere, which is the exact shape that hid the 2026-07-27
+// identity-unverified stall for a full day.
+//
+// It must also NOT fall through to clarifying. The conversing ceiling exists to
+// bound live agent pods; spawning a clarifying pod instead would route around
+// the very limit being reported, and for a kind=review Task it would skip the
+// three guards that live only in the conversing branch.
+func TestDriveUnparks_IdentityUnverifiedDeclinesNoConversingRoom(t *testing.T) {
+	proj := &tatarav1alpha1.Project{}
+	proj.Namespace = "tatara"
+	proj.Name = "infrastructure"
+	proj.Spec.MaxOpenTasks = 6
+	proj.Spec.MaxConversingPods = 1
+
+	// One live conversing Task already occupies the whole ceiling.
+	busy := &tatarav1alpha1.Task{}
+	busy.Namespace = "tatara"
+	busy.Name = "t-busy"
+	busy.Spec.ProjectRef = "infrastructure"
+	busy.Spec.Kind = "clarify"
+	busy.Status.Stage = tatarav1alpha1.StageConversing
+
+	task := &tatarav1alpha1.Task{}
+	task.Namespace = "tatara"
+	task.Name = "t-ident-noroom"
+	task.Spec.ProjectRef = "infrastructure"
+	task.Spec.Kind = "clarify"
+	task.Status.Stage = tatarav1alpha1.StageParked
+	task.Status.StageReason = stage.ReasonIdentityUnverified
+	task.Status.StageEnteredAt = &metav1.Time{Time: time.Now()}
+	task.Status.PendingEvents = []tatarav1alpha1.TaskEvent{{
+		At: metav1.Now(), Kind: "issue_comment", Author: "szymonrychu", Body: "go ahead",
+	}}
+
+	r := newUnparkTestReconciler(t, proj, busy, task)
+
+	ctx, lines := recordingCtx()
+	if err := r.driveUnparks(ctx, proj, time.Now()); err != nil {
+		t.Fatalf("driveUnparks: %v", err)
+	}
+
+	fresh := &tatarav1alpha1.Task{}
+	if err := r.Get(context.Background(), objectKeyOf(task), fresh); err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+	if fresh.Status.Stage != tatarav1alpha1.StageParked {
+		t.Fatalf("stage = %s(%s), want parked: a full conversing ceiling must decline, never fall through to another stage",
+			fresh.Status.Stage, fresh.Status.StageReason)
+	}
+	if len(fresh.Status.PendingEvents) != 1 {
+		t.Fatalf("pendingEvents = %d, want 1: the event is RETAINED so the next pass retries", len(fresh.Status.PendingEvents))
+	}
+	if n := testutil.ToFloat64(r.Metrics.UnparkDeclinedCounter(stage.ReasonIdentityUnverified, string(DeclineNoConversingRoom))); n != 1 {
+		t.Fatalf("operator_unpark_declined_total{identity-unverified,no-conversing-room} = %v, want 1", n)
+	}
+	// BOTH channels, per platform hard rule 13. This is the ONE rule decline
+	// driveUnparks logs: it means a human commented and the operator refused to
+	// answer them purely on capacity, which is operator-actionable, and the
+	// counter alone cannot say WHICH Task went unanswered.
+	if !containsLine(*lines, "unpark: declined (project is at its conversing ceiling; the pending event is retained and the next pass retries)") {
+		t.Fatalf("no-conversing-room declined without an INFO log; lines: %v", *lines)
+	}
 }
 
 // 2026-07-28 security review CRITICAL 1: unparkFires is a THIRD UnparkInput
@@ -163,7 +245,7 @@ func TestDriveUnparks_IdentityUnverifiedOpensConversationNeverImplementing(t *te
 // unconditionally. The window: parked(identity-unverified), a non-bot event,
 // and the conversing ceiling has room. driveUnparks' ApplyUnpark, called with
 // room=true, sends the Task to conversing and saves it; unparkFires, called
-// with room=false (the bug), returns DeclineGrammarNotPassed and fires=false -
+// with room=false (the bug), declines and returns fires=false -
 // so reapParked, once past
 // ParkRetention, would delete a Task the driver was about to save out from
 // under it. driveUnparksPaced and ReapTerminalPaced are paced
@@ -173,7 +255,7 @@ func TestDriveUnparks_IdentityUnverifiedOpensConversationNeverImplementing(t *te
 // This proves the probe and the driver reach the SAME verdict given the SAME
 // room=true answer: unparkFires(room=true) must return fires=true on exactly
 // the input where ApplyUnpark's own stage.UnparkDetailed call would enter
-// conversing (proven by TestUnpark_IdentityUnverifiedWithoutGrammarConversesWhenThereIsRoom
+// conversing (proven by TestUnpark_IdentityUnverifiedAlwaysConverses
 // directly against the pure function).
 func TestUnparkFires_AgreesWithApplyUnparkOnConversingHasRoom(t *testing.T) {
 	proj := &tatarav1alpha1.Project{}

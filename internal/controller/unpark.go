@@ -36,22 +36,21 @@ import (
 // approval label already visible on the forge (2026-07-27, gitlab helmfile#26).
 //
 // THERE IS NO DURABLE GRAMMAR VERDICT ANY MORE (agent-judged-approval-gate,
-// step B). This driver used to read Task.status.approvalVerdict through a
+// steps A-C). This driver used to read Task.status.approvalVerdict through a
 // grammarPassedFor helper and hand the answer to stage.Unpark as
 // UnparkInput.GrammarPassed, so a record written by one webhook request could
 // carry a LATER pass into implementing with no live re-check of the thing the
-// record attested to. Step A deleted every writer of that field and step B
-// deletes the reader: UnparkInput.GrammarPassed is simply not set here, which
-// is false, and nothing in this package can make it true. (The field itself
-// dies in step C, after this file stops setting it - a struct literal that
-// OMITS a field still compiles, one that SETS a removed field does not.)
+// record attested to. Step A deleted every writer of that field, step B the
+// reader, and step C the field: stage.UnparkInput has no verdict slot at all
+// now, so this driver cannot pass one even by accident. internal/stage does no
+// approval reasoning whatsoever.
 //
 // What that leaves for parked(identity-unverified): a non-bot pendingEvent
 // un-parks it to CONVERSING when the project is under its conversing ceiling,
-// and otherwise it declines and stays exactly where it is. IMPLEMENTING is
-// UNREACHABLE from this driver for that reason - see stage.go's
-// ReasonIdentityUnverified arm, whose implementing branch is now behind an
-// always-false GrammarPassed. The ONE surviving grant path into implementing is
+// and otherwise it declines no-conversing-room and stays exactly where it is
+// with its pendingEvent retained. IMPLEMENTING is UNREACHABLE from this driver
+// for that reason - stage.go's ReasonIdentityUnverified arm has no implementing
+// branch left to reach. The ONE surviving grant path into implementing is
 // restapi's verifyApprovalScope (internal/restapi/outcome.go), which runs the
 // LIVE grammar over every owned Issue on every submit_outcome(decision=implement):
 // judged by an agent standing in conversing with a live pod, against live state,
@@ -110,9 +109,8 @@ const (
 	// accident.
 	DeclineNoHumanEvent     UnparkDecline = stage.DeclineNoHumanEvent
 	DeclineOverCap          UnparkDecline = stage.DeclineOverCap
-	DeclineGrammarNotPassed UnparkDecline = stage.DeclineGrammarNotPassed
+	DeclineNoConversingRoom UnparkDecline = stage.DeclineNoConversingRoom
 	DeclineNoOpenIssues     UnparkDecline = stage.DeclineNoOpenIssues
-	DeclineNotAllApproved   UnparkDecline = stage.DeclineNotAllApproved
 	DeclineMergedMR         UnparkDecline = stage.DeclineMergedMR
 	DeclineRoundsExhausted  UnparkDecline = stage.DeclineRoundsExhausted
 	DeclineTurnsExhausted   UnparkDecline = stage.DeclineTurnsExhausted
@@ -128,8 +126,8 @@ func DeclineFor(code string) UnparkDecline {
 	switch code {
 	case stage.DeclineNone:
 		return DeclineNone
-	case stage.DeclineNoHumanEvent, stage.DeclineOverCap, stage.DeclineGrammarNotPassed,
-		stage.DeclineNoOpenIssues, stage.DeclineNotAllApproved, stage.DeclineMergedMR,
+	case stage.DeclineNoHumanEvent, stage.DeclineOverCap, stage.DeclineNoConversingRoom,
+		stage.DeclineNoOpenIssues, stage.DeclineMergedMR,
 		stage.DeclineRoundsExhausted, stage.DeclineTurnsExhausted, stage.DeclineWrongParkedFrom,
 		stage.DeclineIllegalEdge, stage.DeclineNoReentry:
 		return UnparkDecline(code)
@@ -213,10 +211,9 @@ func ApplyUnpark(ctx context.Context, c client.Client, reader client.Reader, pro
 			decline = DeclineGuard
 			return nil
 		}
-		// GrammarPassed is deliberately NOT set: no durable verdict exists to set
-		// it from (see the file header). Its zero value is false, which routes
-		// parked(identity-unverified) to conversing-or-decline and never to
-		// implementing.
+		// Every field UnparkInput HAS is set here. There is no verdict field to
+		// omit any more (step C deleted it), so parked(identity-unverified) can
+		// only reach conversing or decline, never implementing.
 		to, code := stage.UnparkDetailed(stage.UnparkInput{
 			Task:              fresh,
 			Issues:            issues,
@@ -374,12 +371,26 @@ func (r *ProjectReconciler) driveUnparks(ctx context.Context, proj *tatarav1alph
 		}
 		// GUARD declines are always anomalous (the live object had already
 		// drifted from what this pass believed was parked) and worth surfacing
-		// here too, unlike RULE declines: driveUnparks sweeps every parked Task
-		// every pass, and a RULE decline is the expected steady state for most
-		// of them (e.g. merge-timeout still waiting) - logging every one would
-		// be pure log spam, not a signal.
-		if decline == DeclineGuard {
+		// here too, unlike most RULE declines: driveUnparks sweeps every parked
+		// Task every pass, and a RULE decline is the expected steady state for
+		// most of them (e.g. merge-timeout still waiting) - logging every one
+		// would be pure log spam, not a signal.
+		//
+		// NO-CONVERSING-ROOM is the ONE rule decline that is also logged. It is
+		// not steady state: it means a human commented on a parked
+		// identity-unverified Task and the operator refused to put an agent in
+		// front of them purely because the project is at its conversing ceiling
+		// - an operator-actionable capacity refusal, and the only remaining
+		// terminus of that arm. Platform hard rule 13 wants both channels, and
+		// the counter alone (operator_unpark_declined_total) cannot say WHICH
+		// Task went unanswered. Bounded by driveUnparksPaced's floor
+		// (defaultUnparkDriveInterval) and by the ceiling itself being small.
+		switch decline {
+		case DeclineGuard:
 			log.FromContext(ctx).Info("unpark: declined (drift guard)",
+				"action", "unpark_declined", "resource_id", t.Name, "reason", t.Status.StageReason, "decline", string(decline))
+		case DeclineNoConversingRoom:
+			log.FromContext(ctx).Info("unpark: declined (project is at its conversing ceiling; the pending event is retained and the next pass retries)",
 				"action", "unpark_declined", "resource_id", t.Name, "reason", t.Status.StageReason, "decline", string(decline))
 		}
 		if decline != DeclineNone && r.Metrics != nil {

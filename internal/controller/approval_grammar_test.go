@@ -785,19 +785,12 @@ func TestReVerifyParkedSyncsTheThreadFirst(t *testing.T) {
 		t.Fatalf("evidence = %+v, want the SYNCED comment c9 (its ExternalID did not exist in the stale mirror)", iss.Status.Approval)
 	}
 
-	// ONE comment reaches implementing: feed the grammar verdict into F.6.
-	fresh := getTaskCR(t, c, task.Name)
-	target, ok := stage.Unpark(stage.UnparkInput{
-		Task:          fresh,
-		Issues:        []tatarav1alpha1.Issue{*iss},
-		BotLogin:      "tatara-bot",
-		GrammarPassed: passed,
-		MaxOpenTasks:  10,
-		Now:           time.Now(),
-	})
-	if !ok || target != tatarav1alpha1.StageImplementing {
-		t.Fatalf("Unpark = (%q, %v), want (implementing, true)", target, ok)
-	}
+	// This test STOPS at the verdict. It used to feed `passed` on into
+	// stage.Unpark and assert the Task reached implementing in one comment;
+	// agent-judged-approval-gate step C deleted the field that carried it and
+	// the implementing edge it fed, so there is no verdict-to-F.6 coupling left
+	// to assert. What ReVerifyParked does - one forge read, then the C.6 grammar
+	// against the refreshed thread - is unchanged and fully covered above.
 }
 
 // TestReVerifyParkedRefusesANonApprovingComment: "not yet" keeps the Task parked.
@@ -820,13 +813,14 @@ func TestReVerifyParkedRefusesANonApprovingComment(t *testing.T) {
 	if passed {
 		t.Fatal("'not yet' passed the approval grammar")
 	}
+	// The stage.Unpark leg of this test is gone with step C: a refused grammar
+	// no longer has any way to reach F.6, so re-asserting "it did not un-park"
+	// through Unpark would now pass for an unrelated reason (no conversing room)
+	// and prove nothing. What matters here is that ReVerifyParked itself refuses
+	// and leaves the Task where it was.
 	fresh := getTaskCR(t, c, task.Name)
-	iss := getIssueCR(t, c, i1.Name)
-	if _, ok := stage.Unpark(stage.UnparkInput{
-		Task: fresh, Issues: []tatarav1alpha1.Issue{*iss}, BotLogin: "tatara-bot",
-		GrammarPassed: passed, MaxOpenTasks: 10, Now: time.Now(),
-	}); ok {
-		t.Fatal("a refused grammar un-parked the Task")
+	if iss := getIssueCR(t, c, i1.Name); iss.Status.Status == "approved" {
+		t.Fatal("'not yet' stamped the issue approved")
 	}
 	if fresh.Status.Stage != tatarav1alpha1.StageParked {
 		t.Fatalf("task stage = %q, want parked", fresh.Status.Stage)
