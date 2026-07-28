@@ -46,6 +46,16 @@ const AnnBrainstormSources = "tatara.dev/brainstorm-sources"
 // The agent-visible copy of the same number is a literal line in Task.Spec.Goal.
 const AnnBrainstormQuota = "tatara.dev/brainstorm-quota"
 
+// AnnBrainstormResume is the one-shot resume signal for a paused brainstorm.
+// Every resume trigger - the push webhook, an operator merge, a maintainer
+// comment or close, and the manual override a human writes by hand - stamps
+// this SAME annotation on the Project, and the Project reconcile is the single
+// place that clears Status.BrainstormPausedAt and removes it again. The VALUE
+// is the trigger name, carried only so the resume is logged with the trigger
+// that fired; an empty or unrecognised value reads as a manual override.
+// Centralised here so the five writers and the one reader cannot drift.
+const AnnBrainstormResume = "tatara.dev/brainstorm-resume"
+
 // Label keys shared between the sweep and the cron scans.
 const (
 	// LabelSourceKind is the activity kind ("mrScan", "issueScan", etc.).

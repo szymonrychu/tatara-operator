@@ -6126,15 +6126,17 @@ spec:
           status:
             description: ProjectStatus defines the observed state of a Project.
             properties:
-              brainstormConsecutiveSkips:
+              brainstormPauseReason:
                 description: |-
-                  BrainstormConsecutiveSkips counts brainstorm sessions that ended in
-                  action=skip back to back. action=propose resets it to 0; a cron tick
-                  resets it to 0. At BrainstormActivity.ResolveMaxConsecutiveSkips() the
-                  EVENT-driven refill path is suppressed - the liveness brake that stops
-                  skip -> deficit unchanged -> reconcile -> spawn -> skip burning pods on a
-                  proven-dry idea space.
-                type: integer
+                  BrainstormPauseReason carries the agent's verbatim reason, for the operator
+                  to read without opening the Task.
+                type: string
+              brainstormPausedAt:
+                description: |-
+                  BrainstormPausedAt is set when a brainstorm agent reports the idea space is
+                  exhausted. While set, no brainstorm session is scheduled for this project.
+                format: date-time
+                type: string
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current

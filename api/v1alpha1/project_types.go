@@ -1089,14 +1089,14 @@ type ProjectStatus struct {
 	// project. Computed on reconcile.
 	// +optional
 	OpenIncidentsCount int `json:"openIncidentsCount,omitempty"`
-	// BrainstormConsecutiveSkips counts brainstorm sessions that ended in
-	// action=skip back to back. action=propose resets it to 0; a cron tick
-	// resets it to 0. At BrainstormActivity.ResolveMaxConsecutiveSkips() the
-	// EVENT-driven refill path is suppressed - the liveness brake that stops
-	// skip -> deficit unchanged -> reconcile -> spawn -> skip burning pods on a
-	// proven-dry idea space.
+	// BrainstormPausedAt is set when a brainstorm agent reports the idea space is
+	// exhausted. While set, no brainstorm session is scheduled for this project.
 	// +optional
-	BrainstormConsecutiveSkips int `json:"brainstormConsecutiveSkips,omitempty"`
+	BrainstormPausedAt *metav1.Time `json:"brainstormPausedAt,omitempty"`
+	// BrainstormPauseReason carries the agent's verbatim reason, for the operator
+	// to read without opening the Task.
+	// +optional
+	BrainstormPauseReason string `json:"brainstormPauseReason,omitempty"`
 }
 
 // ScanMark records the last GitHub activity timestamp the issue/PR scan has
