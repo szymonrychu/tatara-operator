@@ -37,14 +37,25 @@ func ApplyIssueClosedStop(ctx context.Context, c client.Client, task *tatarav1al
 
 	key := client.ObjectKeyFromObject(task)
 	var prevStage string
+	var deferred bool
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		stopped = false
+		stopped, deferred = false, false
 		fresh := &tatarav1alpha1.Task{}
 		if err := c.Get(ctx, key, fresh); err != nil {
 			return err
 		}
 		if !stage.AllowsIssueClosedStop(fresh.Status.Stage) {
 			return nil // raced off a live source stage (approval/park/deploying); fold
+		}
+		// THE FOLD BARRIER (issue #467). This edge exists for a HUMAN closing the
+		// driving issue; firing it on a refine umbrella mid-adoption terminates the
+		// only thing that can finish that adoption, and its members are then pinned
+		// against a Task that will never run again. It is a DEFER, not a cancel:
+		// FoldInFlightActive is TTL-bounded and the reconcile requeues on cadence,
+		// so the same close stops the Task once the adoption settles or times out.
+		if tatarav1alpha1.FoldInFlightActive(fresh, now) {
+			deferred = true
+			return nil
 		}
 		prevStage = fresh.Status.Stage
 		if err := stage.Enter(fresh, nil, tatarav1alpha1.StageRejected, stage.ReasonIssueClosed, now); err != nil {
@@ -58,6 +69,11 @@ func ApplyIssueClosedStop(ctx context.Context, c client.Client, task *tatarav1al
 		return nil
 	}); err != nil {
 		return false, fmt.Errorf("issue-closed: stop task %s: %w", task.Name, err)
+	}
+	if deferred {
+		log.FromContext(ctx).Info("issue closed while a fold adoption is in flight: deferring the stop",
+			"action", "issue_closed_stop_deferred", "resource_id", task.Name,
+			"stage", task.Status.Stage, "issue", issueName)
 	}
 	if !stopped {
 		return false, nil

@@ -358,11 +358,21 @@ spec:
               foldInFlight:
                 description: |-
                   FoldInFlight names the member Tasks a refine umbrella is mid-adoption of.
-                  The reaper SKIPS any Task named here (fix 8).
+                  The reaper SKIPS any Task named here (fix 8), but ONLY while
+                  FoldInFlightActive - see there.
                 items:
                   type: string
                 maxItems: 20
                 type: array
+              foldInFlightSince:
+                description: |-
+                  FoldInFlightSince is when FoldInFlight was last written. It is the ANCHOR
+                  for the reaper's TTL: without it a stranded marker is indistinguishable
+                  from one written a second ago, which is how issue #467 pinned 26 Tasks
+                  against a dead umbrella with nothing able to tell the difference. Absent
+                  (a marker written by an older build) it falls back to StageEnteredAt.
+                format: date-time
+                type: string
               headMoveReentries:
                 description: |-
                   HeadMoveReentries bounds the FOURTH cycle - the one that SPAWNS PODS

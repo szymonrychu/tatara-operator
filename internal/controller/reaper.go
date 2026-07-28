@@ -341,19 +341,44 @@ func (r *ProjectReconciler) ReapTerminal(ctx context.Context, proj *tatarav1alph
 	}
 	now := time.Now()
 
-	// live is EVERY Task that currently exists, and fold is the SKIP list: any
-	// Task named in a live Task's status.foldInFlight. ds.activeBatchMembers is
-	// the set of Tasks a not-yet-resolved documentation batch is carrying: they
-	// are being actively covered and must not be reported as doc_reference-stuck
-	// however long they have waited (issue #423).
+	// live is EVERY Task that currently exists, and foldHeldSince is the SKIP
+	// list: member name -> when the adoption holding it started.
+	//
+	// THE GATE IS FoldInFlightActive, NOT "the marker is set" (issue #467). A
+	// fold adoption is the body of ONE submit_outcome request; nothing outside
+	// that request ever resumes one. So a marker on an umbrella that is done, or
+	// one older than FoldInFlightTTL, names an adoption that CANNOT complete, and
+	// honouring it pins its members with nothing anywhere able to release them:
+	// #467 held 26 Tasks against an umbrella stopped at rejected(issue-closed)
+	// mid-fold, and a full operator rollout did not clear it because the marker
+	// is in etcd. The RELEASE is what makes the block bounded rather than
+	// permanent, and it is counted because it is always an upstream anomaly.
+	//
+	// ds.activeBatchMembers is the set of Tasks a not-yet-resolved documentation
+	// batch is carrying: they are being actively covered and must not be reported
+	// as doc_reference-stuck however long they have waited (issue #423).
 	live := make(map[string]bool, len(tl.Items))
-	fold := map[string]bool{}
+	foldHeldSince := map[string]time.Time{}
 	ds := &docReapState{activeBatchMembers: map[string]bool{}}
 	for i := range tl.Items {
 		t := &tl.Items[i]
 		live[t.Name] = true
-		for _, member := range t.Status.FoldInFlight {
-			fold[member] = true
+		if len(t.Status.FoldInFlight) > 0 {
+			if tatarav1alpha1.FoldInFlightActive(t, now) {
+				for _, member := range t.Status.FoldInFlight {
+					foldHeldSince[member] = tatarav1alpha1.FoldStartedAt(t)
+				}
+			} else {
+				reason := obs.FoldStrandedTTLExpired
+				if tatarav1alpha1.TaskDone(t) {
+					reason = obs.FoldStrandedUmbrellaDone
+				}
+				obs.FoldStrandedReleasedTotal.WithLabelValues(reason).Inc()
+				l.Info("reap: releasing a fold whose adoption can never complete",
+					"action", "reap_fold_released", "resource_id", t.Name, "stage", t.Status.Stage,
+					"stage_reason", t.Status.StageReason, "reason", reason,
+					"members", len(t.Status.FoldInFlight))
+			}
 		}
 		if t.Spec.Kind == DocBatchKind && len(t.Spec.DocumentsTasks) > 0 &&
 			t.Annotations[AnnDocBatchResolved] != "true" {
@@ -387,6 +412,7 @@ func (r *ProjectReconciler) ReapTerminal(ctx context.Context, proj *tatarav1alph
 	}
 
 	var firstErr error
+	foldBlocked := 0
 	for i := range tl.Items {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -395,10 +421,21 @@ func (r *ProjectReconciler) ReapTerminal(ctx context.Context, proj *tatarav1alph
 		if t.Spec.ProjectRef != proj.Name || t.Status.Stage == "" {
 			continue // the stage machine has not touched it yet
 		}
-		if fold[t.Name] {
-			obs.GCBlockedTotal.WithLabelValues(obs.GCBlockedFoldInFlight).Inc()
-			l.V(1).Info("reap: skipping a Task a live refine umbrella is mid-fold of",
-				"action", "reap_blocked", "resource_id", t.Name, "reason", obs.GCBlockedFoldInFlight)
+		if since, held := foldHeldSince[t.Name]; held {
+			// Counted only PAST the grace, the same treatment doc_reference got in
+			// #424: the counter records one event per pass per held Task, so
+			// counting the healthy seconds-long adoption window tripped the warning
+			// alert on every ordinary fold. foldBlocked is the DISTINCT count the
+			// alert should key on instead.
+			if now.After(since.Add(tatarav1alpha1.FoldInFlightGrace)) {
+				foldBlocked++
+				obs.GCBlockedTotal.WithLabelValues(obs.GCBlockedFoldInFlight).Inc()
+				l.Info("reap: a fold member is held past its adoption window",
+					"action", "reap_blocked", "resource_id", t.Name, "reason", obs.GCBlockedFoldInFlight)
+			} else {
+				l.V(1).Info("reap: skipping a Task a live refine umbrella is mid-fold of",
+					"action", "reap_blocked", "resource_id", t.Name, "reason", obs.GCBlockedFoldInFlight)
+			}
 			continue
 		}
 		if err := r.reapOne(ctx, proj, t, live, now, ds, conversingRoom); err != nil {
@@ -412,6 +449,7 @@ func (r *ProjectReconciler) ReapTerminal(ctx context.Context, proj *tatarav1alph
 	// The DISTINCT count of Tasks genuinely stuck past their doc-hold window this
 	// pass - set every pass (including to 0) so a drained backlog clears the gauge.
 	obs.DocReferenceBlockedTasks.WithLabelValues(proj.Name).Set(float64(ds.blocked))
+	obs.FoldInFlightBlockedTasks.WithLabelValues(proj.Name).Set(float64(foldBlocked))
 	return firstErr
 }
 
@@ -781,10 +819,28 @@ func documentationCronPeriod(proj *tatarav1alpha1.Project, base time.Time) time.
 func (r *ProjectReconciler) releaseTerminal(ctx context.Context, proj *tatarav1alpha1.Project,
 	t *tatarav1alpha1.Task, live map[string]bool) error {
 
+	l := log.FromContext(ctx)
+
+	// FOLDS GO FIRST, ahead of the AnnTerminalReleased short circuit AND ahead of
+	// every fallible step below, for the same reason the wrapper teardown leads
+	// ApplyIssueClosedStop: a terminal Task's fold marker is a tombstone that
+	// blocks OTHER Tasks' GC, and anything above it that can fail (every step
+	// here writes to the forge) leaves that block standing for as long as the
+	// failure lasts. Issue #467 is exactly this list missing its third entry -
+	// releaseTerminal released issues and MRs and had no notion of folds at all,
+	// so it logged "issues=0, mrs=0" while 26 members stayed pinned.
+	if len(t.Status.FoldInFlight) > 0 {
+		if err := r.clearFoldInFlight(ctx, t); err != nil {
+			return err
+		}
+		l.Info("released a terminal task's in-flight fold",
+			"action", "reap_fold_released", "resource_id", t.Name, "stage", t.Status.Stage,
+			"stage_reason", t.Status.StageReason, "reason", obs.FoldStrandedUmbrellaDone)
+	}
+
 	if t.Annotations[AnnTerminalReleased] == "true" {
 		return nil
 	}
-	l := log.FromContext(ctx)
 
 	issues, err := r.ownedIssues(ctx, t)
 	if err != nil {
@@ -1381,6 +1437,30 @@ func stageEnteredAt(t *tatarav1alpha1.Task) time.Time {
 		return t.Status.StageEnteredAt.Time
 	}
 	return t.CreationTimestamp.Time
+}
+
+// clearFoldInFlight drops a terminal Task's fold marker. It is a STATUS write
+// (unlike the annotate* helpers below) because that is where the marker lives,
+// and it re-reads under RetryOnConflict for the usual reason: the restapi's own
+// step-5 clear may be landing on the same object.
+func (r *ProjectReconciler) clearFoldInFlight(ctx context.Context, t *tatarav1alpha1.Task) error {
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var cur tatarav1alpha1.Task
+		if err := r.Get(ctx, client.ObjectKeyFromObject(t), &cur); err != nil {
+			return err
+		}
+		if len(cur.Status.FoldInFlight) == 0 && cur.Status.FoldInFlightSince == nil {
+			return nil
+		}
+		cur.Status.FoldInFlight = nil
+		cur.Status.FoldInFlightSince = nil
+		return r.Status().Update(ctx, &cur)
+	}); err != nil {
+		return fmt.Errorf("reap: clear foldInFlight on %s: %w", t.Name, err)
+	}
+	t.Status.FoldInFlight = nil
+	t.Status.FoldInFlightSince = nil
+	return nil
 }
 
 // annotateTask / annotateIssue / annotateMR persist ONE metadata marker. They are

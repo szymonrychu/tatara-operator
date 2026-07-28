@@ -63,6 +63,22 @@ const (
 	// DocStageBudget bounds a documenting batch: it never pins a parent past
 	// this (B.6/F.4).
 	DocStageBudget = 2 * time.Hour
+	// FoldInFlightGrace is the window inside which a B.3 fold adoption is a
+	// HEALTHY hold and is NOT counted as GC-blocked. It is the same treatment
+	// doc_reference got in #424: operator_gc_blocked_total re-counts one EVENT
+	// per reconcile pass per held object, so counting the legitimate window made
+	// every ordinary fold trip the warning alert. The whole adoption is the body
+	// of ONE submit_outcome request and finishes in seconds; five minutes is two
+	// orders of magnitude of headroom.
+	FoldInFlightGrace = 5 * time.Minute
+	// FoldInFlightTTL is the HARD backstop on that same hold: past it the marker
+	// is stale by construction and the members are released whatever the
+	// umbrella's stage says. It exists because nothing else bounds the hold - the
+	// fold is a single request, so an umbrella that is still live an hour later
+	// is one whose request died without ever reaching step 5 (issue #467, where
+	// 26 members were pinned against an umbrella that self-terminated
+	// mid-adoption).
+	FoldInFlightTTL = 1 * time.Hour
 	// AdmissionStarvedBudget is CLOCK 1: the ADMISSION deadline, measured from
 	// status.stageEnteredAt, armed on EVERY pod stage (podStartedAt == nil).
 	// Breach -> parked(admission-starved), EXCEPT it is skipped entirely when
