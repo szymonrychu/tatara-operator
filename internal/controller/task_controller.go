@@ -13,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -771,6 +772,16 @@ func (r *TaskReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if err := podClocks.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup pod-clock watch: %w", err)
 	}
+	return r.controllerBuilder(mgr).Complete(r)
+}
+
+// controllerBuilder assembles the Task controller's ENTIRE watch set. It is a
+// separate function for the same reason projectControllerBuilder is
+// (project_controller.go): task_ticket_wake_test.go's envtest registers the SAME
+// builder production registers, instead of a hand-copied duplicate that would go
+// on passing after someone deleted the real edge. Deleting any For/Owns/Watches
+// here now turns that test RED.
+func (r *TaskReconciler) controllerBuilder(mgr ctrl.Manager) *builder.Builder {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&tatarav1alpha1.Task{}).
 		Owns(&corev1.Pod{}).
@@ -784,8 +795,7 @@ func (r *TaskReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// MaxConcurrentReconciles: 1 serialises Task reconciles to avoid races in
 		// read-then-write sequences (pod creation, status updates, seq accounting
 		// in the admission queue). The admission queue is the sole concurrency gate.
-		WithOptions(ctrlcontroller.Options{MaxConcurrentReconciles: 1}).
-		Complete(r)
+		WithOptions(ctrlcontroller.Options{MaxConcurrentReconciles: 1})
 }
 
 // deleteWrapper best-effort deletes the wrapper Pod and Service for a task.
