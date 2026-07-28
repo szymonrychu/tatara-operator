@@ -443,7 +443,10 @@ func (d *StageDriver) stallMerge(ctx context.Context, proj *tatarav1alpha1.Proje
 	repo string, cursor int, why string) (ctrl.Result, error) {
 	stalledFor := 0.0
 	if task.Status.StageEnteredAt != nil {
-		stalledFor = d.now().Sub(task.Status.StageEnteredAt.Time).Seconds()
+		// Carry-adjusted (issue #480): a merge-timeout un-park re-stamps
+		// StageEnteredAt, so a bare now.Sub would read the stall clock as reset to
+		// near-zero on every re-entry instead of the whole stuck cycle.
+		stalledFor = stage.StageElapsedSeconds(task, d.now())
 	}
 	obs.MergeCursorStalledSeconds.WithLabelValues(task.Name, repo).Set(stalledFor)
 	log.FromContext(ctx).Info("merge: waiting",

@@ -645,8 +645,34 @@ func Enter(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, to, reason string, now
 		return &MissingReasonError{To: to}
 	}
 
+	// preserveElapsedCarry is issue #480's fix: StageElapsedCarrySeconds must
+	// survive THIS ONE Enter() call exactly on the two edges of a
+	// merge-timeout/deploy-timeout round-trip - parking with that reason
+	// (accumulated below, before StageEnteredAt is overwritten) and the matching
+	// un-park re-entry into the SAME stage (preserved as-is). It is derived from
+	// the LIVE (from, current reason, to) triple this call is already
+	// validating, read BEFORE either StageReason or Stage is overwritten below -
+	// never from status.ParkedFromStage, which stays observability-only (see
+	// its doc comment). Every OTHER edge, including a HEAD-MOVED merging exit
+	// (fix M3-9) and a maintainer-driven fresh implementation
+	// (enterFreshImplementing), resets it to zero below, same as every other
+	// per-transition clock field: a genuinely fresh entry into merging/deploying
+	// must never inherit a stale carry from an unrelated earlier cycle.
+	preserveElapsedCarry := (to == v1alpha1.StageMerging && from == v1alpha1.StageParked && t.Status.StageReason == ReasonMergeTimeout) ||
+		(to == v1alpha1.StageDeploying && from == v1alpha1.StageParked && t.Status.StageReason == ReasonDeployTimeout)
+
 	if to == v1alpha1.StageParked {
 		t.Status.ParkedFromStage = from
+		if reason == ReasonMergeTimeout || reason == ReasonDeployTimeout {
+			// Fold THIS attempt's elapsed work-clock time into the carry before
+			// StageEnteredAt is overwritten, so the un-park re-entry below (and
+			// ArmedClock, and the metrics that read it) see continuous elapsed
+			// time across the whole park/un-park cycle, not per-attempt.
+			if t.Status.StageEnteredAt != nil {
+				t.Status.StageElapsedCarrySeconds += int(now.Sub(t.Status.StageEnteredAt.Time).Seconds())
+			}
+			preserveElapsedCarry = true
+		}
 	}
 	stamp := metav1.NewTime(now)
 	t.Status.Stage = to
@@ -656,6 +682,9 @@ func Enter(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, to, reason string, now
 	t.Status.PodStartedAt = nil
 	t.Status.StageWorkStartedAt = nil
 	t.Status.Stats.PodRecreations = 0
+	if !preserveElapsedCarry {
+		t.Status.StageElapsedCarrySeconds = 0
+	}
 	if to == v1alpha1.StageConversing {
 		t.Status.ConversationLastEventAt = &stamp
 	}
@@ -800,11 +829,17 @@ func ArmedClock(t *v1alpha1.Task, paused bool) (clock string, since time.Time, b
 	}
 
 	if v1alpha1.StagePodless(stg) {
-		// CLOCK 3 ONLY, from stageEnteredAt, against its own budget.
+		// CLOCK 3 ONLY, from stageEnteredAt, against its own budget - CARRY-
+		// ADJUSTED (issue #480): since is pulled back by StageElapsedCarrySeconds
+		// so now.Sub(since) reads the WHOLE merge-timeout/deploy-timeout
+		// round-trip's elapsed time, not just the time since the latest
+		// re-entry. Zero for every stage/cycle Enter did not mark to preserve, so
+		// this is a no-op everywhere else.
 		if paused && elapse.Reason == ReasonAdmissionStarved {
 			return ClockNone, time.Time{}, 0, Edge{}
 		}
-		return ClockWork, t.Status.StageEnteredAt.Time, budget, elapse
+		carry := time.Duration(t.Status.StageElapsedCarrySeconds) * time.Second
+		return ClockWork, t.Status.StageEnteredAt.Add(-carry), budget, elapse
 	}
 
 	// A POD stage. Which of the three is armed depends ENTIRELY on the stamps.
@@ -835,6 +870,24 @@ func Elapsed(t *v1alpha1.Task, paused bool, now time.Time) (Edge, bool) {
 		return Edge{}, false
 	}
 	return edge, true
+}
+
+// StageElapsedSeconds is the carry-adjusted (issue #480) elapsed time since
+// Status.StageEnteredAt: now.Sub(StageEnteredAt) plus StageElapsedCarrySeconds.
+// ArmedClock's podless WORK clock applies the same adjustment inline (it needs
+// an adjusted `since`, not a bare elapsed float); this is the form every OTHER
+// caller that reports or compares stage age must use instead of a bare
+// now.Sub(StageEnteredAt) - operator_task_stage_age_seconds
+// (project_controller.go's updateTaskStageGauges) and
+// operator_merge_cursor_stalled_seconds (merge.go's stallMerge) both do, or
+// they under-report true residency by up to a full budget per re-entry, exactly
+// as #480 documented live (a gauge reading 2h20m for a Task that had been
+// merging 10h21m). Returns 0 when StageEnteredAt is nil (no clock armed yet).
+func StageElapsedSeconds(t *v1alpha1.Task, now time.Time) float64 {
+	if t.Status.StageEnteredAt == nil {
+		return 0
+	}
+	return now.Sub(t.Status.StageEnteredAt.Time).Seconds() + float64(t.Status.StageElapsedCarrySeconds)
 }
 
 // Respawn is the CLOCK 2 breach handler, and it mirrors the semantics of the
