@@ -75,6 +75,14 @@ type MergeRequestStatus struct {
 	CommentsRetainedFrom *metav1.Time `json:"commentsRetainedFrom,omitempty"`
 	// +optional
 	MergedAt *metav1.Time `json:"mergedAt,omitempty"`
+	// MergedSHA is the merge commit the OPERATOR produced for this MR. It is the
+	// operator's own record of what it landed, and it is the anchor for the
+	// identity-scoped push-resume check (internal/controller OperatorLandedSHA):
+	// a push whose head is not one of these is a head the operator did not
+	// produce. It is NEVER derived from a commit message or from git author
+	// metadata, both of which are forgeable.
+	// +optional
+	MergedSHA string `json:"mergedSHA,omitempty"`
 	// +optional
 	DeployedAt *metav1.Time `json:"deployedAt,omitempty"`
 	// +optional

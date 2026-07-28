@@ -46,23 +46,3 @@ func TestResolveHistoryWindow(t *testing.T) {
 		})
 	}
 }
-
-func TestResolveMaxConsecutiveSkips(t *testing.T) {
-	tests := []struct {
-		name string
-		act  BrainstormActivity
-		want int
-	}{
-		{"unset", BrainstormActivity{}, DefaultMaxConsecutiveSkips},
-		{"explicit", BrainstormActivity{MaxConsecutiveSkips: ptr(1)}, 1},
-		{"zero means the breaker never trips", BrainstormActivity{MaxConsecutiveSkips: ptr(0)}, 0},
-		{"negative clamps to zero", BrainstormActivity{MaxConsecutiveSkips: ptr(-2)}, 0},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := tc.act.ResolveMaxConsecutiveSkips(); got != tc.want {
-				t.Fatalf("ResolveMaxConsecutiveSkips() = %d, want %d", got, tc.want)
-			}
-		})
-	}
-}

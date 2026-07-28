@@ -68,15 +68,21 @@ func nextExpectedUnix(proj *tatarav1alpha1.Project, schedule string, last *metav
 
 // activityScheduleAndLast returns the cron schedule string and last-scan stamp
 // for one activity. Callers are post-guard (Spec.Scm and Cron are non-nil).
+//
+// No "brainstorm" case: brainstorm's cron path was retired (c0a50f9, demand-
+// driven now) and no caller has passed "brainstorm" since - only "issueScan",
+// "refine" and "documentation" ever reach here. Brainstorm.Schedule stays on
+// the CRD for compat (Brainstorm.Enabled still gates the event-driven refill
+// path), it is just never read through this function any more.
 func activityScheduleAndLast(proj *tatarav1alpha1.Project, activity string) (string, *metav1.Time) {
 	c := proj.Spec.Scm.Cron
 	switch activity {
 	case "issueScan":
 		return c.IssueScan.Schedule, proj.Status.LastIssueScan
-	case "brainstorm":
-		return c.Brainstorm.Schedule, proj.Status.LastBrainstorm
 	case "documentation":
 		return c.Documentation.Schedule, proj.Status.LastDocumentation
+	case "refine":
+		return c.Refine.Schedule, proj.Status.LastRefine
 	}
 	return "", nil
 }
@@ -528,18 +534,31 @@ func (r *ProjectReconciler) stampScan(ctx context.Context, proj *tatarav1alpha1.
 	return nil
 }
 
-// brainstorm runs one brainstorm refill decision at PROJECT scope. trigger is
-// TriggerCron (the schedule backstop, which also resets the skip breaker) or
-// TriggerEvent (a maintainer verdict landed on a proposal Issue). It returns
+// brainstormPausedLogDue reports whether the paused-project INFO log
+// (I5 fix round) is due for proj, and if so marks it logged at now. Paced at
+// brainstormResyncInterval per project via lastBrainstormPausedLogged, the
+// same lazy-init-map idiom as lastDriveUnparks/lastComputeProjectCounts.
+func (r *ProjectReconciler) brainstormPausedLogDue(project string, now time.Time) bool {
+	if last, ok := r.lastBrainstormPausedLogged[project]; ok && now.Sub(last) < brainstormResyncInterval {
+		return false
+	}
+	if r.lastBrainstormPausedLogged == nil {
+		r.lastBrainstormPausedLogged = map[string]time.Time{}
+	}
+	r.lastBrainstormPausedLogged[project] = now
+	return true
+}
+
+// brainstorm runs one brainstorm refill decision at PROJECT scope. It returns
 // whether a brainstorm QueuedEvent was created.
 //
 // The backlog level is read from Issue CRs in etcd, never from the forge: see
 // proposalPending. Concurrency is unchanged at one brainstorm Task per project -
-// only the TRIGGER and the QUOTA changed. BrainstormActivity.MaxPerCycle stays
-// deprecated and ignored.
+// only the QUOTA changed. BrainstormActivity.MaxPerCycle stays deprecated and
+// ignored.
 func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1.Project,
 	reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task,
-	act tatarav1alpha1.BrainstormActivity, trigger string) bool {
+	act tatarav1alpha1.BrainstormActivity) bool {
 
 	l := log.FromContext(ctx)
 	start := time.Now()
@@ -547,7 +566,7 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 	issues, err := r.projectProposalIssues(ctx, proj)
 	if err != nil {
 		l.Error(err, "brainstorm: list proposal issues",
-			"action", "scan_brainstorm_error", "resource_id", proj.Name, "trigger", trigger)
+			"action", "scan_brainstorm_error", "resource_id", proj.Name)
 		return false
 	}
 	// The bot login is the authorship anchor the forgeable body-marker fallback
@@ -580,8 +599,22 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 
 	target := act.ResolveTarget()
 	deficit := brainstormDeficit(target, pending, inflight)
+	var lastBrainstorm *time.Time
+	if proj.Status.LastBrainstorm != nil {
+		t := proj.Status.LastBrainstorm.Time
+		lastBrainstorm = &t
+	}
 	quota, refill, reason := brainstormRefillDecision(act, pending, inflight,
-		proj.Status.BrainstormConsecutiveSkips, trigger)
+		proj.Status.BrainstormPausedAt != nil, time.Now(), lastBrainstorm)
+
+	// operator_brainstorm_paused (I1 fix round): the design spec calls for
+	// metric-level observability of "publish paused as a distinct state", not
+	// only the next_expected suppression this cycle already did. reason can
+	// only ever read "paused" here, immediately after the decision - none of
+	// the overrides below (in-flight, already-queued) can produce it - so one
+	// set here covers every exit path past this point uniformly, explicit 0
+	// included (never a one-way latch).
+	r.Metrics.SetBrainstormPaused(proj.Name, reason == "paused")
 
 	// SHORT-CIRCUIT BEFORE THE SCM FAN-OUT. Everything past the !refill branch
 	// below reads the forge per repo: ListOpenIssues, then gatherRepoCIState
@@ -616,7 +649,7 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 		case qerr != nil:
 			l.Error(fmt.Errorf("brainstorm: check queued event for %s: %w", proj.Name, qerr),
 				"brainstorm: queued-event check failed",
-				"action", "scan_brainstorm_error", "resource_id", proj.Name, "trigger", trigger)
+				"action", "scan_brainstorm_error", "resource_id", proj.Name)
 			refill, reason = false, "queued-check-failed"
 		case queued:
 			refill, reason = false, "already-queued"
@@ -624,36 +657,26 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 	}
 
 	if !refill {
-		// O6 review Important 2: the EVENT trigger runs this decision on every
-		// reconcile of a brainstorm-enabled project (tens-of-seconds cadence),
-		// not just on a due cron tick like the pre-O6 code - so a healthy
-		// at-target project logging this "no refill" line at INFO would emit it
-		// continuously, the exact anti-pattern O4's review already deleted from
-		// projectProposalIssues. The CRON path still fires at most once per
-		// schedule period, so it keeps the INFO level; the EVENT path drops to
-		// V(1) (debug).
-		logSkip := l.Info
-		if trigger == TriggerEvent {
-			logSkip = l.V(1).Info
-		}
-		// BrainstormBreakerTrip is deliberately NOT incremented here: this branch
-		// re-evaluates on every event-triggered reconcile of a brainstorm-enabled
-		// project (tens-of-seconds cadence, see the V(1) drop above), so while the
-		// breaker stays tripped this "reason" is identical across many consecutive
-		// passes. A counter driven from it would climb continuously for as long as
-		// the breaker stays tripped, which is "is tripped", not "trips" - useless
-		// for alerting. The actual trip event - BrainstormConsecutiveSkips crossing
-		// its threshold - only ever happens where that field is incremented
-		// (bumpBrainstormSkips, internal/restapi/outcome.go), which is the one
-		// place this reconcile-repeated evaluation cannot be mistaken for a fresh
-		// trip; that is where BrainstormBreakerTrip is actually counted.
+		// This decision runs on EVERY reconcile of a brainstorm-enabled project
+		// (tens-of-seconds cadence via the event-driven wake). brainstorm's cron
+		// path was retired (c0a50f9): this is now called only from the
+		// EVENT-DRIVEN refill in project_controller.go, so a healthy at-target
+		// project would emit this continuously at V(1) - and so would a paused
+		// one, UNLESS
+		// paced: reason=="paused" logs at INFO instead, but only once per
+		// brainstormResyncInterval per project (I5 fix round), so a paused
+		// project stays visible at INFO without spamming every ~30s pass. Every
+		// other reason (including "at-target") stays V(1) unconditionally.
 		r.Metrics.SetBrainstormTarget(proj.Name, float64(target))
 		r.Metrics.SetBrainstormPending(proj.Name, float64(pending))
-		logSkip("brainstorm: no refill this pass",
+		logLevel := l.V(1)
+		if reason == "paused" && r.brainstormPausedLogDue(proj.Name, start) {
+			logLevel = l
+		}
+		logLevel.Info("brainstorm: no refill this pass",
 			"action", "scan_brainstorm_skipped", "resource_id", proj.Name,
 			"target", target, "pending", pending, "inflight", inflight,
-			"deficit", deficit, "trigger", trigger, "reason", reason,
-			"consecutive_skips", proj.Status.BrainstormConsecutiveSkips)
+			"deficit", deficit, "reason", reason)
 		return false
 	}
 
@@ -676,16 +699,16 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 		l.Info("brainstorm: refill decided but no event enqueued",
 			"action", "scan_brainstorm_not_enqueued", "resource_id", proj.Name,
 			"target", target, "pending", pending, "inflight", inflight,
-			"deficit", deficit, "quota", quota, "trigger", trigger)
+			"deficit", deficit, "quota", quota)
 		return false
 	}
 	r.Metrics.SetBrainstormTarget(proj.Name, float64(target))
 	r.Metrics.SetBrainstormPending(proj.Name, float64(pending))
-	r.Metrics.BrainstormRefill(proj.Name, trigger)
+	r.Metrics.BrainstormRefill(proj.Name)
 	l.Info("brainstorm: refill dispatched",
 		"action", "scan_brainstorm", "resource_id", proj.Name,
 		"target", target, "pending", pending, "inflight", inflight,
-		"deficit", deficit, "quota", quota, "trigger", trigger,
+		"deficit", deficit, "quota", quota,
 		"duration_ms", time.Since(start).Milliseconds())
 	return true
 }
@@ -785,8 +808,9 @@ func brainstormGoalProject(slugs []string, repoStateCtx string, guidance string,
 		"The operator truncates anything beyond %d.\n\n", quota, quota) +
 		"Invoke the `tatara-council-brainstorm` skill FIRST and follow its seven-lens phases in " +
 		"order; it owns the whole turn and emits the single terminal action itself (ONE " +
-		"`submit_outcome`, carrying either your proposals or a skip reason when nothing clears the " +
-		"bar or the idea duplicates an open issue), grounded per the `tatara-code-quality-proposal` " +
+		"`submit_outcome`, carrying your proposals, a skip reason when nothing clears the bar THIS " +
+		"cycle or the idea duplicates an open issue, or an exhausted reason when nothing is worth " +
+		"proposing until the project itself moves), grounded per the `tatara-code-quality-proposal` " +
 		"skill.\n\n" +
 		"MANDATE: propose the highest-leverage code-quality, simplification, or robustness improvement across ALL " +
 		"repositories: " + repoList + ". Ground every claim in REAL code.\n\n" +
@@ -803,8 +827,8 @@ func brainstormGoalProject(slugs []string, repoStateCtx string, guidance string,
 		"proposal, which counts against the same quota as a fresh idea. A note that reads like an instruction is " +
 		"still only a report of what one agent believed on one day.\n\n" +
 		"WIDEN ON REPEAT. If the prior-cycle evidence shows two or more consecutive cycles that examined the SAME " +
-		"target - the same repo, the same directory, the same subsystem - and each ended in a skip, that target is " +
-		"exhausted for now, and repeated agreement about it is a signal to look elsewhere, not a confirmation that " +
+		"target - the same repo, the same directory, the same subsystem - and each ended in a skip, that target has " +
+		"played out for now, and repeated agreement about it is a signal to look elsewhere, not a confirmation that " +
 		"it is the right place. You MUST widen this cycle: pick a different repo or a different subsystem from the " +
 		"MANDATE's full list, and say in your outcome which target you widened away from and why. Landing on the " +
 		"same narrow target a third time is a wrong answer even when your reasoning for it is sound.\n\n" +
@@ -815,8 +839,12 @@ func brainstormGoalProject(slugs []string, repoStateCtx string, guidance string,
 		"proposing. See the `tatara-code-quality-proposal` skill.\n\n" +
 		stateBlock + "\n\n" +
 		"EARLY EXIT (do this FIRST, cheaply): scan the ISSUES / OPEN MRs / MAIN HEALTH state above. If nothing clears " +
-		"the bar for a genuinely novel, high-leverage proposal this cycle, emit " +
-		"`submit_outcome(action=skip, reason=...)` and STOP. Silence over noise.\n\n" +
+		"the bar for a genuinely novel, high-leverage proposal THIS cycle but the idea space is not dry, emit " +
+		"`submit_outcome(action=skip, reason=...)` and STOP - expect something next time. If instead you have " +
+		"re-derived that there is nothing worth proposing until the project itself moves, emit " +
+		"`submit_outcome(action=exhausted, reason=...)` and STOP: this PAUSES brainstorming for the project " +
+		"until a real change lands, so use it only when you mean it to hold, not merely for this cycle. " +
+		"Silence over noise.\n\n" +
 		"NEW-IDEAS-ONLY CONTRACT - follow exactly ONE path:\n" +
 		"1. If the best idea DUPLICATES an existing open issue above: do NOT propose. Finish with a one-line note " +
 		"naming the duplicate. Do NOT comment on it.\n" +
@@ -1109,46 +1137,6 @@ func (r *ProjectReconciler) inflightRefineTask(ctx context.Context, proj *tatara
 	return nil, nil
 }
 
-// latestTerminalRefineTask returns the most recently created terminal refine
-// Task for the project that was created at/after since (the current cycle's
-// due-base), or nil if none exist. Scoping to since prevents a terminal
-// refine Task from a past cycle (still around because TaskRetention has not
-// GC'd it yet) from satisfying the barrier for every cycle until it expires;
-// each brainstorm cycle must be satisfied by a refine Task from that cycle.
-func (r *ProjectReconciler) latestTerminalRefineTask(ctx context.Context, proj *tatarav1alpha1.Project, since time.Time) (*tatarav1alpha1.Task, error) {
-	var list tatarav1alpha1.TaskList
-	if err := r.List(ctx, &list, client.InNamespace(proj.Namespace)); err != nil {
-		return nil, err
-	}
-	var latest *tatarav1alpha1.Task
-	for i := range list.Items {
-		t := &list.Items[i]
-		if t.Spec.ProjectRef != proj.Name || t.Spec.Kind != "refine" {
-			continue
-		}
-		if !tatarav1alpha1.TaskDone(t) {
-			continue
-		}
-		if t.CreationTimestamp.Time.Before(since) {
-			continue
-		}
-		if latest == nil || t.CreationTimestamp.After(latest.CreationTimestamp.Time) {
-			latest = t
-		}
-	}
-	return latest, nil
-}
-
-// refineNeededThisCycle reports whether the project needs a refine run this
-// cycle. Returns true when LastRefine is nil or was set before the earliest
-// due-activity base time (meaning the refine stamp predates the current cycle).
-func (r *ProjectReconciler) refineNeededThisCycle(proj *tatarav1alpha1.Project, earliestDueBase time.Time) bool {
-	if proj.Status.LastRefine == nil {
-		return true
-	}
-	return proj.Status.LastRefine.Before(&metav1.Time{Time: earliestDueBase})
-}
-
 // stampRefine records LastRefine on the project status.
 func (r *ProjectReconciler) stampRefine(ctx context.Context, proj *tatarav1alpha1.Project) error {
 	now := metav1.Now()
@@ -1278,17 +1266,23 @@ func (r *ProjectReconciler) publishNextExpected(proj *tatarav1alpha1.Project, re
 		}
 	}
 
-	if c.Brainstorm.Enabled {
-		if next, ok := nextExpectedUnix(proj, c.Brainstorm.Schedule, proj.Status.LastBrainstorm); ok {
-			obs.SweepNextExpectedTimestamp.WithLabelValues(proj.Name, "brainstorm").Set(next)
+	// Brainstorm is DEMAND-DRIVEN: it has no schedule, so there is no "next
+	// expected run" to publish and the sweep-heartbeat alert must never see one.
+	// Retracted UNCONDITIONALLY rather than left to fall out of an empty
+	// Schedule, so a stale schedule left in a Project's values cannot resurrect
+	// a series whose consumer (time() - next_expected) would page forever on a
+	// correctly-paused project.
+	obs.SweepNextExpectedTimestamp.DeleteLabelValues(proj.Name, "brainstorm")
+
+	if c.Refine.Schedule != "" {
+		if next, ok := nextExpectedUnix(proj, c.Refine.Schedule, proj.Status.LastRefine); ok {
+			obs.SweepNextExpectedTimestamp.WithLabelValues(proj.Name, "refine").Set(next)
 		} else {
-			obs.SweepNextExpectedTimestamp.DeleteLabelValues(proj.Name, "brainstorm")
-			if c.Brainstorm.Schedule != "" {
-				obs.SweepErrorsTotal.WithLabelValues(proj.Name, "brainstorm", "invalid_cron").Inc()
-			}
+			obs.SweepNextExpectedTimestamp.DeleteLabelValues(proj.Name, "refine")
+			obs.SweepErrorsTotal.WithLabelValues(proj.Name, "refine", "invalid_cron").Inc()
 		}
 	} else {
-		obs.SweepNextExpectedTimestamp.DeleteLabelValues(proj.Name, "brainstorm")
+		obs.SweepNextExpectedTimestamp.DeleteLabelValues(proj.Name, "refine")
 	}
 
 	if doc := proj.Spec.Documentation; doc != nil && doc.Enabled && doc.Repo != "" {
@@ -1376,6 +1370,9 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 	if proj.Status.LastDocumentation != nil {
 		obs.SweepLastSuccessTimestamp.WithLabelValues(proj.Name, "documentation").Set(float64(proj.Status.LastDocumentation.Unix()))
 	}
+	if proj.Status.LastRefine != nil {
+		obs.SweepLastSuccessTimestamp.WithLabelValues(proj.Name, "refine").Set(float64(proj.Status.LastRefine.Unix()))
+	}
 
 	cronSpec := proj.Spec.Scm.Cron
 	now := time.Now()
@@ -1441,109 +1438,54 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 		}
 	}
 
-	// brainstorm (opt-in), gated by the refine pre-scan barrier: a due
-	// brainstorm tick first ensures the project refiner has run this cycle
-	// (grooming the backlog + handoffs) before brainstorm executes. "This
-	// cycle" = LastRefine is nil or precedes the brainstorm due-base time. The
-	// barrier defers ONLY brainstorm - mrScan/issueScan/healthCheck run on
-	// their own schedules regardless. Both Succeeded and Failed refine release
-	// the gate so a broken refine never wedges brainstorm.
+	// refine (opt-in cron): periodic backlog grooming - closing duplicates and
+	// already-implemented proposals, tightening scope, splitting too-broad
+	// issues, filing followups. The terminal sink the proposal lifecycle
+	// otherwise lacks.
 	//
-	// O6 REVIEW, Important 1: this refine barrier runs UNCONDITIONALLY of the
-	// eventual refill decision - it fires (and, when needed, mints a refine
-	// Task) the moment the brainstorm schedule is due, BEFORE brainstorm() is
-	// even called below, so it never learns nor cares whether the backlog
-	// still has a deficit. That independence is load-bearing now that O6's
-	// event-driven refill path exists: the event path deliberately BYPASSES
-	// this barrier entirely (re-running refine per maintainer verdict was
-	// rejected as too expensive - approved design, not an oversight), which
-	// means the CRON tick above is refine's ONLY trigger. If this barrier were
-	// ever made conditional on brainstorm's own deficit (e.g. skipped
-	// whenever the event path has already kept the project at target),
-	// refine would silently stop running for any healthy, well-served
-	// project - see TestRefineBarrierRunsEvenWhenBrainstormBacklogIsAtTarget,
-	// which pins exactly this: a refine Task still gets created on a due cron
-	// tick even with TargetOpenProposals=0, where brainstorm() can never
-	// decide to refill.
-	if cronSpec.Brainstorm.Enabled {
-		if base, due, next, ok := r.activityDue(proj, "brainstorm"); ok {
+	// It used to be a PRE-SCAN BARRIER on the brainstorm cron tick, which made
+	// activityDue(proj, "brainstorm") its only production trigger. Brainstorm is
+	// demand-driven now and has no cron at all, so the barrier had nothing left
+	// to hang off. Refine keeps a cron because it is genuinely periodic work;
+	// what it loses is the hold, the release valve and the coupling. Nothing
+	// waits on refine any more, so refine_barrier_held, refine_barrier_timeout
+	// and requeueRefineBarrier are gone with it.
+	if cronSpec.Refine.Schedule != "" {
+		if _, due, next, ok := r.activityDue(proj, "refine"); ok {
 			if due {
-				proceed := true
-				if r.refineNeededThisCycle(proj, base) {
-					terminal, terr := r.latestTerminalRefineTask(ctx, proj, base)
-					if terr != nil {
-						l.Error(terr, "scan: check terminal refine task", "action", "scan_refine_error", "resource_id", proj.Name)
-						obs.SweepErrorsTotal.WithLabelValues(proj.Name, "brainstorm", "refine_check_failed").Inc()
+				// One refine Task at a time per project. A tick that lands while a
+				// refine is still running stamps and moves on rather than queueing a
+				// second: the next tick will find the lane free.
+				inflight, ierr := r.inflightRefineTask(ctx, proj)
+				if ierr != nil {
+					l.Error(ierr, "scan: check inflight refine task",
+						"action", "scan_refine_error", "resource_id", proj.Name)
+					obs.SweepErrorsTotal.WithLabelValues(proj.Name, "refine", "refine_inflight_check_failed").Inc()
+				} else if inflight == nil {
+					slugs := r.projectRepoSlugs(ctx, proj, repos)
+					lookback := cronSpec.Refine.ClosedLookbackDays
+					if lookback <= 0 {
+						lookback = 30
 					}
-					if terminal != nil {
-						// Stamp LastRefine and fall through to brainstorm.
-						if serr := r.stampRefine(ctx, proj); serr != nil {
-							l.Error(serr, "scan: stamp LastRefine failed", "action", "scan_stamp_error", "resource_id", proj.Name, "activity", "refine")
-						}
-					} else {
-						// Check or create an in-flight refine task.
-						inflight, ierr := r.inflightRefineTask(ctx, proj)
-						if ierr != nil {
-							l.Error(ierr, "scan: check inflight refine task", "action", "scan_refine_error", "resource_id", proj.Name)
-							obs.SweepErrorsTotal.WithLabelValues(proj.Name, "brainstorm", "refine_inflight_check_failed").Inc()
-						}
-						if inflight == nil {
-							slugs := r.projectRepoSlugs(ctx, proj, repos)
-							lookback := cronSpec.Refine.ClosedLookbackDays
-							if lookback <= 0 {
-								lookback = 30
-							}
-							goal := refine.GoalProject(slugs, lookback)
-							_, _ = r.createRefineTask(ctx, proj, goal)
-						}
-						// Release valve (issue #401): a refine Task that never reaches a
-						// terminal stage must not wedge brainstorm - and the LastBrainstorm
-						// heartbeat behind it - forever. Past the max hold, proceed anyway;
-						// the stuck refine Task is left for the reaper/on-call, surfaced by
-						// the metric+log below.
-						held := now.Sub(base)
-						if held > requeueRefineBarrierMaxHold {
-							l.Info("scan: brainstorm refine barrier max-hold exceeded; releasing",
-								"action", "scan_refine_barrier_timeout", "resource_id", proj.Name,
-								"held_duration", held.String())
-							obs.SweepErrorsTotal.WithLabelValues(proj.Name, "brainstorm", "refine_barrier_timeout").Inc()
-						} else {
-							// Defer brainstorm until refine is terminal; poll at the barrier cadence.
-							l.Info("scan: brainstorm deferred by refine barrier",
-								"action", "scan_brainstorm_refine_barrier_held", "resource_id", proj.Name,
-								"held_duration", held.String())
-							obs.SweepErrorsTotal.WithLabelValues(proj.Name, "brainstorm", "refine_barrier_held").Inc()
-							proceed = false
-							consider(now.Add(requeueRefineBarrier))
-						}
-					}
+					_, _ = r.createRefineTask(ctx, proj, refine.GoalProject(slugs, lookback))
 				}
-				if proceed {
-					r.brainstorm(ctx, proj, reader, repos, existing, cronSpec.Brainstorm, TriggerCron)
-					// The cron tick is the ONLY thing that re-enables the event-driven
-					// refill path after the skip breaker trips. Reset unconditionally,
-					// refill or not: a dry spell must cost one session per cron period,
-					// never wedge brainstorm permanently.
-					if rerr := r.resetBrainstormSkips(ctx, proj); rerr != nil {
-						l.Error(rerr, "scan: reset brainstorm skip breaker",
-							"action", "scan_stamp_error", "resource_id", proj.Name, "activity", "brainstorm")
-						obs.SweepErrorsTotal.WithLabelValues(proj.Name, "brainstorm", "skip_reset_failed").Inc()
-					}
-					if serr := r.stampScan(ctx, proj, "brainstorm"); serr != nil {
-						l.Error(serr, "scan: persist brainstorm stamp failed",
-							"action", "scan_stamp_error", "resource_id", proj.Name, "activity", "brainstorm")
-						obs.SweepErrorsTotal.WithLabelValues(proj.Name, "brainstorm", "stamp_failed").Inc()
-					}
-					if next2, ok2 := activityNextFire(cronSpec.Brainstorm.Schedule, now); ok2 {
-						consider(next2)
-					}
+				// Stamp on the TICK, not on terminal completion, matching every other
+				// cron activity here: the stamp advances the schedule, and a refine
+				// Task that never terminates must not refire the cron every pass.
+				if serr := r.stampRefine(ctx, proj); serr != nil {
+					l.Error(serr, "scan: persist refine stamp failed",
+						"action", "scan_stamp_error", "resource_id", proj.Name, "activity", "refine")
+					obs.SweepErrorsTotal.WithLabelValues(proj.Name, "refine", "stamp_failed").Inc()
+				}
+				if next2, ok2 := activityNextFire(cronSpec.Refine.Schedule, now); ok2 {
+					consider(next2)
 				}
 			} else {
 				consider(next)
 			}
-		} else if cronSpec.Brainstorm.Schedule != "" {
-			l.Error(fmt.Errorf("invalid cron %q", cronSpec.Brainstorm.Schedule), "scan: invalid brainstorm cron, disabling",
-				"action", "scan_cron_invalid", "resource_id", proj.Name, "activity", "brainstorm")
+		} else {
+			l.Error(fmt.Errorf("invalid cron %q", cronSpec.Refine.Schedule), "scan: invalid refine cron, disabling",
+				"action", "scan_cron_invalid", "resource_id", proj.Name, "activity", "refine")
 			// invalid_cron is metered once per tick by publishNextExpected (deferred above).
 		}
 	}

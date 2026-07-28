@@ -100,17 +100,18 @@ var sweepSeedReasons = []string{
 	"get_owning_task", "get_mr_cr", "adopt_pr", "mint_review_task",
 }
 
-// scanSeedReasons is the second closed reason set, for projectscan.go's cron
-// activities (issue #401's refine-barrier stall fix). Cross-seeded for all three
-// activities even though refine_barrier_* / refine_*_check_failed only ever fire
-// for brainstorm (the refine pre-scan barrier is brainstorm-only) - a
-// permanently-zero series for documentation/issueScan on those reasons is a
-// harmless baseline, and one seedLabels call is simpler than splitting the cross
-// product per-activity.
-var scanSeedReasons = []string{
-	"refine_barrier_held", "refine_check_failed", "refine_inflight_check_failed",
-	"invalid_cron", "stamp_failed", "refine_barrier_timeout",
-}
+// cronReasons/refineReasons are the closed reason sets for projectscan.go's
+// cron activities, split per-activity (Task 3, refine re-homing) rather than
+// cross-seeded: brainstorm has no cron of its own any more (demand-driven,
+// event path only, so only stamp_failed can ever fire on it), issueScan and
+// documentation share the plain cron shape (invalid_cron, stamp_failed), and
+// refine is now the ONE activity with its own inflight-dedup check, so it
+// alone carries refine_inflight_check_failed. The old barrier-era
+// refine_barrier_held/refine_barrier_timeout/refine_check_failed reasons are
+// gone with the barrier itself - keeping them seeded would leave permanently
+// dead series with no producer left anywhere in the codebase.
+var cronReasons = []string{"invalid_cron", "stamp_failed"}
+var refineReasons = []string{"invalid_cron", "stamp_failed", "refine_inflight_check_failed"}
 
 // SeedSweepErrorsForProject pre-seeds the closed (activity x reason) label set of
 // SweepErrorsTotal for ONE project, so a healthy sweep with zero errors still
@@ -122,7 +123,7 @@ var scanSeedReasons = []string{
 // This used to run in init(). It cannot any more: `project` joined the label set
 // in issue #441 and project names are not known at process start. The Project
 // reconciler calls this on every pass; WithLabelValues returns the existing child
-// for an already-seeded combination, so it is idempotent and cheap (44 map
+// for an already-seeded combination, so it is idempotent and cheap (21 map
 // lookups per Project per reconcile).
 func SeedSweepErrorsForProject(project string) {
 	seed := func(l ...string) { SweepErrorsTotal.WithLabelValues(l...) }
@@ -134,7 +135,9 @@ func SeedSweepErrorsForProject(project string) {
 	// fire - 13 wasted series process-wide before this branch, 13 per Project
 	// after it labelled the metric by project.
 	seedLabels(seed, []string{project}, []string{"sweep"}, sweepSeedReasons)
-	seedLabels(seed, []string{project}, []string{"brainstorm", "documentation", "issueScan"}, scanSeedReasons)
+	seedLabels(seed, []string{project}, []string{"brainstorm"}, []string{"stamp_failed"})
+	seedLabels(seed, []string{project}, []string{"documentation", "issueScan"}, cronReasons)
+	seedLabels(seed, []string{project}, []string{"refine"}, refineReasons)
 }
 
 func init() {

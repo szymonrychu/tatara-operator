@@ -84,7 +84,9 @@ Open, out of scope, deliberately not done:
   `targetOpenProposals` backlog the controller refills on a maintainer verdict, not a cron cap -
   `deficit = max(0, target - pending - inflight)`, pending counted from Issue CRs
   (`Spec.ProposalKind`), never a live SCM label; new `ProjectReconciler.Watches(&Issue{})` event
-  trigger + 15m cron backstop with a consecutive-skip circuit breaker; a refill Task carries a
+  trigger + 15m cron backstop with a consecutive-skip circuit breaker (HISTORY: the breaker and
+  brainstorm's own cron trigger were both retired by the `demand-driven-brainstorm` branch -
+  demand-driven refill plus a durable cooldown gate replaced them, see `MEMORY.md`); a refill Task carries a
   quota annotation `submit_outcome` truncates to (clamped `[1,5]`); brainstorm pod turn-0 bundle
   gains a `<proposal_history>` block rendered from the Issue CR mirror; a declined proposal's
   mirror is retained (not deleted) under a dedicated 14-day `DeclinedProposalRetention`, distinct

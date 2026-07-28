@@ -50,8 +50,8 @@ type OperatorMetrics struct {
 	openProposals                 *prometheus.GaugeVec
 	brainstormTarget              *prometheus.GaugeVec
 	brainstormPending             *prometheus.GaugeVec
+	brainstormPaused              *prometheus.GaugeVec
 	brainstormRefillTotal         *prometheus.CounterVec
-	brainstormBreakerTripTotal    *prometheus.CounterVec
 	brainstormQuotaTruncatedTotal *prometheus.CounterVec
 	turnTimeoutTotal              *prometheus.CounterVec
 	ingestJobTotal                *prometheus.CounterVec
@@ -193,13 +193,13 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_brainstorm_pending_proposals",
 			Help: "Brainstorm proposals open and awaiting a maintainer decision per project, counted from Issue CRs with systemic groups collapsed to one slot. NOT the same as operator_open_proposals{repo}, which is the uncollapsed per-repo split.",
 		}, []string{"project"}),
+		brainstormPaused: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "operator_brainstorm_paused",
+			Help: "1 while a project's brainstorm is paused on an action=exhausted verdict (Status.BrainstormPausedAt set), 0 otherwise. The only metric-level signal for a project paused and never resuming - pair with operator_brainstorm_pending_proposals staying flat.",
+		}, []string{"project"}),
 		brainstormRefillTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_brainstorm_refill_total",
-			Help: "Brainstorm refills dispatched, by trigger (event = a maintainer verdict landed on a proposal Issue; cron = the schedule backstop).",
-		}, []string{"project", "trigger"}),
-		brainstormBreakerTripTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "operator_brainstorm_breaker_trip_total",
-			Help: "Times the consecutive-skip circuit breaker suppressed an event-driven refill. A rising value means the idea space is proven dry; the cron tick resets it.",
+			Help: "Brainstorm refills dispatched per project. The trigger label is gone: the cron tick and the event wake now run the same level-triggered decision.",
 		}, []string{"project"}),
 		brainstormQuotaTruncatedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_brainstorm_quota_truncated_total",
@@ -499,8 +499,8 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.openProposals,
 		m.brainstormTarget,
 		m.brainstormPending,
+		m.brainstormPaused,
 		m.brainstormRefillTotal,
-		m.brainstormBreakerTripTotal,
 		m.brainstormQuotaTruncatedTotal,
 		m.turnTimeoutTotal,
 		m.ingestJobTotal,
@@ -943,31 +943,25 @@ func (m *OperatorMetrics) SetBrainstormPending(project string, n float64) {
 	m.brainstormPending.WithLabelValues(project).Set(n)
 }
 
-// BrainstormRefill counts one dispatched refill by trigger (event|cron).
-func (m *OperatorMetrics) BrainstormRefill(project, trigger string) {
+// SetBrainstormPaused sets operator_brainstorm_paused for a project: 1 while
+// paused on an action=exhausted verdict, 0 otherwise.
+func (m *OperatorMetrics) SetBrainstormPaused(project string, paused bool) {
 	if m == nil {
 		return
 	}
-	m.brainstormRefillTotal.WithLabelValues(project, trigger).Inc()
+	v := 0.0
+	if paused {
+		v = 1.0
+	}
+	m.brainstormPaused.WithLabelValues(project).Set(v)
 }
 
-// BrainstormBreakerTrip counts one skip-breaker TRIP: the consecutive-skip
-// counter crossing its configured threshold. Call this only at the crossing,
-// never on every pass the breaker stays tripped - the latter is "is tripped",
-// not "trips", and is useless for alerting (a monotonic counter that never
-// stops climbing while healthy-but-dry looks identical to one climbing
-// because something is actually wrong).
-func (m *OperatorMetrics) BrainstormBreakerTrip(project string) {
+// BrainstormRefill counts one dispatched refill.
+func (m *OperatorMetrics) BrainstormRefill(project string) {
 	if m == nil {
 		return
 	}
-	m.brainstormBreakerTripTotal.WithLabelValues(project).Inc()
-}
-
-// BrainstormBreakerTripCounter returns the counter for project for test
-// assertions.
-func (m *OperatorMetrics) BrainstormBreakerTripCounter(project string) prometheus.Counter {
-	return m.brainstormBreakerTripTotal.WithLabelValues(project)
+	m.brainstormRefillTotal.WithLabelValues(project).Inc()
 }
 
 // BrainstormQuotaTruncated counts proposals dropped by quota truncation.

@@ -452,12 +452,6 @@ type BrainstormActivity struct {
 	// DefaultHistoryWindow. An explicit 0 omits the block.
 	// +optional
 	HistoryWindow *int `json:"historyWindow,omitempty"`
-	// MaxConsecutiveSkips is the circuit-breaker threshold. After this many
-	// consecutive brainstorm sessions ending in action=skip, the EVENT-driven
-	// refill path is suppressed until a cron tick resets the counter. Unset uses
-	// DefaultMaxConsecutiveSkips. An explicit 0 means the breaker never trips.
-	// +optional
-	MaxConsecutiveSkips *int `json:"maxConsecutiveSkips,omitempty"`
 	// StaleProposalDays configures the staleness reaper that auto-closes
 	// bot-authored proposals with no human engagement (no human comment, no live
 	// work) for at least that many days, clearing dead proposals out of the
@@ -471,6 +465,22 @@ type BrainstormActivity struct {
 	// +kubebuilder:validation:items:Enum=docs;memory;internet
 	// +optional
 	Sources []string `json:"sources,omitempty"`
+	// MinSessionIntervalMinutes floors the wall-clock gap between two
+	// brainstorm SESSIONS for this project, regardless of which path
+	// dispatched the prior one (a due cron tick or the event-driven wake).
+	// This is a RATE LIMIT, not a breaker: it only delays a refill until the
+	// floor has elapsed, it never suppresses one permanently and it never
+	// inspects why the prior session ended (a skip and a propose are throttled
+	// identically). It exists because a skip files no Issue, so the backlog
+	// deficit the event-driven wake reacts to stays positive and the wake
+	// fires again immediately - with no floor, the only remaining brake was
+	// the LLM's own `exhausted` judgment call, which must not be the sole
+	// defense against a busy-loop. Semantics mirror StaleProposalDays: a
+	// POSITIVE value sets an explicit floor in minutes; the UNSET default (0)
+	// enables the floor at DefaultBrainstormMinSessionIntervalMinutes; a
+	// NEGATIVE value is the explicit opt-out that disables the floor entirely.
+	// +optional
+	MinSessionIntervalMinutes int `json:"minSessionIntervalMinutes,omitempty"`
 }
 
 // Brainstorm backlog defaults. They live here, not at the kubebuilder-default
@@ -480,12 +490,16 @@ type BrainstormActivity struct {
 const (
 	DefaultTargetOpenProposals = 3
 	DefaultHistoryWindow       = 20
-	DefaultMaxConsecutiveSkips = 3
 	// MaxProposalsPerOutcome mirrors the submit_outcome schema ceiling enforced
 	// in internal/restapi/outcome.go. The quota is clamped to it so a large
 	// targetOpenProposals cannot instruct an obedient agent to emit a payload
 	// the operator will refuse with a 400.
 	MaxProposalsPerOutcome = 5
+	// DefaultBrainstormMinSessionIntervalMinutes is the floor MinSessionIntervalMinutes
+	// resolves to when unset: generous enough that a healthy project refills at most
+	// a few times an hour, finite enough that a genuinely short backlog still drains
+	// promptly. See MinSessionIntervalMinutes for the full rationale.
+	DefaultBrainstormMinSessionIntervalMinutes = 12
 )
 
 // ResolveTarget resolves the backlog target: the explicit field, else the
@@ -510,16 +524,30 @@ func (a BrainstormActivity) ResolveHistoryWindow() int {
 	return DefaultHistoryWindow
 }
 
-// ResolveMaxConsecutiveSkips resolves the breaker threshold. 0 disables it.
-func (a BrainstormActivity) ResolveMaxConsecutiveSkips() int {
-	if a.MaxConsecutiveSkips != nil {
-		return max(*a.MaxConsecutiveSkips, 0)
+// ResolveMinSessionInterval resolves the floor between two brainstorm
+// sessions. Semantics mirror StaleProposalDays: positive is an explicit
+// floor, zero (unset) is the default floor, negative disables it (0
+// duration, i.e. no gate).
+func (a BrainstormActivity) ResolveMinSessionInterval() time.Duration {
+	switch {
+	case a.MinSessionIntervalMinutes > 0:
+		return time.Duration(a.MinSessionIntervalMinutes) * time.Minute
+	case a.MinSessionIntervalMinutes < 0:
+		return 0
+	default:
+		return DefaultBrainstormMinSessionIntervalMinutes * time.Minute
 	}
-	return DefaultMaxConsecutiveSkips
 }
 
-// RefineActivity configures the cron-cycle refiner pre-step.
+// RefineActivity configures the periodic project refiner. It is NOT a
+// brainstorm pre-step any more: brainstorm is demand-driven and has no cron to
+// hang a barrier off, so refine carries its own schedule. Grooming the backlog
+// is genuinely periodic work; refilling it is not.
 type RefineActivity struct {
+	// Schedule is a 5-field cron (robfig ParseStandard). Empty disables refine.
+	// +kubebuilder:validation:Pattern=`^$|^(\S+\s+){4}\S+$`
+	// +optional
+	Schedule string `json:"schedule,omitempty"`
 	// ClosedLookbackDays bounds how far back closed issues are loaded for
 	// already-implemented detection. Default 30 when zero.
 	// +optional
@@ -539,8 +567,9 @@ type ScmCron struct {
 	// Schedule disables it.
 	// +optional
 	Documentation CronActivity `json:"documentation,omitempty"`
-	// Refine configures the project-refiner pre-step. No schedule: refine fires
-	// off the existing scan cadence as a mandatory barrier before scans/brainstorm.
+	// Refine configures the periodic project refiner. It has its OWN cron
+	// (RefineActivity.Schedule) - it is not a pre-scan barrier and does not
+	// piggyback on any other activity's cadence. Empty Schedule disables it.
 	// +optional
 	Refine RefineActivity `json:"refine,omitempty"`
 }
@@ -1089,14 +1118,35 @@ type ProjectStatus struct {
 	// project. Computed on reconcile.
 	// +optional
 	OpenIncidentsCount int `json:"openIncidentsCount,omitempty"`
-	// BrainstormConsecutiveSkips counts brainstorm sessions that ended in
-	// action=skip back to back. action=propose resets it to 0; a cron tick
-	// resets it to 0. At BrainstormActivity.ResolveMaxConsecutiveSkips() the
-	// EVENT-driven refill path is suppressed - the liveness brake that stops
-	// skip -> deficit unchanged -> reconcile -> spawn -> skip burning pods on a
-	// proven-dry idea space.
+	// BrainstormPausedAt is set when a brainstorm agent reports the idea space is
+	// exhausted. While set, no brainstorm session is scheduled for this project.
 	// +optional
-	BrainstormConsecutiveSkips int `json:"brainstormConsecutiveSkips,omitempty"`
+	BrainstormPausedAt *metav1.Time `json:"brainstormPausedAt,omitempty"`
+	// BrainstormPauseReason carries the agent's verbatim reason, for the operator
+	// to read without opening the Task.
+	// +optional
+	BrainstormPauseReason string `json:"brainstormPauseReason,omitempty"`
+	// LastMovementAt records the last time ANY brainstorm-resume trigger fired
+	// for this project (push, merge, maintainer-comment, maintainer-close,
+	// manual), stamped UNCONDITIONALLY - regardless of whether brainstorm was
+	// paused at the time (I3 fix round).
+	//
+	// This is deliberately NOT the same signal as the AnnBrainstormResume
+	// annotation, which StampBrainstormResume only ever writes on a project
+	// that IS ALREADY paused (the reconcile's clearBrainstormPauseIfRequested
+	// is its single consumer, and annotating an unpaused project would be an
+	// unconditional write per webhook delivery for no scheduling effect). That
+	// left a gap: a merge/push/maintainer trigger landing WHILE a brainstorm
+	// session was in flight for a project that was NOT YET paused was silently
+	// discarded, so the session's own eventual exhausted verdict could pause a
+	// project that had already moved - the OPPOSITE of the design's intended
+	// fail direction ("over-resumes rather than under-resumes"). The exhausted
+	// outcome handler (internal/restapi/outcome.go) compares this field
+	// against the session's own Task start time and refuses the pause when
+	// movement is newer, so the annotation path stays paused-only while this
+	// field is always live for that comparison.
+	// +optional
+	LastMovementAt *metav1.Time `json:"lastMovementAt,omitempty"`
 }
 
 // ScanMark records the last GitHub activity timestamp the issue/PR scan has

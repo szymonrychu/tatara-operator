@@ -1386,66 +1386,94 @@ func brainstormQuota(task *tatarav1alpha1.Task) int {
 	return min(max(n, 1), tatarav1alpha1.MaxProposalsPerOutcome)
 }
 
-// brainstormMaxConsecutiveSkips resolves the breaker threshold from a Project,
-// nil-safe against both spec.scm and spec.scm.cron being unset (mirrors
-// brainstormCronSpec in internal/controller/project_issue_watch.go, which this
-// package cannot call directly since it is unexported across the package
-// boundary).
-func brainstormMaxConsecutiveSkips(proj *tatarav1alpha1.Project) int {
-	if proj.Spec.Scm == nil || proj.Spec.Scm.Cron == nil {
-		return 0
-	}
-	return proj.Spec.Scm.Cron.Brainstorm.ResolveMaxConsecutiveSkips()
+// stampBrainstormPause records the agent's exhausted verdict on the Project.
+// The reason is stored VERBATIM and never parsed: it exists for a human reading
+// `kubectl get project -o yaml`, not for any control flow. Clearing is the
+// Project reconcile's job (internal/controller, AnnBrainstormResume), never
+// this handler's - except for the propose path below, where the session just
+// PROVED the idea space is not exhausted.
+//
+// sessionStart is this brainstorm session's own Task entering StageBrainstorming
+// (o.task.Status.StageEnteredAt, the "clock for the POD-LESS stages" per its
+// own doc comment - the closest thing a Task has to "when this session
+// started"). It is compared against Project.Status.LastMovementAt inside
+// setBrainstormPause's retry loop (I3 fix round): see that function's comment
+// for why.
+func (s *Server) stampBrainstormPause(ctx context.Context, projName, reason string, sessionStart time.Time) error {
+	return s.setBrainstormPause(ctx, projName, &reason, sessionStart)
 }
 
-// bumpBrainstormSkips adds one to Project.status.brainstormConsecutiveSkips, or
-// resets it to 0 when reset is true. action=skip increments; action=propose
-// resets. The counter is what suppresses the event-driven refill on a
-// proven-dry idea space; the cron tick also clears it (resetBrainstormSkips in
-// internal/controller), which is the liveness guarantee for a project that
-// never gets another maintainer verdict to trigger a propose-side reset.
+// clearBrainstormPause is stampBrainstormPause's inverse, used by the propose
+// path. Both funnel through setBrainstormPause so the conflict-retry and the
+// no-op short circuit exist once. sessionStart is irrelevant on the clear
+// path (nothing to refuse), so it passes the zero value.
+func (s *Server) clearBrainstormPause(ctx context.Context, projName string) error {
+	return s.setBrainstormPause(ctx, projName, nil, time.Time{})
+}
+
+// setBrainstormPause is the single funnel for both stampBrainstormPause and
+// clearBrainstormPause.
 //
-// This is the ONLY place BrainstormConsecutiveSkips is ever incremented, which
-// makes it the only place a genuine breaker TRIP (the counter crossing its
-// threshold) can be told apart from "the breaker is still tripped" - the
-// reconcile loop in internal/controller re-evaluates the already-tripped state
-// on every event-triggered pass and would over-count a naive per-pass counter.
-// BrainstormBreakerTrip therefore fires here, exactly once per crossing, after
-// a successful commit (not inside the retry closure before Update, which would
-// double-count a conflict-retried attempt).
-func (s *Server) bumpBrainstormSkips(ctx context.Context, projName string, reset bool) error {
+// THE FAIL DIRECTION (I3 fix round). The design spec's intended fail
+// direction is "over-resumes rather than under-resumes" (see
+// ResumeBrainstormOnPush's own comment, same precedent). StampBrainstormResume
+// (internal/controller/brainstorm_resume.go) used to early-return on an
+// UNPAUSED project, so a merge/push/maintainer trigger landing WHILE a
+// brainstorm session was in flight - before this exhausted verdict ever
+// landed - was silently discarded: the session's own eventual exhausted
+// verdict then paused a project that had ALREADY moved, and it stayed paused
+// until the next qualifying event - the OPPOSITE of the intended direction.
+// StampBrainstormResume now stamps Status.LastMovementAt UNCONDITIONALLY,
+// whether or not the project was paused, so that signal survives regardless.
+// Read fresh inside the retry loop (never from a caller-held snapshot, which
+// could itself be stale by the time this write lands): if it is newer than
+// sessionStart, the project moved out from under this verdict before it was
+// ever submitted, so the pause is refused entirely - not stamped and then
+// immediately resumed, which would cost a real session for nothing. The
+// caller's Task commit still proceeds; refusing the pause is not refusing the
+// outcome.
+func (s *Server) setBrainstormPause(ctx context.Context, projName string, reason *string, sessionStart time.Time) error {
 	key := types.NamespacedName{Namespace: s.ns, Name: projName}
-	tripped := false
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		tripped = false
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var proj tatarav1alpha1.Project
 		if err := s.c.Get(ctx, key, &proj); err != nil {
-			return fmt.Errorf("bump brainstorm skips: get project %s: %w", projName, err)
+			return fmt.Errorf("set brainstorm pause: get project %s: %w", projName, err)
 		}
-		if reset {
-			if proj.Status.BrainstormConsecutiveSkips == 0 {
+		if reason == nil {
+			if proj.Status.BrainstormPausedAt == nil && proj.Status.BrainstormPauseReason == "" {
 				return nil
 			}
-			proj.Status.BrainstormConsecutiveSkips = 0
+			proj.Status.BrainstormPausedAt = nil
+			proj.Status.BrainstormPauseReason = ""
 		} else {
-			proj.Status.BrainstormConsecutiveSkips++
-			if maxSkips := brainstormMaxConsecutiveSkips(&proj); maxSkips > 0 &&
-				proj.Status.BrainstormConsecutiveSkips == maxSkips {
-				tripped = true
+			if proj.Status.LastMovementAt != nil && proj.Status.LastMovementAt.After(sessionStart) {
+				return nil
 			}
+			now := metav1.NewTime(s.now())
+			proj.Status.BrainstormPausedAt = &now
+			proj.Status.BrainstormPauseReason = *reason
 		}
 		if err := s.c.Status().Update(ctx, &proj); err != nil {
-			return fmt.Errorf("bump brainstorm skips: update project %s: %w", projName, err)
+			return fmt.Errorf("set brainstorm pause: update project %s: %w", projName, err)
 		}
 		return nil
 	})
-	if err != nil {
-		return err
+}
+
+// brainstormSessionStart resolves the brainstorm Task's own session start,
+// for setBrainstormPause's movement comparison (I3 fix round). StageEnteredAt
+// is "the clock for the POD-LESS stages" (task_types.go's own doc comment) -
+// stamped on EVERY stage transition, including the entry into
+// StageBrainstorming that begins this session - so it is the closest thing a
+// Task has to "when this session started". Falls back to the Task's own
+// CreationTimestamp on the (should-never-happen) chance StageEnteredAt is
+// unset, rather than the zero time: the zero time would make EVERY movement
+// ever recorded read as "after sessionStart" and refuse the pause forever.
+func brainstormSessionStart(task *tatarav1alpha1.Task) time.Time {
+	if task.Status.StageEnteredAt != nil {
+		return task.Status.StageEnteredAt.Time
 	}
-	if tripped {
-		s.metrics.BrainstormBreakerTrip(projName)
-	}
-	return nil
+	return task.CreationTimestamp.Time
 }
 
 func (o *outcomeCtx) brainstorm(p brainstormPayload) {
@@ -1468,37 +1496,55 @@ func (o *outcomeCtx) brainstorm(p brainstormPayload) {
 				return
 			}
 		}
-	case "skip":
+	case "skip", "exhausted":
 		if strings.TrimSpace(p.Reason) == "" {
-			o.bad("action=skip requires a non-empty reason", "missing-field")
+			o.bad("action="+p.Action+" requires a non-empty reason", "missing-field")
 			return
 		}
 	default:
-		o.bad("action must be one of propose, skip", "bad-action")
+		o.bad("action must be one of propose, skip, exhausted", "bad-action")
 		return
 	}
 
-	if p.Action == "skip" {
-		// documentedBy stays EMPTY (fix 25): a cron brainstorm that correctly
-		// says "nothing novel" must not spawn a docs pod, a docs PR about
-		// nothing, a review, a merge and a release - every day.
+	if p.Action == "skip" || p.Action == "exhausted" {
+		// A skip stamps NOTHING: it is "nothing this cycle", it is transient, and
+		// it has no scheduling consequence at all. Only exhausted - "nothing worth
+		// proposing until the project moves" - pauses, and ONE is enough.
+		//
+		// THE PAUSE STAMP RUNS BEFORE THE COMMIT AND FAILS CLOSED (I1 fix round).
+		// It used to run best-effort AFTER the Task committed to Delivered: a
+		// failed write still returned 200, the Task was already terminal so
+		// nothing ever retried it, and the project fell straight back into C2's
+		// busy loop with the one brake that exists for it silently lost. Losing a
+		// pause costs the whole braking mechanism, unlike losing a skip's (deleted)
+		// counter increment, which cost nothing - so unlike a plain best-effort
+		// side write, this one must hold up the whole outcome: fail here, and the
+		// Task stays non-terminal so the agent's retry of this SAME idempotent
+		// outcome lands both halves together.
+		if p.Action == "exhausted" {
+			if err := s.stampBrainstormPause(ctx, o.proj.Name, p.Reason, brainstormSessionStart(o.task)); err != nil {
+				s.log.ErrorContext(ctx, "restapi: stamping the brainstorm pause failed; agent must retry",
+					append(reqLogFields(o.r), "task", o.task.Name, "project", o.proj.Name, "error", err)...)
+				writeError(o.w, http.StatusInternalServerError, "internal error")
+				return
+			}
+			s.log.InfoContext(ctx, "restapi: brainstorm paused on an exhausted verdict",
+				append(reqLogFields(o.r), "action", "brainstorm_paused", "task", o.task.Name,
+					"project", o.proj.Name, "reason", p.Reason)...)
+		}
+		// documentedBy stays EMPTY (fix 25): a brainstorm that correctly says
+		// "nothing novel" must not spawn a docs pod, a docs PR about nothing, a
+		// review, a merge and a release.
 		if !o.commit(func(t *tatarav1alpha1.Task) error {
 			if err := stage.Enter(t, nil, tatarav1alpha1.StageDelivered, "", s.now()); err != nil {
 				return err
 			}
-			agentNote(t, o.kind, "note", "skip: "+p.Reason, s.now())
+			agentNote(t, o.kind, "note", p.Action+": "+p.Reason, s.now())
 			return nil
 		}) {
 			return
 		}
-		// Best-effort: losing a whole agent session over a status-counter write
-		// is the wrong trade, so a failure here is logged, never surfaced to the
-		// agent as a failed outcome.
-		if err := s.bumpBrainstormSkips(ctx, o.proj.Name, false); err != nil {
-			s.log.ErrorContext(ctx, "restapi: bumping the brainstorm skip breaker failed",
-				append(reqLogFields(o.r), "task", o.task.Name, "project", o.proj.Name, "error", err)...)
-		}
-		o.ok("skip")
+		o.ok(p.Action)
 		return
 	}
 
@@ -1577,10 +1623,11 @@ func (o *outcomeCtx) brainstorm(p brainstormPayload) {
 	}) {
 		return
 	}
-	// A productive session resets the breaker (best-effort, same trade as the
-	// skip-side bump: never fail an already-committed outcome over this).
-	if err := s.bumpBrainstormSkips(ctx, o.proj.Name, true); err != nil {
-		s.log.ErrorContext(ctx, "restapi: resetting the brainstorm skip breaker failed",
+	// A productive session PROVES the idea space is not exhausted, so it clears
+	// any standing pause without waiting for one of the five external triggers
+	// (best-effort, same trade as the exhausted-side stamp).
+	if err := s.clearBrainstormPause(ctx, o.proj.Name); err != nil {
+		s.log.ErrorContext(ctx, "restapi: clearing the brainstorm pause failed",
 			append(reqLogFields(o.r), "task", o.task.Name, "project", o.proj.Name, "error", err)...)
 	}
 	o.ok("propose", "spawned", strings.Join(spawned, ","))

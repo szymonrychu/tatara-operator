@@ -33,7 +33,7 @@ func TestBrainstorm_ProjectLevel_MultiRepo_OneTask(t *testing.T) {
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
-	r.brainstorm(context.Background(), proj, reader, repos, nil, proj.Spec.Scm.Cron.Brainstorm, TriggerCron)
+	r.brainstorm(context.Background(), proj, reader, repos, nil, proj.Spec.Scm.Cron.Brainstorm)
 
 	qes := listBrainstormQEs(t, "bs-proj-one")
 	if len(qes) != 1 {
@@ -73,7 +73,7 @@ func TestBrainstorm_ProjectLevel_InFlight_AnyRepo_Blocks(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
 	existing := []tatarav1alpha1.Task{*pre}
-	r.brainstorm(context.Background(), proj, reader, repos, existing, proj.Spec.Scm.Cron.Brainstorm, TriggerCron)
+	r.brainstorm(context.Background(), proj, reader, repos, existing, proj.Spec.Scm.Cron.Brainstorm)
 
 	tasks := listBrainstormTasks(t, "bs-proj-inflight")
 	// Only the pre-existing Task; no new QE created because the in-flight Task
@@ -104,7 +104,7 @@ func TestBrainstorm_ProjectLevel_DeterministicPrimaryRepo(t *testing.T) {
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
-	r.brainstorm(context.Background(), proj, reader, repos, nil, proj.Spec.Scm.Cron.Brainstorm, TriggerCron)
+	r.brainstorm(context.Background(), proj, reader, repos, nil, proj.Spec.Scm.Cron.Brainstorm)
 
 	qes := listBrainstormQEs(t, "bs-proj-det")
 	if len(qes) != 1 {
@@ -166,7 +166,7 @@ func TestBrainstorm_ProjectLevel_EmptyRepositoryRef(t *testing.T) {
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
-	r.brainstorm(context.Background(), proj, reader, repos, nil, proj.Spec.Scm.Cron.Brainstorm, TriggerCron)
+	r.brainstorm(context.Background(), proj, reader, repos, nil, proj.Spec.Scm.Cron.Brainstorm)
 
 	qes := listBrainstormQEs(t, "bs-proj-emptyref")
 	if len(qes) != 1 {
@@ -187,7 +187,7 @@ func TestBrainstorm_ProjectLevel_ProjectScopedPodName(t *testing.T) {
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
-	r.brainstorm(context.Background(), proj, reader, repos, nil, proj.Spec.Scm.Cron.Brainstorm, TriggerCron)
+	r.brainstorm(context.Background(), proj, reader, repos, nil, proj.Spec.Scm.Cron.Brainstorm)
 
 	qes := listBrainstormQEs(t, "bs-proj-podname")
 	if len(qes) != 1 {
@@ -226,7 +226,7 @@ func TestBrainstormUnsetTargetFallsBackToTheDeprecatedAlias(t *testing.T) {
 				seedProposalIssue(t, r, proj, tc.projName+"-r1", i, "brainstorm", "open", "new")
 			}
 
-			r.brainstorm(context.Background(), proj, reader, repos, nil, proj.Spec.Scm.Cron.Brainstorm, TriggerCron)
+			r.brainstorm(context.Background(), proj, reader, repos, nil, proj.Spec.Scm.Cron.Brainstorm)
 
 			qes := listBrainstormQEs(t, tc.projName)
 			if len(qes) != tc.wantQE {

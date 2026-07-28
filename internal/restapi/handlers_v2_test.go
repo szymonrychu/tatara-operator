@@ -318,7 +318,7 @@ func (e *v2Env) issue(t *testing.T, name string) *tatarav1alpha1.Issue {
 }
 
 // project re-reads a Project CR by name, for tests that assert on a status
-// field a handler wrote (e.g. Status.BrainstormConsecutiveSkips).
+// field a handler wrote (e.g. Status.BrainstormPausedAt).
 func (e *v2Env) project(t *testing.T, name string) *tatarav1alpha1.Project {
 	t.Helper()
 	var out tatarav1alpha1.Project

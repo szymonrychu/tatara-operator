@@ -195,11 +195,6 @@ func (in *BrainstormActivity) DeepCopyInto(out *BrainstormActivity) {
 		*out = new(int)
 		**out = **in
 	}
-	if in.MaxConsecutiveSkips != nil {
-		in, out := &in.MaxConsecutiveSkips, &out.MaxConsecutiveSkips
-		*out = new(int)
-		**out = **in
-	}
 	if in.Sources != nil {
 		in, out := &in.Sources, &out.Sources
 		*out = make([]string, len(*in))
@@ -857,6 +852,14 @@ func (in *ProjectStatus) DeepCopyInto(out *ProjectStatus) {
 		for i := range *in {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}
+	}
+	if in.BrainstormPausedAt != nil {
+		in, out := &in.BrainstormPausedAt, &out.BrainstormPausedAt
+		*out = (*in).DeepCopy()
+	}
+	if in.LastMovementAt != nil {
+		in, out := &in.LastMovementAt, &out.LastMovementAt
+		*out = (*in).DeepCopy()
 	}
 }
 

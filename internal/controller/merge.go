@@ -324,7 +324,7 @@ func (d *StageDriver) ReconcileMerging(ctx context.Context, proj *tatarav1alpha1
 			// Merged out from under the operator - the C.9 accepted risk, or our own
 			// merge from a pass that died before it could stamp. Record it and resume.
 			RecordUnexpectedMerge(task, mr)
-			if err := d.stampMerged(ctx, proj, mr); err != nil {
+			if err := d.stampMerged(ctx, proj, mr, ""); err != nil {
 				return ctrl.Result{}, err
 			}
 			cursor = i + 1
@@ -365,8 +365,20 @@ func (d *StageDriver) ReconcileMerging(ctx context.Context, proj *tatarav1alpha1
 			"action", "scm_merged", "resource_id", task.Name, "repo", repoRef,
 			"pr", mr.Spec.Number, "head_sha", liveHead, "merge_sha", sha, "provider", provider)
 
-		if err := d.stampMerged(ctx, proj, mr); err != nil {
+		if err := d.stampMerged(ctx, proj, mr, sha); err != nil {
 			return ctrl.Result{}, err
+		}
+		// RESUME TRIGGER (merge). The operator landing an MR for a Task that moves
+		// the project clears a standing brainstorm pause. It is keyed on
+		// Task.Spec.Kind - a field the operator writes itself - and NEVER on what
+		// the commit says about itself. A documentation or pin-bump merge is
+		// explicitly NOT movement and deliberately does not resume; see
+		// TestBrainstormResumeKindExcludesDocumentationAndPinBumpTasks.
+		if brainstormResumeKind(task.Spec.Kind) {
+			if rerr := StampBrainstormResume(ctx, d.Client, proj.Namespace, proj.Name, ResumeTriggerMerge); rerr != nil {
+				l.Error(rerr, "merge: stamping the brainstorm resume failed",
+					"action", "brainstorm_resume_error", "resource_id", task.Name, "project", proj.Name)
+			}
 		}
 		// Wait for the release job at sha to go green before the NEXT repo merges:
 		// the sequential order exists precisely so a dependent repo never ships
@@ -481,7 +493,8 @@ func (d *StageDriver) releaseGreen(ctx context.Context, proj *tatarav1alpha1.Pro
 // stampMerged writes the merge the operator just performed straight onto the
 // mirror. The sweep is HOURLY; the merge loop cannot wait an hour to learn what
 // it did one line ago.
-func (d *StageDriver) stampMerged(ctx context.Context, proj *tatarav1alpha1.Project, mr *tatarav1alpha1.MergeRequest) error {
+func (d *StageDriver) stampMerged(ctx context.Context, proj *tatarav1alpha1.Project,
+	mr *tatarav1alpha1.MergeRequest, mergeSHA string) error {
 	now := metav1.NewTime(d.now())
 	key := client.ObjectKeyFromObject(mr)
 	if err := objbudget.FitMergeRequest(ctx, d.Client, d.spiller(proj), key, func(m *tatarav1alpha1.MergeRequest) {
@@ -489,10 +502,16 @@ func (d *StageDriver) stampMerged(ctx context.Context, proj *tatarav1alpha1.Proj
 		if m.Status.MergedAt == nil {
 			m.Status.MergedAt = &now
 		}
+		if mergeSHA != "" && m.Status.MergedSHA == "" {
+			m.Status.MergedSHA = mergeSHA
+		}
 	}); err != nil {
 		return fmt.Errorf("merge: stamp merged on %s: %w", key.Name, err)
 	}
 	mr.Status.State = "merged"
+	if mergeSHA != "" && mr.Status.MergedSHA == "" {
+		mr.Status.MergedSHA = mergeSHA
+	}
 	return nil
 }
 

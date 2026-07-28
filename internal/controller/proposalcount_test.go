@@ -2,6 +2,7 @@ package controller
 
 import (
 	"testing"
+	"time"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -303,35 +304,156 @@ func TestBrainstormDeficit(t *testing.T) {
 	}
 }
 
+// The control law after the breaker's retirement: paused BEATS a positive
+// deficit, at-target clamps, and there is no trigger-dependent branch left to
+// test - the cron path and the event path are the same path now.
 func TestBrainstormRefillDecision(t *testing.T) {
 	target := func(n int) tatarav1alpha1.BrainstormActivity {
 		v := n
 		return tatarav1alpha1.BrainstormActivity{TargetOpenProposals: &v}
 	}
 	tests := []struct {
-		name                     string
-		act                      tatarav1alpha1.BrainstormActivity
-		pending, inflight, skips int
-		trigger                  string
-		wantQuota                int
-		wantRefill               bool
-		wantReason               string
+		name              string
+		act               tatarav1alpha1.BrainstormActivity
+		pending, inflight int
+		paused            bool
+		wantQuota         int
+		wantRefill        bool
+		wantReason        string
 	}{
-		{"empty backlog on an event", target(3), 0, 0, 0, "event", 3, true, ""},
-		{"at target on an event", target(3), 3, 0, 0, "event", 0, false, "at-target"},
-		{"in flight on an event", target(3), 0, 1, 0, "event", 2, true, ""},
-		{"breaker tripped suppresses the event path", target(3), 0, 0, 3, "event", 0, false, "breaker-tripped"},
-		{"breaker below threshold does not suppress", target(3), 0, 0, 2, "event", 3, true, ""},
-		{"a cron tick ignores the breaker", target(3), 0, 0, 9, "cron", 3, true, ""},
-		{"a large target is clamped to the submit_outcome ceiling", target(20), 0, 0, 0, "cron", 5, true, ""},
+		{"empty backlog refills to target", target(3), 0, 0, false, 3, true, ""},
+		{"at target", target(3), 3, 0, false, 0, false, "at-target"},
+		{"over target never refills and never closes", target(3), 5, 0, false, 0, false, "at-target"},
+		{"an in-flight session counts toward the target", target(3), 0, 1, false, 2, true, ""},
+		{"paused beats an empty backlog", target(3), 0, 0, true, 0, false, "paused"},
+		{"paused beats a partial deficit", target(3), 1, 0, true, 0, false, "paused"},
+		{"paused and at target still reads paused", target(3), 3, 0, true, 0, false, "paused"},
+		{"an explicit target of 0 disables refill", target(0), 0, 0, false, 0, false, "at-target"},
+		{"a large target is clamped to the submit_outcome ceiling", target(20), 0, 0, false, 5, true, ""},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			quota, refill, reason := brainstormRefillDecision(tc.act, tc.pending, tc.inflight, tc.skips, tc.trigger)
+			// lastBrainstorm=nil: no session has ever been dispatched, so the
+			// cooldown gate (TestBrainstormRefillDecision_CooldownGate below)
+			// never applies here - this table is exclusively about the
+			// paused/deficit law.
+			quota, refill, reason := brainstormRefillDecision(tc.act, tc.pending, tc.inflight, tc.paused, time.Now(), nil)
 			if quota != tc.wantQuota || refill != tc.wantRefill || reason != tc.wantReason {
 				t.Fatalf("brainstormRefillDecision = (%d, %v, %q), want (%d, %v, %q)",
 					quota, refill, reason, tc.wantQuota, tc.wantRefill, tc.wantReason)
 			}
 		})
+	}
+}
+
+// TestBrainstormRefillDecision_CooldownGate is C2's brake: an explicit
+// minimum wall-clock interval between two brainstorm SESSIONS, independent of
+// the `exhausted` LLM judgment call and independent of whether the prior
+// session proposed, skipped, or was paused. It must (a) never block the
+// FIRST session (lastBrainstorm == nil), (b) block a second session that
+// falls inside the floor with the distinct "cooling-down" reason, and (c)
+// let it through again once the floor has elapsed.
+func TestBrainstormRefillDecision_CooldownGate(t *testing.T) {
+	target3 := 3
+	act := tatarav1alpha1.BrainstormActivity{TargetOpenProposals: &target3, MinSessionIntervalMinutes: 10}
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name           string
+		lastBrainstorm *time.Time
+		wantQuota      int
+		wantRefill     bool
+		wantReason     string
+	}{
+		{
+			name:           "no prior session never blocks the first one",
+			lastBrainstorm: nil,
+			wantQuota:      3, wantRefill: true, wantReason: "",
+		},
+		{
+			name:           "a session one minute ago is inside the floor",
+			lastBrainstorm: timePtr(now.Add(-1 * time.Minute)),
+			wantQuota:      0, wantRefill: false, wantReason: "cooling-down",
+		},
+		{
+			name:           "a session nine minutes fifty-nine seconds ago is still inside the floor",
+			lastBrainstorm: timePtr(now.Add(-(10*time.Minute - time.Second))),
+			wantQuota:      0, wantRefill: false, wantReason: "cooling-down",
+		},
+		{
+			name:           "a session exactly at the floor is no longer gated",
+			lastBrainstorm: timePtr(now.Add(-10 * time.Minute)),
+			wantQuota:      3, wantRefill: true, wantReason: "",
+		},
+		{
+			name:           "a session well past the floor is not gated",
+			lastBrainstorm: timePtr(now.Add(-1 * time.Hour)),
+			wantQuota:      3, wantRefill: true, wantReason: "",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			quota, refill, reason := brainstormRefillDecision(act, 0, 0, false, now, tc.lastBrainstorm)
+			if quota != tc.wantQuota || refill != tc.wantRefill || reason != tc.wantReason {
+				t.Fatalf("brainstormRefillDecision = (%d, %v, %q), want (%d, %v, %q)",
+					quota, refill, reason, tc.wantQuota, tc.wantRefill, tc.wantReason)
+			}
+		})
+	}
+}
+
+// TestBrainstormRefillDecision_CooldownDisabledByNegativeInterval: a negative
+// MinSessionIntervalMinutes is the explicit opt-out (mirrors
+// StaleProposalDays), so even a session one second ago must not gate.
+func TestBrainstormRefillDecision_CooldownDisabledByNegativeInterval(t *testing.T) {
+	target3 := 3
+	act := tatarav1alpha1.BrainstormActivity{TargetOpenProposals: &target3, MinSessionIntervalMinutes: -1}
+	now := time.Now()
+	last := now.Add(-1 * time.Second)
+	quota, refill, reason := brainstormRefillDecision(act, 0, 0, false, now, &last)
+	if !refill || quota != 3 || reason != "" {
+		t.Fatalf("brainstormRefillDecision = (%d, %v, %q), want refill with no cooldown gate", quota, refill, reason)
+	}
+}
+
+// TestBrainstormRefillDecision_PausedBeatsCooldownReason: paused is checked
+// first, so a paused-and-cooling-down project reports "paused", the more
+// actionable of the two reasons for a human reading status.
+func TestBrainstormRefillDecision_PausedBeatsCooldownReason(t *testing.T) {
+	target3 := 3
+	act := tatarav1alpha1.BrainstormActivity{TargetOpenProposals: &target3, MinSessionIntervalMinutes: 10}
+	now := time.Now()
+	last := now.Add(-1 * time.Minute)
+	quota, refill, reason := brainstormRefillDecision(act, 0, 0, true, now, &last)
+	if refill || quota != 0 || reason != "paused" {
+		t.Fatalf("brainstormRefillDecision = (%d, %v, %q), want (0, false, \"paused\")", quota, refill, reason)
+	}
+}
+
+func timePtr(t time.Time) *time.Time { return &t }
+
+// TestBrainstormPausedLogDue is I5's pacing gate: a paused project's "no
+// refill this pass" line must be visible at INFO, but not on every ~30s
+// event-driven reconcile pass. It fires once, then holds off for
+// brainstormResyncInterval, then fires again - and two DIFFERENT projects
+// never throttle each other.
+func TestBrainstormPausedLogDue(t *testing.T) {
+	r := &ProjectReconciler{}
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+
+	if !r.brainstormPausedLogDue("p1", now) {
+		t.Fatal("first call for a project must be due")
+	}
+	if r.brainstormPausedLogDue("p1", now.Add(1*time.Minute)) {
+		t.Fatal("a second call one minute later must be suppressed")
+	}
+	if r.brainstormPausedLogDue("p1", now.Add(brainstormResyncInterval-time.Second)) {
+		t.Fatal("a call one second short of the resync interval must still be suppressed")
+	}
+	if !r.brainstormPausedLogDue("p1", now.Add(brainstormResyncInterval)) {
+		t.Fatal("a call at the resync interval must be due again")
+	}
+	if !r.brainstormPausedLogDue("p2", now.Add(1*time.Minute)) {
+		t.Fatal("a different project must not be throttled by p1's pacing")
 	}
 }

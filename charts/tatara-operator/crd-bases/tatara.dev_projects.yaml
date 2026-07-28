@@ -5840,13 +5840,6 @@ spec:
                               brainstorm pod's turn-0 bundle as the <proposal_history> block. Unset uses
                               DefaultHistoryWindow. An explicit 0 omits the block.
                             type: integer
-                          maxConsecutiveSkips:
-                            description: |-
-                              MaxConsecutiveSkips is the circuit-breaker threshold. After this many
-                              consecutive brainstorm sessions ending in action=skip, the EVENT-driven
-                              refill path is suppressed until a cron tick resets the counter. Unset uses
-                              DefaultMaxConsecutiveSkips. An explicit 0 means the breaker never trips.
-                            type: integer
                           maxOpenProposals:
                             default: 5
                             description: |-
@@ -5860,6 +5853,23 @@ spec:
                               Deprecated: MaxPerCycle is retained for API compatibility only. The controller
                               hard-caps brainstorm at one Task per project per cycle regardless of this value.
                               Setting it has no effect. See MEMORY.md for rationale.
+                            type: integer
+                          minSessionIntervalMinutes:
+                            description: |-
+                              MinSessionIntervalMinutes floors the wall-clock gap between two
+                              brainstorm SESSIONS for this project, regardless of which path
+                              dispatched the prior one (a due cron tick or the event-driven wake).
+                              This is a RATE LIMIT, not a breaker: it only delays a refill until the
+                              floor has elapsed, it never suppresses one permanently and it never
+                              inspects why the prior session ended (a skip and a propose are throttled
+                              identically). It exists because a skip files no Issue, so the backlog
+                              deficit the event-driven wake reacts to stays positive and the wake
+                              fires again immediately - with no floor, the only remaining brake was
+                              the LLM's own `exhausted` judgment call, which must not be the sole
+                              defense against a busy-loop. Semantics mirror StaleProposalDays: a
+                              POSITIVE value sets an explicit floor in minutes; the UNSET default (0)
+                              enables the floor at DefaultBrainstormMinSessionIntervalMinutes; a
+                              NEGATIVE value is the explicit opt-out that disables the floor entirely.
                             type: integer
                           schedule:
                             pattern: ^$|^(\S+\s+){4}\S+$
@@ -5930,14 +5940,20 @@ spec:
                         type: object
                       refine:
                         description: |-
-                          Refine configures the project-refiner pre-step. No schedule: refine fires
-                          off the existing scan cadence as a mandatory barrier before scans/brainstorm.
+                          Refine configures the periodic project refiner. It has its OWN cron
+                          (RefineActivity.Schedule) - it is not a pre-scan barrier and does not
+                          piggyback on any other activity's cadence. Empty Schedule disables it.
                         properties:
                           closedLookbackDays:
                             description: |-
                               ClosedLookbackDays bounds how far back closed issues are loaded for
                               already-implemented detection. Default 30 when zero.
                             type: integer
+                          schedule:
+                            description: Schedule is a 5-field cron (robfig ParseStandard).
+                              Empty disables refine.
+                            pattern: ^$|^(\S+\s+){4}\S+$
+                            type: string
                         type: object
                     type: object
                   declinedLabel:
@@ -6126,15 +6142,17 @@ spec:
           status:
             description: ProjectStatus defines the observed state of a Project.
             properties:
-              brainstormConsecutiveSkips:
+              brainstormPauseReason:
                 description: |-
-                  BrainstormConsecutiveSkips counts brainstorm sessions that ended in
-                  action=skip back to back. action=propose resets it to 0; a cron tick
-                  resets it to 0. At BrainstormActivity.ResolveMaxConsecutiveSkips() the
-                  EVENT-driven refill path is suppressed - the liveness brake that stops
-                  skip -> deficit unchanged -> reconcile -> spawn -> skip burning pods on a
-                  proven-dry idea space.
-                type: integer
+                  BrainstormPauseReason carries the agent's verbatim reason, for the operator
+                  to read without opening the Task.
+                type: string
+              brainstormPausedAt:
+                description: |-
+                  BrainstormPausedAt is set when a brainstorm agent reports the idea space is
+                  exhausted. While set, no brainstorm session is scheduled for this project.
+                format: date-time
+                type: string
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current
@@ -6213,6 +6231,29 @@ spec:
                 format: date-time
                 type: string
               lastIssueScan:
+                format: date-time
+                type: string
+              lastMovementAt:
+                description: |-
+                  LastMovementAt records the last time ANY brainstorm-resume trigger fired
+                  for this project (push, merge, maintainer-comment, maintainer-close,
+                  manual), stamped UNCONDITIONALLY - regardless of whether brainstorm was
+                  paused at the time (I3 fix round).
+
+                  This is deliberately NOT the same signal as the AnnBrainstormResume
+                  annotation, which StampBrainstormResume only ever writes on a project
+                  that IS ALREADY paused (the reconcile's clearBrainstormPauseIfRequested
+                  is its single consumer, and annotating an unpaused project would be an
+                  unconditional write per webhook delivery for no scheduling effect). That
+                  left a gap: a merge/push/maintainer trigger landing WHILE a brainstorm
+                  session was in flight for a project that was NOT YET paused was silently
+                  discarded, so the session's own eventual exhausted verdict could pause a
+                  project that had already moved - the OPPOSITE of the design's intended
+                  fail direction ("over-resumes rather than under-resumes"). The exhausted
+                  outcome handler (internal/restapi/outcome.go) compares this field
+                  against the session's own Task start time and refuses the pause when
+                  movement is newer, so the annotation path stays paused-only while this
+                  field is always live for that comparison.
                 format: date-time
                 type: string
               lastRefine:

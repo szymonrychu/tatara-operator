@@ -375,11 +375,27 @@ func TestPublishNextExpected_ThroughRunScans(t *testing.T) {
 		}
 	})
 
-	t.Run("enabled-then-disabled transition retracts a previously published series", func(t *testing.T) {
+	t.Run("brainstorm never publishes a series even when enabled: it is demand-driven, not cron-driven", func(t *testing.T) {
+		cronSpec := &tatarav1alpha1.ScmCron{
+			Brainstorm: tatarav1alpha1.BrainstormActivity{Enabled: true, Schedule: "0 0 1 1 *"},
+		}
+		proj, _ := seedScanProject(t, "nx-brainstorm-never", cronSpec)
+
+		r := newScanReconciler(&fakeReader{})
+		r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+		if _, _, _, _, err := r.runScans(context.Background(), proj); err != nil {
+			t.Fatalf("runScans: %v", err)
+		}
+		if nextExpectedSeriesExists(t, "nx-brainstorm-never", "brainstorm") {
+			t.Error("next expected{brainstorm} series exists; brainstorm is demand-driven and must never publish one, Enabled/Schedule notwithstanding")
+		}
+	})
+
+	t.Run("refine enabled-then-disabled transition retracts a previously published series", func(t *testing.T) {
 		cronSpec := &tatarav1alpha1.ScmCron{
 			// Yearly, same reasoning as the first subtest: never due inside a test
 			// run, so only the deferred publication is under test.
-			Brainstorm: tatarav1alpha1.BrainstormActivity{Enabled: true, Schedule: "0 0 1 1 *"},
+			Refine: tatarav1alpha1.RefineActivity{Schedule: "0 0 1 1 *"},
 		}
 		proj, _ := seedScanProject(t, "nx-transition", cronSpec)
 
@@ -388,19 +404,19 @@ func TestPublishNextExpected_ThroughRunScans(t *testing.T) {
 		if _, _, _, _, err := r.runScans(context.Background(), proj); err != nil {
 			t.Fatalf("runScans (enabled pass): %v", err)
 		}
-		if !nextExpectedSeriesExists(t, "nx-transition", "brainstorm") {
-			t.Fatalf("next expected{brainstorm} series missing after an enabled pass")
+		if !nextExpectedSeriesExists(t, "nx-transition", "refine") {
+			t.Fatalf("next expected{refine} series missing after an enabled pass")
 		}
 
-		// Flip Enabled off, exactly as a human editing the Project spec would,
+		// Clear the schedule, exactly as a human editing the Project spec would,
 		// and reconcile again with the SAME in-memory object runScans already
 		// operates on directly (it never re-fetches Spec for this check).
-		proj.Spec.Scm.Cron.Brainstorm.Enabled = false
+		proj.Spec.Scm.Cron.Refine.Schedule = ""
 		if _, _, _, _, err := r.runScans(context.Background(), proj); err != nil {
 			t.Fatalf("runScans (disabled pass): %v", err)
 		}
-		if nextExpectedSeriesExists(t, "nx-transition", "brainstorm") {
-			t.Error("next expected{brainstorm} series still exists after Enabled flipped to false, want retracted")
+		if nextExpectedSeriesExists(t, "nx-transition", "refine") {
+			t.Error("next expected{refine} series still exists after Schedule cleared, want retracted")
 		}
 	})
 
@@ -495,8 +511,8 @@ func TestPublishNextExpected_ThroughRunScans(t *testing.T) {
 // teardown hole a spec edit reaches instead of a disable flag or a delete.
 func TestRunScans_CronClearedRetractsNextExpected(t *testing.T) {
 	cronSpec := &tatarav1alpha1.ScmCron{
-		IssueScan:  tatarav1alpha1.CronActivity{Schedule: "0 */4 * * *"},
-		Brainstorm: tatarav1alpha1.BrainstormActivity{Enabled: true, Schedule: "0 0 1 1 *"},
+		IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 */4 * * *"},
+		Refine:    tatarav1alpha1.RefineActivity{Schedule: "0 0 1 1 *"},
 	}
 	proj, _ := seedScanProject(t, "nx-cron-cleared", cronSpec)
 
@@ -505,7 +521,7 @@ func TestRunScans_CronClearedRetractsNextExpected(t *testing.T) {
 	if _, _, _, _, err := r.runScans(context.Background(), proj); err != nil {
 		t.Fatalf("runScans (healthy pass): %v", err)
 	}
-	for _, activity := range []string{"issueScan", SweepActivity, "brainstorm"} {
+	for _, activity := range []string{"issueScan", SweepActivity, "refine"} {
 		if !nextExpectedSeriesExists(t, "nx-cron-cleared", activity) {
 			t.Fatalf("setup: expected next expected{%s} series after a healthy pass", activity)
 		}
@@ -516,7 +532,7 @@ func TestRunScans_CronClearedRetractsNextExpected(t *testing.T) {
 	if _, _, _, _, err := r.runScans(context.Background(), proj); err != nil {
 		t.Fatalf("runScans (cron cleared pass): %v", err)
 	}
-	for _, activity := range []string{"issueScan", SweepActivity, "brainstorm"} {
+	for _, activity := range []string{"issueScan", SweepActivity, "refine"} {
 		if nextExpectedSeriesExists(t, "nx-cron-cleared", activity) {
 			t.Errorf("next expected{%s} series still exists after spec.scm.cron cleared, want retracted", activity)
 		}

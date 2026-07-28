@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
@@ -93,7 +94,7 @@ func TestBrainstormStampsTheQuotaAnnotation(t *testing.T) {
 	r := newScanReconciler(emptyReader("o/r1"))
 
 	created := r.brainstorm(ctx, proj, emptyReader("o/r1"), repos, nil,
-		proj.Spec.Scm.Cron.Brainstorm, TriggerCron)
+		proj.Spec.Scm.Cron.Brainstorm)
 	if !created {
 		t.Fatal("want a brainstorm event created with an empty backlog")
 	}
@@ -119,7 +120,7 @@ func TestBrainstormRefillsOnlyTheDeficit(t *testing.T) {
 	seedProposalIssue(t, r, proj, "bs-tgt-deficit-r1", 2, "brainstorm", "open", "new")
 
 	if created := r.brainstorm(ctx, proj, emptyReader("o/r1"), repos, nil,
-		proj.Spec.Scm.Cron.Brainstorm, TriggerCron); !created {
+		proj.Spec.Scm.Cron.Brainstorm); !created {
 		t.Fatal("want a brainstorm event created with pending=2 target=3")
 	}
 	qes := listBrainstormQEs(t, proj.Name)
@@ -139,7 +140,7 @@ func TestBrainstormApprovedProposalFreesItsSlot(t *testing.T) {
 	seedProposalIssue(t, r, proj, "bs-tgt-approved-r1", 1, "brainstorm", "open", "approved")
 
 	if created := r.brainstorm(ctx, proj, emptyReader("o/r1"), repos, nil,
-		proj.Spec.Scm.Cron.Brainstorm, TriggerCron); !created {
+		proj.Spec.Scm.Cron.Brainstorm); !created {
 		t.Fatal("an approved proposal must free its slot and allow a refill")
 	}
 }
@@ -153,7 +154,7 @@ func TestBrainstormOverTargetCreatesNothingAndClosesNothing(t *testing.T) {
 	}
 
 	if created := r.brainstorm(ctx, proj, emptyReader("o/r1"), repos, nil,
-		proj.Spec.Scm.Cron.Brainstorm, TriggerCron); created {
+		proj.Spec.Scm.Cron.Brainstorm); created {
 		t.Fatal("pending 3 over target 1 must yield deficit 0 and no Task")
 	}
 	if n := len(listBrainstormQEs(t, proj.Name)); n != 0 {
@@ -176,7 +177,7 @@ func TestBrainstormInFlightSessionCountsTowardTheTarget(t *testing.T) {
 	existing := []tatarav1alpha1.Task{liveBrainstormTask(proj)}
 
 	if created := r.brainstorm(ctx, proj, emptyReader("o/r1"), repos, existing,
-		proj.Spec.Scm.Cron.Brainstorm, TriggerCron); created {
+		proj.Spec.Scm.Cron.Brainstorm); created {
 		t.Fatal("an in-flight brainstorm Task must consume the only slot")
 	}
 }
@@ -222,7 +223,7 @@ func TestBrainstormInFlightSkipsTheForgeFanOut(t *testing.T) {
 			}
 
 			created := r.brainstorm(ctx, proj, rd, repos, existing,
-				proj.Spec.Scm.Cron.Brainstorm, TriggerCron)
+				proj.Spec.Scm.Cron.Brainstorm)
 
 			if created != tc.wantCreated {
 				t.Fatalf("brainstorm created = %v, want %v", created, tc.wantCreated)
@@ -247,7 +248,7 @@ func TestBrainstormQueuedEventSkipsTheForgeFanOut(t *testing.T) {
 	r := newScanReconciler(rd)
 
 	if created := r.brainstorm(ctx, proj, rd, repos, nil,
-		proj.Spec.Scm.Cron.Brainstorm, TriggerCron); !created {
+		proj.Spec.Scm.Cron.Brainstorm); !created {
 		t.Fatal("the first pass must enqueue a brainstorm event")
 	}
 	first := forgeReadCalls(rd)
@@ -259,7 +260,7 @@ func TestBrainstormQueuedEventSkipsTheForgeFanOut(t *testing.T) {
 	// above is still 0 here and the queued check is the only thing holding the
 	// line.
 	if created := r.brainstorm(ctx, proj, rd, repos, nil,
-		proj.Spec.Scm.Cron.Brainstorm, TriggerCron); created {
+		proj.Spec.Scm.Cron.Brainstorm); created {
 		t.Fatal("a still-queued brainstorm event must suppress a second refill")
 	}
 	if got := forgeReadCalls(rd); got != first {
@@ -270,19 +271,94 @@ func TestBrainstormQueuedEventSkipsTheForgeFanOut(t *testing.T) {
 	}
 }
 
-func TestBrainstormBreakerSuppressesTheEventPathOnly(t *testing.T) {
+// A paused project files nothing however large its deficit. This is the
+// scheduling half of the exhausted contract; the API half is
+// TestBrainstormExhaustedStampsThePause (internal/restapi).
+//
+// The pause is set directly on the in-memory proj passed to r.brainstorm(),
+// which is the only copy the function ever reads (no internal re-Get) - a
+// round-trip Status().Update here would prove nothing about r.brainstorm()'s
+// own read and was dropped (review finding I6: it used to write via
+// k8sClient.Status().Update and then pass this SAME already-mutated proj,
+// so the write was unexercised theatre).
+func TestBrainstormPausedProjectRefillsNothing(t *testing.T) {
 	ctx := context.Background()
-	proj, repos := seedBrainstormProject(t, "bs-tgt-breaker", []string{"o/r1"}, ptrInt(3))
-	proj.Status.BrainstormConsecutiveSkips = 3
+	proj, repos := seedBrainstormProject(t, "bs-tgt-paused", []string{"o/r1"}, ptrInt(3))
+	now := metav1.Now()
+	proj.Status.BrainstormPausedAt = &now
+	proj.Status.BrainstormPauseReason = "every lane is blocked on a human"
 	r := newScanReconciler(emptyReader("o/r1"))
 
 	if created := r.brainstorm(ctx, proj, emptyReader("o/r1"), repos, nil,
-		proj.Spec.Scm.Cron.Brainstorm, TriggerEvent); created {
-		t.Fatal("a tripped breaker must suppress the event-driven refill")
+		proj.Spec.Scm.Cron.Brainstorm); created {
+		t.Fatal("a paused project must not dispatch a refill")
 	}
+}
+
+// TestBrainstormCooldownGateSuppressesASecondSessionThenReleases is C2's
+// integration proof through the real wiring (not just the pure
+// brainstormRefillDecision table): a project whose backlog stays in deficit
+// (deficit=3, nothing pending) gets its FIRST session through unthrottled,
+// but a session dispatched moments ago - the durable Status.LastBrainstorm
+// stamp, round-tripped through etcd exactly as the event-driven Reconcile
+// path (project_controller.go) now writes it after a real dispatch - blocks
+// a second one until the configured floor elapses.
+func TestBrainstormCooldownGateSuppressesASecondSessionThenReleases(t *testing.T) {
+	ctx := context.Background()
+	proj, repos := seedBrainstormProject(t, "bs-tgt-cooldown", []string{"o/r1"}, ptrInt(3))
+	proj.Spec.Scm.Cron.Brainstorm.MinSessionIntervalMinutes = 10
+	if err := k8sClient.Update(ctx, proj); err != nil {
+		t.Fatalf("set MinSessionIntervalMinutes: %v", err)
+	}
+	r := newScanReconciler(emptyReader("o/r1"))
+
+	// First session: no prior stamp anywhere, so the floor must not block it.
 	if created := r.brainstorm(ctx, proj, emptyReader("o/r1"), repos, nil,
-		proj.Spec.Scm.Cron.Brainstorm, TriggerCron); !created {
-		t.Fatal("the cron backstop must refill regardless of the breaker")
+		proj.Spec.Scm.Cron.Brainstorm); !created {
+		t.Fatal("want the first session dispatched; the floor must never block session one")
+	}
+
+	// Delete the QueuedEvent the first session enqueued: this test isolates the
+	// cooldown gate, not the separate already-queued dedup guard that a real
+	// Task admission would otherwise clear (out of scope here).
+	for _, qe := range listBrainstormQEs(t, proj.Name) {
+		if err := k8sClient.Delete(ctx, &qe); err != nil {
+			t.Fatalf("delete brainstorm QE: %v", err)
+		}
+	}
+
+	// Durably stamp LastBrainstorm one minute ago (well inside the 10-minute
+	// floor) via a real Status().Update round-trip, then re-Get so the next
+	// call reads it exactly like a fresh reconcile would - this is the part
+	// that must be durable across operator replicas/restarts, not in-memory.
+	recent := metav1.NewTime(time.Now().Add(-1 * time.Minute))
+	proj.Status.LastBrainstorm = &recent
+	if err := k8sClient.Status().Update(ctx, proj); err != nil {
+		t.Fatalf("stamp LastBrainstorm: %v", err)
+	}
+	fresh := &tatarav1alpha1.Project{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: proj.Name}, fresh); err != nil {
+		t.Fatalf("re-get project: %v", err)
+	}
+
+	if created := r.brainstorm(ctx, fresh, emptyReader("o/r1"), repos, nil,
+		fresh.Spec.Scm.Cron.Brainstorm); created {
+		t.Fatal("a session one minute after the last one must be gated by the 10-minute floor")
+	}
+
+	// Past the floor: a stamp from 11 minutes ago must release the gate again -
+	// this is the "delays, never suppresses permanently" property.
+	past := metav1.NewTime(time.Now().Add(-11 * time.Minute))
+	fresh.Status.LastBrainstorm = &past
+	if err := k8sClient.Status().Update(ctx, fresh); err != nil {
+		t.Fatalf("stamp older LastBrainstorm: %v", err)
+	}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: proj.Name}, fresh); err != nil {
+		t.Fatalf("re-get project: %v", err)
+	}
+	if created := r.brainstorm(ctx, fresh, emptyReader("o/r1"), repos, nil,
+		fresh.Spec.Scm.Cron.Brainstorm); !created {
+		t.Fatal("a session past the 10-minute floor must be allowed again")
 	}
 }
 
@@ -299,7 +375,7 @@ func TestBrainstormNotEnqueuedStillSetsGauges(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(reg)
 
 	if created := r.brainstorm(ctx, proj, emptyReader(), nil, nil,
-		proj.Spec.Scm.Cron.Brainstorm, TriggerCron); created {
+		proj.Spec.Scm.Cron.Brainstorm); created {
 		t.Fatal("no repos with a valid slug: nothing can be enqueued")
 	}
 	if got, ok := brainstormTargetSeries(t, reg, proj.Name); !ok || got != 3 {
@@ -330,6 +406,57 @@ func brainstormTargetSeries(t *testing.T, reg *prometheus.Registry, project stri
 func brainstormPendingSeries(t *testing.T, reg *prometheus.Registry, project string) (float64, bool) {
 	t.Helper()
 	return projectGaugeSeries(t, reg, "operator_brainstorm_pending_proposals", "project", project)
+}
+
+// brainstormPausedSeries reads operator_brainstorm_paused{project}.
+func brainstormPausedSeries(t *testing.T, reg *prometheus.Registry, project string) (float64, bool) {
+	t.Helper()
+	return projectGaugeSeries(t, reg, "operator_brainstorm_paused", "project", project)
+}
+
+// TestBrainstormPausedProjectSetsPausedGauge is I1's fix round proof: the
+// design spec calls for metric-level observability of a project paused and
+// never resuming, and operator_brainstorm_paused did not exist at all before
+// this fix - the observability alert citing it was referencing a series that
+// was never published. A paused project's refill pass must publish it as 1.
+func TestBrainstormPausedProjectSetsPausedGauge(t *testing.T) {
+	ctx := context.Background()
+	proj, repos := seedBrainstormProject(t, "bs-tgt-paused-gauge", []string{"o/r1"}, ptrInt(3))
+	now := metav1.Now()
+	proj.Status.BrainstormPausedAt = &now
+	proj.Status.BrainstormPauseReason = "every lane is blocked on a human"
+	reg := prometheus.NewRegistry()
+	r := newScanReconciler(emptyReader("o/r1"))
+	r.Metrics = obs.NewOperatorMetrics(reg)
+
+	if created := r.brainstorm(ctx, proj, emptyReader("o/r1"), repos, nil,
+		proj.Spec.Scm.Cron.Brainstorm); created {
+		t.Fatal("a paused project must not dispatch a refill")
+	}
+	if got, ok := brainstormPausedSeries(t, reg, proj.Name); !ok || got != 1 {
+		t.Fatalf("operator_brainstorm_paused{project=%s} = %v (present=%v), want 1", proj.Name, got, ok)
+	}
+}
+
+// TestBrainstormUnpausedProjectClearsPausedGauge proves the gauge is not a
+// one-way latch: an at-target (unpaused) project must read an EXPLICIT 0, not
+// absent - a dashboard cannot otherwise tell "never paused" from "paused, then
+// the pod restarted and the process-local series was lost".
+func TestBrainstormUnpausedProjectClearsPausedGauge(t *testing.T) {
+	ctx := context.Background()
+	proj, repos := seedBrainstormProject(t, "bs-tgt-unpaused-gauge", []string{"o/r1"}, ptrInt(0))
+	reg := prometheus.NewRegistry()
+	r := newScanReconciler(emptyReader("o/r1"))
+	r.Metrics = obs.NewOperatorMetrics(reg)
+
+	if created := r.brainstorm(ctx, proj, emptyReader("o/r1"), repos, nil,
+		proj.Spec.Scm.Cron.Brainstorm); created {
+		t.Fatal("target 0: nothing should be dispatched")
+	}
+	if got, ok := brainstormPausedSeries(t, reg, proj.Name); !ok || got != 0 {
+		t.Fatalf("operator_brainstorm_paused{project=%s} = %v (present=%v), want an explicit 0",
+			proj.Name, got, ok)
+	}
 }
 
 // projectGaugeSeries reads a single-label gauge vec's value for one label
@@ -370,7 +497,7 @@ func TestBrainstormOpenProposalsGaugeIsSluggedAndReachesZero(t *testing.T) {
 	iss2 := seedProposalIssue(t, r, proj, repos[0].Name, 2, "brainstorm", "open", "new")
 
 	r.brainstorm(ctx, proj, emptyReader("o/g1", "o/g2"), repos, nil,
-		proj.Spec.Scm.Cron.Brainstorm, TriggerCron)
+		proj.Spec.Scm.Cron.Brainstorm)
 
 	if _, ok := openProposalsSeries(t, reg, repos[0].Name); ok {
 		t.Fatalf("gauge is labelled with the Repository CR name %q; it must be the owner/name slug", repos[0].Name)
@@ -390,7 +517,7 @@ func TestBrainstormOpenProposalsGaugeIsSluggedAndReachesZero(t *testing.T) {
 		t.Fatalf("approve issue: %v", err)
 	}
 	r.brainstorm(ctx, proj, emptyReader("o/g1", "o/g2"), repos, nil,
-		proj.Spec.Scm.Cron.Brainstorm, TriggerCron)
+		proj.Spec.Scm.Cron.Brainstorm)
 	if got, ok := openProposalsSeries(t, reg, "o/g1"); !ok || got != 1 {
 		t.Fatalf("after one approval operator_open_proposals{repo=o/g1} = %v (present=%v), want 1", got, ok)
 	}
@@ -401,46 +528,8 @@ func TestBrainstormOpenProposalsGaugeIsSluggedAndReachesZero(t *testing.T) {
 		t.Fatalf("approve issue: %v", err)
 	}
 	r.brainstorm(ctx, proj, emptyReader("o/g1", "o/g2"), repos, nil,
-		proj.Spec.Scm.Cron.Brainstorm, TriggerCron)
+		proj.Spec.Scm.Cron.Brainstorm)
 	if got, ok := openProposalsSeries(t, reg, "o/g1"); !ok || got != 0 {
 		t.Fatalf("an emptied repo latched at %v (present=%v); want an explicit 0", got, ok)
-	}
-}
-
-// resetBrainstormSkips is what makes the cron tick the breaker's only reset. It
-// must be a no-op (no write, no error) when the counter is already zero.
-func TestResetBrainstormSkips(t *testing.T) {
-	ctx := context.Background()
-	tests := []struct {
-		name  string
-		start int
-	}{
-		{"tripped breaker resets to zero", 4},
-		{"already zero is a no-op", 0},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			proj, _ := seedBrainstormProject(t, "bs-tgt-reset-"+strconv.Itoa(tc.start), []string{"o/r1"}, ptrInt(3))
-			r := newScanReconciler(emptyReader("o/r1"))
-			if tc.start > 0 {
-				proj.Status.BrainstormConsecutiveSkips = tc.start
-				if err := r.Status().Update(ctx, proj); err != nil {
-					t.Fatalf("seed skips: %v", err)
-				}
-			}
-			if err := r.resetBrainstormSkips(ctx, proj); err != nil {
-				t.Fatalf("resetBrainstormSkips: %v", err)
-			}
-			if proj.Status.BrainstormConsecutiveSkips != 0 {
-				t.Fatalf("in-memory skips = %d, want 0", proj.Status.BrainstormConsecutiveSkips)
-			}
-			var fresh tatarav1alpha1.Project
-			if err := r.Get(ctx, types.NamespacedName{Namespace: proj.Namespace, Name: proj.Name}, &fresh); err != nil {
-				t.Fatalf("get project: %v", err)
-			}
-			if fresh.Status.BrainstormConsecutiveSkips != 0 {
-				t.Fatalf("persisted skips = %d, want 0", fresh.Status.BrainstormConsecutiveSkips)
-			}
-		})
 	}
 }
