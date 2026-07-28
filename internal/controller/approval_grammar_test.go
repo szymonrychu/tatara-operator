@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,54 +16,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// TestGrammarMatchesApprovalPhrase is the C.6 clause (c) ANCHORED WHOLE-LINE
-// matcher. The comment must CONSIST OF the phrase, not contain it: the v3
-// substring match approved "I can't approve this until the tests pass", and
-// because clause (b) takes the maintainer's MOST RECENT comment, their own
-// corrective follow-up approved the work too.
-func TestGrammarMatchesApprovalPhrase(t *testing.T) {
-	def := tatarav1alpha1.DefaultApprovalPhrases()
-
-	tests := []struct {
-		name    string
-		body    string
-		phrases []string
-		want    string
-		ok      bool
-	}{
-		{"negated approve does not approve", "I can't approve this until tests pass", def, "", false},
-		{"negated go-ahead does not approve", "don't go ahead with this", def, "", false},
-		{"go ahead approves", "go ahead", def, "go ahead", true},
-		{"lgtm with bang approves", "LGTM!", def, "lgtm", true},
-		{"padded approved approves", "  approved.  ", def, "approved", true},
-		{"bold lgtm approves", "**LGTM**", def, "lgtm", true},
-		{"bold lgtm with period approves", "**LGTM**.", def, "lgtm", true},
-		{"backticked lgtm approves", "`lgtm`", def, "lgtm", true},
-		{"underscored approved approves", "_approved_", def, "approved", true},
-		{"lgtm with emoji shortcode approves", "LGTM :rocket:", def, "lgtm", true},
-		{"lgtm with unicode emoji approves", "LGTM \U0001F680", def, "lgtm", true},
-		{"phrase on its own line among prose approves", "thanks for the writeup\n\nlgtm\n", def, "lgtm", true},
-		{"phrase inside a fenced code block does not approve", "here is the marker:\n```\nlgtm\n```\n", def, "", false},
-		{"phrase in a quoted line does not approve", "> lgtm\n\nnot yet, see above", def, "", false},
-		{"phrase with a trailing clause does not approve", "lgtm, but fix the tests first", def, "", false},
-		{"ship it approves", "Ship it.", def, "ship it", true},
-		{"empty body does not approve", "", def, "", false},
-		{"regex metacharacters in a phrase are quoted, not interpolated", "a+b", []string{"a+b"}, "a+b", true},
-		{"a quoted metacharacter phrase does not match its regex expansion", "aab", []string{"a+b"}, "", false},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got, ok := MatchesApprovalPhrase(tc.body, tc.phrases)
-			if ok != tc.ok || got != tc.want {
-				t.Fatalf("MatchesApprovalPhrase(%q) = (%q, %v), want (%q, %v)", tc.body, got, ok, tc.want, tc.ok)
-			}
-		})
-	}
-}
-
-// approvalProject builds the C.6 project: a bot login, a maintainer set, and
-// the default (closed) approval wordlist.
+// approvalProject builds the project: a bot login and a maintainer set. There is
+// no wordlist any more - the agent judges the wording, the operator judges who
+// wrote the comment it cited.
 func approvalProject(maintainers ...string) *tatarav1alpha1.Project {
 	p := mirrorProject("tatara-bot")
 	p.Spec.Scm.MaintainerLogins = maintainers
@@ -90,6 +46,15 @@ func approvalComment(id, author, body string, at time.Time, isBot bool) tatarav1
 	}
 }
 
+// cites builds the agent's citation set: one {id, quote} pair per argument pair.
+func cites(pairs ...string) []tatarav1alpha1.ApprovalCitation {
+	out := make([]tatarav1alpha1.ApprovalCitation, 0, len(pairs)/2)
+	for i := 0; i+1 < len(pairs); i += 2 {
+		out = append(out, tatarav1alpha1.ApprovalCitation{ID: pairs[i], Quote: pairs[i+1]})
+	}
+	return out
+}
+
 func approvalTask(name string, issueRefs ...string) *tatarav1alpha1.Task {
 	return &tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS},
@@ -111,21 +76,21 @@ func getTaskCR(t *testing.T, c client.Client, name string) *tatarav1alpha1.Task 
 }
 
 // TestVerifyApprovalScopeIsEveryLiveIssue is fix H9: clarifying -> approved
-// never said WHICH owned Issue was approved, so one "lgtm" on one issue
+// never said WHICH owned Issue was approved, so one approval on one issue
 // approved a Task spanning every repo in mergeOrder. EVERY live issue needs its
-// own evidence.
+// own evidence, derived from a citation that resolves on THAT issue.
 func TestVerifyApprovalScopeIsEveryLiveIssue(t *testing.T) {
 	ctx := context.Background()
 	proj, repo := approvalProject("szymonrychu"), mirrorRepo()
 	now := time.Now()
 
-	i1 := approvalIssue(repo.Name, 1, approvalComment("c1", "szymonrychu", "lgtm", now, false))
+	i1 := approvalIssue(repo.Name, 1, approvalComment("c1", "szymonrychu", "yes, go ahead", now, false))
 	i2 := approvalIssue(repo.Name, 2)
 	i3 := approvalIssue(repo.Name, 3)
 	task := approvalTask("t-scope", i1.Name, i2.Name, i3.Name)
 	c := newMirrorClient(t, proj, repo, i1, i2, i3, task)
 
-	ev, err := VerifyApproval(ctx, c, &mirrorSpiller{}, proj, task)
+	ev, err := VerifyApproval(ctx, c, &mirrorSpiller{}, proj, task, cites("c1", "go ahead"))
 	if err != nil {
 		t.Fatalf("VerifyApproval: %v", err)
 	}
@@ -133,13 +98,13 @@ func TestVerifyApprovalScopeIsEveryLiveIssue(t *testing.T) {
 		t.Fatalf("evidence entries = %d, want 3 (one per LIVE issue)", len(ev))
 	}
 	if ev[i1.Name] == nil {
-		t.Fatal("the issue carrying lgtm has no evidence")
+		t.Fatal("the issue whose maintainer comment was cited has no evidence")
 	}
 	if ev[i2.Name] != nil || ev[i3.Name] != nil {
-		t.Fatal("an issue with NO maintainer phrase produced evidence")
+		t.Fatal("an issue with NO maintainer comment produced evidence")
 	}
 	if ApprovalPassed(ev) {
-		t.Fatal("one lgtm on one of three issues passed the gate")
+		t.Fatal("one citation on one of three issues passed the gate")
 	}
 	if got := getTaskCR(t, c, task.Name).Status.Stage; got != tatarav1alpha1.StageClarifying {
 		t.Fatalf("task stage = %q, want clarifying (the gate did NOT pass)", got)
@@ -148,16 +113,17 @@ func TestVerifyApprovalScopeIsEveryLiveIssue(t *testing.T) {
 		t.Fatal("an issue with no evidence was marked approved")
 	}
 
-	// Now approve the other two: the Task reaches approved.
+	// Now the maintainer comments on the other two and the agent cites those too.
 	for _, name := range []string{i2.Name, i3.Name} {
 		iss := getIssueCR(t, c, name)
-		iss.Status.Comments = []tatarav1alpha1.Comment{approvalComment("c9", "szymonrychu", "go ahead", now, false)}
+		iss.Status.Comments = []tatarav1alpha1.Comment{
+			approvalComment("c9", "szymonrychu", "please go ahead", now, false)}
 		if err := c.Status().Update(ctx, iss); err != nil {
 			t.Fatalf("seed comment on %s: %v", name, err)
 		}
 	}
 	task = getTaskCR(t, c, task.Name)
-	ev, err = VerifyApproval(ctx, c, &mirrorSpiller{}, proj, task)
+	ev, err = VerifyApproval(ctx, c, &mirrorSpiller{}, proj, task, cites("c1", "go ahead", "c9", "go ahead"))
 	if err != nil {
 		t.Fatalf("VerifyApproval (2): %v", err)
 	}
@@ -175,15 +141,15 @@ func TestVerifyApprovalScopeIsEveryLiveIssue(t *testing.T) {
 }
 
 // TestVerifyApprovalClosedIssueIsOutOfScope: a human closing ONE issue of a
-// multi-issue Task must not make approval require a phrase on a CLOSED thread,
+// multi-issue Task must not make approval require a citation on a CLOSED thread,
 // forever (fix L3-14).
 func TestVerifyApprovalClosedIssueIsOutOfScope(t *testing.T) {
 	ctx := context.Background()
 	proj, repo := approvalProject("szymonrychu"), mirrorRepo()
 	now := time.Now()
 
-	i1 := approvalIssue(repo.Name, 1, approvalComment("c1", "szymonrychu", "lgtm", now, false))
-	i2 := approvalIssue(repo.Name, 2, approvalComment("c2", "szymonrychu", "lgtm", now, false))
+	i1 := approvalIssue(repo.Name, 1, approvalComment("c1", "szymonrychu", "go ahead", now, false))
+	i2 := approvalIssue(repo.Name, 2, approvalComment("c2", "szymonrychu", "go ahead", now, false))
 	closed := approvalIssue(repo.Name, 3)
 	closed.Status.State = "closed"
 	done := approvalIssue(repo.Name, 4)
@@ -191,7 +157,7 @@ func TestVerifyApprovalClosedIssueIsOutOfScope(t *testing.T) {
 	task := approvalTask("t-closed", i1.Name, i2.Name, closed.Name, done.Name)
 	c := newMirrorClient(t, proj, repo, i1, i2, closed, done, task)
 
-	ev, err := VerifyApproval(ctx, c, &mirrorSpiller{}, proj, task)
+	ev, err := VerifyApproval(ctx, c, &mirrorSpiller{}, proj, task, cites("c1", "go ahead", "c2", "go ahead"))
 	if err != nil {
 		t.Fatalf("VerifyApproval: %v", err)
 	}
@@ -208,22 +174,26 @@ func TestVerifyApprovalClosedIssueIsOutOfScope(t *testing.T) {
 
 // TestVerifyApprovalBotCannotApprove: the bot is excluded STRUCTURALLY, before
 // IsMaintainer runs, so a bot misconfigured into maintainerLogins still cannot
-// approve. The operator's own park comment must never un-park the Task it parked.
+// approve - not even when the agent cites the bot's own comment. The operator's
+// own park comment must never un-park the Task it parked.
 func TestVerifyApprovalBotCannotApprove(t *testing.T) {
 	ctx := context.Background()
 	proj, repo := approvalProject("szymonrychu", "tatara-bot"), mirrorRepo()
 
-	i1 := approvalIssue(repo.Name, 1, approvalComment("c1", "tatara-bot", "lgtm", time.Now(), true))
+	i1 := approvalIssue(repo.Name, 1, approvalComment("c1", "tatara-bot", "go ahead", time.Now(), true))
 	task := approvalTask("t-bot", i1.Name)
 	c := newMirrorClient(t, proj, repo, i1, task)
 
-	ev, refusals, err := VerifyApprovalDetailed(ctx, c, &mirrorSpiller{}, proj, task, nil)
+	ev, refusals, err := VerifyApprovalDetailed(ctx, c, &mirrorSpiller{}, proj, task,
+		cites("c1", "go ahead"), nil)
 	if err != nil {
 		t.Fatalf("VerifyApprovalDetailed: %v", err)
 	}
 	if ApprovalPassed(ev) {
 		t.Fatal("the BOT approved its own work")
 	}
+	// The bot comment is not a maintainer comment at all, so NO maintainer has
+	// spoken on this thread: the refusal is the clause-(a) one.
 	if refusals[i1.Name] != ApprovalRefusedNoMaintainer {
 		t.Fatalf("refusal = %q, want %q", refusals[i1.Name], ApprovalRefusedNoMaintainer)
 	}
@@ -232,50 +202,89 @@ func TestVerifyApprovalBotCannotApprove(t *testing.T) {
 	}
 }
 
-// TestVerifyApprovalMostRecentMaintainerCommentGoverns is clause (b): an older
-// approving maintainer comment behind a NEWER non-approving maintainer comment
-// does NOT approve. The maintainer's corrective follow-up is the one that counts.
-func TestVerifyApprovalMostRecentMaintainerCommentGoverns(t *testing.T) {
+// TestVerifyApprovalEarlierMaintainerCommentIsCitable replaces the old clause-(b)
+// recency test, which is DELETED behaviour, not a relaxed one. Requiring the
+// newest maintainer comment deadlocks an ordinary thread: "go ahead, I approve!"
+// followed by "thanks - ping me when the PR is up" leaves consent unambiguous
+// with nothing citable, so the agent would submit discuss every turn and the Task
+// would park forever. Whether a LATER comment withdraws the approval is an intent
+// question and therefore the AGENT's call, not the operator's.
+func TestVerifyApprovalEarlierMaintainerCommentIsCitable(t *testing.T) {
 	ctx := context.Background()
 	proj, repo := approvalProject("szymonrychu"), mirrorRepo()
 	now := time.Now()
 
 	i1 := approvalIssue(repo.Name, 1,
-		approvalComment("c1", "szymonrychu", "lgtm", now.Add(-2*time.Hour), false),
-		approvalComment("c2", "rando", "go ahead", now.Add(-time.Hour), false),
-		approvalComment("c3", "szymonrychu", "actually hold on, this breaks the reaper", now, false),
+		approvalComment("c1", "szymonrychu", "sure, go ahead, I approve!", now.Add(-2*time.Hour), false),
+		approvalComment("c2", "rando", "nice", now.Add(-time.Hour), false),
+		approvalComment("c3", "szymonrychu", "thanks - ping me when the PR is up", now, false),
 	)
-	task := approvalTask("t-recent", i1.Name)
+	task := approvalTask("t-earlier", i1.Name)
 	c := newMirrorClient(t, proj, repo, i1, task)
 
-	ev, refusals, err := VerifyApprovalDetailed(ctx, c, &mirrorSpiller{}, proj, task, nil)
+	ev, refusals, err := VerifyApprovalDetailed(ctx, c, &mirrorSpiller{}, proj, task,
+		cites("c1", "go ahead, I approve!"), nil)
+	if err != nil {
+		t.Fatalf("VerifyApprovalDetailed: %v", err)
+	}
+	if !ApprovalPassed(ev) {
+		t.Fatalf("an EARLIER maintainer approval was refused: refusals=%+v", refusals)
+	}
+	if got := ev[i1.Name]; got == nil || got.CommentID != "c1" || got.Phrase != "go ahead, I approve!" {
+		t.Fatalf("evidence = %+v, want the CITED comment c1 and its verbatim quote", got)
+	}
+}
+
+// TestVerifyApprovalNonMaintainerCannotApprove: closed-by-default. A citation of
+// a NON-maintainer's comment is not consent, even when a maintainer is talking
+// on the same thread.
+func TestVerifyApprovalNonMaintainerCannotApprove(t *testing.T) {
+	ctx := context.Background()
+	proj, repo := approvalProject("szymonrychu"), mirrorRepo()
+	now := time.Now()
+
+	i1 := approvalIssue(repo.Name, 1,
+		approvalComment("c1", "rando", "go ahead", now, false),
+		approvalComment("c2", "szymonrychu", "let me look", now.Add(time.Minute), false),
+	)
+	task := approvalTask("t-rando", i1.Name)
+	c := newMirrorClient(t, proj, repo, i1, task)
+
+	ev, refusals, err := VerifyApprovalDetailed(ctx, c, &mirrorSpiller{}, proj, task,
+		cites("c1", "go ahead"), nil)
 	if err != nil {
 		t.Fatalf("VerifyApprovalDetailed: %v", err)
 	}
 	if ApprovalPassed(ev) {
-		t.Fatal("an older lgtm approved despite a NEWER non-approving maintainer comment")
+		t.Fatal("a non-maintainer approved")
 	}
-	if refusals[i1.Name] != ApprovalRefusedNoPhrase {
-		t.Fatalf("refusal = %q, want %q", refusals[i1.Name], ApprovalRefusedNoPhrase)
+	if refusals[i1.Name] != ApprovalRefusedCitationNotMaintainer {
+		t.Fatalf("refusal = %q, want %q", refusals[i1.Name], ApprovalRefusedCitationNotMaintainer)
 	}
 }
 
-// TestVerifyApprovalNonMaintainerCannotApprove: closed-by-default. A phrase from
-// a non-maintainer is not consent.
-func TestVerifyApprovalNonMaintainerCannotApprove(t *testing.T) {
+// TestVerifyApprovalFabricatedQuoteCannotApprove is the anti-fabrication check:
+// the operator re-reads the cited comment's body itself, so a quote the agent
+// invented refuses even though the comment and its author are real.
+func TestVerifyApprovalFabricatedQuoteCannotApprove(t *testing.T) {
 	ctx := context.Background()
 	proj, repo := approvalProject("szymonrychu"), mirrorRepo()
 
-	i1 := approvalIssue(repo.Name, 1, approvalComment("c1", "rando", "lgtm", time.Now(), false))
-	task := approvalTask("t-rando", i1.Name)
+	i1 := approvalIssue(repo.Name, 1,
+		approvalComment("c1", "szymonrychu", "hold off until the reaper fix lands", time.Now(), false))
+	task := approvalTask("t-fabricated", i1.Name)
 	c := newMirrorClient(t, proj, repo, i1, task)
 
-	ev, err := VerifyApproval(ctx, c, &mirrorSpiller{}, proj, task)
+	ev, refusals, err := VerifyApprovalDetailed(ctx, c, &mirrorSpiller{}, proj, task,
+		cites("c1", "go ahead, I approve!"), nil)
 	if err != nil {
-		t.Fatalf("VerifyApproval: %v", err)
+		t.Fatalf("VerifyApprovalDetailed: %v", err)
 	}
 	if ApprovalPassed(ev) {
-		t.Fatal("a non-maintainer approved")
+		t.Fatal("a FABRICATED quote approved the work")
+	}
+	if refusals[i1.Name] != ApprovalRefusedQuoteAbsent {
+		t.Fatalf("refusal = %q, want %q", refusals[i1.Name], ApprovalRefusedQuoteAbsent)
 	}
 }
 
@@ -286,17 +295,18 @@ func TestVerifyApprovalSingleUseEvidence(t *testing.T) {
 	proj, repo := approvalProject("szymonrychu"), mirrorRepo()
 	now := time.Now().UTC().Truncate(time.Second)
 
-	i1 := approvalIssue(repo.Name, 1, approvalComment("c1", "szymonrychu", "lgtm", now, false))
+	i1 := approvalIssue(repo.Name, 1, approvalComment("c1", "szymonrychu", "go ahead", now, false))
 	// The comment was already consumed, and the Issue was subsequently reset out
 	// of approved (a re-clarify). The SAME comment must not approve it again.
 	i1.Status.Status = "new"
 	i1.Status.Approval = &tatarav1alpha1.ApprovalEvidence{
-		Login: "szymonrychu", CommentID: "c1", CreatedAt: metav1.NewTime(now), Phrase: "lgtm",
+		Login: "szymonrychu", CommentID: "c1", CreatedAt: metav1.NewTime(now), Phrase: "go ahead",
 	}
 	task := approvalTask("t-replay", i1.Name)
 	c := newMirrorClient(t, proj, repo, i1, task)
 
-	ev, refusals, err := VerifyApprovalDetailed(ctx, c, &mirrorSpiller{}, proj, task, nil)
+	ev, refusals, err := VerifyApprovalDetailed(ctx, c, &mirrorSpiller{}, proj, task,
+		cites("c1", "go ahead"), nil)
 	if err != nil {
 		t.Fatalf("VerifyApprovalDetailed: %v", err)
 	}
@@ -307,23 +317,39 @@ func TestVerifyApprovalSingleUseEvidence(t *testing.T) {
 		t.Fatalf("refusal = %q, want %q", refusals[i1.Name], ApprovalRefusedEvidenceReplayed)
 	}
 
-	// A NEWER maintainer comment approves.
+	// A DIFFERENT maintainer comment approves.
 	iss := getIssueCR(t, c, i1.Name)
 	iss.Status.Comments = append(iss.Status.Comments,
-		approvalComment("c2", "szymonrychu", "go ahead", now.Add(time.Hour), false))
+		approvalComment("c2", "szymonrychu", "ok, go ahead now", now.Add(time.Hour), false))
 	if err := c.Status().Update(ctx, iss); err != nil {
 		t.Fatalf("seed newer comment: %v", err)
 	}
-	ev, err = VerifyApproval(ctx, c, &mirrorSpiller{}, proj, getTaskCR(t, c, task.Name))
+
+	// Still refused while the CONSUMED comment is the first citable one on the
+	// thread: the first resolvable citation is the one verified, and a consumed
+	// one refuses there rather than falling through to the next. That ordering is
+	// deliberate and fail-closed - the agent must cite the comment it means.
+	_, refusals, err = VerifyApprovalDetailed(ctx, c, &mirrorSpiller{}, proj, getTaskCR(t, c, task.Name),
+		cites("c1", "go ahead", "c2", "go ahead now"), nil)
 	if err != nil {
-		t.Fatalf("VerifyApproval (2): %v", err)
+		t.Fatalf("VerifyApprovalDetailed (2): %v", err)
+	}
+	if refusals[i1.Name] != ApprovalRefusedEvidenceReplayed {
+		t.Fatalf("refusal = %q, want %q (the consumed citation is verified first)",
+			refusals[i1.Name], ApprovalRefusedEvidenceReplayed)
+	}
+
+	ev, err = VerifyApproval(ctx, c, &mirrorSpiller{}, proj, getTaskCR(t, c, task.Name),
+		cites("c2", "go ahead now"))
+	if err != nil {
+		t.Fatalf("VerifyApproval (3): %v", err)
 	}
 	if !ApprovalPassed(ev) {
 		t.Fatal("a NEW maintainer comment failed to approve")
 	}
 	got := getIssueCR(t, c, i1.Name).Status.Approval
-	if got == nil || got.CommentID != "c2" || got.Phrase != "go ahead" || got.Login != "szymonrychu" {
-		t.Fatalf("evidence = %+v, want {login: szymonrychu, commentId: c2, phrase: go ahead}", got)
+	if got == nil || got.CommentID != "c2" || got.Phrase != "go ahead now" || got.Login != "szymonrychu" {
+		t.Fatalf("evidence = %+v, want {login: szymonrychu, commentId: c2, phrase: go ahead now}", got)
 	}
 }
 
@@ -343,7 +369,9 @@ func autoProposalIssue(repo, botLogin, kind string, number int, comments ...tata
 // autoApproveTataraProposals path removes the last human gate before prod, so
 // every fail-closed branch is asserted explicitly. Auto-approval is granted ONLY
 // on the all-green row (flag on + bot author + valid marker + open + no
-// maintainer comment); every other row must refuse and leave the Task clarifying.
+// maintainer comment) and it is the one arm where NO citation is required,
+// because there is no comment to cite; every other row must refuse and leave the
+// Task clarifying.
 func TestAutoApprove_FailClosedMatrix(t *testing.T) {
 	ctx := context.Background()
 	const bot = "tatara-bot"
@@ -439,7 +467,11 @@ func TestAutoApprove_FailClosedMatrix(t *testing.T) {
 			wantRefusal: ApprovalRefusedNoMaintainer,
 		},
 		{
-			name:   "a maintainer NON-approval comment blocks auto-approve (no-phrase)",
+			// THE carve-out boundary. The moment a maintainer speaks, consent is a
+			// live question and the carve-out no longer applies: with nothing cited
+			// this refuses, and it refuses for the CITATION reason, not the
+			// no-maintainer one.
+			name:   "a maintainer commented, so the carve-out no longer applies and nothing was cited",
 			flagOn: true,
 			mutate: func(iss *tatarav1alpha1.Issue) {
 				iss.Status.Comments = []tatarav1alpha1.Comment{
@@ -447,7 +479,21 @@ func TestAutoApprove_FailClosedMatrix(t *testing.T) {
 				}
 			},
 			wantStage:   tatarav1alpha1.StageClarifying,
-			wantRefusal: ApprovalRefusedNoPhrase,
+			wantRefusal: ApprovalRefusedNoCitation,
+		},
+		{
+			// And a citation of that maintainer's own words does NOT rescue it
+			// when the words are not in the comment: the anti-fabrication check
+			// runs on the carve-out path too.
+			name:   "a maintainer commented and the agent fabricated a quote",
+			flagOn: true,
+			mutate: func(iss *tatarav1alpha1.Issue) {
+				iss.Status.Comments = []tatarav1alpha1.Comment{
+					approvalComment("c1", "szymonrychu", "hold on, this is wrong", now, false),
+				}
+			},
+			wantStage:   tatarav1alpha1.StageClarifying,
+			wantRefusal: ApprovalRefusedQuoteAbsent,
 		},
 	}
 
@@ -465,8 +511,13 @@ func TestAutoApprove_FailClosedMatrix(t *testing.T) {
 			task := approvalTask("t-auto-matrix", iss.Name)
 			c := newMirrorClient(t, proj, repo, iss, task)
 
+			var citations []tatarav1alpha1.ApprovalCitation
+			if tc.wantRefusal == ApprovalRefusedQuoteAbsent {
+				citations = cites("c1", "go ahead")
+			}
+
 			metrics := obs.NewOperatorMetrics(prometheus.NewRegistry())
-			ev, refusals, err := VerifyApprovalDetailed(ctx, c, &mirrorSpiller{}, proj, task, metrics)
+			ev, refusals, err := VerifyApprovalDetailed(ctx, c, &mirrorSpiller{}, proj, task, citations, metrics)
 			if err != nil {
 				t.Fatalf("VerifyApprovalDetailed: %v", err)
 			}
@@ -487,8 +538,11 @@ func TestAutoApprove_FailClosedMatrix(t *testing.T) {
 				if ApprovalPassed(ev) {
 					t.Fatal("a fail-closed row auto-approved")
 				}
-				if tc.wantRefusal != "" && refusals[iss.Name] != tc.wantRefusal {
+				if refusals[iss.Name] != tc.wantRefusal {
 					t.Fatalf("refusal = %q, want %q", refusals[iss.Name], tc.wantRefusal)
+				}
+				if got := testutil.ToFloat64(metrics.ApprovalRefusedCounter(tc.wantRefusal)); got != 1 {
+					t.Fatalf("operator_approval_refused_total{reason=%q} = %v, want 1", tc.wantRefusal, got)
 				}
 			}
 			if got := getTaskCR(t, c, task.Name).Status.Stage; got != tc.wantStage {
@@ -515,7 +569,7 @@ func TestAutoApprove_ClosedIssueVetoed(t *testing.T) {
 	task := approvalTask("t-auto-closed", iss.Name)
 	c := newMirrorClient(t, proj, repo, iss, task)
 
-	ev, err := VerifyApproval(ctx, c, &mirrorSpiller{}, proj, task)
+	ev, err := VerifyApproval(ctx, c, &mirrorSpiller{}, proj, task, nil)
 	if err != nil {
 		t.Fatalf("VerifyApproval: %v", err)
 	}
@@ -527,7 +581,7 @@ func TestAutoApprove_ClosedIssueVetoed(t *testing.T) {
 	}
 }
 
-// TestAutoApprove_HumanApprovalWins: when a real maintainer approval IS present,
+// TestAutoApprove_HumanApprovalWins: when a real maintainer approval IS cited,
 // the human evidence (Auto:false, real commentId) is recorded, not the auto
 // sentinel - the auto path is a fallback for the no-human case, never an override.
 func TestAutoApprove_HumanApprovalWins(t *testing.T) {
@@ -537,16 +591,16 @@ func TestAutoApprove_HumanApprovalWins(t *testing.T) {
 	now := time.Now()
 
 	iss := autoProposalIssue(repo.Name, "tatara-bot", tatarav1alpha1.ProposalKindBrainstorm, 1,
-		approvalComment("c1", "szymonrychu", "lgtm", now, false))
+		approvalComment("c1", "szymonrychu", "yes, go ahead", now, false))
 	task := approvalTask("t-auto-human", iss.Name)
 	c := newMirrorClient(t, proj, repo, iss, task)
 
-	ev, err := VerifyApproval(ctx, c, &mirrorSpiller{}, proj, task)
+	ev, err := VerifyApproval(ctx, c, &mirrorSpiller{}, proj, task, cites("c1", "go ahead"))
 	if err != nil {
 		t.Fatalf("VerifyApproval: %v", err)
 	}
 	if !ApprovalPassed(ev) {
-		t.Fatal("a maintainer lgtm on a bot proposal failed to approve")
+		t.Fatal("a cited maintainer approval on a bot proposal failed to approve")
 	}
 	got := ev[iss.Name]
 	if got == nil || got.Auto || got.Login != "szymonrychu" || got.CommentID != "c1" {
@@ -557,7 +611,7 @@ func TestAutoApprove_HumanApprovalWins(t *testing.T) {
 // TestVerifyApprovalAutoEvidenceSurvivesAReRun: autoApproveTataraProposals is
 // the ONLY other path into approved, and it writes ApprovalEvidence{Auto: true,
 // Login: "<tatara:auto>", CommentID: ""} - evidence with NO comment to re-match.
-// A re-run of the grammar must not refuse it and bounce the Task out of approved.
+// A re-run must not refuse it and bounce the Task out of approved.
 func TestVerifyApprovalAutoEvidenceSurvivesAReRun(t *testing.T) {
 	ctx := context.Background()
 	proj, repo := approvalProject("szymonrychu"), mirrorRepo()
@@ -570,7 +624,7 @@ func TestVerifyApprovalAutoEvidenceSurvivesAReRun(t *testing.T) {
 	task := approvalTask("t-auto", i1.Name)
 	c := newMirrorClient(t, proj, repo, i1, task)
 
-	ev, err := VerifyApproval(ctx, c, &mirrorSpiller{}, proj, task)
+	ev, err := VerifyApproval(ctx, c, &mirrorSpiller{}, proj, task, nil)
 	if err != nil {
 		t.Fatalf("VerifyApproval: %v", err)
 	}
@@ -587,18 +641,19 @@ func TestVerifyApprovalAutoEvidenceSurvivesAReRun(t *testing.T) {
 
 // TestVerifyApprovalIsNotRevokedByLaterChat: approval is un-stuck by ACQUIRING an
 // Issue (clause 2), never by a maintainer's later chatter. A "thanks!" after an
-// "lgtm" must not revoke the approval it already granted.
+// approval must not revoke the approval it already granted - and a re-run with NO
+// citation at all must not either, because the stored evidence short-circuits.
 func TestVerifyApprovalIsNotRevokedByLaterChat(t *testing.T) {
 	ctx := context.Background()
 	proj, repo := approvalProject("szymonrychu"), mirrorRepo()
 	now := time.Now()
 
-	i1 := approvalIssue(repo.Name, 1, approvalComment("c1", "szymonrychu", "lgtm", now, false))
+	i1 := approvalIssue(repo.Name, 1, approvalComment("c1", "szymonrychu", "go ahead", now, false))
 	task := approvalTask("t-chat", i1.Name)
 	c := newMirrorClient(t, proj, repo, i1, task)
 
-	if ev, err := VerifyApproval(ctx, c, &mirrorSpiller{}, proj, task); err != nil || !ApprovalPassed(ev) {
-		t.Fatalf("lgtm did not approve: ev=%+v err=%v", ev, err)
+	if ev, err := VerifyApproval(ctx, c, &mirrorSpiller{}, proj, task, cites("c1", "go ahead")); err != nil || !ApprovalPassed(ev) {
+		t.Fatalf("the cited approval did not approve: ev=%+v err=%v", ev, err)
 	}
 
 	iss := getIssueCR(t, c, i1.Name)
@@ -608,7 +663,7 @@ func TestVerifyApprovalIsNotRevokedByLaterChat(t *testing.T) {
 		t.Fatalf("seed later chat: %v", err)
 	}
 
-	ev, err := VerifyApproval(ctx, c, &mirrorSpiller{}, proj, getTaskCR(t, c, task.Name))
+	ev, err := VerifyApproval(ctx, c, &mirrorSpiller{}, proj, getTaskCR(t, c, task.Name), nil)
 	if err != nil {
 		t.Fatalf("VerifyApproval (2): %v", err)
 	}
@@ -629,9 +684,9 @@ func TestVerifyApprovalIsNotSticky(t *testing.T) {
 	now := time.Now()
 
 	issues := []*tatarav1alpha1.Issue{
-		approvalIssue(repo.Name, 1, approvalComment("c1", "szymonrychu", "lgtm", now, false)),
-		approvalIssue(repo.Name, 2, approvalComment("c2", "szymonrychu", "lgtm", now, false)),
-		approvalIssue(repo.Name, 3, approvalComment("c3", "szymonrychu", "lgtm", now, false)),
+		approvalIssue(repo.Name, 1, approvalComment("c1", "szymonrychu", "go ahead", now, false)),
+		approvalIssue(repo.Name, 2, approvalComment("c2", "szymonrychu", "go ahead", now, false)),
+		approvalIssue(repo.Name, 3, approvalComment("c3", "szymonrychu", "go ahead", now, false)),
 	}
 	task := approvalTask("t-sticky", issues[0].Name, issues[1].Name, issues[2].Name)
 	objs := []client.Object{proj, repo, task}
@@ -640,7 +695,8 @@ func TestVerifyApprovalIsNotSticky(t *testing.T) {
 	}
 	c := newMirrorClient(t, objs...)
 
-	if ev, err := VerifyApproval(ctx, c, &mirrorSpiller{}, proj, task); err != nil || !ApprovalPassed(ev) {
+	all := cites("c1", "go ahead", "c2", "go ahead", "c3", "go ahead")
+	if ev, err := VerifyApproval(ctx, c, &mirrorSpiller{}, proj, task, all); err != nil || !ApprovalPassed(ev) {
 		t.Fatalf("three approved issues did not pass the gate: ev=%+v err=%v", ev, err)
 	}
 	if got := getTaskCR(t, c, task.Name).Status.Stage; got != tatarav1alpha1.StageApproved {
@@ -658,7 +714,7 @@ func TestVerifyApprovalIsNotSticky(t *testing.T) {
 		t.Fatalf("acquire issue 4: %v", err)
 	}
 
-	ev, err := VerifyApproval(ctx, c, &mirrorSpiller{}, proj, getTaskCR(t, c, task.Name))
+	ev, err := VerifyApproval(ctx, c, &mirrorSpiller{}, proj, getTaskCR(t, c, task.Name), all)
 	if err != nil {
 		t.Fatalf("VerifyApproval (2): %v", err)
 	}
@@ -678,7 +734,7 @@ func TestVerifyApprovalEmptySetIsNotALicence(t *testing.T) {
 	task := approvalTask("t-empty")
 	c := newMirrorClient(t, proj, repo, task)
 
-	ev, err := VerifyApproval(ctx, c, &mirrorSpiller{}, proj, task)
+	ev, err := VerifyApproval(ctx, c, &mirrorSpiller{}, proj, task, nil)
 	if err != nil {
 		t.Fatalf("VerifyApproval: %v", err)
 	}
@@ -691,49 +747,45 @@ func TestVerifyApprovalEmptySetIsNotALicence(t *testing.T) {
 }
 
 // TestVerifyApprovalRefusalNamesWhatWasMissing: the park comment the operator
-// posts on a refusal names what was missing. It is BOT-authored, so it can never
-// un-park the Task (E.3 enqueue filter + F.6).
+// posts on a refusal names what the OPERATOR could not establish, and every
+// refusal reason renders its own distinct message. It must NOT instruct the human
+// to type a magic phrase: there is no wordlist any more, and that instruction was
+// the failure this redesign removes. It is BOT-authored, so it can never un-park
+// the Task (E.3 enqueue filter + F.6).
 func TestVerifyApprovalRefusalNamesWhatWasMissing(t *testing.T) {
-	phrases := tatarav1alpha1.DefaultApprovalPhrases()
+	seen := map[string]string{}
 	for _, reason := range []string{
-		ApprovalRefusedNoMaintainer, ApprovalRefusedNoPhrase, ApprovalRefusedEvidenceReplayed,
+		ApprovalRefusedNoMaintainer, ApprovalRefusedNoCitation,
+		ApprovalRefusedCitationNotMaintainer, ApprovalRefusedQuoteAbsent,
+		ApprovalRefusedEvidenceReplayed,
 	} {
-		msg := ApprovalRefusedComment(reason, phrases)
+		msg := ApprovalRefusedComment(reason)
 		if msg == "" {
 			t.Fatalf("refusal %q rendered an EMPTY comment", reason)
 		}
-		if !containsAll(msg, "lgtm", "go ahead") {
-			t.Fatalf("refusal comment does not name the accepted phrases: %q", msg)
+		if other, dup := seen[msg]; dup {
+			t.Fatalf("refusals %q and %q render the SAME comment", reason, other)
 		}
+		seen[msg] = reason
+		if strings.Contains(msg, "CONSISTS OF") {
+			t.Fatalf("refusal %q still tells the human to type a magic phrase: %q", reason, msg)
+		}
+	}
+	if got := ApprovalRefusedComment("something-unmapped"); got == "" {
+		t.Fatal("an unmapped reason rendered an EMPTY comment")
 	}
 }
 
-func containsAll(s string, subs ...string) bool {
-	for _, sub := range subs {
-		found := false
-		for i := 0; i+len(sub) <= len(s); i++ {
-			if s[i:i+len(sub)] == sub {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return false
-		}
-	}
-	return true
-}
-
-// approvalEvent builds the non-bot pendingEvent that re-drives the grammar.
+// approvalEvent builds the non-bot pendingEvent that re-drives the verification.
 func approvalEvent(repo string, number int, author, body string) tatarav1alpha1.TaskEvent {
 	return tatarav1alpha1.TaskEvent{
 		At: metav1.Now(), Kind: "issue_comment", Repo: repo, Number: number, Author: author, Body: body,
 	}
 }
 
-// parkedTask is a Task parked at identity-unverified with the non-bot event that
-// triggers the C3-3 re-verification.
-func parkedTask(name string, ev tatarav1alpha1.TaskEvent, issueRefs ...string) *tatarav1alpha1.Task {
+// parkedApprovalTask is a Task parked at identity-unverified with the non-bot
+// event that triggers the C3-3 re-verification.
+func parkedApprovalTask(name string, ev tatarav1alpha1.TaskEvent, issueRefs ...string) *tatarav1alpha1.Task {
 	t := approvalTask(name, issueRefs...)
 	t.Status.Stage = tatarav1alpha1.StageParked
 	t.Status.StageReason = stage.ReasonIdentityUnverified
@@ -742,13 +794,13 @@ func parkedTask(name string, ev tatarav1alpha1.TaskEvent, issueRefs ...string) *
 }
 
 // TestReVerifyParkedSyncsTheThreadFirst is the C3-3 path, and the ordering is
-// mandatory. A Task parked at identity-unverified, given a maintainer comment
-// "go ahead", reaches implementing in ONE comment - not two comments and 7 days.
+// mandatory. A Task parked at identity-unverified reaches a verified approval in
+// ONE comment - not two comments and 7 days.
 //
 // The mirror here is DELIBERATELY ONE DAY STALE (the parked cadence is DAILY):
-// without the on-demand sync the grammar re-runs against a thread that does not
-// contain the comment that triggered it, clause (d) has no ExternalID to check
-// against, and the re-verification silently fails.
+// without the on-demand sync the verification re-runs against a thread that does
+// not contain the comment that triggered it, so the cited ExternalID resolves to
+// nothing and the re-verification silently fails.
 func TestReVerifyParkedSyncsTheThreadFirst(t *testing.T) {
 	ctx := context.Background()
 	proj, repo := approvalProject("szymonrychu"), mirrorRepo()
@@ -757,17 +809,17 @@ func TestReVerifyParkedSyncsTheThreadFirst(t *testing.T) {
 	i1 := approvalIssue(repo.Name, 291,
 		approvalComment("b1", "tatara-bot", "tatara: I cannot start work on this yet", dayOld.Time, true))
 	i1.Status.LastSyncedAt = &dayOld
-	ev := approvalEvent(repo.Name, 291, "szymonrychu", "go ahead")
-	task := parkedTask("t-reverify", ev, i1.Name)
+	ev := approvalEvent(repo.Name, 291, "szymonrychu", "sure, go ahead")
+	task := parkedApprovalTask("t-reverify", ev, i1.Name)
 	c := newMirrorClient(t, proj, repo, i1, task)
 
 	// The FORGE has the approving comment; the stale mirror does not.
 	rd := &mirrorReader{comments: []scm.IssueComment{
 		{ExternalID: "b1", Author: "tatara-bot", Body: "tatara: I cannot start work on this yet", CreatedAt: dayOld.Time},
-		{ExternalID: "c9", Author: "szymonrychu", Body: "go ahead", CreatedAt: time.Now().UTC().Truncate(time.Second)},
+		{ExternalID: "c9", Author: "szymonrychu", Body: "sure, go ahead", CreatedAt: time.Now().UTC().Truncate(time.Second)},
 	}}
 
-	passed, err := ReVerifyParked(ctx, c, &mirrorSpiller{}, rd, proj, task, ev, nil)
+	passed, err := ReVerifyParked(ctx, c, &mirrorSpiller{}, rd, proj, task, ev, cites("c9", "go ahead"), nil)
 	if err != nil {
 		t.Fatalf("ReVerifyParked: %v", err)
 	}
@@ -775,7 +827,7 @@ func TestReVerifyParkedSyncsTheThreadFirst(t *testing.T) {
 		t.Fatalf("forge reads = %d, want EXACTLY 1 (sync that issue's thread, once)", rd.calls)
 	}
 	if !passed {
-		t.Fatal("a maintainer 'go ahead' on a parked Task did not pass the re-verified grammar")
+		t.Fatal("a cited maintainer approval on a parked Task did not pass the re-verification")
 	}
 	iss := getIssueCR(t, c, i1.Name)
 	if iss.Status.Status != "approved" {
@@ -789,35 +841,36 @@ func TestReVerifyParkedSyncsTheThreadFirst(t *testing.T) {
 	// stage.Unpark and assert the Task reached implementing in one comment;
 	// agent-judged-approval-gate step C deleted the field that carried it and
 	// the implementing edge it fed, so there is no verdict-to-F.6 coupling left
-	// to assert. What ReVerifyParked does - one forge read, then the C.6 grammar
-	// against the refreshed thread - is unchanged and fully covered above.
+	// to assert. What ReVerifyParked does - one forge read, then the citation
+	// check against the refreshed thread - is unchanged and fully covered above.
 }
 
-// TestReVerifyParkedRefusesANonApprovingComment: "not yet" keeps the Task parked.
-func TestReVerifyParkedRefusesANonApprovingComment(t *testing.T) {
+// TestReVerifyParkedRefusesAnUncitedComment: a human comment that the agent did
+// not cite keeps the Task parked.
+func TestReVerifyParkedRefusesAnUncitedComment(t *testing.T) {
 	ctx := context.Background()
 	proj, repo := approvalProject("szymonrychu"), mirrorRepo()
 
 	i1 := approvalIssue(repo.Name, 291)
 	ev := approvalEvent(repo.Name, 291, "szymonrychu", "not yet")
-	task := parkedTask("t-notyet", ev, i1.Name)
+	task := parkedApprovalTask("t-notyet", ev, i1.Name)
 	c := newMirrorClient(t, proj, repo, i1, task)
 
 	rd := &mirrorReader{comments: []scm.IssueComment{
 		{ExternalID: "c9", Author: "szymonrychu", Body: "not yet", CreatedAt: time.Now()},
 	}}
-	passed, err := ReVerifyParked(ctx, c, &mirrorSpiller{}, rd, proj, task, ev, nil)
+	passed, err := ReVerifyParked(ctx, c, &mirrorSpiller{}, rd, proj, task, ev, nil, nil)
 	if err != nil {
 		t.Fatalf("ReVerifyParked: %v", err)
 	}
 	if passed {
-		t.Fatal("'not yet' passed the approval grammar")
+		t.Fatal("an UNCITED maintainer comment passed the approval gate")
 	}
-	// The stage.Unpark leg of this test is gone with step C: a refused grammar
-	// no longer has any way to reach F.6, so re-asserting "it did not un-park"
-	// through Unpark would now pass for an unrelated reason (no conversing room)
-	// and prove nothing. What matters here is that ReVerifyParked itself refuses
-	// and leaves the Task where it was.
+	// The stage.Unpark leg of this test is gone with step C: a refused
+	// verification no longer has any way to reach F.6, so re-asserting "it did
+	// not un-park" through Unpark would now pass for an unrelated reason (no
+	// conversing room) and prove nothing. What matters here is that
+	// ReVerifyParked itself refuses and leaves the Task where it was.
 	fresh := getTaskCR(t, c, task.Name)
 	if iss := getIssueCR(t, c, i1.Name); iss.Status.Status == "approved" {
 		t.Fatal("'not yet' stamped the issue approved")
@@ -834,17 +887,17 @@ func TestReVerifyParkedIgnoresABotEvent(t *testing.T) {
 	proj, repo := approvalProject("szymonrychu"), mirrorRepo()
 
 	i1 := approvalIssue(repo.Name, 291)
-	ev := approvalEvent(repo.Name, 291, "tatara-bot", "lgtm")
-	task := parkedTask("t-botevent", ev, i1.Name)
+	ev := approvalEvent(repo.Name, 291, "tatara-bot", "go ahead")
+	task := parkedApprovalTask("t-botevent", ev, i1.Name)
 	c := newMirrorClient(t, proj, repo, i1, task)
 
 	rd := &mirrorReader{}
-	passed, err := ReVerifyParked(ctx, c, &mirrorSpiller{}, rd, proj, task, ev, nil)
+	passed, err := ReVerifyParked(ctx, c, &mirrorSpiller{}, rd, proj, task, ev, cites("c1", "go ahead"), nil)
 	if err != nil {
 		t.Fatalf("ReVerifyParked: %v", err)
 	}
 	if passed {
-		t.Fatal("a BOT comment passed the approval grammar")
+		t.Fatal("a BOT comment passed the approval gate")
 	}
 	if rd.calls != 0 {
 		t.Fatalf("forge reads = %d, want 0 (a bot event is never re-verified)", rd.calls)

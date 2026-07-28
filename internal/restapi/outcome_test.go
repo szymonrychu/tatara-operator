@@ -701,6 +701,123 @@ func TestOutcome_Clarify_AutoApproveIncrementsCounter(t *testing.T) {
 	require.Equal(t, 1.0, testutil.ToFloat64(metrics.AutoApproveCounter(tatarav1alpha1.ProposalKindBrainstorm)))
 }
 
+// TestOutcome_Clarify_CitationsReachTheVerifierVerbatim: the handler is a pipe.
+// It parses the agent's citations off the clarify payload and hands them to the
+// verifier UNCHANGED, for every owned Issue - it never inspects, normalises or
+// judges them itself. The whole verification lives in controller.verifyOneIssue.
+func TestOutcome_Clarify_CitationsReachTheVerifierVerbatim(t *testing.T) {
+	i1 := issueV2("tatara-operator", 291, "t1")
+	i2 := issueV2("tatara-operator", 292, "t1")
+	fa := &fakeApproval{grant: map[string]bool{i1.Name: true, i2.Name: true}, needCitation: true}
+	e := buildV2(t, v2Opts{writer: panicForge{}, approval: fa},
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"), i1, i2)
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"clarify","payload":{"decision":"implement","reason":"maintainer approved",`+
+			`"approvalCitations":[{"id":"c-2","quote":"go ahead, I approve!"}]}}`)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, tatarav1alpha1.StageApproved, e.task(t, "t1").Status.Stage)
+
+	require.Len(t, fa.gotCitations, 2, "every owned Issue is offered the citation set")
+	for _, got := range fa.gotCitations {
+		require.Equal(t, []tatarav1alpha1.ApprovalCitation{{ID: "c-2", Quote: "go ahead, I approve!"}}, got)
+	}
+}
+
+// TestOutcome_Clarify_CitationRefusalIs200AndParks is the load-bearing contract
+// shape. A missing or failing citation is a REFUSAL, not a client error: 200 +
+// park at identity-unverified, exactly as a failed grammar check did. A
+// mis-instructed agent then parks ONE task instead of deadlocking the fleet.
+// Only malformed JSON and a missing decision / blank reason stay 4xx.
+func TestOutcome_Clarify_CitationRefusalIs200AndParks(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		body     string
+		approval *fakeApproval
+	}{
+		{
+			name:     "no citations at all",
+			body:     `{"decision":"implement","reason":"maintainer-1 approved"}`,
+			approval: &fakeApproval{grant: map[string]bool{"iss-tatara-operator-291": true}, needCitation: true},
+		},
+		{
+			name: "citations present but the verifier refuses them",
+			body: `{"decision":"implement","reason":"x","approvalCitations":[{"id":"c-1","quote":"go ahead"}]}`,
+			// The verifier refuses (a non-maintainer's comment, a fabricated
+			// quote, a replayed id - the reason is the controller's business).
+			approval: &fakeApproval{grant: map[string]bool{}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			i1 := issueV2("tatara-operator", 291, "t1")
+			e := buildV2(t, v2Opts{writer: panicForge{}, approval: tc.approval},
+				projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+				taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"), i1)
+
+			w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+				`{"kind":"clarify","payload":`+tc.body+`}`)
+			require.Equal(t, http.StatusOK, w.Code, "a refusal is never a 4xx")
+
+			got := e.task(t, "t1")
+			require.Equal(t, tatarav1alpha1.StageParked, got.Status.Stage)
+			require.Equal(t, "identity-unverified", got.Status.StageReason)
+			require.Empty(t, e.issue(t, i1.Name).Status.Approval, "nothing is stamped on a refusal")
+		})
+	}
+}
+
+// TestOutcome_Clarify_BadShapeStays4xx pins the OTHER side of the line: a
+// payload the operator cannot even read is still a client error.
+func TestOutcome_Clarify_BadShapeStays4xx(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"malformed json", `{"decision":`},
+		{"unknown field", `{"decision":"implement","reason":"x","approvalCitation":[]}`},
+		{"unknown field inside a citation", `{"decision":"implement","reason":"x","approvalCitations":[{"id":"c-1","text":"go ahead"}]}`},
+		{"missing decision", `{"reason":"x"}`},
+		{"blank reason", `{"decision":"implement","reason":"   "}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := buildV2(t, v2Opts{writer: panicForge{},
+				approval: &fakeApproval{grant: map[string]bool{"iss-tatara-operator-291": true}}},
+				projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+				taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"),
+				issueV2("tatara-operator", 291, "t1"))
+			w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+				`{"kind":"clarify","payload":`+tc.body+`}`)
+			require.GreaterOrEqual(t, w.Code, 400)
+			require.Less(t, w.Code, 500)
+		})
+	}
+}
+
+// TestOutcome_Clarify_GrantedWithNilEvidenceIsNotWritten: granted==true implies
+// every Issue produced evidence, but this writer used to assign it UNGUARDED.
+// status=approved with a nil approval is an approved Issue with NO approver - it
+// defeats the idempotence short-circuit, defeats the single-use replay guard,
+// and projects tatara-approved to the forge with nobody behind it. The
+// controller's own writer guards this; this one did not.
+func TestOutcome_Clarify_GrantedWithNilEvidenceIsNotWritten(t *testing.T) {
+	i1 := issueV2("tatara-operator", 291, "t1")
+	e := buildV2(t, v2Opts{writer: panicForge{},
+		approval: &fakeApproval{grant: map[string]bool{i1.Name: true}, grantWithNilEvidence: true}},
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"), i1)
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"clarify","payload":{"decision":"implement","reason":"x",`+
+			`"approvalCitations":[{"id":"c-2","quote":"go ahead"}]}}`)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	got := e.issue(t, i1.Name)
+	require.Nil(t, got.Status.Approval)
+	require.NotEqual(t, "approved", got.Status.Status,
+		"an approver-less approval must never be written")
+}
+
 // A nil verifier FAILS CLOSED.
 func TestOutcome_Clarify_NoVerifierFailsClosed(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),

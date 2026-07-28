@@ -23,36 +23,52 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
-// THE APPROVAL GATE (contract C.6). PRESENCE IS NOT CONSENT; TEXT IS.
+// THE APPROVAL GATE (contract C.6). PRESENCE IS NOT CONSENT; A CITATION IS.
 //
 // The pre-redesign approvingMaintainer() returned a maintainer-authored comment
 // WITHOUT READING IT, so a maintainer saying "I can't approve this until the
 // tests pass" released the autonomous implement -> review -> merge -> deploy
-// chain. The grammar below is the fix, and every clause of it is load-bearing:
+// chain. The literal wordlist that replaced it failed the other way: it could
+// not read "go ahead, I approve!" and parked a Task whose maintainer intent was
+// unambiguous.
 //
-//	a. the author is a maintainer AND is structurally NOT the bot
-//	b. it is the MOST RECENT maintainer-authored comment on that thread
-//	c. an ANCHORED WHOLE-LINE match: the comment CONSISTS OF an approval phrase
+// The gate is now SPLIT. The AGENT judges what a maintainer comment MEANS and
+// CITES it. The OPERATOR judges WHO, structurally, against its own mirror, and
+// never reads intent at all:
+//
+//	a. a maintainer-authored, structurally-non-bot comment exists on this Issue
+//	b. the agent CITED one of THEM (set membership, NOT recency)
+//	c. the agent's verbatim quote OCCURS in the body the operator holds
 //	d. the evidence is SINGLE-USE: a consumed commentId cannot approve twice
 //
 // and the SCOPE is EVERY LIVE owned Issue (state=open, status not in
-// done/rejected), never just one: one "lgtm" on one issue must not approve a
+// done/rejected), never just one: one citation on one issue must not approve a
 // Task spanning every repo in mergeOrder.
-//
-// A negation BLOCKLIST was rejected outright: blocklists lose. That is the same
-// argument that makes C.7's close-directive filter an ALLOWLIST.
 
-// Approval refusal reasons. They name what was MISSING, and they are what the
-// operator's park comment reports back to the human.
+// Approval refusal reasons. They name what the OPERATOR could not establish -
+// never what the comment meant, which is the agent's job. They are the `reason`
+// label on operator_approval_refused_total and the text the operator's park
+// comment reports back to the human.
 const (
-	// ApprovalRefusedNoMaintainer: clauses (a)/(b) - no maintainer-authored,
-	// non-bot comment on the thread at all.
+	// ApprovalRefusedNoMaintainer: there is no maintainer-authored, non-bot
+	// comment on the thread at all, and the auto-approve carve-out does not apply.
 	ApprovalRefusedNoMaintainer = "no-maintainer-comment"
-	// ApprovalRefusedNoPhrase: clause (c) - the MOST RECENT maintainer comment
-	// does not CONSIST OF an approval phrase.
-	ApprovalRefusedNoPhrase = "no-approval-phrase"
-	// ApprovalRefusedEvidenceReplayed: clause (d) - that comment was already
-	// consumed as evidence once.
+	// ApprovalRefusedNoCitation: a maintainer HAS commented, so consent is a
+	// live question, and the agent cited nothing. Fail closed.
+	ApprovalRefusedNoCitation = "no-citation"
+	// ApprovalRefusedCitationNotMaintainer: the cited id names no
+	// maintainer-authored, non-bot comment on this Issue - it is a
+	// non-maintainer's, it is the bot's, it is an unknown id, or it is not on
+	// this Issue at all. It is NOT a recency complaint: an EARLIER approving
+	// comment is perfectly citable while newer maintainer comments exist. A
+	// later comment that withdraws the approval is the agent's call, not this
+	// constant's.
+	ApprovalRefusedCitationNotMaintainer = "citation-not-maintainer"
+	// ApprovalRefusedQuoteAbsent: the agent's verbatim substring does not occur
+	// in the body the OPERATOR holds. This is the anti-fabrication check.
+	ApprovalRefusedQuoteAbsent = "quote-not-in-comment"
+	// ApprovalRefusedEvidenceReplayed: that comment was already consumed as
+	// evidence once. A later approval must cite a DIFFERENT comment.
 	ApprovalRefusedEvidenceReplayed = "evidence-replayed"
 )
 
@@ -186,29 +202,29 @@ func ApprovalPassed(evidence map[string]*tatarav1alpha1.ApprovalEvidence) bool {
 }
 
 // ApprovalRefusedComment renders the comment the operator posts on an Issue
-// whose approval grammar failed, naming what was missing. It is BOT-authored,
-// so it can never un-park the Task it parked (E.3 enqueue filter + F.6).
-func ApprovalRefusedComment(reason string, phrases []string) string {
-	quoted := make([]string, 0, len(phrases))
-	for _, p := range phrases {
-		quoted = append(quoted, "`"+p+"`")
-	}
-	list := strings.Join(quoted, ", ")
-
+// whose approval could not be verified, naming what the OPERATOR could not
+// establish. It never says what wording to use: there is no wordlist any more,
+// and telling a human to type a magic phrase is exactly the failure this
+// redesign removes. It is BOT-authored, so it can never un-park the Task it
+// parked (E.3 enqueue filter + F.6).
+func ApprovalRefusedComment(reason string) string {
 	var missing string
 	switch reason {
 	case ApprovalRefusedNoMaintainer:
 		missing = "no maintainer has commented on this thread"
-	case ApprovalRefusedNoPhrase:
-		missing = "the most recent maintainer comment is not an approval"
+	case ApprovalRefusedNoCitation:
+		missing = "a maintainer has commented, but nothing on this thread was cited as an approval"
+	case ApprovalRefusedCitationNotMaintainer:
+		missing = "the cited comment is not a maintainer's comment on this issue"
+	case ApprovalRefusedQuoteAbsent:
+		missing = "the cited wording does not appear in the comment it was attributed to"
 	case ApprovalRefusedEvidenceReplayed:
-		missing = "the most recent maintainer comment was already used to approve this issue once"
+		missing = "the cited comment was already used to approve this issue once"
 	default:
 		missing = "the approval could not be verified"
 	}
 	return fmt.Sprintf("tatara: I am not starting work on this yet - %s. "+
-		"A maintainer can approve it with a comment that CONSISTS OF one of: %s "+
-		"(the comment must be the phrase alone, not a sentence containing it).", missing, list)
+		"A maintainer can approve it by saying so in a comment on this issue.", missing)
 }
 
 // approvalInScope is C.6 clause (2), narrowed to LIVE issues (fix L3-14): a
@@ -221,73 +237,146 @@ func approvalInScope(iss *tatarav1alpha1.Issue) bool {
 	return iss.Status.Status != "done" && iss.Status.Status != "rejected"
 }
 
-// mostRecentMaintainerComment is C.6 clauses (a) and (b): the LATEST comment on
-// the thread whose author is a verified maintainer and is structurally NOT the
-// bot. The bot exclusion runs BEFORE IsMaintainer, so a bot login misconfigured
-// into maintainerLogins still cannot approve.
-func mostRecentMaintainerComment(iss *tatarav1alpha1.Issue, proj *tatarav1alpha1.Project,
-	repo *tatarav1alpha1.Repository, botLogin string) *tatarav1alpha1.Comment {
-	var best *tatarav1alpha1.Comment
-	for i := range iss.Status.Comments {
-		c := &iss.Status.Comments[i]
-		if c.IsBot || c.Author == "" || (botLogin != "" && c.Author == botLogin) {
-			continue
-		}
-		if !tatarav1alpha1.IsMaintainer(proj, repo, c.Author) {
-			continue
-		}
-		if best == nil || !c.CreatedAt.Time.Before(best.CreatedAt.Time) {
-			best = c
-		}
+// isMaintainerComment is the operator's WHO check on one comment: a verified
+// maintainer wrote it and it is structurally NOT the bot. The bot exclusion runs
+// BEFORE IsMaintainer, so a bot login misconfigured into maintainerLogins still
+// cannot approve.
+func isMaintainerComment(c *tatarav1alpha1.Comment, proj *tatarav1alpha1.Project,
+	repo *tatarav1alpha1.Repository, botLogin string) bool {
+	if c.IsBot || c.Author == "" || (botLogin != "" && c.Author == botLogin) {
+		return false
 	}
-	return best
+	return tatarav1alpha1.IsMaintainer(proj, repo, c.Author)
 }
 
-// verifyOneIssue is the C.6 per-Issue grammar body, and it is the SINGLE
-// definition of the per-Issue verdict - shared by VerifyApprovalDetailed's
-// per-Task scope loop and by GrammarVerifier (the production restapi
-// ApprovalVerifier the /outcome clarify path calls). It is PURE: it derives the
-// verdict and NEVER writes. The caller (grammar loop OR outcome.go) persists.
+// verifyOneIssue is the per-Issue approval decision and the SINGLE definition
+// of it. It is PURE: it derives the verdict and NEVER writes; the caller
+// persists.
+//
+// SPLIT OF DUTIES. The agent judges WHAT THE COMMENT MEANS - that is the whole
+// point of this design, because the literal wordlist could not read
+// "go ahead, I approve!" and parked a Task with the maintainer's intent
+// unambiguous. The operator judges WHO, all deterministic, all against its own
+// mirror:
+//
+//	a. a maintainer-authored, structurally-non-bot comment exists on this Issue
+//	   (isMaintainerComment: the bot exclusion runs BEFORE IsMaintainer, so a bot
+//	   login misconfigured into maintainerLogins still cannot approve);
+//	b. the agent CITED one of THEM - the cited id resolves to a member of that
+//	   SET;
+//	c. the agent's verbatim Quote OCCURS in the body the operator itself holds,
+//	   which closes fabrication;
+//	d. the evidence is SINGLE-USE: a consumed commentId cannot approve twice.
+//
+// Clause (b) is a set membership test and NOT a recency test. The cited comment
+// need not be the newest maintainer comment, because requiring that deadlocks an
+// ordinary thread: "go ahead, I approve!" followed by "thanks - ping me when the
+// PR is up" leaves consent unambiguous but nothing citable, so the agent would
+// submit discuss every turn and the Task would park at awaiting-human forever
+// with no signal. A later maintainer comment that WITHDRAWS the approval is the
+// AGENT's call - it reads the whole thread and submits discuss instead of
+// implement. That is an intent question, and intent is the agent's side of this
+// split. The consequence, accepted deliberately: the operator's backstop against
+// a MISJUDGING agent is weaker here than the wordlist's was, because a stale
+// "go ahead" can now out-vote a fresh "hold off" if the agent misreads.
+//
+// It does NOT check the comment against Task.status.stageEnteredAt either.
+// stage.Enter re-stamps that on EVERY transition, so the primary flow - park,
+// human comments, un-park to conversing (re-stamp), agent cites the comment that
+// caused the un-park - would refuse itself forever. Clause (d) and the agent's
+// own reading of the thread already give everything recency-vs-park would have.
 //
 // The caller has already established the Issue is in scope (approvalInScope).
-// An Issue that ALREADY CARRIES VALID EVIDENCE is approved - clause (2) asks
+// An Issue that ALREADY CARRIES VALID EVIDENCE is approved: clause (2) asks
 // whether every live Issue CARRIES evidence, not whether it can be re-derived
-// from the thread right now. That idempotence keeps the autoApproveTataraProposals
-// path (ApprovalEvidence{Auto: true, CommentID: ""}) alive and stops a
-// maintainer's later "thanks!" from REVOKING an approval already given.
+// right now. That idempotence keeps the autoApproveTataraProposals path
+// (ApprovalEvidence{Auto: true, CommentID: ""}) alive and stops a maintainer's
+// later "thanks!" from REVOKING an approval already given.
 func verifyOneIssue(iss *tatarav1alpha1.Issue, proj *tatarav1alpha1.Project,
-	repo *tatarav1alpha1.Repository, phrases []string, botLogin string) (*tatarav1alpha1.ApprovalEvidence, string) {
+	repo *tatarav1alpha1.Repository, botLogin string,
+	citations []tatarav1alpha1.ApprovalCitation) (*tatarav1alpha1.ApprovalEvidence, string) {
+
 	if iss.Status.Status == "approved" && iss.Status.Approval != nil {
 		return iss.Status.Approval, ""
 	}
-	cmt := mostRecentMaintainerComment(iss, proj, repo, botLogin)
-	if cmt == nil {
-		// THE AUTO-APPROVE CARVE-OUT (autoApproveTataraProposals). It sits ONLY in
-		// the no-maintainer-comment arm on purpose: it fires when the bot proposed
-		// the work and no human has spoken, but a maintainer who DID comment
-		// something that is not an approval still falls through to
-		// ApprovalRefusedNoPhrase below and blocks the release. It is fail-closed on
-		// every axis (flag / bot-authorship / marker / scope); see autoApproveApplies.
+
+	// Clause (a). Does ANY maintainer-authored non-bot comment exist at all?
+	maintainerSpoke := false
+	for i := range iss.Status.Comments {
+		if isMaintainerComment(&iss.Status.Comments[i], proj, repo, botLogin) {
+			maintainerSpoke = true
+			break
+		}
+	}
+	if !maintainerSpoke {
+		// THE AUTO-APPROVE CARVE-OUT (autoApproveTataraProposals). It sits ONLY
+		// in the no-maintainer-comment arm on purpose: there is no comment to
+		// cite, which is exactly why the citation fields are NOT unconditionally
+		// required. A maintainer who DID comment falls through below and blocks
+		// the release. Fail-closed on every axis; see autoApproveApplies.
 		if autoApproveApplies(iss, proj, botLogin) {
 			return autoApprovalEvidence(), ""
 		}
 		return nil, ApprovalRefusedNoMaintainer
 	}
-	phrase, ok := MatchesApprovalPhrase(cmt.Body, phrases)
-	if !ok {
-		return nil, ApprovalRefusedNoPhrase
+
+	// A maintainer has spoken, so consent is a live question and SOMETHING must
+	// be cited. An empty citation here is a refusal, not a fallback to
+	// auto-approve.
+	if len(citations) == 0 {
+		return nil, ApprovalRefusedNoCitation
 	}
-	if iss.Status.Approval != nil && iss.Status.Approval.CommentID == cmt.ExternalID {
-		// Clause (d), SINGLE-USE: this comment was consumed as evidence once
-		// already and the Issue is no longer approved. It cannot approve a second
-		// time; a later approval must cite a NEWER comment.
+
+	// Clause (b): SET MEMBERSHIP, not recency. Any maintainer-authored non-bot
+	// comment on this Issue is citable, including an older one with newer
+	// maintainer comments after it. An empty ExternalID on either side can never
+	// match: a mirror row with no id is not citable, and a citation with no id
+	// cites nothing.
+	//
+	// The FIRST citable comment in thread order is the one verified, and clauses
+	// (c)/(d) then either grant on it or refuse - there is no falling through to
+	// the next citation. That is deliberate and fail-closed: an agent that cites
+	// several comments gets a verdict on the first one it named that exists, not
+	// the most convenient one.
+	var cited *tatarav1alpha1.Comment
+	var quoted string
+	for i := range iss.Status.Comments {
+		c := &iss.Status.Comments[i]
+		if c.ExternalID == "" || !isMaintainerComment(c, proj, repo, botLogin) {
+			continue
+		}
+		for j := range citations {
+			if citations[j].ID == c.ExternalID {
+				cited, quoted = c, citations[j].Quote
+				break
+			}
+		}
+		if cited != nil {
+			break
+		}
+	}
+	if cited == nil {
+		return nil, ApprovalRefusedCitationNotMaintainer
+	}
+
+	// Clause (c). TrimSpace first: an empty or whitespace-only quote is a
+	// trivially-matching substring and must be refused explicitly, not accepted
+	// by strings.Contains's empty-needle rule.
+	quote := strings.TrimSpace(quoted)
+	if quote == "" || !strings.Contains(cited.Body, quote) {
+		return nil, ApprovalRefusedQuoteAbsent
+	}
+
+	// Clause (d), SINGLE-USE.
+	if iss.Status.Approval != nil && iss.Status.Approval.CommentID == cited.ExternalID {
 		return nil, ApprovalRefusedEvidenceReplayed
 	}
+
 	return &tatarav1alpha1.ApprovalEvidence{
-		Login:     cmt.Author,
-		CommentID: cmt.ExternalID,
-		CreatedAt: cmt.CreatedAt,
-		Phrase:    phrase,
+		Login:     cited.Author,
+		CommentID: cited.ExternalID,
+		CreatedAt: cited.CreatedAt,
+		Phrase:    quote, // the agent's verbatim quote, re-verified by the operator
 	}, ""
 }
 
@@ -348,12 +437,15 @@ func autoApprovalEvidence() *tatarav1alpha1.ApprovalEvidence {
 // GrammarVerifier is the PRODUCTION restapi.ApprovalVerifier (fix W1). Before it
 // was wired, restapi.Config.Approval was nil, so verifyApprovalScope failed
 // closed on EVERY clarify decision=implement and the platform could never
-// implement anything. It runs the C.6 per-Issue grammar against the Issue CR's
-// MIRRORED comments - the same grammar VerifyApprovalDetailed runs per Task - so
-// the REST clarify path verifies a real maintainer approval rather than failing
-// closed. It is a pure READER; outcome.go persists the returned evidence.
+// implement anything. It runs the per-Issue citation check against the Issue
+// CR's MIRRORED comments, so the REST clarify path verifies a real maintainer
+// approval rather than failing closed. It is a pure READER; outcome.go persists
+// the returned evidence.
+//
+// Metrics may be nil (every accessor is nil-safe).
 type GrammarVerifier struct {
-	Client client.Client
+	Client  client.Client
+	Metrics *obs.OperatorMetrics
 }
 
 // VerifyApproval implements the restapi.ApprovalVerifier seam for ONE owned
@@ -361,7 +453,8 @@ type GrammarVerifier struct {
 // approval and never blocks the scope check: it passes with whatever evidence it
 // already carries, mirroring VerifyApprovalDetailed's skip.
 func (g *GrammarVerifier) VerifyApproval(ctx context.Context, proj *tatarav1alpha1.Project,
-	iss *tatarav1alpha1.Issue) (*tatarav1alpha1.ApprovalEvidence, bool) {
+	iss *tatarav1alpha1.Issue,
+	citations []tatarav1alpha1.ApprovalCitation) (*tatarav1alpha1.ApprovalEvidence, bool) {
 	if !approvalInScope(iss) {
 		return iss.Status.Approval, true
 	}
@@ -370,8 +463,11 @@ func (g *GrammarVerifier) VerifyApproval(ctx context.Context, proj *tatarav1alph
 		botLogin = proj.Spec.Scm.BotLogin
 	}
 	repo := approvalRepo(ctx, g.Client, iss)
-	ev, reason := verifyOneIssue(iss, proj, repo, tatarav1alpha1.EffectiveApprovalPhrases(proj), botLogin)
+	ev, reason := verifyOneIssue(iss, proj, repo, botLogin, citations)
 	if reason != "" {
+		log.FromContext(ctx).Info("approval refused",
+			"action", "approval_refused", "issue", iss.Name, "reason", reason)
+		g.Metrics.ApprovalRefused(reason)
 		return nil, false
 	}
 	return ev, true
@@ -394,8 +490,9 @@ func (g *GrammarVerifier) VerifyApproval(ctx context.Context, proj *tatarav1alph
 // parked identity-unverified Task can only reach conversing. This function has
 // no production caller either (only tests); it is deleted in step 7.
 func VerifyApproval(ctx context.Context, c client.Client, sp objbudget.Spiller,
-	proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (map[string]*tatarav1alpha1.ApprovalEvidence, error) {
-	evidence, _, err := VerifyApprovalDetailed(ctx, c, sp, proj, task, nil)
+	proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task,
+	citations []tatarav1alpha1.ApprovalCitation) (map[string]*tatarav1alpha1.ApprovalEvidence, error) {
+	evidence, _, err := VerifyApprovalDetailed(ctx, c, sp, proj, task, citations, nil)
 	return evidence, err
 }
 
@@ -403,17 +500,22 @@ func VerifyApproval(ctx context.Context, c client.Client, sp objbudget.Spiller,
 // operator's park comment names (ApprovalRefusedComment). The evidence map has an
 // entry for every LIVE owned Issue; a nil value is a refusal.
 //
+// citations are the agent's approval citations for THIS verification, applied to
+// every live owned Issue - the same set restapi's verifyApprovalScope offers each
+// Issue in the scope loop.
+//
 // metrics may be nil; when set, an auto-approval TRANSITION (the last human gate
 // removed) increments operator_auto_approve_total{kind} so the path is queryable
-// without log-scraping (hard rule 13).
+// without log-scraping (hard rule 13), and every refusal increments
+// operator_approval_refused_total{reason}.
 func VerifyApprovalDetailed(ctx context.Context, c client.Client, sp objbudget.Spiller,
-	proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task, metrics *obs.OperatorMetrics) (
+	proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task,
+	citations []tatarav1alpha1.ApprovalCitation, metrics *obs.OperatorMetrics) (
 	map[string]*tatarav1alpha1.ApprovalEvidence, map[string]string, error) {
 	l := log.FromContext(ctx)
 	evidence := make(map[string]*tatarav1alpha1.ApprovalEvidence, len(task.Status.IssueRefs))
 	refusals := make(map[string]string, len(task.Status.IssueRefs))
 
-	phrases := tatarav1alpha1.EffectiveApprovalPhrases(proj)
 	botLogin := ""
 	if proj.Spec.Scm != nil {
 		botLogin = proj.Spec.Scm.BotLogin
@@ -432,12 +534,13 @@ func VerifyApprovalDetailed(ctx context.Context, c client.Client, sp objbudget.S
 		}
 
 		repo := approvalRepo(ctx, c, &iss)
-		ev, reason := verifyOneIssue(&iss, proj, repo, phrases, botLogin)
+		ev, reason := verifyOneIssue(&iss, proj, repo, botLogin, citations)
 		if reason != "" {
 			evidence[name] = nil
 			refusals[name] = reason
 			l.Info("approval refused",
 				"action", "approval_refused", "task", task.Name, "issue", name, "reason", reason)
+			metrics.ApprovalRefused(reason)
 			continue
 		}
 
@@ -454,8 +557,8 @@ func VerifyApprovalDetailed(ctx context.Context, c client.Client, sp objbudget.S
 			}
 			l.Info("approval verified",
 				"action", "approval_verified", "task", task.Name, "issue", name,
-				"maintainer_login", ev.Login, "comment_external_id", ev.CommentID,
-				"matched_phrase", ev.Phrase, "auto", ev.Auto)
+				"maintainer_login", ev.Login, "cited_comment_id", ev.CommentID,
+				"auto", ev.Auto)
 			if ev.Auto && metrics != nil {
 				if kind := tatarav1alpha1.ProposalKindFromBody(iss.Status.Body); kind != "" {
 					metrics.AutoApproveTotal(kind)
@@ -543,8 +646,8 @@ func applyApprovalStage(ctx context.Context, c client.Client, sp objbudget.Spill
 // never un-park the Task it parked.
 func ReVerifyParked(ctx context.Context, c client.Client, sp objbudget.Spiller, reader scm.SCMReader,
 	proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task, ev tatarav1alpha1.TaskEvent,
-	metrics *obs.OperatorMetrics) (bool, error) {
-	passed, _, err := ReVerifyParkedDetailed(ctx, c, sp, reader, proj, task, ev, metrics)
+	citations []tatarav1alpha1.ApprovalCitation, metrics *obs.OperatorMetrics) (bool, error) {
+	passed, _, err := ReVerifyParkedDetailed(ctx, c, sp, reader, proj, task, ev, citations, metrics)
 	return passed, err
 }
 
@@ -556,6 +659,7 @@ func ReVerifyParked(ctx context.Context, c client.Client, sp objbudget.Spiller, 
 // goes nowhere: this function is test-only, like ReVerifyParked above it.
 func ReVerifyParkedDetailed(ctx context.Context, c client.Client, sp objbudget.Spiller, reader scm.SCMReader,
 	proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task, ev tatarav1alpha1.TaskEvent,
+	citations []tatarav1alpha1.ApprovalCitation,
 	metrics *obs.OperatorMetrics) (bool, map[string]*tatarav1alpha1.ApprovalEvidence, error) {
 
 	botLogin := ""
@@ -573,7 +677,7 @@ func ReVerifyParkedDetailed(ctx context.Context, c client.Client, sp objbudget.S
 			}
 		}
 	}
-	evidence, _, err := VerifyApprovalDetailed(ctx, c, sp, proj, task, metrics)
+	evidence, _, err := VerifyApprovalDetailed(ctx, c, sp, proj, task, citations, metrics)
 	if err != nil {
 		return false, nil, err
 	}

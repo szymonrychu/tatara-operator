@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -234,28 +235,46 @@ func TestGrammarVerifier_VerdictsPerIssue(t *testing.T) {
 	}
 	approved := wfIssue("iss-ok")
 	approved.Status.Comments = []tatarav1alpha1.Comment{{
-		ExternalID: "c1", Author: "maint", Body: "go ahead", CreatedAt: metav1.Now(),
+		ExternalID: "c1", Author: "maint", Body: "sure, go ahead", CreatedAt: metav1.Now(),
 	}}
-	noPhrase := wfIssue("iss-nophrase")
-	noPhrase.Status.Comments = []tatarav1alpha1.Comment{{
+	fabricated := wfIssue("iss-fabricated")
+	fabricated.Status.Comments = []tatarav1alpha1.Comment{{
 		ExternalID: "c2", Author: "maint", Body: "thanks, will look", CreatedAt: metav1.Now(),
 	}}
 	nonMaint := wfIssue("iss-nonmaint")
-	nonMaint.Status.Comments = []tatarav1alpha1.Comment{{
-		ExternalID: "c3", Author: "randomuser", Body: "go ahead", CreatedAt: metav1.Now(),
-	}}
-
-	c := newMirrorClient(t, approved, noPhrase, nonMaint)
-	g := &GrammarVerifier{Client: c}
-
-	if ev, ok := g.VerifyApproval(context.Background(), proj, approved); !ok || ev == nil || ev.Login != "maint" {
-		t.Fatalf("valid maintainer approval refused: ok=%v ev=%+v", ok, ev)
+	nonMaint.Status.Comments = []tatarav1alpha1.Comment{
+		{ExternalID: "c3", Author: "randomuser", Body: "go ahead", CreatedAt: metav1.Now()},
+		{ExternalID: "c4", Author: "maint", Body: "let me look", CreatedAt: metav1.Now()},
 	}
-	if _, ok := g.VerifyApproval(context.Background(), proj, noPhrase); ok {
-		t.Fatalf("a non-approval-phrase comment granted approval")
+
+	c := newMirrorClient(t, approved, fabricated, nonMaint)
+	reg := prometheus.NewRegistry()
+	metrics := obs.NewOperatorMetrics(reg)
+	g := &GrammarVerifier{Client: c, Metrics: metrics}
+	ctx := context.Background()
+
+	if ev, ok := g.VerifyApproval(ctx, proj, approved, cites("c1", "go ahead")); !ok || ev == nil || ev.Login != "maint" {
+		t.Fatalf("valid cited maintainer approval refused: ok=%v ev=%+v", ok, ev)
 	}
-	if _, ok := g.VerifyApproval(context.Background(), proj, nonMaint); ok {
+	if _, ok := g.VerifyApproval(ctx, proj, fabricated, cites("c2", "go ahead")); ok {
+		t.Fatalf("a FABRICATED quote granted approval")
+	}
+	if _, ok := g.VerifyApproval(ctx, proj, nonMaint, cites("c3", "go ahead")); ok {
 		t.Fatalf("a non-maintainer comment granted approval")
+	}
+	// Hard rule 13: every refusal path is queryable without log-scraping.
+	if got := testutil.ToFloat64(metrics.ApprovalRefusedCounter(ApprovalRefusedQuoteAbsent)); got != 1 {
+		t.Fatalf("operator_approval_refused_total{reason=quote-not-in-comment} = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.ApprovalRefusedCounter(ApprovalRefusedCitationNotMaintainer)); got != 1 {
+		t.Fatalf("operator_approval_refused_total{reason=citation-not-maintainer} = %v, want 1", got)
+	}
+
+	// A nil Metrics must not panic: the seam is wired with metrics in production
+	// but constructed bare in several tests.
+	bare := &GrammarVerifier{Client: c}
+	if _, ok := bare.VerifyApproval(ctx, proj, nonMaint, nil); ok {
+		t.Fatal("a nil-metrics verifier granted approval with no citation")
 	}
 }
 

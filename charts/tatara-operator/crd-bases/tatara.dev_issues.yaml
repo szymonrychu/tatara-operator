@@ -125,6 +125,9 @@ spec:
                   login:
                     type: string
                   phrase:
+                    description: |-
+                      Phrase is the agent's VERBATIM quote from that comment, re-verified by the
+                      operator against the body it holds itself.
                     type: string
                 required:
                 - commentId

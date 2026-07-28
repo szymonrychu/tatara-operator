@@ -148,12 +148,29 @@ func (f *fakeMemory) Fetch(_ context.Context, trackID string) (json.RawMessage, 
 type fakeApproval struct {
 	grant map[string]bool // issue CR name -> granted
 	auto  bool            // when set, granted issues return Auto evidence
+	// needCitation makes the fake behave like the real verifier's shape: it
+	// refuses unless the agent cited something. It is what proves the citations
+	// actually reach the seam.
+	needCitation bool
+	// grantWithNilEvidence exercises the defensive nil-evidence guard in the
+	// clarify writer: ok=true with a nil evidence must never write an
+	// approver-less approval.
+	grantWithNilEvidence bool
+	gotCitations         [][]tatarav1alpha1.ApprovalCitation
 }
 
 func (f *fakeApproval) VerifyApproval(_ context.Context, _ *tatarav1alpha1.Project,
-	iss *tatarav1alpha1.Issue) (*tatarav1alpha1.ApprovalEvidence, bool) {
+	iss *tatarav1alpha1.Issue,
+	citations []tatarav1alpha1.ApprovalCitation) (*tatarav1alpha1.ApprovalEvidence, bool) {
+	f.gotCitations = append(f.gotCitations, citations)
 	if !f.grant[iss.Name] {
 		return nil, false
+	}
+	if f.needCitation && len(citations) == 0 {
+		return nil, false
+	}
+	if f.grantWithNilEvidence {
+		return nil, true
 	}
 	if f.auto {
 		return &tatarav1alpha1.ApprovalEvidence{

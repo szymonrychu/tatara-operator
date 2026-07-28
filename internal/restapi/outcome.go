@@ -119,9 +119,23 @@ type headMovedResponse struct {
 	Message         string `json:"message"`
 }
 
+// clarifyPayload is the /outcome clarify wire shape.
+//
+// ApprovalCitations is the agent's EVIDENCE for decision=implement, and it is
+// NOT unconditionally required. The autoApproveTataraProposals carve-out fires
+// only when NO maintainer has commented, so there is literally no comment to
+// cite; requiring the field would kill that path. The operator decides, per
+// Issue, whether a citation was needed - see controller.verifyOneIssue.
+//
+// A missing or failing citation is a REFUSAL, not a 400: this handler returns
+// 200 + "implement-unverified" and parks at identity-unverified, exactly as a
+// failed grammar check did. Only malformed JSON and a missing decision / blank
+// reason stay 4xx. That matches existing behaviour AND means a mis-instructed
+// agent parks one Task instead of deadlocking the fleet.
 type clarifyPayload struct {
-	Decision string `json:"decision"`
-	Reason   string `json:"reason"`
+	Decision          string                            `json:"decision"`
+	Reason            string                            `json:"reason"`
+	ApprovalCitations []tatarav1alpha1.ApprovalCitation `json:"approvalCitations,omitempty"`
 }
 
 type proposalPayload struct {
@@ -1265,16 +1279,16 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 		return
 	}
 
-	// decision=implement. APPROVAL IS IN NO SCHEMA: the agent reports its
-	// decision and the operator INDEPENDENTLY verifies the C.6 grammar - both
-	// the TEXT (anchored whole-line) and the SCOPE (EVERY owned Issue, not one:
-	// fix H9).
+	// decision=implement. The agent reports its decision and CITES the comment
+	// it judged to approve; the operator INDEPENDENTLY re-derives the structural
+	// facts - WHO wrote the cited comment, whether the quote is really in it -
+	// and the SCOPE (EVERY owned Issue, not one: fix H9). It never reads intent.
 	issues, err := s.ownedIssues(ctx, o.task)
 	if err != nil {
 		writeClientErr(o.w, err)
 		return
 	}
-	granted, evidence := s.verifyApprovalScope(ctx, o.proj, issues)
+	granted, evidence := s.verifyApprovalScope(ctx, o.proj, issues, p.ApprovalCitations)
 	if !granted {
 		if !o.commit(func(t *tatarav1alpha1.Task) error {
 			if err := stage.Enter(t, mrs, tatarav1alpha1.StageParked, stage.ReasonIdentityUnverified, s.now()); err != nil {
@@ -1285,7 +1299,7 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 		}) {
 			return
 		}
-		s.log.WarnContext(ctx, "restapi: clarify reported approval but the C.6 grammar did not pass on every owned issue",
+		s.log.WarnContext(ctx, "restapi: clarify reported approval but the citation did not verify on every owned issue",
 			append(reqLogFields(o.r), "task", o.task.Name, "issues", len(issues))...)
 		o.ok("implement-unverified")
 		return
@@ -1302,6 +1316,17 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 			if kind := tatarav1alpha1.ProposalKindFromBody(iss.Status.Body); kind != "" {
 				s.metrics.AutoApproveTotal(kind)
 			}
+		}
+		if ev == nil {
+			// Defensive: granted==true means every issue produced evidence.
+			// Writing status=approved with a nil approval would produce an
+			// approved Issue with NO approver - it defeats the idempotence
+			// short-circuit, defeats the single-use replay guard, and projects
+			// tatara-approved to the forge with nobody behind it. The
+			// controller's own writer already guards this; this one did not.
+			s.log.ErrorContext(ctx, "restapi: approval granted with nil evidence; refusing to write an approver-less approval",
+				append(reqLogFields(o.r), "task", o.task.Name, "issue", iss.Name)...)
+			continue
 		}
 		key := types.NamespacedName{Namespace: s.ns, Name: iss.Name}
 		if err := objbudget.FitIssue(ctx, s.c, s.spillerForOrNil(o.proj), key, func(is *tatarav1alpha1.Issue) {
@@ -1324,19 +1349,20 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 	o.ok("implement", "issues", len(issues))
 }
 
-// verifyApprovalScope runs the C.6 grammar over EVERY owned Issue. The empty
-// set is NOT a licence: a clarify Task with no Issue has nothing to approve and
-// is refused.
+// verifyApprovalScope re-derives the approval over EVERY owned Issue, offering
+// each of them the SAME citation set the agent submitted. The empty set is NOT a
+// licence: a clarify Task with no Issue has nothing to approve and is refused.
 //
 // A nil verifier FAILS CLOSED.
 func (s *Server) verifyApprovalScope(ctx context.Context, proj *tatarav1alpha1.Project,
-	issues []tatarav1alpha1.Issue) (bool, map[string]*tatarav1alpha1.ApprovalEvidence) {
+	issues []tatarav1alpha1.Issue,
+	citations []tatarav1alpha1.ApprovalCitation) (bool, map[string]*tatarav1alpha1.ApprovalEvidence) {
 	if len(issues) == 0 || s.approval == nil {
 		return false, nil
 	}
 	out := make(map[string]*tatarav1alpha1.ApprovalEvidence, len(issues))
 	for i := range issues {
-		ev, ok := s.approval.VerifyApproval(ctx, proj, &issues[i])
+		ev, ok := s.approval.VerifyApproval(ctx, proj, &issues[i], citations)
 		if !ok {
 			return false, nil
 		}

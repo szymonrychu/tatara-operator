@@ -178,12 +178,12 @@ func addWebhookServer(ctx context.Context, mgr ctrl.Manager, cfg config.Config, 
 		// SCM-write rate limit, mirroring the webhook server's
 		// IncidentRefireCommentCooldown wiring above.
 		IncidentInvestigationCommentCooldown: cfg.IncidentInvestigationCommentCooldown,
-		// Approval is the C.6 grammar seam. Before this was wired the field was
-		// nil, so verifyApprovalScope FAILED CLOSED on every clarify
+		// Approval is the approval-citation seam. Before this was wired the field
+		// was nil, so verifyApprovalScope FAILED CLOSED on every clarify
 		// decision=implement and the platform could never implement anything
-		// (fix W1). GrammarVerifier runs the real maintainer-identity + anchored-
-		// phrase check against the Issue CR's mirrored comments.
-		Approval: &controller.GrammarVerifier{Client: mgr.GetClient()},
+		// (fix W1). GrammarVerifier runs the real maintainer-identity +
+		// verbatim-quote check against the Issue CR's mirrored comments.
+		Approval: &controller.GrammarVerifier{Client: mgr.GetClient(), Metrics: metrics},
 		// Minter mints/unparks the OP5 takeover Task behind OP9's
 		// POST /projects/{p}/scm/mr-takeover, via the SAME intake funnel every
 		// other mint path uses (SpillerFor per-project, matching newSpillerFor
