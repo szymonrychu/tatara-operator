@@ -180,7 +180,7 @@ func (s *Server) maybeTriggerLabelMint(ctx context.Context, provider string, pro
 			"project", proj.Name, "issue_ref", ev.IssueRef)
 		return
 	} else if created {
-		if cerr := controller.ClearWebhookOriginated(ctx, s.cfg.Client, s.cfg.Namespace, tatarav1.IssueName(repo.Name, ev.Number)); cerr != nil {
+		if cerr := controller.ClearWebhookOriginated(ctx, s.cfg.Client, s.reader(), s.cfg.Namespace, tatarav1.IssueName(repo.Name, ev.Number)); cerr != nil {
 			s.log.ErrorContext(ctx, "issues: clear webhook-originated marker failed", "error", cerr, "issue_ref", ev.IssueRef)
 		}
 		s.log.InfoContext(ctx, "issues: trigger label minted clarify task",

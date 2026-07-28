@@ -341,6 +341,23 @@ func (m *Minter) createTaskRaceSafe(ctx context.Context, task *tatarav1alpha1.Ta
 }
 
 // issueCR returns the Issue CR for (repo, number), or nil when none exists.
+//
+// Deliberately reads through m.Client (cached), NOT m.reader(). A 2026-07-28
+// review round tried switching this to the uncached reader (the same idiom
+// MarkWebhookOriginated now uses) and it broke
+// TestResumeNoReentryPark_DirectMintCacheLagStillActive: resumeOne (resume.go)
+// severs an issue's ownership via r.Client THEN calls MintForItem in the SAME
+// pass, and that sever's write is exactly what this Get must observe. In
+// production APIReader would see it too (an uncached read always reflects a
+// completed write to the same API server), but resumeOne's own doc comment
+// establishes the actual pattern this package uses: ONLY the specific
+// re-entrant read that needs it (liveIssue, for comment visibility) goes
+// through APIReader - the broader orphan/ownership classification stays on
+// the cached Client. cr=nil vs. cr=<a freshly-created, still-ownerless CR> is
+// also provably equivalent for IsOrphanIssue's own verdict (its cr!=nil guard
+// only ever changes the outcome when cr IS owned), so MarkWebhookOriginated's
+// own create-time stamp and reader threading are what close the read-after-
+// write race for THIS read's caller - this Get does not need to duplicate it.
 func (m *Minter) issueCR(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, number int) (*tatarav1alpha1.Issue, error) {
 	var iss tatarav1alpha1.Issue
 	key := types.NamespacedName{Namespace: proj.Namespace, Name: tatarav1alpha1.IssueName(repo.Name, number)}

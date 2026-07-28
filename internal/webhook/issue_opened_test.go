@@ -28,16 +28,22 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/types"
+	clientgotesting "k8s.io/client-go/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	tatarav1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/controller"
+	"github.com/szymonrychu/tatara-operator/internal/obs"
+	"github.com/szymonrychu/tatara-operator/internal/queue"
+	"github.com/szymonrychu/tatara-operator/internal/webhook"
 )
 
 // issueOpenedBy renders an issues.<action> delivery authored by login.
@@ -267,4 +273,111 @@ func TestIssueOpened_LaggingCacheStillMintsTriaging(t *testing.T) {
 	require.Len(t, tl.Items, 1, "a brand-new maintainer issue must mint exactly one Task")
 	require.Equal(t, tatarav1.StageTriaging, tl.Items[0].Spec.InitialStage,
 		"the mint must be ACTIVE: a human just opened this issue")
+}
+
+// newServerWithReader mirrors newServer but wires reader as Config.APIReader -
+// production's manager.GetAPIReader(), an UNCACHED client distinct from the
+// cached Client. Used only by TestIssueOpened_UncachedReaderClosesTheRace,
+// which needs the two genuinely separate (real vs. cache-lagging) reads that a
+// single client cannot model.
+func newServerWithReader(c client.Client, reader client.Reader) http.Handler {
+	return webhook.NewServer(webhook.Config{
+		Client:    c,
+		APIReader: reader,
+		Namespace: ns,
+		Metrics:   obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		Seq:       &queue.SeqSource{Client: c, Namespace: ns},
+	}).Handler()
+}
+
+// TestIssueOpened_UncachedReaderClosesTheRace IS FINDING 3'S REGRESSION TEST
+// (2026-07-28 review round 1, following mtg-decks#9). The test above
+// (TestIssueOpened_LaggingCacheStillMintsTriaging) proves MarkWebhookOriginated
+// itself survives a lagging cache. It does NOT prove the whole request does: a
+// review pass found that under sustained lag, a request could still 500
+// DOWNSTREAM of a successful mark and mint - in mirror.SyncIssue's own
+// objbudget.FitIssue read, called from MintIssueTask right after the Task is
+// created - and because that happens AFTER the Task already exists, the
+// marker is left stamped forever: neither the webhook (the error return skips
+// its own ClearWebhookOriginated call) nor a later sweep pass (whose own
+// createTaskRaceSafe now finds a live twin and takes the repair branch, which
+// never touches the marker) ever clears it, so the issue re-activates on
+// every later reap cycle.
+//
+// cachedClient and liveReader below share ONE k8s.io/client-go/testing.ObjectTracker
+// - only cachedClient carries the lag interceptor - modeling manager.GetClient()
+// (informer-backed, can lag a write it just made) against manager.GetAPIReader()
+// (direct to the API server, never lags) exactly as production wires
+// webhook.Config.APIReader. MarkWebhookOriginated now reads through
+// Server.reader(), which prefers APIReader, so ITS OWN read never depends on
+// the lagging client catching up - and because that keeps Mark's own footprint
+// on the cached client down to at most one Get on the create path (finding 1),
+// objbudget.FitIssue's own pre-existing createLagBackoff (~3.1s across 5
+// attempts, unrelated to this fix and out of its scope: it is shared by
+// ~15 call sites across the whole codebase) comfortably absorbs the rest for
+// a realistic, bounded lag. (issueCR - MintForItem's own orphan-classification
+// read - was ALSO tried on the uncached reader during this review round; it
+// broke TestResumeNoReentryPark_DirectMintCacheLagStillActive, whose own doc
+// comment documents that only the specific re-entrant read that needs
+// freshness goes through APIReader, not the general classification read, so
+// intake.go's issueCR deliberately stays on the cached Client - see its own
+// doc comment for the full reasoning.)
+func TestIssueOpened_UncachedReaderClosesTheRace(t *testing.T) {
+	const secretVal = "whsec-lag2"
+	scheme := newScheme(t)
+	tracker := clientgotesting.NewObjectTracker(scheme, serializer.NewCodecFactory(scheme).UniversalDecoder())
+	for _, o := range []client.Object{
+		projectWithReporters("lagproj2", "lagproj2-scm", "tatara", "tatara-bot", nil),
+		secret("lagproj2-scm", secretVal),
+		repository("repo-lag2", "lagproj2", "https://github.com/o/r.git", "main"),
+	} {
+		require.NoError(t, tracker.Add(o))
+	}
+
+	// 5, not "generously large": FitIssue's own getWaitingOutCreateLag retries a
+	// cached NotFound up to 5 times (objbudget.createLagBackoff's Steps), and
+	// this budget must run out WITHIN that window - 1 for SyncIssue's own
+	// ensureIssueCR probe (harmless: it just falls through to Create's
+	// AlreadyExists) plus at most 4 of FitIssue's 5 attempts, leaving its LAST
+	// attempt to see real data. A budget large enough to also swallow FitIssue's
+	// final attempt would fail this test for a reason FINDING 3 does not claim
+	// to fix (objbudget's own pre-existing, separately-owned backoff), not for a
+	// regression in the code this test actually exercises.
+	remaining := 5
+	lag := interceptor.Funcs{
+		Get: func(ctx context.Context, cli client.WithWatch, key client.ObjectKey,
+			obj client.Object, opts ...client.GetOption) error {
+			if _, isIssue := obj.(*tatarav1.Issue); isIssue && remaining > 0 {
+				remaining--
+				return apierrors.NewNotFound(
+					tatarav1.GroupVersion.WithResource("issues").GroupResource(), key.Name)
+			}
+			return cli.Get(ctx, key, obj, opts...)
+		},
+	}
+	withStatus := func(b *fake.ClientBuilder) *fake.ClientBuilder {
+		return b.WithStatusSubresource(&tatarav1.Project{}, &tatarav1.Repository{}, &tatarav1.Task{},
+			&tatarav1.QueuedEvent{}, &tatarav1.Issue{}, &tatarav1.MergeRequest{})
+	}
+	cachedClient := withStatus(fake.NewClientBuilder().WithScheme(scheme).WithObjectTracker(tracker)).
+		WithInterceptorFuncs(lag).Build()
+	liveReader := withStatus(fake.NewClientBuilder().WithScheme(scheme).WithObjectTracker(tracker)).Build()
+
+	h := newServerWithReader(cachedClient, liveReader)
+
+	// postIssueOpened asserts 202 itself. Before MarkWebhookOriginated read
+	// through the uncached reader (finding 1/3), this budget was enough to also
+	// fail Mark's own Get, producing the worse defect: a 500 downstream of an
+	// already-successful mark and mint, with the marker left stamped forever.
+	postIssueOpened(t, h, "lagproj2", secretVal, issueOpenedBy("opened", "alice", 9))
+
+	var tl tatarav1.TaskList
+	require.NoError(t, liveReader.List(context.Background(), &tl))
+	require.Len(t, tl.Items, 1, "a brand-new maintainer issue must mint exactly one Task even while the cache lags")
+
+	var iss tatarav1.Issue
+	require.NoError(t, liveReader.Get(context.Background(),
+		types.NamespacedName{Namespace: ns, Name: tatarav1.IssueName("repo-lag2", 9)}, &iss))
+	require.Empty(t, iss.Annotations[controller.AnnWebhookOriginated],
+		"a successful mint must consume the marker (F7-1), not leak it under a lagging cache")
 }

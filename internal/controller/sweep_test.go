@@ -1782,42 +1782,53 @@ func TestSweepHeartbeatIsPerProject(t *testing.T) {
 // deterministically.
 // ---------------------------------------------------------------------------
 
-// laggingIssueGets returns an interceptor that answers NotFound to the first n
-// Gets of an Issue, mimicking an informer cache that has not observed a Create
-// yet. Gets of every other kind, and Issue Gets after the nth, pass through.
-func laggingIssueGets(n int) interceptor.Funcs {
-	remaining := n
+// laggingIssueGets returns an interceptor that answers NotFound to every Get of
+// an Issue while live (the default), mimicking an informer cache that has not
+// observed a Create yet, plus a caughtUp func the caller uses to switch the
+// cache back on before it verifies what was actually stored. Unlike a fixed
+// budget, this never runs out from under a test's OWN verification read: a
+// budget large enough to survive an implementation regression back to a
+// second internal read is, by the same arithmetic, large enough to also
+// intercept the test's post-call verification Get, since both draw from the
+// SAME counter. A caller that never calls caughtUp gets every Issue Get
+// lagging for the whole test, n irrelevant (kept for the one caller - the
+// already-exists test below - that wants a SPECIFIC number of real reads to
+// lag and then stop on its own, matching its own internal call count).
+func laggingIssueGets(n int) (interceptor.Funcs, func()) {
+	remaining, live := n, true
 	return interceptor.Funcs{
 		Get: func(ctx context.Context, cli client.WithWatch, key client.ObjectKey,
 			obj client.Object, opts ...client.GetOption) error {
-			if _, isIssue := obj.(*tatarav1alpha1.Issue); isIssue && remaining > 0 {
+			if _, isIssue := obj.(*tatarav1alpha1.Issue); isIssue && live && remaining > 0 {
 				remaining--
 				return apierrors.NewNotFound(
 					tatarav1alpha1.GroupVersion.WithResource("issues").GroupResource(), key.Name)
 			}
 			return cli.Get(ctx, key, obj, opts...)
 		},
-	}
+	}, func() { live = false }
 }
 
 // TestMarkWebhookOriginatedBrandNewIssueNeedsNoSecondRead: the COMMON path. No
 // mirror CR exists, every cached Issue read lags, and the mark still succeeds -
 // because the marker is stamped on the object being CREATED, so there is no
-// second read to race.
+// second read to race. The lag stays live for the WHOLE call (a fixed budget
+// here would silently stop protecting the assertion the moment an
+// implementation regression added back a second internal read, because that
+// extra read would consume the budget meant for this test's own verification
+// Get instead) - caughtUp() only switches it off afterward, once the call has
+// returned.
 func TestMarkWebhookOriginatedBrandNewIssueNeedsNoSecondRead(t *testing.T) {
 	proj := sweepProject("race-new-proj")
 	repo := sweepRepo("race-new-proj")
-	// Budget of 1: the create path performs exactly ONE real Issue Get (the
-	// existence probe), and that is the read that must lag. A larger budget
-	// would also intercept this test's own verification read below, since the
-	// fix's whole point is that the create path never issues a second one.
+	lag, caughtUp := laggingIssueGets(8)
 	c := fake.NewClientBuilder().
 		WithScheme(mirrorScheme(t)).
 		WithObjects(proj, repo).
-		WithInterceptorFuncs(laggingIssueGets(1)).
+		WithInterceptorFuncs(lag).
 		Build()
 
-	marked, err := MarkWebhookOriginated(context.Background(), c, proj, repo, 9,
+	marked, err := MarkWebhookOriginated(context.Background(), c, nil, proj, repo, 9,
 		"https://github.com/szymonrychu/mtg-decks/issues/9", time.Now())
 	if err != nil {
 		t.Fatalf("MarkWebhookOriginated = %v, want nil: a brand-new issue must not depend on a cached re-read", err)
@@ -1826,8 +1837,9 @@ func TestMarkWebhookOriginatedBrandNewIssueNeedsNoSecondRead(t *testing.T) {
 		t.Fatal("marked = false, want true: the create-time stamp IS the mark")
 	}
 
-	// Read straight off the tracker: the interceptor budget is spent by now, and
-	// the annotation must actually be on the stored object, not just reported.
+	// The cache has now "caught up": switch the lag off before reading back what
+	// was actually stored, so this verification read is not itself intercepted.
+	caughtUp()
 	var iss tatarav1alpha1.Issue
 	if err := c.Get(context.Background(), types.NamespacedName{
 		Namespace: testNS, Name: tatarav1alpha1.IssueName(repo.Name, 9)}, &iss); err != nil {
@@ -1856,14 +1868,17 @@ func TestMarkWebhookOriginatedRetriesNotFoundFromTheCache(t *testing.T) {
 	}
 	// TWO lagging Gets: the first is ensureIssueCR's existence probe (which then
 	// Creates and loses on AlreadyExists), the second is the Get/Update branch's
-	// own read. The third Get sees the object and the Update stamps it.
+	// own read. The third Get sees the object and the Update stamps it - this
+	// test's own budget naturally runs out from its own internal call count, so
+	// it does not need caughtUp (discarded here).
+	lag, _ := laggingIssueGets(2)
 	c := fake.NewClientBuilder().
 		WithScheme(mirrorScheme(t)).
 		WithObjects(proj, repo, existing).
-		WithInterceptorFuncs(laggingIssueGets(2)).
+		WithInterceptorFuncs(lag).
 		Build()
 
-	marked, err := MarkWebhookOriginated(context.Background(), c, proj, repo, 9,
+	marked, err := MarkWebhookOriginated(context.Background(), c, nil, proj, repo, 9,
 		"https://github.com/szymonrychu/mtg-decks/issues/9", time.Now())
 	if err != nil {
 		t.Fatalf("MarkWebhookOriginated = %v, want nil: a NotFound from a lagging cache must be RETRIED, not returned", err)
@@ -1879,5 +1894,44 @@ func TestMarkWebhookOriginatedRetriesNotFoundFromTheCache(t *testing.T) {
 	}
 	if iss.Annotations[AnnWebhookOriginated] == "" {
 		t.Fatal("the existing Issue CR was never marked")
+	}
+}
+
+// TestClearWebhookOriginatedRetriesNotFoundFromTheCache is FINDING 2's
+// regression test (2026-07-28 review round 1): ClearWebhookOriginated used to
+// treat a cached NotFound as "no marker to clear" and return nil - correct for
+// a genuinely absent CR, wrong for a CR this same webhook request may have
+// just CREATED (mint's own Task.status.issueRefs write races the same
+// informer watch MarkWebhookOriginated used to lose against). Silently no-op'ing
+// that left the marker stamped forever: nothing else in the platform ever
+// clears it, so the issue re-activates on every later reap cycle. It must now
+// RETRY a NotFound instead, exactly like MarkWebhookOriginated.
+func TestClearWebhookOriginatedRetriesNotFoundFromTheCache(t *testing.T) {
+	existing := &tatarav1alpha1.Issue{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: tatarav1alpha1.IssueName("clear-repo", 9), Namespace: testNS,
+			Annotations: map[string]string{AnnWebhookOriginated: "2026-07-28T06:08:07Z"},
+		},
+		Spec: tatarav1alpha1.IssueSpec{RepositoryRef: "clear-repo", Number: 9, ProjectRef: "clear-proj"},
+	}
+	// ONE lagging Get: ClearWebhookOriginated's own read. The second sees the
+	// object and the Update spends the marker.
+	lag, _ := laggingIssueGets(1)
+	c := fake.NewClientBuilder().
+		WithScheme(mirrorScheme(t)).
+		WithObjects(existing).
+		WithInterceptorFuncs(lag).
+		Build()
+
+	if err := ClearWebhookOriginated(context.Background(), c, nil, testNS, existing.Name); err != nil {
+		t.Fatalf("ClearWebhookOriginated = %v, want nil: a NotFound from a lagging cache must be RETRIED, not swallowed as a no-op", err)
+	}
+
+	var iss tatarav1alpha1.Issue
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: existing.Name}, &iss); err != nil {
+		t.Fatalf("get issue CR: %v", err)
+	}
+	if _, ok := iss.Annotations[AnnWebhookOriginated]; ok {
+		t.Fatal("the marker is still set: ClearWebhookOriginated must have spent it despite the lagging cache")
 	}
 }

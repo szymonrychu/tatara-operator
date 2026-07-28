@@ -641,7 +641,7 @@ func (s *Server) handleIssueOpened(ctx context.Context, w http.ResponseWriter, p
 			"repository", repo.Name, "number", ev.Number, "issue_action", ev.Action)
 	}
 
-	marked, err := controller.MarkWebhookOriginated(ctx, s.cfg.Client, &proj, repo, ev.Number, ev.URL, time.Now())
+	marked, err := controller.MarkWebhookOriginated(ctx, s.cfg.Client, s.reader(), &proj, repo, ev.Number, ev.URL, time.Now())
 	if err != nil {
 		s.log.ErrorContext(ctx, "issues: mark webhook-originated failed", "error", err,
 			"project", proj.Name, "issue_ref", ev.IssueRef)
@@ -666,7 +666,7 @@ func (s *Server) handleIssueOpened(ctx context.Context, w http.ResponseWriter, p
 		// Consumed-exactly-once (F7-1): this mint READ the liveness marker (it
 		// minted ACTIVE), so clear it - only the sweep did before, so a webhook
 		// mint left the marker to re-activate the issue on a later reap cycle.
-		if cerr := controller.ClearWebhookOriginated(ctx, s.cfg.Client, s.cfg.Namespace, tatarav1.IssueName(repo.Name, ev.Number)); cerr != nil {
+		if cerr := controller.ClearWebhookOriginated(ctx, s.cfg.Client, s.reader(), s.cfg.Namespace, tatarav1.IssueName(repo.Name, ev.Number)); cerr != nil {
 			s.log.ErrorContext(ctx, "issues: clear webhook-originated marker failed", "error", cerr,
 				"project", proj.Name, "issue_ref", ev.IssueRef)
 		}
@@ -794,7 +794,7 @@ func (s *Server) handleIssueComment(ctx context.Context, w http.ResponseWriter, 
 				s.reject(w, http.StatusInternalServerError, "mint orphan issue comment", provider, ev.Kind, ev.Action, "error")
 				return
 			} else if created {
-				if cerr := controller.ClearWebhookOriginated(ctx, s.cfg.Client, s.cfg.Namespace, tatarav1.IssueName(commentRepo.Name, ev.Number)); cerr != nil {
+				if cerr := controller.ClearWebhookOriginated(ctx, s.cfg.Client, s.reader(), s.cfg.Namespace, tatarav1.IssueName(commentRepo.Name, ev.Number)); cerr != nil {
 					s.log.ErrorContext(ctx, "issue_comment: clear webhook-originated marker failed", "error", cerr, "issue_ref", ev.IssueRef)
 				}
 				s.log.InfoContext(ctx, "issue_comment: webhook minted clarify task",

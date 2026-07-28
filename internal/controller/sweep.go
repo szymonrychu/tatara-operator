@@ -17,6 +17,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -230,10 +231,21 @@ func WebhookOriginated(cr *tatarav1alpha1.Issue) bool {
 // NotFound as well as Conflict: the CR exists but this client's cache may not
 // have observed it yet, and returning that NotFound is what 500'd the delivery
 // for mtg-decks#9 and lost the mint outright (GitHub does not retry a 500).
-func MarkWebhookOriginated(ctx context.Context, c client.Client, proj *tatarav1alpha1.Project,
+//
+// reader, when set, is the manager's UNCACHED reader (webhook.Config.APIReader /
+// ProjectReconciler.APIReader), threaded into both the create-time existence
+// probe and the Get/Update branch's own Get. Nil falls back to c. This is the
+// belt's OTHER half: webhookMarkerBackoff below bounds how long a genuinely
+// cached read is retried, but a caller that hands in the uncached reader never
+// depends on that backoff at all, because every Get it makes reads the API
+// server directly rather than waiting on an informer watch event.
+func MarkWebhookOriginated(ctx context.Context, c client.Client, reader client.Reader, proj *tatarav1alpha1.Project,
 	repo *tatarav1alpha1.Repository, number int, url string, now time.Time) (bool, error) {
 
-	created, err := ensureIssueCRWithAnnotations(ctx, c, proj, repo, number, url,
+	if reader == nil {
+		reader = c
+	}
+	created, err := ensureIssueCRWithAnnotations(ctx, c, reader, proj, repo, number, url,
 		map[string]string{AnnWebhookOriginated: now.UTC().Format(time.RFC3339)})
 	if err != nil {
 		return false, err
@@ -245,12 +257,12 @@ func MarkWebhookOriginated(ctx context.Context, c client.Client, proj *tatarav1a
 	}
 	key := types.NamespacedName{Namespace: proj.Namespace, Name: tatarav1alpha1.IssueName(repo.Name, number)}
 	marked := false
-	err = retry.OnError(retry.DefaultRetry, func(err error) bool {
+	err = retry.OnError(webhookMarkerBackoff, func(err error) bool {
 		return apierrors.IsConflict(err) || apierrors.IsNotFound(err)
 	}, func() error {
 		marked = false
 		var iss tatarav1alpha1.Issue
-		if err := c.Get(ctx, key, &iss); err != nil {
+		if err := reader.Get(ctx, key, &iss); err != nil {
 			return err
 		}
 		if _, owned := own.ControllerOwner(&iss); owned {
@@ -272,6 +284,18 @@ func MarkWebhookOriginated(ctx context.Context, c client.Client, proj *tatarav1a
 	return marked, nil
 }
 
+// webhookMarkerBackoff bounds how long the belt-and-braces branches of
+// MarkWebhookOriginated/ClearWebhookOriginated retry a Conflict or a NotFound
+// against the CACHED client (their reader parameter is nil, e.g. an older
+// caller or a unit test with no APIReader wired). retry.DefaultRetry
+// (Steps:5, Duration:10ms, Factor:1.0 - ~50ms total) is sized for a write
+// conflict between two live clients, not an informer that has not yet
+// observed a Create; the live incident this whole fix answers (mtg-decks#9)
+// lost the race by 437ms, nearly 9x that budget. Matches objbudget's own
+// createLagBackoff (same problem, same shape), ~3.1s of total sleep across 5
+// attempts, then a NotFound is real and surfaces.
+var webhookMarkerBackoff = wait.Backoff{Steps: 5, Duration: 100 * time.Millisecond, Factor: 2}
+
 // clearWebhookOriginated spends the marker. It runs on the mint that READ it,
 // whatever stage that mint chose: a marker that outlived its mint would
 // re-activate the issue on the next reap/re-mint cycle, forever.
@@ -282,24 +306,36 @@ func MarkWebhookOriginated(ctx context.Context, c client.Client, proj *tatarav1a
 func (r *ProjectReconciler) clearWebhookOriginated(ctx context.Context, proj *tatarav1alpha1.Project,
 	repo *tatarav1alpha1.Repository, number int) error {
 
-	return ClearWebhookOriginated(ctx, r.Client, proj.Namespace, tatarav1alpha1.IssueName(repo.Name, number))
+	return ClearWebhookOriginated(ctx, r.Client, r.APIReader, proj.Namespace, tatarav1alpha1.IssueName(repo.Name, number))
 }
 
 // ClearWebhookOriginated deletes the AnnWebhookOriginated marker from the mirror
-// Issue CR (namespace, issueName), idempotently: a missing CR or missing marker
-// is a no-op. It is the "consumed exactly once" half of the liveness contract -
-// the mint that READ the marker clears it, so the marker cannot outlive its mint
-// and re-activate the issue on a later reap/re-mint cycle. Both the sweep
-// backstop and the webhook PRIMARY mint (fix F7-1) call it: before F7-1 only the
-// sweep cleared it, so a webhook mint left the marker behind forever.
-func ClearWebhookOriginated(ctx context.Context, c client.Client, namespace, issueName string) error {
+// Issue CR (namespace, issueName). It is the "consumed exactly once" half of
+// the liveness contract - the mint that READ the marker clears it, so the
+// marker cannot outlive its mint and re-activate the issue on a later
+// reap/re-mint cycle. Both the sweep backstop and the webhook PRIMARY mint
+// (fix F7-1) call it: before F7-1 only the sweep cleared it, so a webhook mint
+// left the marker behind forever.
+//
+// reader is MarkWebhookOriginated's uncached reader, nil-safe the same way.
+// It RETRIES a NotFound exactly like Mark does now, rather than swallowing it
+// as a no-op: a cached Get here can lose the SAME read-after-write race Mark
+// used to lose, on an Issue CR this same request may have just created, and
+// silently no-op'ing that left the marker never cleared (mtg-decks#9's
+// sibling defect - the mint still succeeded, but the marker leaked forever
+// because this Get never got a second chance). A CR that is genuinely gone
+// surfaces as an error after the backoff exhausts, exactly like Mark; every
+// caller already logs that error as non-fatal.
+func ClearWebhookOriginated(ctx context.Context, c client.Client, reader client.Reader, namespace, issueName string) error {
+	if reader == nil {
+		reader = c
+	}
 	key := types.NamespacedName{Namespace: namespace, Name: issueName}
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	err := retry.OnError(webhookMarkerBackoff, func(err error) bool {
+		return apierrors.IsConflict(err) || apierrors.IsNotFound(err)
+	}, func() error {
 		var iss tatarav1alpha1.Issue
-		if err := c.Get(ctx, key, &iss); err != nil {
-			if apierrors.IsNotFound(err) {
-				return nil
-			}
+		if err := reader.Get(ctx, key, &iss); err != nil {
 			return err
 		}
 		if _, ok := iss.Annotations[AnnWebhookOriginated]; !ok {
