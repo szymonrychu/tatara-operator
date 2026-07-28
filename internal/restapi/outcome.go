@@ -1307,6 +1307,14 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 
 	for i := range issues {
 		iss := &issues[i]
+		// The SAME filter verifyApprovalScope applied, and it must be the same:
+		// that function deliberately puts no out-of-scope Issue in the map, so
+		// without this an ordinary success - one closed Issue alongside one live
+		// approved one - looked up a nil and fired the approver-less-approval
+		// ERROR below once per closed Issue on every approval that WORKED.
+		if !controller.ApprovalInScope(iss) {
+			continue
+		}
 		ev := evidence[iss.Name]
 		// Count the auto-approval TRANSITION (an issue not already approved): the
 		// last human gate is being removed, so it must be queryable without
@@ -1318,12 +1326,14 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 			}
 		}
 		if ev == nil {
-			// Defensive: granted==true means every issue produced evidence.
-			// Writing status=approved with a nil approval would produce an
-			// approved Issue with NO approver - it defeats the idempotence
-			// short-circuit, defeats the single-use replay guard, and projects
-			// tatara-approved to the forge with nobody behind it. The
-			// controller's own writer already guards this; this one did not.
+			// Genuinely defensive, and only because of the scope skip above:
+			// granted==true means every LIVE issue produced evidence, and this
+			// loop now sees only those. Writing status=approved with a nil
+			// approval would produce an approved Issue with NO approver - it
+			// defeats the idempotence short-circuit, defeats the single-use
+			// replay guard, and projects tatara-approved to the forge with
+			// nobody behind it. The controller's own writer already guards this;
+			// this one did not.
 			s.log.ErrorContext(ctx, "restapi: approval granted with nil evidence; refusing to write an approver-less approval",
 				append(reqLogFields(o.r), "task", o.task.Name, "issue", iss.Name)...)
 			continue

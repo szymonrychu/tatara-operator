@@ -870,12 +870,23 @@ func TestOutcome_Clarify_ClosedIssueIsNotALicence(t *testing.T) {
 // Issue must produce evidence". A human closing ONE issue of a multi-issue Task
 // must not strand the rest: the closed thread drops out of the scope loop
 // entirely rather than contributing a nil that refuses the whole Task.
+//
+// It also pins the SECOND place that filter has to be applied. The write loop
+// iterates every OWNED Issue and looks each one up in the evidence map, which
+// deliberately contains no out-of-scope entry - so without the same skip there,
+// this ordinary SUCCESS logged "approval granted with nil evidence; refusing to
+// write an approver-less approval" at ERROR, once per closed Issue, about an
+// approver-less approval that never happened. Nothing was mis-written, but an
+// ERROR naming a security failure on the happy path is a triage trap and
+// violates hard rule 12's level discipline.
 func TestOutcome_Clarify_ClosedIssueDoesNotBlockALiveOne(t *testing.T) {
 	live := issueV2("tatara-operator", 291, "t1")
 	closed := issueV2("tatara-cli", 12, "t1", func(i *tatarav1alpha1.Issue) {
 		i.Status.State = "closed"
 	})
+	var logBuf bytes.Buffer
 	e := buildV2(t, v2Opts{writer: panicForge{},
+		logger:   slog.New(slog.NewJSONHandler(&logBuf, nil)),
 		approval: &fakeApproval{grant: map[string]bool{live.Name: true}, needCitation: true}},
 		projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"), repoV2("tatara-cli", "tatara"),
@@ -890,6 +901,10 @@ func TestOutcome_Clarify_ClosedIssueDoesNotBlockALiveOne(t *testing.T) {
 	require.Equal(t, "approved", e.issue(t, live.Name).Status.Status)
 	require.NotEqual(t, "approved", e.issue(t, closed.Name).Status.Status,
 		"the out-of-scope Issue is skipped, never written")
+	require.NotContains(t, logBuf.String(), "approver-less approval",
+		"a successful approval alongside a closed Issue must not log an approver-less-approval ERROR")
+	require.NotContains(t, logBuf.String(), `"level":"ERROR"`,
+		"the happy path must log no ERROR at all")
 }
 
 // A nil verifier FAILS CLOSED.

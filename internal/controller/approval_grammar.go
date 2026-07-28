@@ -371,6 +371,14 @@ type GrammarVerifier struct {
 // Issue. An out-of-scope (closed / done / rejected) Issue is not pending
 // approval and never blocks the scope check: it passes with whatever evidence it
 // already carries, mirroring VerifyApprovalDetailed's skip.
+//
+// THAT ARM IS PERMISSIVE, NOT FAIL-CLOSED, and the safety is NOT here: the
+// evidence it returns is routinely nil. It is the CALLER that must not treat
+// that as an approval - restapi's verifyApprovalScope filters out-of-scope
+// Issues out of the scope loop entirely (ApprovalInScope, the same predicate)
+// and refuses both an empty remainder and any in-scope Issue that grants nil
+// evidence. Relying on this arm alone is precisely the hole that let a Task
+// whose only Issue a human had CLOSED reach approved with no evidence at all.
 func (g *GrammarVerifier) VerifyApproval(ctx context.Context, proj *tatarav1alpha1.Project,
 	iss *tatarav1alpha1.Issue,
 	citations []tatarav1alpha1.ApprovalCitation) (*tatarav1alpha1.ApprovalEvidence, bool) {
