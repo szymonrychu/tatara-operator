@@ -9,7 +9,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
@@ -43,26 +42,28 @@ func awaitWake(wakes <-chan reconcile.Request, key types.NamespacedName, d time.
 // The last edge is a status-subresource write, which is why
 // GenerationChangedPredicate is forbidden on this edge - it would drop it - and
 // `delivered` is not a terminalStages member, which is why the predicate reads
-// TaskDone. Before this change the refill waited brainstormResyncInterval (15m)
-// for that third edge; the assertion timeout is seconds.
+// TaskDone. Before this change the refill waited up to defaultUnparkDriveInterval
+// (30s, the Project reconcile's self-requeue floor) for that third edge, NOT
+// brainstormResyncInterval (15m); this edge makes the wake immediate instead.
 func TestBrainstormChainWakesProjectReconcile(t *testing.T) {
 	mgr := newTestManager(t)
 	wakes := make(chan reconcile.Request, 32)
 
 	// .Named() is REQUIRED: controller-runtime's controller-name registry is
 	// process-wide, and project_controller_setup_test.go already registers a
-	// controller named "project" in this same test binary.
-	err := brainstormChainEdge(
-		ctrl.NewControllerManagedBy(mgr).
-			Named("brainstorm-chain-envtest").
-			For(&tatarav1alpha1.Project{}),
-	).Complete(reconcile.Func(func(_ context.Context, req reconcile.Request) (reconcile.Result, error) {
-		select {
-		case wakes <- req:
-		default:
-		}
-		return reconcile.Result{}, nil
-	}))
+	// controller named "project" in this same test binary. This registers the
+	// SAME builder production registers (projectControllerBuilder), not a
+	// hand-copied duplicate, so deleting the real edge from SetupWithManager
+	// turns this test RED instead of leaving it passing against a stale copy.
+	err := projectControllerBuilder(mgr).
+		Named("brainstorm-chain-envtest").
+		Complete(reconcile.Func(func(_ context.Context, req reconcile.Request) (reconcile.Result, error) {
+			select {
+			case wakes <- req:
+			default:
+			}
+			return reconcile.Result{}, nil
+		}))
 	if err != nil {
 		t.Fatalf("register the test controller: %v", err)
 	}
@@ -128,6 +129,7 @@ func TestBrainstormChainWakesProjectReconcile(t *testing.T) {
 	}
 	if !awaitWake(wakes, key, timeout) {
 		t.Fatalf("a finished brainstorm cycle did not wake the Project reconcile within %s; "+
-			"the refill would have waited %s for the resync", timeout, brainstormResyncInterval)
+			"without this edge it would have waited up to %s for the next self-requeue",
+			timeout, defaultUnparkDriveInterval)
 	}
 }

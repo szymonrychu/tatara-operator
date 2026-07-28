@@ -15,10 +15,26 @@ func isBrainstormTask(t *tatarav1alpha1.Task) bool {
 
 // brainstormCycleFinishedPredicate admits exactly the events that RAISE the
 // brainstorm deficit, so the refill runs the moment a cycle stops counting
-// against it instead of waiting out brainstormResyncInterval (15m). A cycle
-// that SKIPS writes no Issue at all, so the Watches(&Issue{}) edge never sees
-// it - that is the gap this closes, and it cost the mtg proposer five 15m
-// waits in a row in 2026-07.
+// against it. A cycle that SKIPS writes no Issue at all, so the
+// Watches(&Issue{}) edge never sees it - that is the gap this closes.
+//
+// CORRECTED RATIONALE: this does NOT save waiting out brainstormResyncInterval
+// (15m) - Project already self-requeues every defaultUnparkDriveInterval (30s,
+// project_controller.go) on every non-error pass, and soonestRequeue takes the
+// minimum against the 15m resync, so a skipped cycle was already re-evaluated
+// within ~30s before this edge existed. What this edge actually buys is an
+// immediate wake instead of waiting up to that 30s floor, plus an event Add
+// bypassing the workqueue's rate limiter - which matters when the Project
+// reconcile is in error backoff and the next self-requeue is pushed out
+// further than 30s.
+//
+// It does NOT rescue the five-consecutive-skips regime either:
+// brainstormRefillDecision (proposalcount.go) trips its skip breaker for
+// trigger==TriggerEvent once consecutiveSkips >= maxSkips (default 3), the
+// exact trigger this edge routes through - so from skip 3 onward this wake is
+// suppressed by the same breaker it would be motivated by fixing. Only the
+// CRON tick resets that breaker; the skip breaker, not this edge, governs the
+// five-consecutive-skips symptom.
 //
 //	Update  admit iff isBrainstorm && !TaskDone(old) && TaskDone(new)
 //	Delete  admit iff isBrainstorm && !TaskDone(obj)   (an in-flight cycle's slot is freed)

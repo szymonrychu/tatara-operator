@@ -61,14 +61,19 @@ const (
 	TataraParkedLabel = "tatara-parked"
 
 	// AnnWebhookOriginated is the DURABLE LIVENESS MARKER a live, HMAC-verified
-	// issues.opened/issues.reopened delivery leaves on the mirror Issue CR, and it
-	// is the ONLY thing that tells a freshly-opened human issue apart from a
-	// three-year-old untouched backlog issue: both are open, human-authored and
-	// ZERO-COMMENT, so humanHasLastWord is false for BOTH.
+	// issues.opened/issues.reopened delivery leaves on the mirror Issue CR, and,
+	// FOR AN AUTHOR OUTSIDE THE MAINTAINER/REPORTER ALLOWLISTS, it is the ONLY
+	// thing that tells a freshly-opened human issue apart from a three-year-old
+	// untouched backlog issue: both are open, human-authored and ZERO-COMMENT, so
+	// humanHasLastWord is false for BOTH. MintStage's trusted-human-author clause
+	// (below, sweep.go) mints ACTIVE for a maintainer/reporter's issue regardless
+	// of this marker, so this paragraph applies only to the untrusted-author case.
 	//
-	// WITHOUT IT THE PLATFORM'S FRONT DOOR IS SHUT. A human opens an issue, the
-	// sweep mints parked(backlog-sweep), no pod runs, and nothing happens until the
-	// human comments a SECOND time on their own issue.
+	// WITHOUT IT, FOR THAT UNTRUSTED-AUTHOR CASE, THE PLATFORM'S FRONT DOOR IS
+	// SHUT: a human opens an issue, the sweep mints parked(backlog-sweep), no pod
+	// runs, and nothing happens until the human comments a SECOND time on their
+	// own issue. A maintainer's or reporter's issue is unaffected either way - see
+	// MintStage's trusted-human-author clause.
 	//
 	// It CANNOT be replaced by reading "zero comments" as "a human has the last
 	// word": that mints the ENTIRE cutover backlog ACTIVE, which is the 150-issue,
