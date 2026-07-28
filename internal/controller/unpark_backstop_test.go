@@ -37,16 +37,18 @@ func objectKeyOf(o client.Object) client.ObjectKey {
 	return client.ObjectKeyFromObject(o)
 }
 
-// TestApplyUnpark_VerdictIsNotConsulted is the Step B guarantee. Before this
-// change a durable Task.status.approvalVerdict could carry a parked
-// identity-unverified Task into implementing without any live re-check: the
-// deleted grammarPassedFor read the record off the Task and handed it to
-// stage.Unpark as UnparkInput.GrammarPassed. After it, the ONLY grant path into
-// implementing is restapi's verifyApprovalScope (internal/restapi/outcome.go),
-// which runs the LIVE grammar against a live pod's submit_outcome - so a Task
-// carrying a PASSING, in-scope verdict AND an approved owned Issue, exactly the
-// shape the old fast path re-entered on, must still land on conversing.
-func TestApplyUnpark_VerdictIsNotConsulted(t *testing.T) {
+// TestApplyUnpark_IdentityUnverifiedNeverReachesImplementing is the step B-to-D
+// guarantee. There USED TO BE a durable Task.status.approvalVerdict that could
+// carry a parked identity-unverified Task into implementing without any live
+// re-check: the deleted grammarPassedFor read the record off the Task and handed
+// it to stage.Unpark as UnparkInput.GrammarPassed. Step B deleted the reader,
+// step C the UnparkInput field, step D the API type - so the ONLY grant path
+// into implementing is now restapi's verifyApprovalScope
+// (internal/restapi/outcome.go), which runs the LIVE grammar against a live
+// pod's submit_outcome. A Task in exactly the shape the old fast path re-entered
+// on - an approved owned Issue and a human comment pending - must land on
+// conversing.
+func TestApplyUnpark_IdentityUnverifiedNeverReachesImplementing(t *testing.T) {
 	proj := &tatarav1alpha1.Project{}
 	proj.Namespace = "tatara"
 	proj.Name = "infrastructure"
@@ -66,16 +68,6 @@ func TestApplyUnpark_VerdictIsNotConsulted(t *testing.T) {
 		At: metav1.Now(), Kind: "issue_comment", Repo: "helmfile", Number: 26,
 		Author: "szymonrychu", Body: "go ahead",
 	}}
-	// A verdict that would have satisfied every scoping check grammarPassedFor
-	// applied: non-empty Author, and stamped well AFTER this park began.
-	task.Status.ApprovalVerdict = &tatarav1alpha1.ApprovalVerdict{
-		At:                metav1.Time{Time: parkedAt.Add(5 * time.Minute)},
-		IssueRef:          "iss-helmfile-26",
-		CommentExternalID: "3606943691",
-		Author:            "szymonrychu",
-		Phrase:            "go ahead",
-	}
-
 	// Owned AND approved live: the other half of the old fast path's condition.
 	iss := &tatarav1alpha1.Issue{}
 	iss.Namespace = "tatara"
@@ -91,14 +83,14 @@ func TestApplyUnpark_VerdictIsNotConsulted(t *testing.T) {
 	}
 	if target == tatarav1alpha1.StageImplementing {
 		t.Fatal("target = implementing: a parked identity-unverified Task must NEVER reach implementing from unpark, " +
-			"whatever verdict its status happens to carry")
+			"whatever its owned Issues already say")
 	}
 	if target != tatarav1alpha1.StageConversing || decline != DeclineNone {
 		t.Fatalf("target = %q decline = %q, want conversing/none", target, decline)
 	}
 }
 
-// The SAME guarantee as TestApplyUnpark_VerdictIsNotConsulted, one level up:
+// The SAME guarantee as TestApplyUnpark_IdentityUnverifiedNeverReachesImplementing, one level up:
 // through the PACED reconcile driver rather than ApplyUnpark directly, so the
 // conversingRoomBudget hoist and the NeedsConversingRoom gate are exercised too
 // (a batch driver that never computed room for identity-unverified would leave
@@ -114,7 +106,7 @@ func TestApplyUnpark_VerdictIsNotConsulted(t *testing.T) {
 // a kind=clarify Task like this one. A clarify agent standing in conversing CAN
 // still move this Task toward implementing, via a GENUINE decision=implement
 // that passes that live check - see
-// TestOutcome_Conversing_ApprovalVerdictIsNeverConsulted (internal/restapi).
+// TestOutcome_Conversing_ImplementRefusedWhenLiveGrammarFails (internal/restapi).
 func TestDriveUnparks_IdentityUnverifiedOpensConversationNeverImplementing(t *testing.T) {
 	proj := &tatarav1alpha1.Project{}
 	proj.Namespace = "tatara"

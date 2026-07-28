@@ -549,10 +549,11 @@ func ReVerifyParked(ctx context.Context, c client.Client, sp objbudget.Spiller, 
 }
 
 // ReVerifyParkedDetailed is ReVerifyParked plus the EVIDENCE the pass was built
-// from, keyed by Issue CR name. The caller persists it as the Task's durable
-// ApprovalVerdict: the grammar verdict is the one input the periodic un-park
-// backstop can never reconstruct, because it needs a freshly synced forge thread
-// and a webhook payload the backstop did not see.
+// from, keyed by Issue CR name. The caller USED TO persist that evidence as a
+// durable Task.status.approvalVerdict, on the reasoning that the grammar verdict
+// was the one input the periodic un-park backstop could never reconstruct. That
+// field was deleted in agent-judged-approval-gate step D and the evidence now
+// goes nowhere: this function is test-only, like ReVerifyParked above it.
 func ReVerifyParkedDetailed(ctx context.Context, c client.Client, sp objbudget.Spiller, reader scm.SCMReader,
 	proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task, ev tatarav1alpha1.TaskEvent,
 	metrics *obs.OperatorMetrics) (bool, map[string]*tatarav1alpha1.ApprovalEvidence, error) {

@@ -36,14 +36,15 @@ import (
 // approval label already visible on the forge (2026-07-27, gitlab helmfile#26).
 //
 // THERE IS NO DURABLE GRAMMAR VERDICT ANY MORE (agent-judged-approval-gate,
-// steps A-C). This driver used to read Task.status.approvalVerdict through a
+// steps A-D). This driver used to read Task.status.approvalVerdict through a
 // grammarPassedFor helper and hand the answer to stage.Unpark as
 // UnparkInput.GrammarPassed, so a record written by one webhook request could
 // carry a LATER pass into implementing with no live re-check of the thing the
-// record attested to. Step A deleted every writer of that field, step B the
-// reader, and step C the field: stage.UnparkInput has no verdict slot at all
-// now, so this driver cannot pass one even by accident. internal/stage does no
-// approval reasoning whatsoever.
+// record attested to. Step A deleted every writer of Task.status.approvalVerdict,
+// step B the reader, step C the UnparkInput.GrammarPassed slot and step D the
+// API type itself: there is no verdict left anywhere to pass, so this driver
+// cannot pass one even by accident. internal/stage does no approval reasoning
+// whatsoever.
 //
 // What that leaves for parked(identity-unverified): a non-bot pendingEvent
 // un-parks it to CONVERSING when the project is under its conversing ceiling,

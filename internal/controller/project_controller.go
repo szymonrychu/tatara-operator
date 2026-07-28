@@ -390,12 +390,11 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// the comment-driven awaiting-human/backlog-sweep/identity-unverified backstop.
 	// identity-unverified is INCLUDED, so a comment the webhook fast path dropped
 	// on a cache race still gets a second look on the reconcile cadence. READ
-	// THIS BEFORE RELYING ON IT FOR MORE THAN THAT: as of
-	// agent-judged-approval-gate step B, NO grammar verdict is fed to
-	// stage.Unpark by anything (step A deleted every writer of
-	// Task.status.approvalVerdict, step B deleted the reader), so this loop can
-	// only ever move a parked(identity-unverified) Task to conversing, never to
-	// implementing. The approval decision itself now happens live, in restapi's
+	// THIS BEFORE RELYING ON IT FOR MORE THAN THAT: NO grammar verdict is fed to
+	// stage.Unpark by anything (agent-judged-approval-gate step A deleted every
+	// writer of Task.status.approvalVerdict, step B the reader, step C the
+	// UnparkInput slot, step D the API type), so this loop can only ever move a
+	// parked(identity-unverified) Task to conversing, never to implementing. The approval decision itself now happens live, in restapi's
 	// verifyApprovalScope on submit_outcome(decision=implement), against a Task
 	// with a running pod. Paced independently of Reconcile()'s
 	// other drivers (tatara-operator#368: an unrelated 10s-or-faster forced
