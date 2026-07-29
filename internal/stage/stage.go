@@ -302,8 +302,8 @@ var Transitions = map[string][]Edge{
 	),
 
 	v1alpha1.StageClarifying: podStageEdges(
-		Edge{To: v1alpha1.StageApproved, Trigger: "submit_outcome(decision=implement) AND the C.6 grammar passes for EVERY owned Issue"},
-		Edge{To: v1alpha1.StageParked, Reason: ReasonIdentityUnverified, Trigger: "decision=implement but the C.6 grammar FAILS"},
+		Edge{To: v1alpha1.StageApproved, Trigger: "submit_outcome(decision=implement) AND the agent's CITATION verifies for EVERY LIVE owned Issue"},
+		Edge{To: v1alpha1.StageParked, Reason: ReasonIdentityUnverified, Trigger: "decision=implement but the citation does NOT verify (uncited, not a maintainer's, quote absent, or evidence replayed)"},
 		Edge{To: v1alpha1.StageParked, Reason: ReasonAwaitingHuman, Trigger: "decision=discuss, or the 24h clarify budget elapses"},
 		Edge{To: v1alpha1.StageRejected, Reason: ReasonDeclined, Trigger: "decision=close (the operator closes the issue)"},
 		Edge{To: v1alpha1.StageConversing, Trigger: "a qualifying comment arrived on an owned thread: the Task moves to a live conversation. The clarify pod of the stage being left is torn down by EnterStage as for any pod stage; the conversing pod's turn-0 bundle carries the whole thread, the notes journal and <events>, and every SUBSEQUENT comment reaches that live pod warm"},
@@ -327,7 +327,7 @@ var Transitions = map[string][]Edge{
 	// that is why the paused-project carve-out covers it too.
 	v1alpha1.StageApproved: {
 		{To: v1alpha1.StageImplementing, Trigger: "a QueuedEvent for the implement pod is ADMITTED"},
-		{To: v1alpha1.StageClarifying, Trigger: "the Task ACQUIRES a new Issue after approval. Approval is not sticky (fix H9)"},
+		{To: v1alpha1.StageClarifying, Trigger: "the Task ACQUIRES a new Issue after approval (fix H9). LEGAL BUT UNDRIVEN: applyApprovalStage was the only production caller and it died with the agent-judged approval gate, so nothing re-gates an approved Task today. If it is re-implemented the home is queue_controller.go, not restapi"},
 		{To: v1alpha1.StageParked, Reason: ReasonAdmissionStarved, Trigger: "the 24h admission budget elapses (skipped when the project is PAUSED)"},
 		{To: v1alpha1.StageParked, Reason: ReasonOwnershipLost, Trigger: "an external commit landed on the MR while approved: a takeover Task mints straight into approved already controller-owning the MR (MintOrUnparkTakeoverTask), so it can be flipped before ever reaching implementing"},
 		{To: v1alpha1.StageFailed, Reason: ReasonOperatorError, Trigger: "unrecoverable operator error"},
@@ -366,8 +366,8 @@ var Transitions = map[string][]Edge{
 	// turn - a conversation that goes quiet becomes an ordinary park, and an
 	// ordinary park is re-entered by the ordinary F.6 rules.
 	v1alpha1.StageConversing: podStageEdges(
-		Edge{To: v1alpha1.StageApproved, Trigger: "submit_outcome(decision=implement) AND verifyApprovalScope's LIVE C.6 grammar passes for EVERY owned Issue, exactly as from clarifying. Refused by LegalFor's GUARD 1 for a kind=review Task (a review Task owns zero Issues, so the grammar can never pass for it anyway; the guard makes that refusal structural rather than merely likely)"},
-		Edge{To: v1alpha1.StageParked, Reason: ReasonIdentityUnverified, Trigger: "decision=implement but the C.6 grammar FAILS, exactly as from clarifying"},
+		Edge{To: v1alpha1.StageApproved, Trigger: "submit_outcome(decision=implement) AND verifyApprovalScope's LIVE citation check passes for EVERY LIVE owned Issue, exactly as from clarifying. Refused by LegalFor's GUARD 1 for a kind=review Task (a review Task owns zero Issues, so the citation check can never pass for it anyway; the guard makes that refusal structural rather than merely likely)"},
+		Edge{To: v1alpha1.StageParked, Reason: ReasonIdentityUnverified, Trigger: "decision=implement but the citation does NOT verify, exactly as from clarifying"},
 		Edge{To: v1alpha1.StageParked, Reason: ReasonAwaitingHuman, Trigger: "the conversation went idle past conversationIdleMinutes (after a handoff turn), the per-project conversing ceiling evicted the longest-idle conversation (after a handoff turn), or decision=discuss"},
 		Edge{To: v1alpha1.StageRejected, Reason: ReasonDeclined, Trigger: "decision=close (the operator closes the issue)"},
 		Edge{To: v1alpha1.StageReviewing, Trigger: "the conversation was entered FROM reviewing and the agent hands the thread back for a fresh review round. LegalFor's kind guard is untouched: implementing, merging AND approved remain unreachable for a kind=review Task, by any path"},
@@ -418,7 +418,7 @@ var Transitions = map[string][]Edge{
 	v1alpha1.StageParked: {
 		{To: v1alpha1.StageTriaging, Trigger: "F.6 backlog-sweep: a non-bot pendingEvent AND ACTIVE Tasks < maxOpenTasks"},
 		{To: v1alpha1.StageReviewing, Trigger: "F.6 awaiting-human on a kind=review Task / handoff-stalled on a human comment (any kind). Both bounded by humanReviewRounds (5)"},
-		{To: v1alpha1.StageImplementing, Trigger: "F.6 awaiting-human (every open owned Issue approved) / identity-unverified (the C.6 grammar re-passes) / no-outcome (zero merged MRs)"},
+		{To: v1alpha1.StageImplementing, Trigger: "F.6 awaiting-human (every open owned Issue approved) / no-outcome (zero merged MRs). NOT identity-unverified: that reason's only F.6 target is conversing, because F.6 does no approval reasoning at all"},
 		{To: v1alpha1.StageClarifying, Trigger: "F.6 awaiting-human, not every open owned Issue is approved"},
 		{To: v1alpha1.StageMerging, Trigger: "F.6 merge-timeout, under maxMergeReentries. NEVER implementing"},
 		{To: v1alpha1.StageDeploying, Trigger: "F.6 deploy-timeout, under maxDeployReentries. NEVER implementing"},
@@ -917,7 +917,10 @@ func RequestChanges(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, maxReviewRoun
 //     failed(turn-budget-exhausted) (F4).
 //   - every other reason folds (ok=false). awaiting-human / identity-unverified /
 //     backlog-sweep are resumed by the webhook's pending-event path
-//     (driveCommentUnpark); the exhaustion reasons (review-loop-exhausted,
+//     (driveCommentUnpark) and by the project reconcile's driveUnparks sweep;
+//     for identity-unverified BOTH lead to conversing or a decline and never to
+//     implementing, because F.6 does no approval reasoning. The exhaustion
+//     reasons (review-loop-exhausted,
 //     stage-deadline, ...) age out - re-entering them here would escape their own
 //     cap one human review at a time (F1).
 //
@@ -1007,21 +1010,18 @@ func HeadMoved(t *v1alpha1.Task, maxHeadMoveReentries int) (Edge, bool) {
 
 // UnparkInput is everything F.6 reads.
 //
-// internal/stage is PURE. The caller has ALREADY done every forge read and every
-// grammar evaluation before it calls Unpark. In particular, for a
-// parked(identity-unverified) Task with a non-bot pendingEvent, the caller MUST,
-// in this order (fixes C3-3, M11):
+// internal/stage is PURE, and as of the agent-judged approval gate it does NO
+// approval reasoning at all. The caller performs NO approval evaluation before
+// calling Unpark and passes NO verdict in: this package never sees an approval,
+// and no field here can carry one.
 //
-//  1. SYNC THAT ISSUE'S COMMENTS FROM THE FORGE. The C.6 grammar's single-use-
-//     evidence clause needs the approving comment IN THE MIRROR with its
-//     ExternalID, and TaskEvent carries no externalId; B.4's mirror-cadence table
-//     does not cover parked(identity-unverified) Tasks. Without the sync the
-//     grammar re-runs against a thread that does not contain the comment that
-//     triggered it, and silently fails.
-//  2. RE-EVALUATE THE C.6 GRAMMAR against the refreshed thread, and on a pass
-//     stamp Issue.status.approval and status=approved.
-//
-// GrammarPassed is that verdict. It is IGNORED for every other stageReason.
+// That is what makes parked(identity-unverified) re-entry a RESPONSIVENESS
+// decision only - "should a live agent be put in front of the human who just
+// commented, and is there room for one" - rather than an authorization decision.
+// The authorization lives in exactly one place, restapi.verifyApprovalScope, and
+// it runs against the operator's own mirror on every
+// submit_outcome(decision=implement). Nothing this function returns can grant
+// implementing or approved from that park reason.
 type UnparkInput struct {
 	Task *v1alpha1.Task
 	// Issues and MRs are the Issues / MergeRequests this Task OWNS. A review
@@ -1038,7 +1038,6 @@ type UnparkInput struct {
 	// event and can never un-park anything: the operator's own park comment must
 	// not un-park the Task it parked.
 	BotLogin        string
-	GrammarPassed   bool
 	MaxTurnsPerTask int
 	// ConversingHasRoom is the CALLER's answer to "is this project under its
 	// conversing ceiling right now". internal/stage is pure and cannot count live
@@ -1055,7 +1054,7 @@ type UnparkInput struct {
 // the set must stay small and stable. A decline that cannot name its condition
 // is the defect this vocabulary exists to make impossible: the 2026-07-27
 // identity-unverified stall declined silently and no log or counter anywhere
-// could say which of GrammarPassed, len(open) and allApproved refused.
+// could say which of the several conditions that arm then checked had refused.
 const (
 	// DeclineNone means Unpark re-entered (target != "").
 	DeclineNone = ""
@@ -1064,14 +1063,12 @@ const (
 	// DeclineOverCap: backlog-sweep promotion would exceed maxOpenTasks. The
 	// promotion DEFERS; the event is retained.
 	DeclineOverCap = "over-cap"
-	// DeclineGrammarNotPassed: identity-unverified, and the C.6 grammar did not
-	// pass on this evaluation.
-	DeclineGrammarNotPassed = "grammar-not-passed"
+	// DeclineNoConversingRoom: identity-unverified with a qualifying human
+	// comment, but the project is at its conversing ceiling. The pendingEvent is
+	// RETAINED and the next pass retries; nothing is dropped.
+	DeclineNoConversingRoom = "no-conversing-room"
 	// DeclineNoOpenIssues: the empty owned-Issue set is not a licence (fix V6-3).
 	DeclineNoOpenIssues = "no-open-issues"
-	// DeclineNotAllApproved: at least one open owned Issue is not approved. This
-	// is the shape a stale cached read produces after a fresh approval write.
-	DeclineNotAllApproved = "not-all-approved"
 	// DeclineMergedMR: re-entry would spawn a pod against an already-merged MR.
 	DeclineMergedMR = "merged-mr"
 	// DeclineRoundsExhausted: humanReviewRounds is at MaxHumanReviewRounds.
@@ -1192,63 +1189,50 @@ func UnparkDetailed(in UnparkInput) (target string, decline string) {
 		return enter(v1alpha1.StageClarifying, "")
 
 	case ReasonIdentityUnverified:
-		// A comment ALONE cannot un-park this - the one park reason sitting
-		// directly in front of "write code and merge it to prod". Only a comment
-		// that PASSES THE C.6 GRAMMAR can: maintainer identity, anchored
-		// whole-line phrase, single-use evidence, re-evaluated by the OPERATOR
-		// against a freshly SYNCED thread (see UnparkInput). On a FAIL it stays
-		// parked and the bot does NOT comment again.
+		// A comment alone still cannot GRANT anything here. What changed is
+		// where the grant lives: it is now EXCLUSIVELY
+		// restapi.verifyApprovalScope, which re-derives the maintainer identity
+		// and re-checks the agent's citation against the operator's own mirror
+		// on every submit_outcome(decision=implement). This arm therefore has
+		// exactly one job - put a live agent in front of the human who just
+		// commented - and it can never reach implementing or approved.
+		//
+		// #294: this is a DECISION flip at the chokepoint, not a new EDGE. The
+		// Task still traverses clarifying|conversing -> approved -> implementing,
+		// still faces LegalFor GUARD 1, ticket admission and the 24h budget.
 		if !hasNonBotEvent(t, in.BotLogin) {
 			return "", DeclineNoHumanEvent
 		}
-		if !in.GrammarPassed {
-			// The human SAID something the C.6 grammar could not read as approval.
-			// That is precisely a conversation: an agent should read it and reply,
-			// rather than the Task sitting parked while the human waits. This edge
-			// does NOT itself grant implementing or approved - the real gate is
-			// restapi's verifyApprovalScope (internal/restapi/outcome.go), which
-			// runs the LIVE C.6 grammar over every owned Issue on every
-			// submit_outcome(decision=implement) and never reads
-			// status.approvalVerdict. Widens responsiveness; the approval gate
-			// itself is untouched.
-			if in.ConversingHasRoom {
-				if t.Spec.Kind == kindReview {
-					// A kind=review Task owns ZERO Issues (H9's empty-set rule
-					// below), so verifyApprovalScope can NEVER pass for it -
-					// every decision=implement from a review-kind conversation
-					// bounces straight back to parked(identity-unverified). Without
-					// the SAME three guards ReasonAwaitingHuman's review branch
-					// carries above, a stuck kind=review Task would re-enter
-					// conversing on every subsequent human comment and spawn ONE
-					// POD PER COMMENT forever, capped only by maxTurnsPerTask
-					// (300) - the exact failure that branch's own comment names.
-					if anyMerged(in.MRs) {
-						return "", DeclineMergedMR
-					}
-					if t.Status.HumanReviewRounds >= v1alpha1.MaxHumanReviewRounds {
-						return "", DeclineRoundsExhausted // STAY PARKED. Do not spawn another pod.
-					}
-					t.Status.HumanReviewRounds++
-					target, decline := enter(v1alpha1.StageConversing, "")
-					if decline != DeclineNone {
-						t.Status.HumanReviewRounds--
-					}
-					return target, decline
-				}
-				return enter(v1alpha1.StageConversing, "")
+		if !in.ConversingHasRoom {
+			// D1: the truthful terminus. NOT a fallthrough to clarifying: the
+			// conversing ceiling exists to bound live agent pods, and spawning a
+			// clarifying pod instead would route around the very limit being
+			// reported. The pendingEvent is RETAINED, so the next comment or the
+			// next reconcile retries.
+			return "", DeclineNoConversingRoom
+		}
+		if t.Spec.Kind == kindReview {
+			// A kind=review Task owns ZERO Issues (H9's empty-set rule), so
+			// verifyApprovalScope can NEVER pass for it - every
+			// decision=implement from a review-kind conversation bounces back to
+			// parked(identity-unverified). Without these three guards a stuck
+			// kind=review Task would re-enter conversing on every subsequent
+			// human comment and spawn ONE POD PER COMMENT forever, capped only
+			// by maxTurnsPerTask (300).
+			if anyMerged(in.MRs) {
+				return "", DeclineMergedMR
 			}
-			return "", DeclineGrammarNotPassed
+			if t.Status.HumanReviewRounds >= v1alpha1.MaxHumanReviewRounds {
+				return "", DeclineRoundsExhausted // STAY PARKED. Do not spawn another pod.
+			}
+			t.Status.HumanReviewRounds++
+			target, decline := enter(v1alpha1.StageConversing, "")
+			if decline != DeclineNone {
+				t.Status.HumanReviewRounds--
+			}
+			return target, decline
 		}
-		open := openIssues(in.Issues)
-		if len(open) == 0 {
-			// H9: implementing needs EVERY owned Issue approved, and the empty
-			// set is not a licence here either.
-			return "", DeclineNoOpenIssues
-		}
-		if !allApproved(open) {
-			return "", DeclineNotAllApproved
-		}
-		return enter(v1alpha1.StageImplementing, "")
+		return enter(v1alpha1.StageConversing, "")
 
 	case ReasonMergeTimeout:
 		if t.Status.MergeReentries >= v1alpha1.MaxMergeReentries {

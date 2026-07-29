@@ -28,7 +28,7 @@ const (
 	// AutoApproveLogin is the sentinel Login stamped on ApprovalEvidence when the
 	// autoApproveTataraProposals path grants approval (CommentID is then empty).
 	// It is NOT a real forge account and can never be a maintainer, so it can
-	// never satisfy the human approval grammar by accident.
+	// never satisfy the human approval citation check by accident.
 	AutoApproveLogin = "<tatara:auto>"
 
 	// ProposalKindBrainstorm marks an issue a brainstorm submit_outcome propose
