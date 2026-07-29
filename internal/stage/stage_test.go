@@ -170,6 +170,13 @@ func openMR() v1alpha1.MergeRequest {
 	return v1alpha1.MergeRequest{Status: v1alpha1.MergeRequestStatus{State: "open"}}
 }
 
+func externalOwnedOpenMR() v1alpha1.MergeRequest {
+	return v1alpha1.MergeRequest{Status: v1alpha1.MergeRequestStatus{
+		State:     "open",
+		Ownership: v1alpha1.OwnershipExternal,
+	}}
+}
+
 func mergedMR() v1alpha1.MergeRequest {
 	now := metav1.Now()
 	return v1alpha1.MergeRequest{Status: v1alpha1.MergeRequestStatus{State: "merged", MergedAt: &now}}
@@ -1728,6 +1735,28 @@ func TestUnpark_AwaitingHumanReviewKindBoundedByHumanReviewRounds(t *testing.T) 
 	}
 	if task.Status.Stage != v1alpha1.StageParked {
 		t.Fatalf("at the cap the Task must STAY PARKED, got %q", task.Status.Stage)
+	}
+}
+
+// #511: a maintainer's "take over" comment on a stood-down (Ownership==external)
+// MR must reach a live review pod even after the ordinary human-review-round
+// cap is spent - the cap exists to bound review ping-pong, not to block a
+// maintainer's take-over request from ever reaching an agent that could act on
+// it (mr_takeover_request).
+func TestUnpark_AwaitingHumanReviewKindBypassesRoundsCapOnExternallyOwnedMR(t *testing.T) {
+	task := newTask("review", v1alpha1.StageParked, stage.ReasonAwaitingHuman)
+	task.Status.HumanReviewRounds = v1alpha1.MaxHumanReviewRounds
+	humanEvent(task)
+	h := newHarness(t, task)
+	h.mrs = []v1alpha1.MergeRequest{externalOwnedOpenMR()}
+
+	target, ok := h.unpark(stage.UnparkInput{ActiveTasks: 1, MaxOpenTasks: 6, BotLogin: botLogin, MaxTurnsPerTask: 300})
+	if !ok || target != v1alpha1.StageReviewing {
+		t.Fatalf("got (%q,%v), want (reviewing,true): a take-over comment on a stood-down MR must not be blocked by the exhausted round cap", target, ok)
+	}
+	if task.Status.HumanReviewRounds != v1alpha1.MaxHumanReviewRounds {
+		t.Fatalf("HumanReviewRounds = %d, want unchanged at %d (this re-entry does not spend a review round)",
+			task.Status.HumanReviewRounds, v1alpha1.MaxHumanReviewRounds)
 	}
 }
 

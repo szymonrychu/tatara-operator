@@ -1325,11 +1325,34 @@ func UnparkDetailed(in UnparkInput) (target string, decline string) {
 				// out at parkRetention and is reaped.
 				return "", DeclineMergedMR
 			}
+			// #511: an externally-owned MR (a stand-down: a commit outside
+			// tatara landed, or a maintainer never let tatara own it in the
+			// first place) is not an ordinary review round - it is the ONE
+			// state a "take over" comment can arrive in, and the round cap was
+			// sized to bound review ping-pong, not to swallow a maintainer's
+			// take-over request. Skip the cap and DO NOT spend a round: this
+			// re-entry either finds nothing to take over (idempotent no-op in
+			// restapi.mrTakeover) or hands ownership back, neither of which is
+			// the review ping-pong the cap exists to bound.
+			if anyExternallyOwned(in.MRs) {
+				return enter(v1alpha1.StageReviewing, "")
+			}
 			if t.Status.HumanReviewRounds >= v1alpha1.MaxHumanReviewRounds {
 				return "", DeclineRoundsExhausted // STAY PARKED. Do not spawn another review pod.
 			}
 			t.Status.HumanReviewRounds++
-			target, decline := enter(v1alpha1.StageReviewing, "")
+			// #508: a maintainer comment on an awaiting-human review Task used to
+			// cold-respawn straight into reviewing, bypassing conversing (and its
+			// idle-TTL/warm-pod behaviour) entirely - the same gap the sibling
+			// identity-unverified review arm above already closed. Prefer conversing
+			// when the project has room for it, exactly like the clarify arm below;
+			// fall back to the pre-existing cold respawn when the ceiling is full so
+			// a full ceiling degrades the experience rather than dropping the event.
+			to := v1alpha1.StageReviewing
+			if in.ConversingHasRoom {
+				to = v1alpha1.StageConversing
+			}
+			target, decline := enter(to, "")
 			if decline != DeclineNone {
 				t.Status.HumanReviewRounds--
 			}
@@ -1553,6 +1576,18 @@ func allApproved(issues []v1alpha1.Issue) bool {
 func anyMerged(mrs []v1alpha1.MergeRequest) bool {
 	for i := range mrs {
 		if mrs[i].Status.State == "merged" || mrs[i].Status.MergedAt != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// anyExternallyOwned reports whether any of mrs is currently Ownership==
+// external - a stand-down state (#511) where a human comment is plausibly a
+// take-over request, not an ordinary review round.
+func anyExternallyOwned(mrs []v1alpha1.MergeRequest) bool {
+	for i := range mrs {
+		if mrs[i].Status.Ownership == v1alpha1.OwnershipExternal {
 			return true
 		}
 	}
