@@ -195,6 +195,13 @@ spec:
           annotations:
             summary: "the B.4 sweep is erroring"
             description: "operator_sweep_errors_total{project=\"{{ "{{" }} $labels.project {{ "}}" }}\",activity=\"{{ "{{" }} $labels.activity {{ "}}" }}\",reason=\"{{ "{{" }} $labels.reason {{ "}}" }}\"} increased in 1h: the only intake path is failing on at least one repo (list_issues, list_prs, owner_repo, mint, ...). Work on the forge is not being picked up."
+        - alert: TataraSweepSkipPersistent
+          expr: increase(operator_sweep_skipped_total[{{ .Values.prometheusRule.sweepSkipWindow }}]) >= {{ .Values.prometheusRule.sweepSkipPassThreshold }}
+          labels:
+            severity: {{ .Values.prometheusRule.severityLabel | quote }}
+          annotations:
+            summary: "the B.4 sweep keeps skipping the same item"
+            description: "operator_sweep_skipped_total{project=\"{{ "{{" }} $labels.project {{ "}}" }}\",activity=\"{{ "{{" }} $labels.activity {{ "}}" }}\",reason=\"{{ "{{" }} $labels.reason {{ "}}" }}\"} increased {{ "{{" }} $value {{ "}}" }} times in {{ .Values.prometheusRule.sweepSkipWindow }}: a single sweep skip is a NORMAL steady state (reason=mr_claimed_by_other_task means a live Task legitimately controller-owns that MergeRequest, including while parked - parked is re-entrant), so this alerts only on one that never clears. That means the owning Task has stopped progressing and is not being reaped: find it with operator_task_stage_age_seconds, then resolve or reap it. Issue #477: this replaces the ERROR-line trickle that used to report the same condition as a repeating sweep fault."
         - alert: TataraObjectTooLarge
           expr: increase(operator_object_too_large_total[1h]) > 0
           labels:
