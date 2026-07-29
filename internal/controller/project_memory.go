@@ -534,8 +534,42 @@ func (r *ProjectReconciler) reconcileMemory(ctx context.Context, p *tataradevv1a
 		return 0, r.failMemory(p, "PasswordError", err)
 	}
 	if err := r.applyMemoryStack(ctx, p); err != nil {
+		// A retryable dependency failure - most concretely an admission webhook
+		// the apiserver could not reach - is NOT a broken memory stack. Absorb it
+		// the same way the health-read path below absorbs an API blip: leave the
+		// phase and MemoryReady condition exactly as they are, return no error,
+		// and requeue on a backed-off poll.
+		//
+		// Issue #439: without this, the 2026-07-24 rolling node reboot took the
+		// cnpg mcluster.cnpg.io webhook down for ~6 minutes and every reconcile
+		// pass in that window (driven far faster than any requeue by the Owns()
+		// edges on the stack's own objects, which were churning for the same
+		// reason) returned a hard error, producing 58 controller-runtime
+		// "Reconciler error" ERROR lines from ONE outage and flipping all three
+		// projects to phase=Failed - which is itself what the critical
+		// operator_memory_stacks{phase=~"Provisioning|Failed"} alert reads.
+		// Nothing was wrong with any stack, and all three recovered untouched.
+		//
+		// A run that outlasts memoryApplyTransientGrace stops being transient by
+		// definition and falls through to the hard path, so a webhook that is
+		// genuinely gone still surfaces.
+		if isTransientApplyError(err) {
+			if backoff, escalate := r.noteTransientApply(p.Name, time.Now()); !escalate {
+				if p.Status.Memory.Phase == "" {
+					p.Status.Memory.Phase = "Provisioning"
+				}
+				r.Metrics.MemoryApplyTransientError(p.Name)
+				l.Info("transient memory apply error, will retry",
+					"action", "memory_apply_retry",
+					"resource_id", p.Name,
+					"requeue_after", backoff.String(),
+					"error", err.Error())
+				return backoff, nil
+			}
+		}
 		return 0, r.failMemory(p, "ApplyError", err)
 	}
+	r.clearTransientApply(p.Name)
 
 	h, err := r.memoryStackHealth(ctx, p)
 	if err != nil {
