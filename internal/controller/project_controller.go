@@ -150,6 +150,14 @@ type ProjectReconciler struct {
 	// path (MaxConcurrentReconciles=1); no mutex required.
 	memoryUnhealthyCycles map[string]int
 
+	// memoryApplyTransientSince records, per project, when the current run of
+	// RETRYABLE applyMemoryStack failures started (issue #439). reconcileMemory
+	// absorbs those failures - no phase=Failed, no returned reconcile error -
+	// until the run outlasts memoryApplyTransientGrace. Read/written only on the
+	// serialised reconcile path (MaxConcurrentReconciles: 1); no mutex required,
+	// same as memoryUnhealthyCycles.
+	memoryApplyTransientSince map[string]time.Time
+
 	// ToolSurfaceHTTP is the client used by updateToolSurfaceProbe to probe the
 	// operator-write tool backend. Nil falls back to a short-timeout
 	// default; tests inject an httptest-backed client.
