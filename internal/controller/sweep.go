@@ -92,6 +92,11 @@ const (
 	// error counters.
 	SweepActivity = "sweep"
 
+	// SweepSkipMRClaimed is the {reason} on SweepSkippedTotal for clause 1b: an
+	// adoptable-by-shape PR whose MergeRequest CR another Task already
+	// controller-owns. Kept in sync with obs.sweepSkipReasons.
+	SweepSkipMRClaimed = "mr_claimed_by_other_task"
+
 	// SweepIssueKind is the Task kind a sweep-minted ISSUE Task carries. F.3 has
 	// NO triaging -> implementing edge: an issue Task enters clarifying, where the
 	// C.6 approval citation check gates it, and only an APPROVED Task implements.
@@ -460,6 +465,14 @@ const (
 	PRReview PRDisposition = "review"
 	// PRIgnore: clauses 2 and 4. No Task. No pod. No tokens.
 	PRIgnore PRDisposition = "ignore"
+	// PRClaimed: clause 1b. The PR is adoptable BY SHAPE (bot-authored, on this
+	// Task's branch, same repo) but its MergeRequest CR is already
+	// controller-owned by a DIFFERENT Task, so the adoption is not this pass's
+	// to make and could never succeed - ownMergeRequest never steals. It is a
+	// SKIP, not an error: the owning Task holds its MR legitimately for as long
+	// as it lives, including while parked (parked is re-entrant - see the
+	// parked->approved/merging edges in internal/stage and DrainStandDownMerge).
+	PRClaimed PRDisposition = "claimed"
 )
 
 // ClassifyPR is B.4's PR/MR disposition. FOUR clauses:
@@ -513,6 +526,19 @@ func ClassifyPR(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, p
 	owner *tatarav1alpha1.Task, cr *tatarav1alpha1.MergeRequest) PRDisposition {
 
 	if AdoptPR(proj, owner, pr) {
+		// CLAUSE 1b (issue #477). An MR already controller-owned by someone
+		// other than owner is not adoptable BY ANYONE: ownMergeRequest refuses
+		// to steal, so calling it here is a guaranteed hard error, repeated
+		// byte-identically on every 4h pass for as long as both Tasks live.
+		// taskForBranch already prefers the claiming Task when it shares this
+		// branch, so reaching here means the claimant is on a DIFFERENT branch
+		// (a takeover hand-over mid-flight, a review mint's expectFrom source).
+		// Skip; the claimant is driving the MR.
+		if cr != nil {
+			if cur, owned := own.ControllerOwner(cr); owned && cur != owner.Name {
+				return PRClaimed
+			}
+		}
 		return PRAdopt
 	}
 	bot := botLoginOf(proj)
@@ -686,6 +712,13 @@ func (r *ProjectReconciler) SweepProject(ctx context.Context, proj *tatarav1alph
 	active, err := r.activeTaskCount(ctx, proj)
 	if err != nil {
 		obs.SweepErrorsTotal.WithLabelValues(proj.Name, activity, "list_tasks").Inc()
+		// Logged HERE, not by the caller. This is the ONE path on which
+		// SweepProject returns without having logged, and runScans' re-report of
+		// the returned error is now V(1) (issue #477's observability half: one
+		// fault must not surface as two ERROR lines at two different msg values,
+		// which double-counted every sweep fault into the ERROR-rate alert).
+		l.Error(err, "sweep: list_tasks", "action", "sweep_error",
+			"resource_id", proj.Name, "activity", activity, "reason", "list_tasks")
 		return fmt.Errorf("sweep: count active tasks: %w", err)
 	}
 	budget := newSweepBudget(proj, active)
@@ -868,14 +901,21 @@ func (r *ProjectReconciler) sweepPRs(ctx context.Context, proj *tatarav1alpha1.P
 
 	l := log.FromContext(ctx)
 	for _, pr := range prs {
-		ownerTask, terr := r.taskForBranch(ctx, proj, pr.HeadBranch)
-		if terr != nil {
-			fail("get_owning_task", terr, "repo", repo.Name, "number", pr.Number)
-			continue
-		}
+		// The mirror is read BEFORE the branch lookup, not after: its controller
+		// owner is what disambiguates a head branch that several Tasks share
+		// (issue #477, see taskForBranch).
 		cr, gerr := r.mergeRequestCR(ctx, proj, repo, pr.Number)
 		if gerr != nil {
 			fail("get_mr_cr", gerr, "repo", repo.Name, "number", pr.Number)
+			continue
+		}
+		claimedBy := ""
+		if cr != nil {
+			claimedBy, _ = own.ControllerOwner(cr)
+		}
+		ownerTask, terr := r.taskForBranch(ctx, proj, pr.HeadBranch, claimedBy)
+		if terr != nil {
+			fail("get_owning_task", terr, "repo", repo.Name, "number", pr.Number)
 			continue
 		}
 		switch ClassifyPR(proj, repo, pr, ownerTask, cr) {
@@ -908,6 +948,17 @@ func (r *ProjectReconciler) sweepPRs(ctx context.Context, proj *tatarav1alpha1.P
 				"repo", repo.Name, "number", pr.Number, "stage", stg, "stage_reason", reason,
 				"kind", SweepReviewKind, "adopted_mirror", cr != nil,
 				"human_review_rounds", task.Status.HumanReviewRounds)
+		case PRClaimed:
+			// Clause 1b (issue #477). NOT an error and NOT metered as one: the
+			// claiming Task owns this MR legitimately and the sweep has nothing
+			// to do until that Task is reaped. Counted, though - a claim that
+			// never clears is a stuck Task, and operator_sweep_skipped_total is
+			// where that shows up without burning the ERROR-rate alert.
+			obs.SweepSkippedTotal.WithLabelValues(proj.Name, activity, SweepSkipMRClaimed).Inc()
+			l.Info("sweep: PR already claimed by another task; adoption skipped",
+				"action", "sweep_skip_pr", "resource_id", proj.Name, "activity", activity,
+				"reason", SweepSkipMRClaimed, "repo", repo.Name, "number", pr.Number,
+				"head_branch", pr.HeadBranch, "branch_task", ownerTask.Name, "claimed_by", claimedBy)
 		case PRIgnore:
 			// Clause 2/4. No Task, no pod, no tokens, and the PR is NOT touched: a
 			// CI pin-bump PR carries the forge's own auto-merge and the platform has
@@ -1080,7 +1131,26 @@ func (r *ProjectReconciler) mergeRequestCR(ctx context.Context, proj *tatarav1al
 // DIFFERENT project's Task, both resolve to nil - which sends a
 // bot-authored PR straight to clause 2 (IGNORE), exactly as intended for an
 // ORPHANED AGENT PR.
-func (r *ProjectReconciler) taskForBranch(ctx context.Context, proj *tatarav1alpha1.Project, branch string) (*tatarav1alpha1.Task, error) {
+//
+// A BRANCH IS NOT UNIQUE TO ONE TASK (issue #477). agent.TaskBranch keys on
+// (branchKind, source.number, title slug), and branchKind COLLAPSES review,
+// brainstorm, clarify and refine into "chore" - so two clarify Tasks minted for
+// the SAME source issue carry the SAME branch, as do an implement Task and the
+// takeover Task that resumes its MR (both "feat"). Returning the first match in
+// list order therefore picked a Task that does NOT own the MR often enough to
+// alert: ClassifyPR said PRAdopt, ownMergeRequest refused ("already has
+// controller owner <other>"), and the sweep re-ran the identical impossible
+// adoption every 4h forever. claimedBy - the MR mirror's CURRENT controller
+// owner, "" when there is none - is the disambiguator: it names which of the
+// colliding Tasks the MR actually belongs to, so the sweep converges on a
+// no-op instead of erroring.
+//
+// With no claim to go on, the pick must still be deterministic AND useful: a
+// still-pushing Task beats a finished one (a fresh PR on a shared branch was
+// pushed by whoever is still running, never by the Task that already
+// delivered), newest beats oldest, and name breaks the final tie so the
+// answer does not depend on list order.
+func (r *ProjectReconciler) taskForBranch(ctx context.Context, proj *tatarav1alpha1.Project, branch, claimedBy string) (*tatarav1alpha1.Task, error) {
 	var tl tatarav1alpha1.TaskList
 	err := r.List(ctx, &tl, client.InNamespace(proj.Namespace), client.MatchingFields{TaskProjectRefIndex: proj.Name})
 	if err != nil {
@@ -1092,13 +1162,44 @@ func (r *ProjectReconciler) taskForBranch(ctx context.Context, proj *tatarav1alp
 			return nil, err
 		}
 	}
+	var best *tatarav1alpha1.Task
 	for i := range tl.Items {
 		t := &tl.Items[i]
-		if t.Spec.ProjectRef == proj.Name && agent.TaskBranch(t) == branch {
+		if t.Spec.ProjectRef != proj.Name || agent.TaskBranch(t) != branch {
+			continue
+		}
+		if claimedBy != "" && t.Name == claimedBy {
 			return t, nil
 		}
+		if betterBranchOwner(best, t) {
+			best = t
+		}
 	}
-	return nil, nil
+	return best, nil
+}
+
+// betterBranchOwner reports whether cand is a better answer than cur for a
+// branch several Tasks share. See taskForBranch for why the order is
+// still-pushing, then newest, then name.
+func betterBranchOwner(cur, cand *tatarav1alpha1.Task) bool {
+	if cur == nil {
+		return true
+	}
+	if a, b := taskStillPushes(cand), taskStillPushes(cur); a != b {
+		return a
+	}
+	if !cand.CreationTimestamp.Equal(&cur.CreationTimestamp) {
+		return cand.CreationTimestamp.After(cur.CreationTimestamp.Time)
+	}
+	return cand.Name > cur.Name
+}
+
+// taskStillPushes reports whether t may still push to its branch. parked counts
+// as pushing even though TaskDone calls it terminal: a parked(ownership-lost)
+// Task is re-entered into approved/merging (F.3, DrainStandDownMerge) and
+// RESUMES pushing. Only delivered/failed/rejected are past pushing.
+func taskStillPushes(t *tatarav1alpha1.Task) bool {
+	return !tatarav1alpha1.TaskDone(t) || t.Status.Stage == tatarav1alpha1.StageParked
 }
 
 // liveTaskPushingTo returns the name of a Task OTHER than exclude that still
@@ -1134,7 +1235,7 @@ func (r *ProjectReconciler) liveTaskPushingTo(ctx context.Context, proj *tatarav
 		if t.Name == exclude || t.Spec.ProjectRef != proj.Name {
 			continue
 		}
-		if tatarav1alpha1.TaskDone(t) && t.Status.Stage != tatarav1alpha1.StageParked {
+		if !taskStillPushes(t) {
 			continue
 		}
 		if agent.PushBranch(t) == branch {
