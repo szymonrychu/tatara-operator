@@ -689,37 +689,6 @@ type ScmSpec struct {
 	// +kubebuilder:validation:Minimum=0
 	// +optional
 	ConversationIdleMinutes int `json:"conversationIdleMinutes,omitempty"`
-	// ApprovalPhrases is the closed, per-project wordlist an approving
-	// maintainer comment must match. The match is an ANCHORED WHOLE-LINE
-	// match, NOT a substring (fix C3 / D-B, USER DECISION): some LINE of the
-	// normalised body must match ^\s*(<phrase>)[\s.!]*$ - the comment must
-	// CONSIST OF the phrase, not merely contain it. Substring matching meant
-	// "I can't approve this until the tests pass" APPROVED - and because the
-	// grammar takes the maintainer's MOST RECENT comment, their corrective
-	// follow-up approved too. Anchored, "go ahead" approves and "don't go
-	// ahead with this" does not. Empty means the DEFAULT list
-	// (DefaultApprovalPhrases); it can NEVER mean "any text approves".
-	// +optional
-	// +kubebuilder:validation:MaxItems=20
-	// +kubebuilder:validation:items:MinLength=2
-	ApprovalPhrases []string `json:"approvalPhrases,omitempty"`
-}
-
-// DefaultApprovalPhrases is the closed wordlist used when a project does not
-// configure ScmSpec.ApprovalPhrases. An empty configuration NEVER means "any
-// text approves" (fix C3 / D-B) - it means this list.
-func DefaultApprovalPhrases() []string {
-	return []string{"lgtm", "approve", "approved", "ship it", "go ahead", "go", "implement it"}
-}
-
-// EffectiveApprovalPhrases returns the project's configured approval
-// wordlist, or DefaultApprovalPhrases() when unset (a nil Scm block or an
-// empty/absent ApprovalPhrases). It can NEVER return "match anything".
-func EffectiveApprovalPhrases(p *Project) []string {
-	if p.Spec.Scm != nil && len(p.Spec.Scm.ApprovalPhrases) > 0 {
-		return p.Spec.Scm.ApprovalPhrases
-	}
-	return DefaultApprovalPhrases()
 }
 
 // ConversationIdleFloor is the minimum idle budget ConversationIdle ever

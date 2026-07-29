@@ -54,51 +54,47 @@ func TestUnparkDetailed_ClassifiesEveryDecline(t *testing.T) {
 			decline: stage.DeclineNoHumanEvent,
 		},
 		{
-			name: "identity-unverified with a human event but no grammar pass",
+			// D1's terminus. The only decline this arm has left once a non-bot
+			// event is present, and it names the real condition instead of
+			// borrowing a grammar label for a capacity refusal.
+			name: "identity-unverified with a human event but no conversing room",
 			in: func() stage.UnparkInput {
 				task := parkedTask("clarify", stage.ReasonIdentityUnverified)
 				task.Status.PendingEvents = unparkDeclineHumanEvent()
-				return stage.UnparkInput{Task: task, GrammarPassed: false, Now: now}
+				return stage.UnparkInput{Task: task, ConversingHasRoom: false, Now: now}
 			},
-			decline: stage.DeclineGrammarNotPassed,
+			decline: stage.DeclineNoConversingRoom,
 		},
 		{
-			name: "identity-unverified, grammar passed, no open issues",
+			// The SAME input with room re-enters conversing. Paired with the row
+			// above so the table proves the ceiling is what decides it, and
+			// proves an owned Issue's approval state does NOT: iss-a is approved
+			// and the target is still conversing, never implementing.
+			name: "identity-unverified with a human event and conversing room",
 			in: func() stage.UnparkInput {
 				task := parkedTask("clarify", stage.ReasonIdentityUnverified)
 				task.Status.PendingEvents = unparkDeclineHumanEvent()
-				return stage.UnparkInput{Task: task, GrammarPassed: true, Now: now}
+				return stage.UnparkInput{
+					Task:              task,
+					Issues:            []v1alpha1.Issue{unparkDeclineOpenIssue("iss-a", "approved")},
+					ConversingHasRoom: true,
+					Now:               now,
+				}
+			},
+			target:  v1alpha1.StageConversing,
+			decline: stage.DeclineNone,
+		},
+		{
+			// no-open-issues survives on ReasonAwaitingHuman, which is now its
+			// only producer: identity-unverified stopped consulting Issues at
+			// all when step C deleted its implementing tail.
+			name: "awaiting-human, non-review kind, owning zero open issues",
+			in: func() stage.UnparkInput {
+				task := parkedTask("clarify", stage.ReasonAwaitingHuman)
+				task.Status.PendingEvents = unparkDeclineHumanEvent()
+				return stage.UnparkInput{Task: task, Now: now}
 			},
 			decline: stage.DeclineNoOpenIssues,
-		},
-		{
-			name: "identity-unverified, grammar passed, an owned issue is unapproved (THE cache-lag shape)",
-			in: func() stage.UnparkInput {
-				task := parkedTask("clarify", stage.ReasonIdentityUnverified)
-				task.Status.PendingEvents = unparkDeclineHumanEvent()
-				return stage.UnparkInput{
-					Task:          task,
-					Issues:        []v1alpha1.Issue{unparkDeclineOpenIssue("iss-a", "open")},
-					GrammarPassed: true,
-					Now:           now,
-				}
-			},
-			decline: stage.DeclineNotAllApproved,
-		},
-		{
-			name: "identity-unverified, grammar passed, every owned issue approved",
-			in: func() stage.UnparkInput {
-				task := parkedTask("clarify", stage.ReasonIdentityUnverified)
-				task.Status.PendingEvents = unparkDeclineHumanEvent()
-				return stage.UnparkInput{
-					Task:          task,
-					Issues:        []v1alpha1.Issue{unparkDeclineOpenIssue("iss-a", "approved")},
-					GrammarPassed: true,
-					Now:           now,
-				}
-			},
-			target:  v1alpha1.StageImplementing,
-			decline: stage.DeclineNone,
 		},
 		{
 			name: "backlog-sweep over cap",
@@ -165,12 +161,12 @@ func TestUnparkDelegatesToUnparkDetailed(t *testing.T) {
 	task := parkedTask("clarify", stage.ReasonIdentityUnverified)
 	task.Status.PendingEvents = unparkDeclineHumanEvent()
 	target, ok := stage.Unpark(stage.UnparkInput{
-		Task:          task,
-		Issues:        []v1alpha1.Issue{unparkDeclineOpenIssue("iss-a", "approved")},
-		GrammarPassed: true,
-		Now:           time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC),
+		Task:              task,
+		Issues:            []v1alpha1.Issue{unparkDeclineOpenIssue("iss-a", "approved")},
+		ConversingHasRoom: true,
+		Now:               time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC),
 	})
-	if !ok || target != v1alpha1.StageImplementing {
-		t.Fatalf("Unpark = (%q, %v), want (implementing, true)", target, ok)
+	if !ok || target != v1alpha1.StageConversing {
+		t.Fatalf("Unpark = (%q, %v), want (conversing, true)", target, ok)
 	}
 }

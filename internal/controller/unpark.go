@@ -18,47 +18,71 @@ import (
 // THE F.6 RE-ENTRY DRIVER (fix W3).
 //
 // stage.Unpark carries a full re-entry body for SIX park reasons, but before
-// this file its ONLY production caller was the webhook's reverifyParked, gated to
-// identity-unverified. unparkFires (reaper.go) merely CHECKS whether a park would
+// this file its ONLY production caller was a bespoke webhook limb, gated to
+// identity-unverified (since deleted - every comment-driven re-entry is
+// ApplyUnpark now). unparkFires (reaper.go) merely CHECKS whether a park would
 // re-enter, on a DeepCopy, so the reaper does not collect a re-entryable Task - it
 // never APPLIED the transition. So awaiting-human, merge-timeout, deploy-timeout,
 // no-outcome and backlog-sweep all had a re-entry body and NO driver: a
 // reviewed+approved delivery whose CI stayed red past its budget parked at
 // merge-timeout and was stranded forever.
 //
-// This driver applies stage.Unpark. identity-unverified USED TO BE EXCLUDED, on
-// the reasoning that it re-enters only against a freshly SYNCED forge thread
-// evaluated by the C.6 grammar (ReVerifyParked, the webhook's job) and that
-// driving it here with GrammarPassed=false would never pass. That reasoning was
-// correct and the exclusion was still a defect: it made the webhook's ONE
-// evaluation the only one that would ever happen, so a fast path that lost a
-// cache race stalled the Task permanently with the approval label already
-// visible on the forge (2026-07-27, gitlab helmfile#26).
+// This driver applies stage.Unpark for EVERY park reason that has an F.6
+// re-entry rule, identity-unverified included. That reason USED TO BE EXCLUDED,
+// on the reasoning that it re-enters only against a freshly SYNCED forge thread
+// evaluated by the C.6 citation check (the webhook's job). The exclusion was a defect:
+// it made the webhook's ONE evaluation the only one that would ever happen, so a
+// fast path that lost a cache race stalled the Task permanently with the
+// approval label already visible on the forge (2026-07-27, gitlab helmfile#26).
 //
-// It is included now because the verdict is DURABLE. The webhook stamps
-// Task.status.approvalVerdict the moment the grammar passes, whether or not the
-// un-park in that same request succeeds. This driver never re-runs the grammar -
-// it cannot - it reads that record and re-derives the rest (are all open owned
-// Issues approved?) from LIVE cluster state, which it can.
+// THERE IS NO DURABLE GRAMMAR VERDICT ANY MORE (agent-judged-approval-gate,
+// steps A-D). This driver used to read Task.status.approvalVerdict through a
+// grammarPassedFor helper and hand the answer to stage.Unpark as
+// UnparkInput.GrammarPassed, so a record written by one webhook request could
+// carry a LATER pass into implementing with no live re-check of the thing the
+// record attested to. Step A deleted every writer of Task.status.approvalVerdict,
+// step B the reader, step C the UnparkInput.GrammarPassed slot and step D the
+// API type itself: there is no verdict left anywhere to pass, so this driver
+// cannot pass one even by accident. internal/stage does no approval reasoning
+// whatsoever.
 //
-// The verdict is SCOPED TO THE CURRENT PARK (2026-07-27 security review
-// finding): stage.Enter never clears ApprovalVerdict, so a Task approved once,
-// moved on, and later re-parked identity-unverified for an UNRELATED reason (a
-// newly acquired, unapproved owned Issue; a later clarify round) still carries
-// the OLD verdict. grammarPassedFor (below) only honours a verdict stamped
-// AFTER the CURRENT park's StageEnteredAt - a verdict already consumed by an
-// earlier park can never satisfy a later one - and refuses a verdict with no
-// Author, so a schema-legal-but-empty {"at": "..."} verdict cannot authorize
-// anything either.
+// What that leaves for parked(identity-unverified): a non-bot pendingEvent of
+// ANY KIND un-parks it to CONVERSING when the project is under its conversing
+// ceiling, and otherwise it declines no-conversing-room and stays exactly where
+// it is with its pendingEvent retained. ANY KIND is not a slip: stage's
+// hasNonBotEvent tests Author != botLogin and does NOT look at Kind, so an
+// issue_edited event re-engages exactly like an issue_comment does. That is
+// correct, because re-entry here is a RESPONSIVENESS decision and not an
+// authorization one. IMPLEMENTING is UNREACHABLE from this driver
+// for that reason - stage.go's ReasonIdentityUnverified arm has no implementing
+// branch left to reach. The ONE surviving grant path into implementing is
+// restapi's verifyApprovalScope (internal/restapi/outcome.go), which runs the
+// LIVE citation check over every owned Issue on every
+// submit_outcome(decision=implement):
+// judged by an agent standing in conversing with a live pod, against live state,
+// never against a record.
 //
-// A Task with no verdict, or only a stale one, declines with grammar-not-passed
-// and stays exactly where it is. ONE CARVE-OUT: under
+// ONE CARVE-OUT, AND IT NEVER FIRES FROM HERE. Under
 // Project.spec.AutoApproveTataraProposals, a bot-authored, anchor-verified
 // proposal with ZERO maintainer comments auto-approves (autoApproveApplies /
-// autoApprovalEvidence, approval_grammar.go) and verdictFrom records that as a
-// verdict with Author=AutoApproveLogin and no CommentExternalID - by design, not
-// a gap this driver introduces. Outside that flag, there is no path here that
-// re-enters implementing without a recorded maintainer approval.
+// autoApprovalEvidence, approval_grammar.go) - a deliberate, narrowly gated
+// exception, not a gap this driver introduces. autoApproveApplies sits inside
+// verifyOneIssue, and after step F verifyOneIssue has exactly ONE production
+// caller left: GrammarVerifier.VerifyApproval, reached from restapi's
+// submit_outcome scope check (internal/restapi/outcome.go). That needs a live
+// pod, which a parked Task does not have, so the carve-out is granted where such
+// a proposal actually lives - clarifying (or conversing) with a pod attached -
+// and never as a side effect of un-parking. Nothing strands: a bot proposal with
+// no maintainer comment is not the shape that parks at identity-unverified in
+// the first place (the scope check GRANTS it), and one that is parked here for
+// some other reason re-enters through conversing on a non-bot pendingEvent like
+// every other park reason, then submits its outcome against a live pod.
+//
+// Outside that flag, there is no path from parked(identity-unverified) into
+// implementing here at all. The OTHER reasons keep their own rules unchanged -
+// awaiting-human still re-enters implementing when every open owned Issue is
+// approved, no-outcome still re-drives implementing - neither of which ever
+// consulted the verdict.
 
 // UnparkDecline classifies WHY ApplyUnpark refused to re-enter (target==""),
 // so callers can tell an anomalous drift bail from a normal steady-state
@@ -88,9 +112,8 @@ const (
 	// accident.
 	DeclineNoHumanEvent     UnparkDecline = stage.DeclineNoHumanEvent
 	DeclineOverCap          UnparkDecline = stage.DeclineOverCap
-	DeclineGrammarNotPassed UnparkDecline = stage.DeclineGrammarNotPassed
+	DeclineNoConversingRoom UnparkDecline = stage.DeclineNoConversingRoom
 	DeclineNoOpenIssues     UnparkDecline = stage.DeclineNoOpenIssues
-	DeclineNotAllApproved   UnparkDecline = stage.DeclineNotAllApproved
 	DeclineMergedMR         UnparkDecline = stage.DeclineMergedMR
 	DeclineRoundsExhausted  UnparkDecline = stage.DeclineRoundsExhausted
 	DeclineTurnsExhausted   UnparkDecline = stage.DeclineTurnsExhausted
@@ -106,8 +129,8 @@ func DeclineFor(code string) UnparkDecline {
 	switch code {
 	case stage.DeclineNone:
 		return DeclineNone
-	case stage.DeclineNoHumanEvent, stage.DeclineOverCap, stage.DeclineGrammarNotPassed,
-		stage.DeclineNoOpenIssues, stage.DeclineNotAllApproved, stage.DeclineMergedMR,
+	case stage.DeclineNoHumanEvent, stage.DeclineOverCap, stage.DeclineNoConversingRoom,
+		stage.DeclineNoOpenIssues, stage.DeclineMergedMR,
 		stage.DeclineRoundsExhausted, stage.DeclineTurnsExhausted, stage.DeclineWrongParkedFrom,
 		stage.DeclineIllegalEdge, stage.DeclineNoReentry:
 		return UnparkDecline(code)
@@ -116,58 +139,12 @@ func DeclineFor(code string) UnparkDecline {
 	}
 }
 
-// grammarPassedFor scopes t's C.6 verdict to t's CURRENT park, for the ONE
-// stageReason (identity-unverified) that reads it. It is the SINGLE definition
-// of that scoping rule, called from both ApplyUnpark (on the freshly-read Task,
-// inside the retry loop) and reaper.go's unparkFires (on its probe DeepCopy),
-// so the periodic driver and the reap-eligibility probe cannot disagree about
-// whether a given verdict counts (2026-07-27 security review finding 3).
-//
-// Two refusals, both fail-closed:
-//
-//  1. v.At must be AFTER t.Status.StageEnteredAt. stage.Enter never clears
-//     ApprovalVerdict but DOES re-stamp StageEnteredAt on every transition,
-//     including into parked(identity-unverified) - so "the verdict postdates
-//     the current park" is exactly "this verdict was produced FOR this park,
-//     not carried over from an earlier one already consumed". Without this, an
-//     Issue approved once (sticky - verifyOneIssue never revokes it) could
-//     satisfy a LATER, unrelated park caused by a different, since-closed
-//     owned Issue (finding 1).
-//  2. v.Author must be non-empty. Task.Status.ApprovalVerdict's CRD schema
-//     leaves author/commentExternalId optional (evolution headroom), so a
-//     hand-written or corrupted {"at": "..."} verdict is schema-valid; Author is
-//     the one field every verdict this codebase writes always carries (a real
-//     maintainer login, or AutoApproveLogin for the guarded proposal
-//     carve-out - see verdictFrom), so requiring it makes the zero-value
-//     struct unreachable by construction here regardless of what a given CR's
-//     admission did or did not enforce (finding/minor 6).
-//
-// fallback is returned for every OTHER stageReason, where GrammarPassed is
-// ignored entirely (see stage.UnparkInput's doc comment).
-//
-// metav1.Time round-trips through the apiserver at WHOLE-SECOND precision (its
-// MarshalJSON drops sub-second digits), so two timestamps written within the
-// same second are indistinguishable by the time either is read back. That
-// never happens for a genuine identity-unverified verdict: a human must
-// physically comment on the forge AFTER the park, which is always seconds to
-// days later, never the same second. Refusing on equality (strict After, not
-// After-or-equal) is deliberately the conservative side of that non-issue.
-func grammarPassedFor(t *tatarav1alpha1.Task, fallback bool) bool {
-	if t.Status.StageReason != stage.ReasonIdentityUnverified {
-		return fallback
-	}
-	v := t.Status.ApprovalVerdict
-	if v == nil || v.Author == "" || t.Status.StageEnteredAt == nil {
-		return false
-	}
-	return v.At.After(t.Status.StageEnteredAt.Time)
-}
-
 // ApplyUnpark runs stage.Unpark for one parked Task and persists the re-entry
 // under optimistic concurrency. It is the SINGLE application of stage.Unpark,
 // shared by the project-reconcile driver (driveUnparks, the time-based reasons)
-// and the webhook comment-driven paths (awaiting-human, backlog-sweep), so every
-// F.6 re-entry flows through one place. activeTasks / maxOpen are supplied by the
+// and the webhook comment-driven paths (awaiting-human, backlog-sweep and, since
+// step A folded away its bespoke limb, identity-unverified), so every F.6
+// re-entry flows through one place. activeTasks / maxOpen are supplied by the
 // caller (computed once per pass) so a bulk promotion cannot exceed maxOpenTasks
 // on a stale count. target is "" when the park did not re-enter; decline then
 // says why (DeclineGuard vs DeclineRule) so the caller can log/count them
@@ -185,7 +162,7 @@ func grammarPassedFor(t *tatarav1alpha1.Task, fallback bool) bool {
 // reader (unit tests that do not wire one) falls back to c.
 //
 // conversingHasRoom is the CALLER's precomputed answer to Task 9's F.6
-// capacity question (needsConversingRoom names which stageReasons ever consult
+// capacity question (NeedsConversingRoom names which stageReasons ever consult
 // it). It is a PARAMETER, not computed in here, on purpose: driveUnparks calls
 // ApplyUnpark once per parked Task in a loop (tatara-operator#368 is the whole
 // reason that loop is paced at all), and ConversingHasRoom's countConversing is
@@ -194,7 +171,7 @@ func grammarPassedFor(t *tatarav1alpha1.Task, fallback bool) bool {
 // #368 exists to prevent. Callers hoist it ONCE per pass instead (2026-07-28
 // security review IMPORTANT 4).
 func ApplyUnpark(ctx context.Context, c client.Client, reader client.Reader, proj *tatarav1alpha1.Project,
-	task *tatarav1alpha1.Task, activeTasks, maxOpen int, grammarPassed, conversingHasRoom bool, now time.Time) (string, UnparkDecline, error) {
+	task *tatarav1alpha1.Task, activeTasks, maxOpen int, conversingHasRoom bool, now time.Time) (string, UnparkDecline, error) {
 
 	// c (cached) is safe here, unlike the retry-loop Task Get below: by the time
 	// driveCommentUnpark reaches this call the owning Issue CR is guaranteed to
@@ -237,10 +214,9 @@ func ApplyUnpark(ctx context.Context, c client.Client, reader client.Reader, pro
 			decline = DeclineGuard
 			return nil
 		}
-		// grammarPassedFor reads the verdict off fresh - the UNCACHED read this
-		// closure just did - not off the caller's (possibly cached, possibly
-		// stale) task argument. See grammarPassedFor's own doc for why the
-		// verdict must additionally be scoped to fresh's CURRENT park.
+		// Every field UnparkInput HAS is set here. There is no verdict field to
+		// omit any more (step C deleted it), so parked(identity-unverified) can
+		// only reach conversing or decline, never implementing.
 		to, code := stage.UnparkDetailed(stage.UnparkInput{
 			Task:              fresh,
 			Issues:            issues,
@@ -248,7 +224,6 @@ func ApplyUnpark(ctx context.Context, c client.Client, reader client.Reader, pro
 			ActiveTasks:       activeTasks,
 			MaxOpenTasks:      maxOpen,
 			BotLogin:          botLogin,
-			GrammarPassed:     grammarPassedFor(fresh, grammarPassed),
 			MaxTurnsPerTask:   maxTurns,
 			ConversingHasRoom: conversingHasRoom,
 			Now:               now,
@@ -308,23 +283,23 @@ func (r *ProjectReconciler) driveUnparksPaced(ctx context.Context, proj *tatarav
 	return interval, nil
 }
 
-// needsConversingRoom reports whether stageReason is one of the two F.6 rules
+// NeedsConversingRoom reports whether stageReason is one of the two F.6 rules
 // that ever consult UnparkInput.ConversingHasRoom (stage.go's ReasonAwaitingHuman
 // and ReasonIdentityUnverified branches). Every other parked reason (merge-
 // timeout, deploy-timeout, no-outcome, handoff-stalled, backlog-sweep, ...)
 // never reads the field, so a caller sweeping a mixed batch can skip the
 // capacity List entirely when nothing in it would use the answer (2026-07-28
 // security review IMPORTANT 4).
-func needsConversingRoom(stageReason string) bool {
+func NeedsConversingRoom(stageReason string) bool {
 	return stageReason == stage.ReasonAwaitingHuman || stageReason == stage.ReasonIdentityUnverified
 }
 
 // driveUnparks applies stage.Unpark to every parked Task in proj whose park
-// reason has an F.6 re-entry rule, INCLUDING identity-unverified: the grammar
-// verdict it needs comes from the durable Task.status.approvalVerdict (see the
-// file header), never re-evaluated here. activeTasks is computed ONCE and then
-// advanced as each Task re-enters an active stage, so a bulk re-entry never
-// exceeds maxOpenTasks (H8).
+// reason has an F.6 re-entry rule, INCLUDING identity-unverified - for which
+// CONVERSING is the only reachable target, because no approval verdict is ever
+// fed to stage.Unpark any more (see the file header). activeTasks is computed
+// ONCE and then advanced as each Task re-enters an active stage, so a bulk
+// re-entry never exceeds maxOpenTasks (H8).
 func (r *ProjectReconciler) driveUnparks(ctx context.Context, proj *tatarav1alpha1.Project, now time.Time) error {
 	var tl tatarav1alpha1.TaskList
 	if err := r.List(ctx, &tl, client.InNamespace(proj.Namespace)); err != nil {
@@ -359,7 +334,7 @@ func (r *ProjectReconciler) driveUnparks(ctx context.Context, proj *tatarav1alph
 	conversingRoomBudget := 0
 	for i := range tl.Items {
 		t := &tl.Items[i]
-		if t.Spec.ProjectRef == proj.Name && t.Status.Stage == tatarav1alpha1.StageParked && needsConversingRoom(t.Status.StageReason) {
+		if t.Spec.ProjectRef == proj.Name && t.Status.Stage == tatarav1alpha1.StageParked && NeedsConversingRoom(t.Status.StageReason) {
 			live, listErr := countConversing(ctx, r.Client, proj)
 			if listErr != nil {
 				log.FromContext(ctx).Error(listErr, "unpark: conversing capacity check failed; treating this pass as no room",
@@ -380,14 +355,8 @@ func (r *ProjectReconciler) driveUnparks(ctx context.Context, proj *tatarav1alph
 		if t.Spec.ProjectRef != proj.Name || t.Status.Stage != tatarav1alpha1.StageParked {
 			continue
 		}
-		// The verdict is the ONE input this pass cannot reconstruct, and ApplyUnpark
-		// resolves it itself (grammarPassedFor, on its own UNCACHED read) rather than
-		// this loop computing it off t - t comes from the List above (r.Client,
-		// cached) and can lag exactly the write this whole feature exists to survive.
-		// false here is the fallback ApplyUnpark uses for every OTHER stageReason,
-		// where GrammarPassed is ignored entirely.
-		conversingRoom := needsConversingRoom(t.Status.StageReason) && conversingRoomBudget > 0
-		target, decline, err := ApplyUnpark(ctx, r.Client, r.APIReader, proj, t, active, maxOpen, false, conversingRoom, now)
+		conversingRoom := NeedsConversingRoom(t.Status.StageReason) && conversingRoomBudget > 0
+		target, decline, err := ApplyUnpark(ctx, r.Client, r.APIReader, proj, t, active, maxOpen, conversingRoom, now)
 		if err != nil {
 			log.FromContext(ctx).Error(err, "unpark: apply failed",
 				"action", "unpark_error", "resource_id", t.Name, "reason", t.Status.StageReason)
@@ -405,35 +374,32 @@ func (r *ProjectReconciler) driveUnparks(ctx context.Context, proj *tatarav1alph
 		}
 		// GUARD declines are always anomalous (the live object had already
 		// drifted from what this pass believed was parked) and worth surfacing
-		// here too, unlike RULE declines: driveUnparks sweeps every parked Task
-		// every pass, and a RULE decline is the expected steady state for most
-		// of them (e.g. merge-timeout still waiting) - logging every one would
-		// be pure log spam, not a signal.
-		if decline == DeclineGuard {
+		// here too, unlike most RULE declines: driveUnparks sweeps every parked
+		// Task every pass, and a RULE decline is the expected steady state for
+		// most of them (e.g. merge-timeout still waiting) - logging every one
+		// would be pure log spam, not a signal.
+		//
+		// NO-CONVERSING-ROOM is the ONE rule decline that is also logged. It is
+		// not steady state: it means a human commented on a parked
+		// identity-unverified Task and the operator refused to put an agent in
+		// front of them purely because the project is at its conversing ceiling
+		// - an operator-actionable capacity refusal, and the only remaining
+		// terminus of that arm. Platform hard rule 13 wants both channels, and
+		// the counter alone (operator_unpark_declined_total) cannot say WHICH
+		// Task went unanswered. Bounded by driveUnparksPaced's floor
+		// (defaultUnparkDriveInterval) and by the ceiling itself being small.
+		switch decline {
+		case DeclineGuard:
 			log.FromContext(ctx).Info("unpark: declined (drift guard)",
+				"action", "unpark_declined", "resource_id", t.Name, "reason", t.Status.StageReason, "decline", string(decline))
+		case DeclineNoConversingRoom:
+			log.FromContext(ctx).Info("unpark: declined (project is at its conversing ceiling; the pending event is retained and the next pass retries)",
 				"action", "unpark_declined", "resource_id", t.Name, "reason", t.Status.StageReason, "decline", string(decline))
 		}
 		if decline != DeclineNone && r.Metrics != nil {
 			r.Metrics.UnparkDeclined(t.Status.StageReason, string(decline))
 		}
 		if target != "" {
-			if t.Status.StageReason == stage.ReasonIdentityUnverified {
-				// This is the backstop catching what the fast path dropped. It is the
-				// single most important line in this file for diagnosing a repeat of
-				// the 2026-07-27 stall: if it fires often, the webhook fast path is
-				// losing its cache race routinely and the fast path is what to fix.
-				//
-				// t (this loop's cached List item) is diagnostic best-effort here, not
-				// the security decision (that already happened, inside ApplyUnpark,
-				// against an uncached read) - so t.Status.ApprovalVerdict may be nil or
-				// stale even though the re-entry above genuinely succeeded; guard it
-				// rather than deref a verdict the cache never observed.
-				fields := []any{"action", "unpark_verdict_backstop", "resource_id", t.Name, "stage", target}
-				if v := t.Status.ApprovalVerdict; v != nil {
-					fields = append(fields, "verdict_comment", v.CommentExternalID, "verdict_issue", v.IssueRef)
-				}
-				log.FromContext(ctx).Info("unpark: identity-unverified retried from the persisted grammar verdict", fields...)
-			}
 			active++ // the re-entered Task is now active; keep the cap honest this pass.
 		}
 	}

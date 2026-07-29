@@ -55,7 +55,16 @@ func (s SessionInfo) TurnInFlight() bool { return s.State == SessionStateBusy }
 // ContractVersion is the operator/wrapper wire contract version (G.10). It is
 // injected into every agent pod as TATARA_CONTRACT_VERSION and asserted against
 // the wrapper's reported contractVersion at pod-ready, BEFORE turn-0.
-const ContractVersion = 2
+//
+// 2 -> 3: the agent-judged approval gate. submit_outcome(decision=implement)
+// gained approvalCitations, the agent's {id, quote} citation of the maintainer
+// comment it judged to be an approval. The same constant lives at 3 in
+// tatara-cli (internal/mcp/contract.go) and tatara-claude-code-wrapper
+// (internal/version/version.go); all three move in ONE shot. An old cli refuses
+// to start its MCP server and an old wrapper fails AssertContractVersion at
+// pod-ready, so a straggler is a loud pre-work failure rather than a silent
+// mid-turn 400.
+const ContractVersion = 3
 
 // Session is the operator's view of one wrapper session. baseURL is the
 // per-pod wrapper address (http://<svc>.<ns>.svc:8080).
