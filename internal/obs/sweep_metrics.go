@@ -90,6 +90,23 @@ var SweepErrorsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Help: "Sweep errors, by project, activity and reason (contract K.1).",
 }, []string{"project", "activity", "reason"})
 
+// SweepSkippedTotal counts per-item work the sweep DELIBERATELY did not do, by
+// project, activity and reason. It is the counterpart to SweepErrorsTotal and
+// exists so a benign, self-clearing steady state stays VISIBLE without being
+// reported as a fault (issue #477: a PR whose MergeRequest another live Task
+// already controller-owns used to raise a hard sweep error on every 4h pass,
+// which is what the ERROR-rate alert kept catching). A skip rate that never
+// returns to zero is a stuck owning Task - alert on THIS series, not on
+// operator_sweep_errors_total and not on ERROR line counts.
+var SweepSkippedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "operator_sweep_skipped_total",
+	Help: "Sweep items deliberately skipped, by project, activity and reason (contract B.4).",
+}, []string{"project", "activity", "reason"})
+
+// sweepSkipReasons is the closed skip-reason set. Keep in sync with sweep.go's
+// SweepSkip* constants.
+var sweepSkipReasons = []string{"mr_claimed_by_other_task"}
+
 // sweepSeedReasons is the closed fail(reason, ...) set for sweep.go's B.4 pass
 // (SweepActivity), plus list_tasks. Literal here (not imported from
 // internal/controller) to avoid a reverse import; kept in sync with sweep.go's
@@ -149,6 +166,8 @@ func SeedSweepErrorsForProject(project string) {
 	seedLabels(seed, []string{project}, []string{"brainstorm"}, []string{"stamp_failed"})
 	seedLabels(seed, []string{project}, []string{"documentation", "issueScan"}, cronReasons)
 	seedLabels(seed, []string{project}, []string{"refine"}, refineReasons)
+	skip := func(l ...string) { SweepSkippedTotal.WithLabelValues(l...) }
+	seedLabels(skip, []string{project}, []string{"sweep"}, sweepSkipReasons)
 }
 
 func init() {
@@ -158,5 +177,6 @@ func init() {
 		SweepLastSuccessTimestamp,
 		SweepNextExpectedTimestamp,
 		SweepErrorsTotal,
+		SweepSkippedTotal,
 	)
 }
