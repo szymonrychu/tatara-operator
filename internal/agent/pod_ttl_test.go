@@ -57,6 +57,55 @@ func TestTTLDeadlineUsesPodTTLSeconds(t *testing.T) {
 	}
 }
 
+// TestTTLDeadlineExtendsOnFreshConversationActivity is the G.7/F.4 gap issue
+// #508 reports: a conversing pod's TTL deadline was anchored ONLY on
+// podStartedAt, so a maintainer replying well inside the idle budget still
+// got the pod TTL-rotated out from under the conversation at the ORIGINAL
+// podStartedAt+ttl instant - the reply never bought the live pod any more
+// time, even though the stage-exit idle clock (stage.ArmedClock) correctly
+// reset on the same event. The pod-level TTL must track the SAME idle
+// clock: t0 is podStartedAt+ttl, or conversationLastEventAt+ttl when a
+// qualifying event landed AFTER the pod started - whichever is later.
+func TestTTLDeadlineExtendsOnFreshConversationActivity(t *testing.T) {
+	podStart := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	proj := &tatarav1alpha1.Project{}
+	proj.Spec.AgentPodTTLSeconds = 3600
+	proj.Spec.Scm = &tatarav1alpha1.ScmSpec{ConversationIdleMinutes: 15}
+
+	task := &tatarav1alpha1.Task{}
+	task.Status.Stage = tatarav1alpha1.StageConversing
+	task.Status.PodStartedAt = &metav1.Time{Time: podStart}
+
+	// A human replied 10 minutes into the pod's life - well inside the 15m
+	// idle budget - resetting the idle clock as AppendTaskEvent always does.
+	lastEvent := podStart.Add(10 * time.Minute)
+	task.Status.ConversationLastEventAt = &metav1.Time{Time: lastEvent}
+
+	t0, ok := TTLDeadline(proj, task)
+	if !ok {
+		t.Fatal("TTLDeadline ok = false, want true")
+	}
+	want := lastEvent.Add(15 * time.Minute)
+	if !t0.Equal(want) {
+		t.Fatalf("t0 = %v, want %v (anchored on the last conversation event, not the stale pod start)", t0, want)
+	}
+
+	// A pod freshly rotated AFTER the last recorded event must not be
+	// short-changed by a stale ConversationLastEventAt that predates it.
+	task2 := &tatarav1alpha1.Task{}
+	task2.Status.Stage = tatarav1alpha1.StageConversing
+	task2.Status.ConversationLastEventAt = &metav1.Time{Time: podStart.Add(-time.Hour)}
+	freshStart := podStart
+	task2.Status.PodStartedAt = &metav1.Time{Time: freshStart}
+	t0, ok = TTLDeadline(proj, task2)
+	if !ok {
+		t.Fatal("TTLDeadline ok = false, want true")
+	}
+	if want := freshStart.Add(15 * time.Minute); !t0.Equal(want) {
+		t.Fatalf("t0 = %v, want %v (a freshly rotated pod gets a full new window)", t0, want)
+	}
+}
+
 func TestAgentEnvStampsThePerStageTTL(t *testing.T) {
 	proj := &tatarav1alpha1.Project{}
 	proj.Name = "infrastructure"

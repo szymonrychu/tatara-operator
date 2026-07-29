@@ -80,9 +80,19 @@ func (a *FitNoteAppender) AppendNote(ctx context.Context, taskName string, n tat
 
 var _ NoteAppender = (*FitNoteAppender)(nil)
 
-// TTLDeadline is G.7's t0 = podStartedAt + agentPodTTLSeconds. ok is false when
-// the project sets no TTL, or when the Task has no podStartedAt - a Task that
-// has not been admitted has no pod, and therefore no pod clock.
+// TTLDeadline is G.7's t0 = anchor + agentPodTTLSeconds. ok is false when the
+// project sets no TTL, or when the Task has no podStartedAt - a Task that has
+// not been admitted has no pod, and therefore no pod clock.
+//
+// anchor is podStartedAt, EXCEPT on a conversing Task with a
+// conversationLastEventAt that postdates it: a maintainer's reply is exactly
+// what stage.ArmedClock's idle clock resets on (see conversationLastEventAt's
+// doc comment), and before this fix the pod-level TTL never learned about
+// that reset - a reply landing at minute 50 of a 60-minute idle budget still
+// rotated the live pod at the ORIGINAL podStartedAt+60m, discarding the reply
+// window the maintainer was just promised (issue #508). Anchoring on
+// whichever is LATER keeps this clock in lockstep with the one that already
+// governs when the Task itself leaves conversing.
 //
 // t0 is only correct if podStartedAt is FRESH. A stale podStartedAt carried
 // across a stage transition puts t0 in the past for a pod that has just started,
@@ -97,7 +107,12 @@ func TTLDeadline(project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (ti
 	if ttl <= 0 || task.Status.PodStartedAt == nil {
 		return time.Time{}, false
 	}
-	return task.Status.PodStartedAt.Add(time.Duration(ttl) * time.Second), true
+	anchor := task.Status.PodStartedAt.Time
+	if task.Status.Stage == tatarav1alpha1.StageConversing && task.Status.ConversationLastEventAt != nil &&
+		task.Status.ConversationLastEventAt.After(anchor) {
+		anchor = task.Status.ConversationLastEventAt.Time
+	}
+	return anchor.Add(time.Duration(ttl) * time.Second), true
 }
 
 // TTLExpired reports whether the Task's pod is past t0.
