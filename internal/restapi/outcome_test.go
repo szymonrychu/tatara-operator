@@ -1994,6 +1994,79 @@ func TestOutcome_Refine_CloseTargetWithAnActiveTaskIs409(t *testing.T) {
 	require.Contains(t, w.Body.String(), "issue has an active task")
 }
 
+// The unverified-adoption path documents "foldInFlight cleared, members NOT
+// deleted", and until issue #467 it cleared nothing: the umbrella failed with a
+// live marker naming members that still existed, which is a 7-day GC block
+// (FailedRetention) on every one of them.
+func TestOutcome_Refine_UnverifiedFoldClearsTheMarker(t *testing.T) {
+	var stamped bool
+	stripController := interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey,
+			obj client.Object, opts ...client.GetOption) error {
+			if err := c.Get(ctx, key, obj, opts...); err != nil {
+				return err
+			}
+			if _, ok := obj.(*tatarav1alpha1.Issue); ok {
+				obj.SetOwnerReferences(nil) // step 3 re-list finds no controller owner
+			}
+			return nil
+		},
+		SubResourceUpdate: func(ctx context.Context, c client.Client, sub string,
+			obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			// Step 1 must ANCHOR the marker it writes: without the stamp the TTL
+			// has nothing to measure and the reaper is back to guessing.
+			if tk, ok := obj.(*tatarav1alpha1.Task); ok &&
+				len(tk.Status.FoldInFlight) > 0 && tk.Status.FoldInFlightSince != nil {
+				stamped = true
+			}
+			return c.SubResource(sub).Update(ctx, obj, opts...)
+		},
+	}
+	e := buildV2WithCooldownAndInterceptor(t, obs.NewOperatorMetrics(prometheus.NewRegistry()), 0,
+		func() time.Time { return frozenNow }, stripController,
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "refine", tatarav1alpha1.StageRefining, "refine"),
+		taskV2("t2", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"),
+		issueV2("tatara-operator", 291, "t2"))
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"refine","payload":{"folds":[{"task":"t2"}]}}`)
+	require.Equal(t, http.StatusConflict, w.Code)
+
+	require.NoError(t, e.c.Get(context.Background(),
+		client.ObjectKey{Namespace: ns, Name: "t2"}, &tatarav1alpha1.Task{}),
+		"an unverified adoption deletes nothing")
+	got := e.task(t, "t1")
+	require.Equal(t, tatarav1alpha1.StageFailed, got.Status.Stage)
+	require.Empty(t, got.Status.FoldInFlight,
+		"a failed umbrella must not pin its members for FailedRetention")
+	require.Nil(t, got.Status.FoldInFlightSince)
+	require.True(t, stamped, "step 1 must stamp foldInFlightSince alongside foldInFlight")
+}
+
+// The self-termination gate (issue #467): closing an issue THIS Task owns is
+// what stops this Task at rejected(issue-closed), so an outcome that does it in
+// the same breath as a fold kills the umbrella mid-adoption and strands every
+// member. Refused BEFORE foldMembers, where a rejection still costs nothing.
+func TestOutcome_Refine_ClosingAnOwnedIssueMidFoldIs409(t *testing.T) {
+	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "refine", tatarav1alpha1.StageRefining, "refine"),
+		taskV2("t2", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"),
+		issueV2("tatara-operator", 291, "t1"))
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"refine","payload":{
+	  "folds":[{"task":"t2"}],
+	  "closes":[{"repo":"tatara-operator","number":291,"reason":"stale"}]}}`)
+	require.Equal(t, http.StatusConflict, w.Code)
+	require.Contains(t, w.Body.String(), "closing an owned issue would stop this task mid-fold")
+
+	require.NoError(t, e.c.Get(context.Background(),
+		client.ObjectKey{Namespace: ns, Name: "t2"}, &tatarav1alpha1.Task{}),
+		"a refused refine deletes nothing")
+	require.Empty(t, e.task(t, "t1").Status.FoldInFlight,
+		"the fold never started, so no marker is left behind")
+}
+
 // closes[] is LIVE-REVALIDATED against SCM immediately before each close:
 // refine may act on a view up to an hour stale.
 func TestOutcome_Refine_CloseIsLiveRevalidated(t *testing.T) {
