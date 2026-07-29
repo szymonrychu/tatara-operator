@@ -220,63 +220,62 @@ func TestBuildPod_SetsTataraRepos(t *testing.T) {
 
 func TestBuildPodName(t *testing.T) {
 	cases := []struct {
-		name     string
-		project  string
-		provider string
-		repoRef  string
-		kind     string
-		labels   map[string]string
-		source   *tatarav1alpha1.TaskSource
-		want     string
+		name    string
+		project string
+		repoRef string
+		kind    string
+		labels  map[string]string
+		source  *tatarav1alpha1.TaskSource
+		want    string
 	}{
 		{
 			name:    "github issue",
-			project: "tatara", provider: "github", repoRef: "tatara-operator", kind: "issueLifecycle",
+			project: "tatara", repoRef: "tatara-operator", kind: "clarify",
 			source: &tatarav1alpha1.TaskSource{Number: 23, IsPR: false},
-			want:   "tatara-tatara-gh-tatara-operator-issue-23",
+			want:   "clr-tatara-tatara-operator-i23",
 		},
 		{
-			name:    "gitlab mr",
-			project: "tatara", provider: "gitlab", repoRef: "tatara-cli", kind: "issueLifecycle",
+			name:    "gitlab mr folds into p",
+			project: "tatara", repoRef: "tatara-cli", kind: "clarify",
 			source: &tatarav1alpha1.TaskSource{Number: 7, IsPR: true},
-			want:   "tatara-tatara-gl-tatara-cli-mr-7",
+			want:   "clr-tatara-tatara-cli-p7",
 		},
 		{
-			name:    "github scan (no source)",
-			project: "tatara", provider: "github", repoRef: "tatara-operator", kind: "implement",
+			name:    "implement with no source drops id segment",
+			project: "tatara", repoRef: "tatara-operator", kind: "implement",
 			source: nil,
-			want:   "tatara-tatara-gh-tatara-operator-scan",
+			want:   "imp-tatara-tatara-operator",
 		},
 		{
-			name:    "github brainstorm",
-			project: "tatara", provider: "github", repoRef: "tatara-operator", kind: "brainstorm",
+			name:    "brainstorm drops id segment",
+			project: "tatara", repoRef: "tatara-operator", kind: "brainstorm",
 			source: nil,
-			want:   "tatara-tatara-gh-tatara-operator-brainstorm",
+			want:   "brs-tatara-tatara-operator",
 		},
 		{
 			name:    "project board issue drops repo",
-			project: "tatara", provider: "github", repoRef: "", kind: "issueLifecycle",
+			project: "tatara", repoRef: "", kind: "clarify",
 			source: &tatarav1alpha1.TaskSource{Number: 5, IsPR: false},
-			want:   "tatara-tatara-gh-issue-5",
+			want:   "clr-tatara-i5",
 		},
 		{
 			name:    "project board brainstorm drops repo",
-			project: "tatara", provider: "gitlab", repoRef: "", kind: "brainstorm",
+			project: "tatara", repoRef: "", kind: "brainstorm",
 			source: nil,
-			want:   "tatara-tatara-gl-brainstorm",
+			want:   "brs-tatara",
 		},
 		{
-			name:    "github healthCheck disambiguated by activity label",
-			project: "tatara", provider: "github", repoRef: "tatara-operator", kind: "brainstorm",
+			name:    "healthCheck disambiguated by activity label with hc marker",
+			project: "tatara", repoRef: "tatara-operator", kind: "brainstorm",
 			labels: map[string]string{tatarav1alpha1.LabelActivity: "healthCheck"},
 			source: nil,
-			want:   "tatara-tatara-gh-tatara-operator-healthcheck",
+			want:   "brs-tatara-tatara-operator-hc",
 		},
 		{
 			name:    "project-scoped refine",
-			project: "tatara", provider: "github", repoRef: "", kind: "refine",
+			project: "tatara", repoRef: "", kind: "refine",
 			source: nil,
-			want:   "tatara-tatara-gh-refine",
+			want:   "ref-tatara",
 		},
 	}
 	for _, tc := range cases {
@@ -285,7 +284,7 @@ func TestBuildPodName(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Labels: tc.labels},
 				Spec:       tatarav1alpha1.TaskSpec{Kind: tc.kind, Source: tc.source},
 			}
-			require.Equal(t, tc.want, agent.BuildPodName(tc.project, tc.provider, tc.repoRef, task))
+			require.Equal(t, tc.want, agent.BuildPodName(tc.project, tc.repoRef, task))
 		})
 	}
 }
@@ -298,20 +297,20 @@ func TestStampPodName_AndPodNameFallback(t *testing.T) {
 	// Stamped: PodName returns the descriptive name, and BuildPod/BuildService
 	// adopt it.
 	proj, repo, task, cfg := sampleInputs()
-	task.Spec.Kind = "issueLifecycle"
+	task.Spec.Kind = "clarify"
 	task.Spec.Source = &tatarav1alpha1.TaskSource{Provider: "github", Number: 42, IsPR: false}
-	agent.StampPodName(task, "demo", "github", "repo1")
-	require.Equal(t, "tatara-demo-gh-repo1-issue-42", agent.PodName(task))
+	agent.StampPodName(task, "demo", "repo1")
+	require.Equal(t, "clr-demo-repo1-i42", agent.PodName(task))
 	require.Equal(t, agent.PodName(task), agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Name)
 	require.Equal(t, agent.PodName(task), agent.BuildService(proj, repo, task, cfg).Name)
 }
 
 func TestBuildPodName_SanitizesAndCaps(t *testing.T) {
 	task := &tatarav1alpha1.Task{Spec: tatarav1alpha1.TaskSpec{Kind: "brainstorm"}}
-	got := agent.BuildPodName("My Proj", "github", "Weird/Repo Name", task)
-	require.Equal(t, "tatara-my-proj-gh-weird-repo-name-brainstorm", got)
+	got := agent.BuildPodName("My Proj", "Weird/Repo Name", task)
+	require.Equal(t, "brs-my-proj-weird-repo-name", got)
 
-	long := agent.BuildPodName("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "github", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", task)
+	long := agent.BuildPodName("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", task)
 	require.LessOrEqual(t, len(long), 63)
 }
 

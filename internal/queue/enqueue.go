@@ -479,7 +479,7 @@ func BuildTaskFromQueuedEvent(qe *tatarav1alpha1.QueuedEvent, proj *tatarav1alph
 	}
 	om.Labels = labels
 	task := &tatarav1alpha1.Task{ObjectMeta: om, Spec: spec}
-	agent.StampPodName(task, proj.Name, p.Provider, p.PodRepo)
+	agent.StampPodName(task, proj.Name, p.PodRepo)
 	if err := controllerutil.SetControllerReference(proj, task, scheme); err != nil {
 		return nil, fmt.Errorf("build task: set ownerref: %w", err)
 	}

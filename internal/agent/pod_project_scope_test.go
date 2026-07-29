@@ -71,9 +71,9 @@ func TestBuildPodName_emptyRepoRef_isProjectScoped(t *testing.T) {
 	task := &tatarav1alpha1.Task{
 		Spec: tatarav1alpha1.TaskSpec{Kind: "brainstorm"},
 	}
-	got := agent.BuildPodName("myproj", "github", "", task)
-	// Must be: tatara-myproj-gh-brainstorm (no repo segment)
-	require.Equal(t, "tatara-myproj-gh-brainstorm", got)
+	got := agent.BuildPodName("myproj", "", task)
+	// Must be: brs-myproj (no repo segment, no id segment)
+	require.Equal(t, "brs-myproj", got)
 }
 
 // TestBuildPodName_emptyRepoRef_healthcheck: healthCheck (activity label) with
@@ -85,8 +85,8 @@ func TestBuildPodName_emptyRepoRef_healthcheck(t *testing.T) {
 		},
 		Spec: tatarav1alpha1.TaskSpec{Kind: "brainstorm"},
 	}
-	got := agent.BuildPodName("myproj", "github", "", task)
-	require.Equal(t, "tatara-myproj-gh-healthcheck", got)
+	got := agent.BuildPodName("myproj", "", task)
+	require.Equal(t, "brs-myproj-hc", got)
 }
 
 // TestStampPodName_emptyRepoRef: StampPodName with empty repoRef stamps the
@@ -96,8 +96,8 @@ func TestStampPodName_emptyRepoRef(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "bs-proj-1"},
 		Spec:       tatarav1alpha1.TaskSpec{Kind: "brainstorm", ProjectRef: "myproj"},
 	}
-	agent.StampPodName(task, "myproj", "github", "")
-	require.Equal(t, "tatara-myproj-gh-brainstorm", agent.PodName(task))
+	agent.StampPodName(task, "myproj", "")
+	require.Equal(t, "brs-myproj", agent.PodName(task))
 }
 
 // TestBuildPod_nilRepo_stillSetsOtherEnvs: other env vars (MODEL, TASK_BRANCH,
@@ -106,7 +106,7 @@ func TestBuildPod_nilRepo_stillSetsOtherEnvs(t *testing.T) {
 	proj, _, task, cfg := sampleInputs()
 	task.Spec.Kind = "brainstorm"
 	task.Spec.RepositoryRef = ""
-	agent.StampPodName(task, "demo", "github", "")
+	agent.StampPodName(task, "demo", "")
 
 	pod := agent.BuildPod(proj, nil, task, nil, testMemoryEndpoint, cfg)
 	c := pod.Spec.Containers[0]

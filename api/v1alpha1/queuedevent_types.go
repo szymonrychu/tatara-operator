@@ -39,7 +39,9 @@ type QueuedEventPayload struct {
 	// Task name that makes admission idempotent.
 	GenerateName string `json:"generateName,omitempty"`
 	Name         string `json:"name,omitempty"`
-	// Provider + PodRepo feed agent.StampPodName on the rebuilt Task.
+	// PodRepo feeds agent.StampPodName on the rebuilt Task. Provider is no
+	// longer consumed for pod naming (issue #507 dropped the gh/gl segment)
+	// but is kept for other callers.
 	Provider string `json:"provider,omitempty"`
 	PodRepo  string `json:"podRepo,omitempty"`
 	// AlertRule is carried from the incident webhook onto the built Task's
