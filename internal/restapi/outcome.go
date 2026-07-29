@@ -2194,8 +2194,26 @@ func (o *outcomeCtx) refine(p refinePayload) {
 			writeClientErr(o.w, err)
 			return
 		}
-		if ctrl, ok := own.ControllerOwner(&iss); ok && ctrl != o.task.Name {
+		ctrl, owned := own.ControllerOwner(&iss)
+		if owned && ctrl != o.task.Name {
 			o.conflict("issue has an active task", "close-target-live")
+			return
+		}
+		// THE SELF-TERMINATION GATE (issue #467). Closing an issue THIS Task owns
+		// is what stops THIS Task: the close lands on the forge, the mirror flips
+		// to closed, and the WS3-I3 stop edge rejects the owner at
+		// rejected(issue-closed) - refining is one of the ten stages that carry it.
+		// Harmless on its own (the outcome is finishing anyway), fatal next to a
+		// fold: the umbrella dies mid-adoption and its members are stranded against
+		// a Task that will never run again. That is how 26 Tasks were pinned.
+		//
+		// Refused HERE, in the read-only block, and NOT reordered around the fold:
+		// the two are not atomic and cannot be made so from one HTTP handler, and
+		// a rejection after foldMembers is unrecoverable (its step 4 deletes the
+		// members). Rejecting first costs nothing - the retry re-validates at once
+		// and the agent resubmits the closes on a later turn.
+		if owned && ctrl == o.task.Name && len(p.Folds) > 0 {
+			o.conflict("closing an owned issue would stop this task mid-fold", "close-target-self-mid-fold")
 			return
 		}
 	}
@@ -2243,8 +2261,17 @@ func (o *outcomeCtx) refine(p refinePayload) {
 		if err := s.foldMembers(ctx, o.proj, o.task, members); err != nil {
 			if errors.Is(err, errFoldUnverified) {
 				if !o.commit(func(t *tatarav1alpha1.Task) error {
-					return stage.Enter(t, nil, tatarav1alpha1.StageFailed,
-						stage.ReasonFoldAdoptionUnverified, s.now())
+					if err := stage.Enter(t, nil, tatarav1alpha1.StageFailed,
+						stage.ReasonFoldAdoptionUnverified, s.now()); err != nil {
+						return err
+					}
+					// The step-3 contract says "foldInFlight cleared, members NOT
+					// deleted", and until #467 it cleared nothing: the members still
+					// existed, so the marker pinned every one of them off the reaper
+					// for the whole of FailedRetention.
+					t.Status.FoldInFlight = nil
+					t.Status.FoldInFlightSince = nil
+					return nil
 				}) {
 					return
 				}
@@ -2310,6 +2337,7 @@ func (o *outcomeCtx) refine(p refinePayload) {
 			return err
 		}
 		t.Status.FoldInFlight = nil
+		t.Status.FoldInFlightSince = nil
 		return nil
 	}) {
 		return
@@ -2359,10 +2387,14 @@ func (s *Server) foldMembers(ctx context.Context, proj *tatarav1alpha1.Project, 
 
 	spiller := s.spillerForOrNil(proj)
 
-	// STEP 1.
+	// STEP 1. The marker is ANCHORED as it is written: foldInFlightSince is what
+	// the reaper's TTL measures, and an unanchored marker is the #467 shape -
+	// indistinguishable from one written a second ago, so unreleasable.
 	key := types.NamespacedName{Namespace: s.ns, Name: umbrella.Name}
+	since := metav1.NewTime(s.now())
 	if err := objbudget.FitTask(ctx, s.c, spiller, key, func(t *tatarav1alpha1.Task) {
 		t.Status.FoldInFlight = names
+		t.Status.FoldInFlightSince = &since
 	}); err != nil {
 		return err
 	}
@@ -2430,6 +2462,7 @@ func (s *Server) foldMembers(ctx context.Context, proj *tatarav1alpha1.Project, 
 	// STEP 5.
 	return objbudget.FitTask(ctx, s.c, spiller, key, func(t *tatarav1alpha1.Task) {
 		t.Status.FoldInFlight = nil
+		t.Status.FoldInFlightSince = nil
 	})
 }
 
