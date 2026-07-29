@@ -1193,6 +1193,152 @@ func TestCycleCap_DeployReentriesBounded(t *testing.T) {
 	t.Fatal("deploying <-> parked(deploy-timeout) cycled indefinitely")
 }
 
+// ===========================================================================
+// 9b. THE PARK CLOCK MUST SURVIVE RE-ENTRY (issue #480).
+//
+// MergeReentries/DeployReentries bound the LOOP (9, above). They never bounded
+// the COST of each lap: Enter() re-stamps StageEnteredAt on EVERY transition,
+// including the un-park re-entry into the SAME stage, so each lap bought a
+// full fresh 4h/2h budget - turning a capped 3-retry into ~16h of re-testing a
+// deterministically red CI (merging) or a stuck deploy (deploying), and
+// re-arming the CD alert rules every cycle. StageElapsedCarrySeconds must
+// close that gap: the re-entered clock must read AT OR PAST budget the instant
+// the Task re-enters, not near-zero.
+// ===========================================================================
+
+func TestMergeTimeoutClockSurvivesUnpark(t *testing.T) {
+	task := newTask("implement", v1alpha1.StageMerging, "")
+	h := newHarness(t, task)
+	h.mrs = []v1alpha1.MergeRequest{openMR()}
+
+	budget, ok := stage.Budget(v1alpha1.StageMerging)
+	if !ok {
+		t.Fatal("no budget row for merging")
+	}
+	h.now = h.now.Add(budget + time.Second) // the 4h merge budget elapses
+	if err := h.enter(v1alpha1.StageParked, stage.ReasonMergeTimeout); err != nil {
+		t.Fatalf("merging -> parked(merge-timeout): %v", err)
+	}
+
+	h.now = h.now.Add(5 * time.Second) // un-park moments later (issue #480's Q4: 6.5s observed live)
+	target, ok := h.unpark(stage.UnparkInput{MaxOpenTasks: 6, BotLogin: botLogin, MaxTurnsPerTask: 300})
+	if !ok || target != v1alpha1.StageMerging {
+		t.Fatalf("unpark(merge-timeout) = (%q, %v), want (merging, true)", target, ok)
+	}
+
+	clock, since, gotBudget, _ := stage.ArmedClock(task, false)
+	if clock != stage.ClockWork {
+		t.Fatalf("clock = %q, want work", clock)
+	}
+	elapsed := h.now.Sub(since)
+	if elapsed < gotBudget {
+		t.Fatalf("re-entered merging reads elapsed=%s < budget=%s: the un-park bought a FRESH clock "+
+			"instead of resuming the spent one (issue #480)", elapsed, gotBudget)
+	}
+}
+
+func TestDeployTimeoutClockSurvivesUnpark(t *testing.T) {
+	task := newTask("implement", v1alpha1.StageDeploying, "")
+	h := newHarness(t, task)
+	h.mrs = []v1alpha1.MergeRequest{mergedMR()}
+
+	budget, ok := stage.Budget(v1alpha1.StageDeploying)
+	if !ok {
+		t.Fatal("no budget row for deploying")
+	}
+	h.now = h.now.Add(budget + time.Second)
+	if err := h.enter(v1alpha1.StageParked, stage.ReasonDeployTimeout); err != nil {
+		t.Fatalf("deploying -> parked(deploy-timeout): %v", err)
+	}
+
+	h.now = h.now.Add(5 * time.Second)
+	target, ok := h.unpark(stage.UnparkInput{MaxOpenTasks: 6, BotLogin: botLogin, MaxTurnsPerTask: 300})
+	if !ok || target != v1alpha1.StageDeploying {
+		t.Fatalf("unpark(deploy-timeout) = (%q, %v), want (deploying, true)", target, ok)
+	}
+
+	clock, since, gotBudget, _ := stage.ArmedClock(task, false)
+	if clock != stage.ClockWork {
+		t.Fatalf("clock = %q, want work", clock)
+	}
+	elapsed := h.now.Sub(since)
+	if elapsed < gotBudget {
+		t.Fatalf("re-entered deploying reads elapsed=%s < budget=%s: the un-park bought a FRESH clock "+
+			"instead of resuming the spent one (issue #480)", elapsed, gotBudget)
+	}
+}
+
+// TestMergeTimeoutCarryAccumulatesAcrossMultipleLaps: the carry must ADD, not
+// overwrite, across successive merge-timeout laps, so a Task that survives two
+// full parks and re-entries reads roughly 2x budget elapsed on the third lap -
+// proving the clock keeps counting the WHOLE cycle, not just the latest lap.
+func TestMergeTimeoutCarryAccumulatesAcrossMultipleLaps(t *testing.T) {
+	task := newTask("implement", v1alpha1.StageMerging, "")
+	h := newHarness(t, task)
+	h.mrs = []v1alpha1.MergeRequest{openMR()}
+	budget, _ := stage.Budget(v1alpha1.StageMerging)
+
+	for range 2 {
+		h.now = h.now.Add(budget + time.Second)
+		if err := h.enter(v1alpha1.StageParked, stage.ReasonMergeTimeout); err != nil {
+			t.Fatalf("merging -> parked(merge-timeout): %v", err)
+		}
+		h.now = h.now.Add(5 * time.Second)
+		target, ok := h.unpark(stage.UnparkInput{MaxOpenTasks: 6, BotLogin: botLogin, MaxTurnsPerTask: 300})
+		if !ok || target != v1alpha1.StageMerging {
+			t.Fatalf("unpark(merge-timeout) = (%q, %v), want (merging, true)", target, ok)
+		}
+	}
+
+	_, since, _, _ := stage.ArmedClock(task, false)
+	elapsed := h.now.Sub(since)
+	if elapsed < 2*budget {
+		t.Fatalf("after 2 laps elapsed=%s, want >= %s (carry must ACCUMULATE, not just survive one lap)",
+			elapsed, 2*budget)
+	}
+}
+
+// TestMergeTimeoutCarryDoesNotLeakIntoAFreshMergingEntry: a HEAD-MOVED exit
+// from merging (fix M3-9) followed by a genuinely fresh re-entry into merging
+// must NOT inherit a carry left over from an earlier, unrelated
+// merge-timeout cycle - only the SAME-cycle un-park edge preserves it.
+func TestMergeTimeoutCarryDoesNotLeakIntoAFreshMergingEntry(t *testing.T) {
+	task := newTask("implement", v1alpha1.StageMerging, "")
+	h := newHarness(t, task)
+	h.mrs = []v1alpha1.MergeRequest{openMR()}
+	budget, _ := stage.Budget(v1alpha1.StageMerging)
+
+	h.now = h.now.Add(budget + time.Second)
+	if err := h.enter(v1alpha1.StageParked, stage.ReasonMergeTimeout); err != nil {
+		t.Fatalf("merging -> parked(merge-timeout): %v", err)
+	}
+	h.now = h.now.Add(5 * time.Second)
+	target, ok := h.unpark(stage.UnparkInput{MaxOpenTasks: 6, BotLogin: botLogin, MaxTurnsPerTask: 300})
+	if !ok || target != v1alpha1.StageMerging {
+		t.Fatalf("unpark(merge-timeout) = (%q, %v), want (merging, true)", target, ok)
+	}
+
+	// merging -> reviewing (head moved), a FRESH review, then reviewing -> merging.
+	h.now = h.now.Add(time.Minute)
+	if err := h.enter(v1alpha1.StageReviewing, ""); err != nil {
+		t.Fatalf("merging -> reviewing (head moved): %v", err)
+	}
+	h.now = h.now.Add(time.Minute)
+	if err := h.enter(v1alpha1.StageMerging, ""); err != nil {
+		t.Fatalf("reviewing -> merging: %v", err)
+	}
+
+	if task.Status.StageElapsedCarrySeconds != 0 {
+		t.Fatalf("stageElapsedCarrySeconds = %d after a fresh re-entry via reviewing, want 0 (a stale carry "+
+			"would silently shrink an UNRELATED merging attempt's real budget)", task.Status.StageElapsedCarrySeconds)
+	}
+	_, since, _, _ := stage.ArmedClock(task, false)
+	elapsed := h.now.Sub(since)
+	if elapsed >= budget {
+		t.Fatalf("fresh merging entry already reads elapsed=%s >= budget=%s: a stale carry leaked in", elapsed, budget)
+	}
+}
+
 // Cycle 4: reviewing <-> merging on a MOVED HEAD. This is the FOURTH cycle,
 // the ONLY one that SPAWNS A POD every lap, and it had no counter anywhere.
 func TestCycleCap_HeadMoveReentriesBoundedAndPodSpawnsCapped(t *testing.T) {

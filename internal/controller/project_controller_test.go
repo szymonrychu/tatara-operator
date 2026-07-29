@@ -417,6 +417,45 @@ func TestUpdateTaskStageGauges_CountAgeAndReset(t *testing.T) {
 	}
 }
 
+// TestUpdateTaskStageGauges_HonorsElapsedCarry is issue #480's metrics-honesty
+// consequence: operator_task_stage_age_seconds must add
+// Status.StageElapsedCarrySeconds, or it reads the time since the LATEST
+// merge-timeout/deploy-timeout re-entry rather than the whole stuck cycle -
+// exactly the "8404s for a Task merging 10h21m" under-report the issue
+// recorded live.
+func TestUpdateTaskStageGauges_HonorsElapsedCarry(t *testing.T) {
+	ctx := context.Background()
+	r, _ := newProjectReconcilerWithReg()
+	mkSecret(t, "tsg-carry-scm", map[string][]byte{"token": []byte("t"), "webhookSecret": []byte("w")})
+	mkProject(t, "tsg-carry-proj", "tsg-carry-scm")
+
+	const kind = "refine"
+	const carrySeconds = 14401 // one whole merge-timeout budget (4h) plus a second
+	recentlyReentered := metav1.NewTime(time.Now().Add(-5 * time.Second))
+
+	tk := &tataradevv1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "tsg-carry-task", Namespace: testNS},
+		Spec:       tataradevv1alpha1.TaskSpec{ProjectRef: "tsg-carry-proj", Kind: kind, Goal: "g"},
+	}
+	if err := k8sClient.Create(ctx, tk); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	tk.Status.Stage = tataradevv1alpha1.StageMerging
+	tk.Status.StageEnteredAt = &recentlyReentered
+	tk.Status.StageElapsedCarrySeconds = carrySeconds
+	if err := k8sClient.Status().Update(ctx, tk); err != nil {
+		t.Fatalf("set task status: %v", err)
+	}
+
+	r.updateTaskStageGauges(ctx)
+
+	got := testutil.ToFloat64(r.Metrics.TaskStageAgeGauge("tsg-carry-task", tataradevv1alpha1.StageMerging, kind))
+	if got < carrySeconds {
+		t.Fatalf("operator_task_stage_age_seconds{tsg-carry-task} = %v, want >= %d (carry not honored, under-reports the whole cycle)",
+			got, carrySeconds)
+	}
+}
+
 // TestUpdateQueueAgeGauge_OldestPerBucket guards contract K.1's
 // operator_queue_age_seconds: the age of the OLDEST QueuedEvent in a bucket,
 // not the newest. This envtest namespace is shared cluster-wide across the

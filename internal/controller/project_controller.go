@@ -19,6 +19,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/queue"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
+	"github.com/szymonrychu/tatara-operator/internal/stage"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -802,7 +803,10 @@ func (r *ProjectReconciler) updateTaskStageGauges(ctx context.Context) {
 		kind := t.Spec.Kind
 		counts[taskStageBucket{stage: stg, kind: kind}]++
 		if t.Status.StageEnteredAt != nil {
-			age := now.Sub(t.Status.StageEnteredAt.Time).Seconds()
+			// Carry-adjusted (issue #480): a merge-timeout/deploy-timeout un-park
+			// re-stamps StageEnteredAt, so a bare now.Sub would under-report true
+			// stage residency by up to a full budget per re-entry.
+			age := stage.StageElapsedSeconds(t, now)
 			r.Metrics.SetTaskStageAge(t.Name, stg, kind, age)
 		}
 	}
