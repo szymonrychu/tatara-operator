@@ -87,6 +87,8 @@ const (
 	ReasonMRClosedExternally     = "mr-closed-externally"
 	ReasonMergeAuthRefused       = "merge-auth-refused"
 	ReasonMRTakenOver            = "mr-taken-over"
+	ReasonCIRed                  = "ci-red"
+	ReasonCIBlocked              = "ci-blocked"
 )
 
 // Reasons is the F.5 closed set. A reason not in it is REJECTED by Enter.
@@ -129,6 +131,8 @@ var Reasons = []string{
 	ReasonMRClosedExternally,
 	ReasonMergeAuthRefused,
 	ReasonMRTakenOver,
+	ReasonCIRed,
+	ReasonCIBlocked,
 }
 
 // issueClosedTrigger is the F.3 prose for a WS3-I3 rejected(issue-closed) edge.
@@ -346,7 +350,10 @@ var Transitions = map[string][]Edge{
 		// BOTH of these exist ONLY for spec.kind != "review". The guard is in
 		// LegalFor, which Enter uses, so it is structurally impossible to bypass.
 		Edge{To: v1alpha1.StageImplementing, Trigger: "submit_outcome(request_changes) AND spec.kind != review AND reviewRounds < maxReviewRounds. Gated on pendingReview == nil"},
-		Edge{To: v1alpha1.StageMerging, Trigger: "submit_outcome(approve) AND spec.kind != review. Gated on pendingReview == nil"},
+		Edge{To: v1alpha1.StageMerging, Trigger: "submit_outcome(approve) AND spec.kind != review. Gated on pendingReview == nil, and on the LIVE CI at the reviewed head not being red (issue #476)"},
+		Edge{To: v1alpha1.StageImplementing, Reason: ReasonCIRed, Trigger: "an approve whose LIVE CI at the reviewed head has FAILED (issue #476). The approve is real and stays on the forge; the change simply cannot merge, so it goes back to the agent that can fix it instead of being promoted into a pod-less stage whose only exit was the 4h budget. Bounded by maxCIRedReentries"},
+		Edge{To: v1alpha1.StageParked, Reason: ReasonCIRed, Trigger: "red CI while part of spec.mergeOrder has already merged: re-implementing would re-propose merged code and recreate deleted branches, so it is a human's call"},
+		Edge{To: v1alpha1.StageFailed, Reason: ReasonCIBlocked, Trigger: "ciRedReentries at maxCIRedReentries"},
 		Edge{To: v1alpha1.StageParked, Reason: ReasonAwaitingHuman, Trigger: "submit_outcome(approve|request_changes) on a kind=review Task. The review IS posted. A human's PR is fixed and merged by the human (fixes V7-1, C3-2)"},
 		Edge{To: v1alpha1.StageParked, Reason: ReasonReviewLoopExhausted, Trigger: "request_changes at maxReviewRounds, on a non-review Task"},
 		Edge{To: v1alpha1.StageParked, Reason: ReasonReviewPostRefused, Trigger: "a structural 4xx from PostReview (fix C1)"},
@@ -382,6 +389,9 @@ var Transitions = map[string][]Edge{
 		{To: v1alpha1.StageDeploying, Trigger: "every repo in mergeOrder merged, in order, each on green CI"},
 		{To: v1alpha1.StageReviewing, Trigger: "a live head != reviewedSHA, or Merge 409s head-moved. INCREMENTS status.headMoveReentries (the FOURTH cycle, fix M3-9)"},
 		{To: v1alpha1.StageImplementing, Trigger: "a maintainer requested changes on the still-open MR before it merged (F.6-adjacent). kind=review refused by LegalFor"},
+		{To: v1alpha1.StageImplementing, Reason: ReasonCIRed, Trigger: "the LIVE CI at the reviewed head has FAILED (issue #476). A failed check is DETERMINISTIC - polling it every 60s until the 4h budget elapses re-discovers the same verdict 240 times - so the Task leaves merging immediately for the agent that can fix it. Bounded by maxCIRedReentries"},
+		{To: v1alpha1.StageParked, Reason: ReasonCIRed, Trigger: "red CI while an earlier repo in spec.mergeOrder has already merged: re-implementing would re-propose merged code and recreate deleted branches (the same boundary the merge-timeout un-park refuses to cross), so it is a human's call"},
+		{To: v1alpha1.StageFailed, Reason: ReasonCIBlocked, Trigger: "ciRedReentries at maxCIRedReentries"},
 		{To: v1alpha1.StageFailed, Reason: ReasonHeadMoving, Trigger: "headMoveReentries at maxHeadMoveReentries"},
 		{To: v1alpha1.StageFailed, Reason: ReasonMergeBlocked, Trigger: "mergeReentries at maxMergeReentries (fix H7)"},
 		{To: v1alpha1.StageFailed, Reason: ReasonMergeOrderMissing, Trigger: "len(spec.mergeOrder) == 0 on entry (bug-catcher)"},
@@ -944,7 +954,7 @@ func ReenterOnReviewChangesRequested(t *v1alpha1.Task, mrs []v1alpha1.MergeReque
 
 // enterFreshImplementing applies the reviewing|merging|parked -> implementing
 // edge for a maintainer-driven fresh implementation, and on success zeroes the
-// merge and head-move budgets (F3): a fresh implementation deserves a fresh merge
+// merge, head-move and red-CI budgets (F3): a fresh implementation deserves a fresh merge
 // budget, and this reset is human-gated (one maintainer changes_requested per
 // reset), so it is NOT the automatic HeadMoved bounce and cannot spin a head-move
 // loop on its own.
@@ -954,6 +964,7 @@ func enterFreshImplementing(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, now t
 	}
 	t.Status.HeadMoveReentries = 0
 	t.Status.MergeReentries = 0
+	t.Status.CIRedReentries = 0
 	return true
 }
 
@@ -1006,6 +1017,47 @@ func HeadMoved(t *v1alpha1.Task, maxHeadMoveReentries int) (Edge, bool) {
 	}
 	t.Status.HeadMoveReentries++
 	return Edge{To: v1alpha1.StageReviewing}, true
+}
+
+// CIRed is the RED-CI exit (issue #476), and it is CYCLE 5. It is taken from
+// BOTH sides of the promotion it guards:
+//
+//   - reviewing, instead of advancing an approved-but-red change into merging;
+//   - merging, instead of re-polling a red required check every 60s until the 4h
+//     budget parks it (and then un-parks straight back into merging, up to
+//     maxMergeReentries, for ~16h of re-testing one deterministic verdict).
+//
+// A failed check on the head that was reviewed is DETERMINISTIC: no amount of
+// waiting turns it green, only a new commit does. The Task therefore goes back
+// to implementing, where an agent can fix it - which is what the platform would
+// have done had the review verdict itself carried the CI state.
+//
+// It INCREMENTS status.ciRedReentries and caps at maxCIRedReentries ->
+// failed(ci-blocked), for the same reason every other bounce is capped: each lap
+// spawns pods.
+//
+// TWO refusals sit in front of the re-implement:
+//
+//   - kind=review: fixing a human's PR is a HUMAN action, so it parks
+//     awaiting-human exactly like every other kind=review verdict. LegalFor would
+//     refuse implementing anyway; this keeps that refusal from surfacing as an
+//     error-loop instead of an edge.
+//   - anyMerged(mrs): part of spec.mergeOrder has already landed, and
+//     re-implementing would re-propose merged code and recreate deleted branches
+//   - the same boundary reenterParkedOnReview refuses to cross. It parks
+//     ci-red, which has no F.6 re-entry: a human decides.
+func CIRed(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, maxCIRedReentries int) (Edge, bool) {
+	if t.Spec.Kind == kindReview {
+		return Edge{To: v1alpha1.StageParked, Reason: ReasonAwaitingHuman}, true
+	}
+	if anyMerged(mrs) {
+		return Edge{To: v1alpha1.StageParked, Reason: ReasonCIRed}, true
+	}
+	if t.Status.CIRedReentries >= maxCIRedReentries {
+		return Edge{To: v1alpha1.StageFailed, Reason: ReasonCIBlocked}, true
+	}
+	t.Status.CIRedReentries++
+	return Edge{To: v1alpha1.StageImplementing, Reason: ReasonCIRed}, true
 }
 
 // UnparkInput is everything F.6 reads.

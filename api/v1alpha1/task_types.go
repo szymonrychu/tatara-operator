@@ -597,6 +597,15 @@ type TaskStatus struct {
 	// Cap 3 -> failed(head-moving).
 	// +optional
 	HeadMoveReentries int `json:"headMoveReentries,omitempty"`
+	// CIRedReentries bounds the FIFTH cycle: the red-CI bounce back to
+	// implementing (issue #476). A DETERMINISTICALLY red required check on the
+	// reviewed head can never merge, so the Task is routed back to the agent that
+	// can fix it instead of being promoted into merging (or left there polling a
+	// verdict that will never change until the 4h budget parks it). Like every
+	// other bounce it spawns pods, so it gets a counter.
+	// Cap 3 -> failed(ci-blocked).
+	// +optional
+	CIRedReentries int `json:"ciRedReentries,omitempty"`
 	// HumanReviewRounds bounds the reviewing <-> parked(awaiting-human) cycle on a
 	// kind=review Task (fix V7-9). Cap 5, then it STAYS parked.
 	//

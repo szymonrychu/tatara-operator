@@ -1704,6 +1704,11 @@ func TestReasonsIsTheClosedF5Set(t *testing.T) {
 		// MR mirror's controller ownership onto a takeover Task, leaving this parent
 		// review controller-owning zero MRs. kind=review only.
 		"mr-taken-over",
+		// ci-red / ci-blocked: CYCLE 5 (issue #476). A FAILED required check at the
+		// reviewed head routes reviewing|merging -> implementing(ci-red) instead of
+		// promoting into - or polling out - a merge that cannot happen; parked(ci-red)
+		// when part of mergeOrder already merged, and failed(ci-blocked) at the cap.
+		"ci-red", "ci-blocked",
 	}
 	for _, r := range want {
 		if !stage.ValidReason(r) {

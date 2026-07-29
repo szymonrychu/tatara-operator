@@ -60,7 +60,9 @@ type StageDriver struct {
 }
 
 // mergeRequeue paces the merging stage: a PR waiting on CI, on mergeability, or
-// on its release job. The 4h merging budget (F.4) is what ends the wait.
+// on its release job. The 4h merging budget (F.4) is what ends the wait - for
+// the conditions that can actually resolve on their own. A FAILED check is not
+// one of them and leaves at once (the red-CI gate, issue #476).
 const mergeRequeue = 60 * time.Second
 
 func (d *StageDriver) now() time.Time {
@@ -317,6 +319,7 @@ func (d *StageDriver) ReconcileMerging(ctx context.Context, proj *tatarav1alpha1
 		}
 
 		st, err := writer.GetPRState(ctx, repo.Spec.URL, token, mr.Spec.Number)
+		RecordSCM(d.Metrics, provider, "get_pr_state", err)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("merge: get pr state %s!%d: %w", repoRef, mr.Spec.Number, err)
 		}
@@ -329,6 +332,16 @@ func (d *StageDriver) ReconcileMerging(ctx context.Context, proj *tatarav1alpha1
 			}
 			cursor = i + 1
 			continue
+		}
+		// RED IS A VERDICT; PENDING IS NOT (issue #476). The head has just been
+		// confirmed to be the reviewed one, so a FAILED check on it is final: only a
+		// new commit can change it, and merging is pod-less and cannot produce one.
+		// Polling it anyway costs the full 4h budget, then re-enters merging up to
+		// maxMergeReentries for ~16h of re-reading one static failure. Everything
+		// else - pending, running, no CI at all - genuinely does resolve on its own
+		// and still stalls on the 60s poll below.
+		if st.CIStatus == "failure" {
+			return ctrl.Result{}, enterCIRed(ctx, d.Client, d.spiller(proj), d.Metrics, task, mrs, mr, d.now())
 		}
 		if st.CIStatus != "success" || !mergePolicyAllows(proj, st) {
 			return d.stallMerge(ctx, proj, task, repoRef, cursor, "ci-not-green")
@@ -439,6 +452,10 @@ func (d *StageDriver) headMoved(ctx context.Context, proj *tatarav1alpha1.Projec
 // stallMerge parks the pass on a poll: the cursor stays put and
 // operator_merge_cursor_stalled_seconds reports how long it has been stuck. The
 // 4h merging budget (F.4) is what ends the wait, at parked(merge-timeout).
+//
+// Every reason that reaches here is one that CAN resolve without a new commit -
+// pending CI, a not-yet-mergeable branch, a release job still running. The one
+// that cannot, a failed required check, is intercepted before this (issue #476).
 func (d *StageDriver) stallMerge(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task,
 	repo string, cursor int, why string) (ctrl.Result, error) {
 	stalledFor := 0.0
