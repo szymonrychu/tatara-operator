@@ -117,11 +117,62 @@ func lightragInitContainers(n Names, cfg Config) []corev1.Container {
 	}}
 }
 
+// lightragProbePath is the endpoint all three lightrag probes hit. It is
+// deliberately NOT /health.
+//
+// /health is served straight off the asyncio event loop from in-process config
+// and returns 200 without touching any backend at all. That is exactly how the
+// incident stayed invisible for eight hours: a CNPG switchover killed lightrag's
+// in-flight asyncpg connections, its pool-close path timed out after 5s leaving
+// the pool lock held, and every uvicorn worker thread then blocked on that futex
+// permanently, with no PostgreSQL connection left open. The main thread kept
+// accepting sockets and answering /health 200 throughout, so a TCPSocket
+// readiness check (the probe this replaces) and an httpGet /health check would
+// both have passed while insert_text, query and track_status were at 100% error
+// with zero successes.
+//
+// GET /documents/status_counts is the only endpoint that is simultaneously GET
+// (kubelet cannot issue POST), cheap, and Postgres-backed. It is already the one
+// lightrag route this operator calls (fetchLightragDocCounts), so it is proven
+// to work in-cluster with no auth header. Upstream v1.4.16 routes it to
+// PGDocStatusStorage.get_all_status_counts, a single workspace-scoped
+// "SELECT status, COUNT(*) ... GROUP BY status" awaited on the shared pool, and
+// wraps failures in HTTPException(500). Crucially, upstream's ClientManager
+// hands every PG storage class (KV, vector, doc-status) the same process-wide
+// asyncpg pool, so a wedge in any of them is visible here. That shared pool is
+// what makes this probe meaningful rather than decorative.
+//
+// Known blind spot: kubelet counts CONSECUTIVE failures, so a partial wedge in
+// which one unblocked worker occasionally answers defeats this (and any other)
+// probe. The incident's wedge was total, which is why this works. Related, the
+// design assumes a single uvicorn process: lightragEnv sets no WORKERS, so every
+// probe hits the same event loop. Setting WORKERS>1 would make a per-worker
+// wedge probabilistic and silently disable liveness detection.
+const lightragProbePath = "/documents/status_counts"
+
+// lightragProbe builds one data-path probe. Kubelet suspends both liveness and
+// readiness until the startup probe first succeeds, so none of them set
+// InitialDelaySeconds - it would be dead config.
+func lightragProbe(periodSeconds, timeoutSeconds, failureThreshold int32) *corev1.Probe {
+	return &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
+			Path: lightragProbePath,
+			Port: intstr.FromString("http"),
+		}},
+		PeriodSeconds:    periodSeconds,
+		TimeoutSeconds:   timeoutSeconds,
+		FailureThreshold: failureThreshold,
+	}
+}
+
 // LightragDeployment builds the per-Project lightrag Deployment (port 9621,
 // Recreate strategy because the data PVC is RWO with one replica).
 func LightragDeployment(p *tatarav1alpha1.Project, cfg Config) *appsv1.Deployment {
 	n := NamesFor(p.Name)
 	replicas := int32(1)
+	livenessGrace := int64(15)
+	liveness := lightragProbe(30, 10, 10)
+	liveness.TerminationGracePeriodSeconds = &livenessGrace
 	sel := selectorLabels(p.Name, "lightrag")
 	podLabels := labels(p.Name)
 	podLabels["app.kubernetes.io/component"] = "lightrag"
@@ -147,11 +198,68 @@ func LightragDeployment(p *tatarav1alpha1.Project, cfg Config) *appsv1.Deploymen
 							{Name: "http", ContainerPort: 9621, Protocol: corev1.ProtocolTCP},
 						},
 						Env: lightragEnv(p, cfg),
-						ReadinessProbe: &corev1.Probe{
-							ProbeHandler:  corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromString("http")}},
-							PeriodSeconds: 10,
-						},
-						VolumeMounts: []corev1.VolumeMount{{Name: "data", MountPath: "/app/data"}},
+						// Boot budget 300s (10s * 30). The initContainer has already
+						// waited out Neo4j, so this only has to cover lightrag's own
+						// ~180s upstream Postgres boot-retry plus first-boot schema and
+						// index creation. Its real job is to decouple the boot budget
+						// from the wedge-detection budget below: without it, liveness
+						// would have to serve both, and anyone later tightening liveness
+						// would make a slow dependency-bound boot liveness-killable
+						// without noticing the connection. Same rationale as the
+						// startupProbe on the tatara-memory container.
+						StartupProbe: lightragProbe(10, 5, 30),
+						// Wedge budget 300s (30s * 10). This is the number the incident
+						// turns on, so both bounds are deliberate.
+						//
+						// Lower bound: it must ride out every legitimate window in which
+						// the whole data path fails at once. A planned CNPG switchover is
+						// seconds, an unplanned failover 30-120s, and a rolling restart
+						// or node drain relocating the primary up to ~3 min. 300s clears
+						// the worst of those with margin.
+						//
+						// Upper bound: it must be small enough that a permanent wedge
+						// self-heals. The incident cost 2.5 HOURS of total data-plane
+						// failure AFTER Postgres had fully recovered, ending only when a
+						// human ran rollout restart, because nothing could ever restart
+						// the pod.
+						//
+						// A restart during a genuinely long Postgres outage is close to
+						// free: KV, vector and doc-status storage are all PG-backed, so
+						// with Postgres down nothing is making progress and there is no
+						// in-flight work to lose. The resulting CrashLoopBackOff is loud,
+						// standard and alertable, and recovers within one backoff cycle
+						// once Postgres returns - strictly better than a silent wedge
+						// reporting Ready with 0 restarts.
+						//
+						// timeoutSeconds 10 leaves headroom for asyncpg pool-acquire
+						// contention under MAX_PARALLEL_INSERT=8; a single slow probe is
+						// plausible during a large ingest, but ten consecutive ones
+						// spanning five continuous minutes with no success in between is
+						// not, since any success resets the counter.
+						//
+						// terminationGracePeriodSeconds 15 because a wedged process
+						// cannot complete uvicorn's graceful shutdown: without the
+						// probe-level override, SIGTERM hangs and kubelet waits the full
+						// default 30s pod grace period before SIGKILL on every kill.
+						LivenessProbe: liveness,
+						// Shed budget 60s (10s * 6), deliberately ordered to fire well
+						// before liveness: shed traffic first, kill only if it persists.
+						//
+						// With one replica there is no second endpoint to shed to, so
+						// this probe's real effects are that callers fail fast instead of
+						// hanging (tatara-memory's lightrag client burned 60s and 121s
+						// per call awaiting headers that never came) and that the Project
+						// memory phase, which gates on this Deployment's availableReplicas,
+						// finally reflects data-path health. That gate is what released
+						// seven repo ingests into the dead backend during the incident.
+						//
+						// 60s rather than 30s because a Ready->NotReady->Ready round trip
+						// costs roughly four minutes of ingest gating via the 3-minute
+						// MemoryStablyReady window, and a routine CNPG failover should not
+						// pay that. 60s rides one out while still firing five times sooner
+						// than liveness.
+						ReadinessProbe: lightragProbe(10, 5, 6),
+						VolumeMounts:   []corev1.VolumeMount{{Name: "data", MountPath: "/app/data"}},
 					}},
 					Volumes: []corev1.Volume{{
 						Name: "data",

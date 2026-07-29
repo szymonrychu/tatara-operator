@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/szymonrychu/tatara-operator/internal/memory"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 func TestLightragDeployment(t *testing.T) {
@@ -131,3 +132,136 @@ func TestLightragPVC(t *testing.T) {
 }
 
 func appsv1RecreateName() string { return "Recreate" }
+
+func TestLightragDeployment_DataPathProbes(t *testing.T) {
+	p := testProject("acme")
+	d := memory.LightragDeployment(p, testCfg())
+
+	c := d.Spec.Template.Spec.Containers[0]
+
+	// All three probes must be present. A wedged LightRAG that cannot connect to
+	// Postgres is never restarted without the LivenessProbe - the incident showed
+	// 8h of uptime with 0 restarts and 100% data-path failure.
+	require.NotNil(t, c.StartupProbe, "StartupProbe must exist to gate initial health")
+	require.NotNil(t, c.LivenessProbe, "LivenessProbe must exist: a wedged LightRAG is never restarted without it (incident: 8h uptime, 0 restarts, 100% data-path failure)")
+	require.NotNil(t, c.ReadinessProbe, "ReadinessProbe must exist to shed traffic from unhealthy replicas")
+
+	// All probes must use HTTPGet and have no TCPSocket. A TCP-accept check cannot
+	// distinguish 'serving' from 'accepting and hanging forever', which is exactly
+	// what happened in the incident.
+	for _, probe := range []*corev1.Probe{c.StartupProbe, c.LivenessProbe, c.ReadinessProbe} {
+		require.NotNil(t, probe.HTTPGet, "probe must use HTTPGet handler")
+		require.Nil(t, probe.TCPSocket, "probe must not use TCPSocket - a TCP-accept check cannot distinguish serving from hanging forever, which is exactly what happened")
+	}
+
+	// Test the probe paths and ports
+	probePath := "/documents/status_counts"
+	expectedPort := intstr.FromString("http")
+
+	for _, probe := range []*corev1.Probe{c.StartupProbe, c.LivenessProbe, c.ReadinessProbe} {
+		require.Equal(t, probePath, probe.HTTPGet.Path, "probe must use correct data-path endpoint")
+		require.Equal(t, expectedPort, probe.HTTPGet.Port, "probe must target http port")
+	}
+
+	// Explicitly assert each probe's path is NOT /health. The /health endpoint answered
+	// 200 for 8h from the main event-loop thread while every worker was futex-blocked
+	// with no PostgreSQL connection open, so it cannot detect this failure mode.
+	require.NotEqual(t, "/health", c.StartupProbe.HTTPGet.Path, "startup probe path must not be /health - /health answered 200 for 8h from the main event-loop thread while workers were futex-blocked, so it cannot detect data-path failure")
+	require.NotEqual(t, "/health", c.LivenessProbe.HTTPGet.Path, "liveness probe path must not be /health - /health answered 200 for 8h from the main event-loop thread while workers were futex-blocked, so it cannot detect data-path failure")
+	require.NotEqual(t, "/health", c.ReadinessProbe.HTTPGet.Path, "readiness probe path must not be /health - /health answered 200 for 8h from the main event-loop thread while workers were futex-blocked, so it cannot detect data-path failure")
+
+	// Verify timing configurations for each probe
+	type probeSpec struct {
+		name            string
+		probe           *corev1.Probe
+		expectedPeriod  int32
+		expectedTimeout int32
+		expectedFailure int32
+	}
+
+	probes := []probeSpec{
+		{
+			name:            "StartupProbe",
+			probe:           c.StartupProbe,
+			expectedPeriod:  10,
+			expectedTimeout: 5,
+			expectedFailure: 30,
+		},
+		{
+			name:            "LivenessProbe",
+			probe:           c.LivenessProbe,
+			expectedPeriod:  30,
+			expectedTimeout: 10,
+			expectedFailure: 10,
+		},
+		{
+			name:            "ReadinessProbe",
+			probe:           c.ReadinessProbe,
+			expectedPeriod:  10,
+			expectedTimeout: 5,
+			expectedFailure: 6,
+		},
+	}
+
+	for _, spec := range probes {
+		require.Equal(t, spec.expectedPeriod, spec.probe.PeriodSeconds,
+			"%s: PeriodSeconds must match probe configuration", spec.name)
+		require.Equal(t, spec.expectedTimeout, spec.probe.TimeoutSeconds,
+			"%s: TimeoutSeconds must match probe configuration", spec.name)
+		require.Equal(t, spec.expectedFailure, spec.probe.FailureThreshold,
+			"%s: FailureThreshold must match probe configuration", spec.name)
+	}
+
+	// LivenessProbe must have TerminationGracePeriodSeconds set to 15. A wedged
+	// process cannot complete uvicorn's graceful shutdown so SIGTERM would otherwise
+	// hang for the full default 30s pod grace period on every liveness kill.
+	require.NotNil(t, c.LivenessProbe.TerminationGracePeriodSeconds,
+		"LivenessProbe must have TerminationGracePeriodSeconds set")
+	require.Equal(t, int64(15), *c.LivenessProbe.TerminationGracePeriodSeconds,
+		"LivenessProbe: TerminationGracePeriodSeconds must be 15s (wedged process cannot complete uvicorn graceful shutdown so SIGTERM would otherwise hang 30s on every liveness kill)")
+
+	// InitialDelaySeconds must be 0 on liveness and readiness. The StartupProbe gates both
+	// so an initial delay would be dead config.
+	require.Equal(t, int32(0), c.LivenessProbe.InitialDelaySeconds,
+		"LivenessProbe: InitialDelaySeconds must be 0 (StartupProbe gates startup so initial delay is dead config)")
+	require.Equal(t, int32(0), c.ReadinessProbe.InitialDelaySeconds,
+		"ReadinessProbe: InitialDelaySeconds must be 0 (StartupProbe gates startup so initial delay is dead config)")
+
+	// Readiness must fire strictly before liveness: shed traffic first, then kill.
+	readinessBudget := c.ReadinessProbe.PeriodSeconds * c.ReadinessProbe.FailureThreshold
+	livenessBudget := c.LivenessProbe.PeriodSeconds * c.LivenessProbe.FailureThreshold
+	require.Less(t, readinessBudget, livenessBudget,
+		"readiness budget (%d*%d=%ds) must be strictly less than liveness budget (%d*%d=%ds) - correct ordering is shed traffic first, then kill",
+		c.ReadinessProbe.PeriodSeconds, c.ReadinessProbe.FailureThreshold, readinessBudget,
+		c.LivenessProbe.PeriodSeconds, c.LivenessProbe.FailureThreshold, livenessBudget)
+
+	// Liveness budget must be exactly 300s. This must exceed the ~120s worst legitimate
+	// CNPG failover window but stay far below the 2.5h of unnecessary outage the incident
+	// produced after Postgres recovered.
+	require.Equal(t, int32(300), livenessBudget,
+		"liveness budget must be exactly 300s (%d*%d): must exceed ~120s worst CNPG failover but stay far below 2.5h incident outage",
+		c.LivenessProbe.PeriodSeconds, c.LivenessProbe.FailureThreshold)
+
+	// Startup budget must be >= LightRAG's ~180s upstream Postgres boot-retry budget.
+	startupBudget := c.StartupProbe.PeriodSeconds * c.StartupProbe.FailureThreshold
+	require.GreaterOrEqual(t, startupBudget, int32(180),
+		"startup budget (%d*%d=%ds) must be >= LightRAG's ~180s upstream Postgres boot-retry budget",
+		c.StartupProbe.PeriodSeconds, c.StartupProbe.FailureThreshold, startupBudget)
+}
+
+func TestLightragDeployment_SingleUvicornWorker(t *testing.T) {
+	p := testProject("acme")
+	d := memory.LightragDeployment(p, testCfg())
+
+	c := d.Spec.Template.Spec.Containers[0]
+
+	// Verify WORKERS is not present in environment variables. The probe design assumes
+	// a single uvicorn process so every probe hits the same event loop. With WORKERS>1,
+	// a per-worker wedge makes the probe probabilistic and the consecutive-failure
+	// counter resets on any request routed to a healthy worker, silently disabling the
+	// liveness probe.
+	for _, e := range c.Env {
+		require.NotEqual(t, "WORKERS", e.Name,
+			"WORKERS env var must not be present: probe design assumes single uvicorn process; with WORKERS>1 a per-worker wedge makes probes probabilistic and resets failure counters, silently disabling liveness detection")
+	}
+}
