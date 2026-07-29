@@ -28,7 +28,7 @@ import (
 // reaper is the ultimate backstop). It never touches the F.6 re-entry surface
 // (backlog-sweep/awaiting-human/identity-unverified/merge-timeout/deploy-timeout/
 // no-outcome/handoff-stalled are stage.HasReentry and handled by
-// driveUnparks/reverifyParked).
+// driveUnparks).
 func (r *ProjectReconciler) resumeNoReentryParks(ctx context.Context, proj *tatarav1alpha1.Project, now time.Time) error {
 	var tl tatarav1alpha1.TaskList
 	if err := r.List(ctx, &tl, client.InNamespace(proj.Namespace)); err != nil {
@@ -45,7 +45,7 @@ func (r *ProjectReconciler) resumeNoReentryParks(ctx context.Context, proj *tata
 			continue
 		}
 		if stage.HasReentry(t.Status.StageReason) {
-			continue // an F.6 re-entry reason: driveUnparks / reverifyParked owns it.
+			continue // an F.6 re-entry reason: driveUnparks owns it.
 		}
 		if !hasNonBotPendingEvent(t, botLoginOf(proj)) {
 			continue // no human reply waiting: nothing to resume.

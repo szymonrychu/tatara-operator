@@ -362,7 +362,7 @@ func stampDeclinedAt(ctx context.Context, c client.Client, task *tatarav1alpha1.
 // A retained mirror carries status=rejected and keeps a dead rejected Task as
 // its controller owner. Reopened and left that way it would be: invisible to the
 // sweep's orphan intake, so nothing ever mints a Task for it; unapprovable
-// forever, because approvalInScope refuses a rejected thread; and uncounted by
+// forever, because ApprovalInScope refuses a rejected thread; and uncounted by
 // the backlog law, so the controller refills over a proposal the maintainer just
 // revived. The pre-O9 delete-and-re-create had none of those problems, so the
 // reopen has to put the mirror back in the same shape: verdict cleared, mirror

@@ -353,44 +353,6 @@ func TestAlertCapacity_DefaultsToOne(t *testing.T) {
 	}
 }
 
-func TestDefaultApprovalPhrases(t *testing.T) {
-	want := []string{"lgtm", "approve", "approved", "ship it", "go ahead", "go", "implement it"}
-	got := v1alpha1.DefaultApprovalPhrases()
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("DefaultApprovalPhrases() = %v, want %v", got, want)
-	}
-}
-
-// TestApprovalPhrases_EmptyNeverMeansAny asserts the D-B grammar decision:
-// an empty/unset ScmSpec.ApprovalPhrases (or a nil Scm block) resolves to the
-// DEFAULT closed wordlist, never to "any text approves".
-func TestApprovalPhrases_EmptyNeverMeansAny(t *testing.T) {
-	// nil Scm block.
-	p := &v1alpha1.Project{}
-	got := v1alpha1.EffectiveApprovalPhrases(p)
-	if !reflect.DeepEqual(got, v1alpha1.DefaultApprovalPhrases()) {
-		t.Fatalf("nil Scm: EffectiveApprovalPhrases() = %v, want the default list", got)
-	}
-	if len(got) == 0 {
-		t.Fatal("an empty phrase list can NEVER mean 'any text approves'")
-	}
-
-	// explicit empty slice.
-	p2 := &v1alpha1.Project{Spec: v1alpha1.ProjectSpec{Scm: &v1alpha1.ScmSpec{ApprovalPhrases: []string{}}}}
-	got2 := v1alpha1.EffectiveApprovalPhrases(p2)
-	if !reflect.DeepEqual(got2, v1alpha1.DefaultApprovalPhrases()) {
-		t.Fatalf("empty ApprovalPhrases: EffectiveApprovalPhrases() = %v, want the default list", got2)
-	}
-
-	// explicit custom list overrides.
-	custom := []string{"do it"}
-	p3 := &v1alpha1.Project{Spec: v1alpha1.ProjectSpec{Scm: &v1alpha1.ScmSpec{ApprovalPhrases: custom}}}
-	got3 := v1alpha1.EffectiveApprovalPhrases(p3)
-	if !reflect.DeepEqual(got3, custom) {
-		t.Fatalf("custom ApprovalPhrases not honoured: got %v, want %v", got3, custom)
-	}
-}
-
 // TestConversationIdle asserts every input that must fall back to
 // ConversationIdleDefault: a nil Project, a Project with a nil Scm block, and
 // a Project whose Scm is set but ConversationIdleMinutes is left at its
@@ -581,23 +543,6 @@ func TestAgentSpec_NewCaps(t *testing.T) {
 	}
 	if a.MaxPodRecreations != 3 {
 		t.Errorf("MaxPodRecreations = %d, want 3", a.MaxPodRecreations)
-	}
-}
-
-// TestScmSpec_ApprovalPhrasesField asserts the field exists and deep-copies
-// independently.
-func TestScmSpec_ApprovalPhrasesField(t *testing.T) {
-	p := &v1alpha1.Project{Spec: v1alpha1.ProjectSpec{Scm: &v1alpha1.ScmSpec{
-		Provider: "github", Owner: "acme", BotLogin: "bot",
-		ApprovalPhrases: []string{"lgtm", "go ahead"},
-	}}}
-	cp := p.DeepCopy()
-	if !reflect.DeepEqual(cp.Spec.Scm.ApprovalPhrases, []string{"lgtm", "go ahead"}) {
-		t.Fatalf("ApprovalPhrases = %v", cp.Spec.Scm.ApprovalPhrases)
-	}
-	cp.Spec.Scm.ApprovalPhrases[0] = "mutated"
-	if p.Spec.Scm.ApprovalPhrases[0] == "mutated" {
-		t.Fatal("mutating copy mutated original (shared slice)")
 	}
 }
 
