@@ -261,6 +261,48 @@ func TaskDone(t *Task) bool {
 	return StageTerminal(t) || t.Status.Stage == StageDelivered
 }
 
+// FoldStartedAt is the anchor for both fold-hold clocks: the explicit
+// FoldInFlightSince stamp, else the generic stage clock, else the zero time (a
+// marker so old it carries neither, which reads as expired - the safe direction,
+// because the alternative is the unbounded hold of issue #467).
+func FoldStartedAt(t *Task) time.Time {
+	if t.Status.FoldInFlightSince != nil {
+		return t.Status.FoldInFlightSince.Time
+	}
+	if t.Status.StageEnteredAt != nil {
+		return t.Status.StageEnteredAt.Time
+	}
+	return time.Time{}
+}
+
+// FoldInFlightActive reports whether t's B.3 fold adoption CAN STILL COMPLETE,
+// and is therefore the ONE predicate that may hold a member Task off the reaper
+// or defer a stop edge.
+//
+// It is deliberately NOT "len(FoldInFlight) > 0". A fold adoption is the body of
+// ONE submit_outcome request: steps 1-5 run inside it, and nothing outside it
+// ever resumes one. So the marker means "an adoption is running" only while the
+// umbrella could still be running that request, and two things falsify that:
+//
+//   - TaskDone: a delivered/rejected/failed/parked umbrella runs no agent pod
+//     and will never submit another outcome. Its marker is a tombstone.
+//   - FoldInFlightTTL: a live umbrella whose adoption started an hour ago lost
+//     the request some other way (a crash between steps, a 500 on the wire).
+//
+// Issue #467 had neither check: the umbrella closed an issue it owned, was
+// stopped at rejected(issue-closed) mid-adoption, and its 26 members were then
+// skipped by the reaper on every pass, forever, with the counter climbing at a
+// fixed rate and no mechanism anywhere able to clear it.
+func FoldInFlightActive(t *Task, now time.Time) bool {
+	if len(t.Status.FoldInFlight) == 0 {
+		return false
+	}
+	if TaskDone(t) {
+		return false
+	}
+	return now.Before(FoldStartedAt(t).Add(FoldInFlightTTL))
+}
+
 // MaxTaskNameLength is the RFC-1123 label budget TaskName enforces (49
 // chars): the worst-case pod-name suffix "-documentation" is +14 against the
 // 63-char RFC-1123 label limit. CRDs cannot constrain metadata.name length
@@ -414,53 +456,6 @@ type TaskEvent struct {
 	Body string `json:"body"`
 }
 
-// ApprovalVerdict is the DURABLE record that the C.6 approval grammar PASSED
-// for this Task, against one specific comment.
-//
-// It exists because the periodic un-park backstop (driveUnparks) can re-derive
-// everything else about an identity-unverified park from live cluster state -
-// which owned Issues are open, which are approved - but it can NEVER re-run the
-// grammar: the grammar needs a freshly SYNCED forge thread and a webhook payload
-// the backstop did not see. The verdict is that one missing input, made durable
-// at the moment the fast path establishes it, so a fast path that then loses a
-// cache race costs a DELAY rather than a permanent stall.
-//
-// It is evidence of a PAST pass, not a licence: the backstop still re-checks
-// every owned Issue's live approval state before re-entering implementing, AND
-// scopes the verdict to the CURRENT park - a verdict stamped before the Task's
-// current StageEnteredAt is treated as stale and refused, so an approval
-// consumed by an earlier park can never satisfy a later, unrelated one
-// (grammarPassedFor, internal/controller/unpark.go).
-type ApprovalVerdict struct {
-	// At is when the grammar passed.
-	At metav1.Time `json:"at"`
-	// IssueRef is the Issue CR name whose thread carried the approving comment.
-	// +kubebuilder:validation:MaxLength=253
-	IssueRef string `json:"issueRef,omitempty"`
-	// CommentExternalID is the forge comment id the grammar matched, i.e. the
-	// Comment.ExternalID the C.6 single-use-evidence clause consumed. It is what
-	// makes this verdict traceable back to a real human action. Empty for the
-	// AutoApproveTataraProposals carve-out below, which cites no comment.
-	// +kubebuilder:validation:MaxLength=128
-	CommentExternalID string `json:"commentExternalId,omitempty"`
-	// Author is the verified maintainer login whose comment passed - never the
-	// bot login. EXCEPTION: under Project.spec.AutoApproveTataraProposals, a
-	// bot-authored, integrity-anchor-verified proposal with ZERO maintainer
-	// comments auto-approves (autoApproveApplies/autoApprovalEvidence,
-	// internal/controller/approval_grammar.go) and is recorded here with
-	// Author=AutoApproveLogin ("<tatara:auto>") - a deliberate, narrowly-gated
-	// carve-out, not a maintainer approval. Required non-empty: it is the one
-	// field every verdict this codebase ever writes always carries, so a
-	// consumer refusing an empty Author cannot be fooled by a schema-legal but
-	// otherwise-empty verdict.
-	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=128
-	Author string `json:"author,omitempty"`
-	// Phrase is the matched approvalPhrases entry.
-	// +kubebuilder:validation:MaxLength=128
-	Phrase string `json:"phrase,omitempty"`
-}
-
 // TaskStatus defines the observed state of a Task.
 type TaskStatus struct {
 	// +optional
@@ -551,12 +546,6 @@ type TaskStatus struct {
 	// from a pre-implement stage cannot auto-escalate straight into implementing.
 	// +optional
 	ParkedFromStage string `json:"parkedFromStage,omitempty"`
-	// ApprovalVerdict is the durable C.6 grammar pass (see ApprovalVerdict). It is
-	// written by the webhook fast path the moment the grammar passes, and read by
-	// the periodic driveUnparks backstop, which cannot re-run the grammar itself.
-	// Nil means no approving comment has ever been verified for this Task.
-	// +optional
-	ApprovalVerdict *ApprovalVerdict `json:"approvalVerdict,omitempty"`
 	// ConversationLastEventAt is the IDLE CLOCK BASE for the conversing stage. It
 	// is stamped on entry into conversing and RE-STAMPED by AppendTaskEvent on
 	// every non-bot event queued while conversing, so the clock measures silence
@@ -628,10 +617,18 @@ type TaskStatus struct {
 	// +optional
 	HumanReviewRounds int `json:"humanReviewRounds,omitempty"`
 	// FoldInFlight names the member Tasks a refine umbrella is mid-adoption of.
-	// The reaper SKIPS any Task named here (fix 8).
+	// The reaper SKIPS any Task named here (fix 8), but ONLY while
+	// FoldInFlightActive - see there.
 	// +optional
 	// +kubebuilder:validation:MaxItems=20
 	FoldInFlight []string `json:"foldInFlight,omitempty"`
+	// FoldInFlightSince is when FoldInFlight was last written. It is the ANCHOR
+	// for the reaper's TTL: without it a stranded marker is indistinguishable
+	// from one written a second ago, which is how issue #467 pinned 26 Tasks
+	// against a dead umbrella with nothing able to tell the difference. Absent
+	// (a marker written by an older build) it falls back to StageEnteredAt.
+	// +optional
+	FoldInFlightSince *metav1.Time `json:"foldInFlightSince,omitempty"`
 	// ResolvedModel is the MODEL env resolved for this Task's agent pod at spawn
 	// (modelForKind: per-kind override else project-wide). Stamped once at
 	// pod-creation; read by the token/terminal metrics so $ is priced by the

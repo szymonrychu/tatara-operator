@@ -296,6 +296,25 @@ func (d *StageDriver) clearPendingReview(ctx context.Context, proj *tatarav1alph
 // that very field, and the handler had just set it.
 func (d *StageDriver) advanceAfterReview(ctx context.Context, proj *tatarav1alpha1.Project,
 	task *tatarav1alpha1.Task, fresh *tatarav1alpha1.MergeRequest) error {
+	// CHECK THE SNAPSHOT THE WRITE WILL USE (issue #478). task came from
+	// owningTask, i.e. the informer CACHE, but the write below re-reads the Task
+	// LIVE inside objbudget.FitTask - so guarding the advance on the cached
+	// stage guards nothing. In the incident: the task controller finalized this
+	// same review Task reviewing -> delivered (review_finalize_terminal_mr, every
+	// owned MR merged externally), and 1.6-2.1s later this function still saw
+	// reviewing, logged "task advancing off reviewing", and asked for
+	// delivered -> parked. Adopting the live object first is the same idiom the
+	// task reconciler already uses at the top of every dispatch (issue #324),
+	// and it makes this guard mean what it says.
+	//
+	// This does NOT gate the review POST: DrainPendingReview has already put the
+	// review on the forge by the time it calls us, deliberately (its own stale
+	// check, on the cache, is fresh by construction for the case it guards). A
+	// merged-externally MR still gets the agent's findings; what it does not get
+	// is a Task dragged back out of a terminal stage.
+	if err := refreshTaskFromAPI(ctx, d.APIReader, task); err != nil {
+		return err
+	}
 	if task.Status.Stage != tatarav1alpha1.StageReviewing {
 		return nil
 	}
