@@ -120,6 +120,34 @@ func TestEnterConversingRefusesAtTheReviewRoundCap(t *testing.T) {
 	}
 }
 
+// #511: a maintainer's take-over comment on a stood-down (Ownership==external)
+// MR must still reach a live pod even with the round cap spent - the cap
+// bounds ordinary review ping-pong, not a take-over request.
+func TestEnterConversingBypassesRoundCapOnExternallyOwnedMR(t *testing.T) {
+	proj, task, r := ceFixture(t, v1alpha1.StageReviewing, "review", func(task *v1alpha1.Task) {
+		task.Status.HumanReviewRounds = v1alpha1.MaxHumanReviewRounds
+	})
+	now := time.Now()
+	mrs := []v1alpha1.MergeRequest{{Status: v1alpha1.MergeRequestStatus{Ownership: v1alpha1.OwnershipExternal}}}
+
+	entered, err := EnterConversing(context.Background(), r.Client, nil, r.Metrics, proj, task, mrs, now)
+	if err != nil {
+		t.Fatalf("EnterConversing: %v", err)
+	}
+	if !entered {
+		t.Fatal("entered = false, want true: an externally-owned MR must bypass the spent round cap")
+	}
+
+	fresh := ceGetTask(t, r.Client, task.Name)
+	if fresh.Status.Stage != v1alpha1.StageConversing {
+		t.Fatalf("stage = %q, want conversing", fresh.Status.Stage)
+	}
+	if fresh.Status.HumanReviewRounds != v1alpha1.MaxHumanReviewRounds {
+		t.Fatalf("HumanReviewRounds = %d, want unchanged at %d (this re-entry does not spend a round)",
+			fresh.Status.HumanReviewRounds, v1alpha1.MaxHumanReviewRounds)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------

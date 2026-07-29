@@ -335,7 +335,12 @@ func EnterConversing(ctx context.Context, c client.Client, sp objbudget.Spiller,
 	// "reviewing" (2026-07-28 security review Minor).
 	fromStage := task.Status.Stage
 	fromReviewing := task.Status.Stage == tatarav1alpha1.StageReviewing
-	if fromReviewing && task.Status.HumanReviewRounds >= tatarav1alpha1.MaxHumanReviewRounds {
+	// #511: an externally-owned MR (a stand-down) is the one state a
+	// maintainer's "take over" comment can arrive in. The round cap bounds
+	// ordinary review ping-pong; it must not swallow a take-over request, so
+	// this entry is exempted from the cap and does not spend a round.
+	takeoverCandidate := anyExternallyOwnedMR(mrs)
+	if fromReviewing && !takeoverCandidate && task.Status.HumanReviewRounds >= tatarav1alpha1.MaxHumanReviewRounds {
 		log.FromContext(ctx).Info("conversing entry refused: the human review round cap is spent",
 			"action", "conversing_entry_declined", "resource_id", task.Name,
 			"stage", task.Status.Stage, "decline", "rounds-exhausted")
@@ -347,7 +352,7 @@ func EnterConversing(ctx context.Context, c client.Client, sp objbudget.Spiller,
 			// ABSOLUTE ASSIGNMENT only: FitTask re-runs this closure to size the
 			// write and again on every conflict retry, so an increment here would
 			// multiply. The rounds value is computed once, outside.
-			if fromReviewing {
+			if fromReviewing && !takeoverCandidate {
 				t.Status.HumanReviewRounds = task.Status.HumanReviewRounds + 1
 			}
 		})
@@ -358,4 +363,17 @@ func EnterConversing(ctx context.Context, c client.Client, sp objbudget.Spiller,
 		"action", "conversing_entered", "resource_id", task.Name,
 		"from", fromStage, "human_review_rounds", task.Status.HumanReviewRounds)
 	return true, nil
+}
+
+// anyExternallyOwnedMR reports whether any of mrs is currently
+// Ownership==external - see stage.go's identically-purposed anyExternallyOwned
+// (#511). Duplicated rather than shared: this package cannot import the
+// unexported helper from internal/stage, and the check is a two-line loop.
+func anyExternallyOwnedMR(mrs []tatarav1alpha1.MergeRequest) bool {
+	for i := range mrs {
+		if mrs[i].Status.Ownership == tatarav1alpha1.OwnershipExternal {
+			return true
+		}
+	}
+	return false
 }
