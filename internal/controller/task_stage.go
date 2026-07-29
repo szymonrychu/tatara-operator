@@ -431,7 +431,7 @@ func (r *TaskReconciler) reconcileParkedBindingRepair(ctx context.Context, proj 
 	// before repairing and unparking, so a Task another writer already moved is
 	// not re-entered off a stale snapshot (same idiom as the mint/terminal
 	// checks in reconcileStage).
-	if err := r.refreshTaskFromAPI(ctx, task); err != nil {
+	if err := refreshTaskFromAPI(ctx, r.APIReader, task); err != nil {
 		return false, err
 	}
 	if !parkedBindingRepairEligible(task) {
