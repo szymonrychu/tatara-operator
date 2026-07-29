@@ -26,7 +26,7 @@ const sessionJSON = `{
   "model": "claude-opus-5",
   "repo": "tatara-operator",
   "lastActivityAt": "2026-07-12T10:00:00Z",
-  "contractVersion": 2
+  "contractVersion": 3
 }`
 
 // TestGetSession_KeepsAllSixExistingFields: the contract's illustrative
@@ -50,7 +50,7 @@ func TestGetSession_KeepsAllSixExistingFields(t *testing.T) {
 	require.Equal(t, "tatara-operator", info.Repo)
 	require.Equal(t, time.Date(2026, 7, 12, 10, 0, 0, 0, time.UTC), info.LastActivityAt.UTC())
 	require.NotNil(t, info.ContractVersion)
-	require.Equal(t, 2, *info.ContractVersion)
+	require.Equal(t, 3, *info.ContractVersion)
 	require.False(t, info.TurnInFlight())
 }
 
@@ -106,6 +106,17 @@ func decodeSessionInfo(t *testing.T, body string) agent.SessionInfo {
 	return info
 }
 
+// TestContractVersionIsThree pins the cross-repo constant. It goes 2 -> 3 in
+// tatara-operator, tatara-cli and tatara-claude-code-wrapper in ONE shot: an
+// old cli refuses to start its MCP server, and an old wrapper fails
+// AssertContractVersion at pod-ready, BEFORE turn 0. Loud pre-work failure
+// instead of a silent mid-turn 400.
+func TestContractVersionIsThree(t *testing.T) {
+	if agent.ContractVersion != 3 {
+		t.Fatalf("ContractVersion = %d, want 3", agent.ContractVersion)
+	}
+}
+
 // TestAssertContractVersion covers the G.10 handshake. On a mismatch - OR on a
 // response with no contractVersion field at all (an old wrapper) - the assertion
 // fails and NOT ONE turn is submitted.
@@ -116,14 +127,14 @@ func TestAssertContractVersion(t *testing.T) {
 		wantErr bool
 		wantGot int
 	}{
-		{name: "matching version", body: `{"state":"ready","contractVersion":2}`},
-		{name: "old wrapper reports v1", body: `{"state":"ready","contractVersion":1}`, wantErr: true, wantGot: 1},
+		{name: "matching version", body: `{"state":"ready","contractVersion":3}`},
+		{name: "old wrapper reports v2", body: `{"state":"ready","contractVersion":2}`, wantErr: true, wantGot: 2},
 		{
 			name:    "old wrapper has no contractVersion field at all",
 			body:    `{"state":"ready","turnsCompleted":0,"turnsFinished":0,"model":"m","repo":"r","lastActivityAt":"2026-07-12T10:00:00Z"}`,
 			wantErr: true, wantGot: 0,
 		},
-		{name: "future version", body: `{"state":"ready","contractVersion":3}`, wantErr: true, wantGot: 3},
+		{name: "future version", body: `{"state":"ready","contractVersion":4}`, wantErr: true, wantGot: 4},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := &turnRefusingSession{t: t, body: tc.body}

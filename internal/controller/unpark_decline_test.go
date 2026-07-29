@@ -90,6 +90,12 @@ func TestDriveUnparks_GuardDecline_LogsAndCounts(t *testing.T) {
 // operator_unpark_declined_total, distinguished by its specific kind, so the
 // metric stays complete and queryable per condition (not collapsed into a
 // single "rule" bucket).
+//
+// DeclineNoConversingRoom is the ONE exception and is deliberately not the
+// subject here: it is not steady state (a human commented and went unanswered
+// on capacity alone), so step C gives it its own INFO line. Its log is asserted
+// positively by TestDriveUnparks_IdentityUnverifiedDeclinesNoConversingRoom.
+// This test uses DeclineNoHumanEvent, which stays silent.
 func TestDriveUnparks_RuleDecline_CountsButDoesNotLog(t *testing.T) {
 	task := wfParkedTask("t-rule-du", "review", stage.ReasonAwaitingHuman)
 	task.Status.PendingEvents = []tatarav1alpha1.TaskEvent{{

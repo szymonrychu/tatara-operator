@@ -160,60 +160,14 @@ func TestDriveUnparks_BacklogSweepStaysParkedWithoutComment(t *testing.T) {
 	}
 }
 
-// TestDriveUnparks_IdentityUnverifiedWithoutVerdictOpensConversationNeverImplementing
-// was TestDriveUnparks_IdentityUnverifiedWithoutVerdictDeclines before Task 9's
-// conversing widening; renamed because it no longer declines - see below.
-func TestDriveUnparks_IdentityUnverifiedWithoutVerdictOpensConversationNeverImplementing(t *testing.T) {
-	// The reconcile loop DOES drive identity-unverified now (Task 4): it reads
-	// Task.status.approvalVerdict rather than re-running the grammar. This Task
-	// carries no verdict, but its one owned Issue IS live-approved: without the
-	// Issue seeded and approved, this test could not tell "correctly never
-	// reaches implementing because grammarPassed is false" apart from "never
-	// reaches implementing for the unrelated reason no Issues are owned" - it
-	// would pass either way and catch nothing. With the Issue approved, a
-	// wrongly-true grammarPassed WOULD re-enter the Task straight into
-	// implementing; this asserts that specifically never happens.
-	//
-	// Task 9: a GrammarPassed=false comment on identity-unverified now opens a
-	// conversation (conversing) instead of only declining - so this Task DOES
-	// move, but the conversing branch never consults Issue approval state at
-	// all (it fires before that check). The property this test proves - a
-	// live-approved Issue with no fresh grammar pass must never authorize
-	// implementing - is enforced downstream, at restapi's verifyApprovalScope,
-	// which reruns the LIVE C.6 grammar on every decision=implement from
-	// conversing and never reads status.approvalVerdict; it is NOT LegalFor's
-	// kind guard, which keys on Task.Spec.Kind == "review" and this Task is
-	// kind=clarify.
-	task := wfParkedTask("t-ident", "clarify", stage.ReasonIdentityUnverified)
-	task.Status.IssueRefs = []string{"iss-ident"}
-	task.Status.PendingEvents = []tatarav1alpha1.TaskEvent{{
-		At: metav1.Now(), Kind: "issue_comment", Author: "human", Body: "go ahead",
-	}}
-	iss := &tatarav1alpha1.Issue{ObjectMeta: metav1.ObjectMeta{Name: "iss-ident", Namespace: mdNS}}
-	iss.Status.State = "open"
-	iss.Status.Status = "approved"
-	c := newMirrorClient(t, task, iss)
-	metrics := wfMetrics()
-	r := &ProjectReconciler{Client: c, Scheme: c.Scheme(), Metrics: metrics}
-	if err := r.driveUnparks(context.Background(), wfProject(), time.Now()); err != nil {
-		t.Fatalf("driveUnparks: %v", err)
-	}
-	got := mdGetTask(t, c, task.Name)
-	if got.Status.Stage != tatarav1alpha1.StageConversing {
-		t.Fatalf("stage = %s(%s), want conversing: a live-approved Issue with NO fresh grammar verdict must never reach implementing",
-			got.Status.Stage, got.Status.StageReason)
-	}
-	// The original (pre-Task-9) version of this test asserted
-	// UnparkDeclinedCounter(identity-unverified, grammar-not-passed) == 1 - "the
-	// SPECIFIC decline, not just stayed parked". That assertion is gone, not
-	// merely dropped: this pass no longer declines at all (target != ""), so
-	// driveUnparks never calls Metrics.UnparkDeclined for it. Asserted here as
-	// 0, explicitly, so a future regression that made this decline again would
-	// fail LOUDLY on the counter, not silently pass by accident.
-	if got := testutil.ToFloat64(metrics.UnparkDeclinedCounter(stage.ReasonIdentityUnverified, string(DeclineGrammarNotPassed))); got != 0 {
-		t.Fatalf("operator_unpark_declined_total{identity-unverified,grammar-not-passed} = %v, want 0: this pass entered conversing, it did not decline", got)
-	}
-}
+// The identity-unverified driveUnparks coverage that used to live here
+// (TestDriveUnparks_IdentityUnverifiedWithoutVerdictOpensConversationNeverImplementing)
+// moved to unpark_backstop_test.go in step C. Step B had already grown a
+// same-named, same-shaped test there - parked(identity-unverified), a human
+// comment, one live-approved owned Issue, driveUnparks, assert conversing - and
+// keeping two copies of one assertion is exactly the duplication that lets the
+// weaker one rot. The single surviving copy carries this one's extra
+// decline-counter assertion, and the D1 no-conversing-room half sits beside it.
 
 // TestDriveUnparks_ConversingRoomBudgetCapsBulkReEntry is the CRITICAL 2
 // discrimination proof (2026-07-28 final review, first half): driveUnparks
@@ -281,28 +235,46 @@ func TestGrammarVerifier_VerdictsPerIssue(t *testing.T) {
 	}
 	approved := wfIssue("iss-ok")
 	approved.Status.Comments = []tatarav1alpha1.Comment{{
-		ExternalID: "c1", Author: "maint", Body: "go ahead", CreatedAt: metav1.Now(),
+		ExternalID: "c1", Author: "maint", Body: "sure, go ahead", CreatedAt: metav1.Now(),
 	}}
-	noPhrase := wfIssue("iss-nophrase")
-	noPhrase.Status.Comments = []tatarav1alpha1.Comment{{
+	fabricated := wfIssue("iss-fabricated")
+	fabricated.Status.Comments = []tatarav1alpha1.Comment{{
 		ExternalID: "c2", Author: "maint", Body: "thanks, will look", CreatedAt: metav1.Now(),
 	}}
 	nonMaint := wfIssue("iss-nonmaint")
-	nonMaint.Status.Comments = []tatarav1alpha1.Comment{{
-		ExternalID: "c3", Author: "randomuser", Body: "go ahead", CreatedAt: metav1.Now(),
-	}}
-
-	c := newMirrorClient(t, approved, noPhrase, nonMaint)
-	g := &GrammarVerifier{Client: c}
-
-	if ev, ok := g.VerifyApproval(context.Background(), proj, approved); !ok || ev == nil || ev.Login != "maint" {
-		t.Fatalf("valid maintainer approval refused: ok=%v ev=%+v", ok, ev)
+	nonMaint.Status.Comments = []tatarav1alpha1.Comment{
+		{ExternalID: "c3", Author: "randomuser", Body: "go ahead", CreatedAt: metav1.Now()},
+		{ExternalID: "c4", Author: "maint", Body: "let me look", CreatedAt: metav1.Now()},
 	}
-	if _, ok := g.VerifyApproval(context.Background(), proj, noPhrase); ok {
-		t.Fatalf("a non-approval-phrase comment granted approval")
+
+	c := newMirrorClient(t, approved, fabricated, nonMaint)
+	reg := prometheus.NewRegistry()
+	metrics := obs.NewOperatorMetrics(reg)
+	g := &GrammarVerifier{Client: c, Metrics: metrics}
+	ctx := context.Background()
+
+	if ev, ok := g.VerifyApproval(ctx, proj, approved, cites("c1", "go ahead")); !ok || ev == nil || ev.Login != "maint" {
+		t.Fatalf("valid cited maintainer approval refused: ok=%v ev=%+v", ok, ev)
 	}
-	if _, ok := g.VerifyApproval(context.Background(), proj, nonMaint); ok {
+	if _, ok := g.VerifyApproval(ctx, proj, fabricated, cites("c2", "go ahead")); ok {
+		t.Fatalf("a FABRICATED quote granted approval")
+	}
+	if _, ok := g.VerifyApproval(ctx, proj, nonMaint, cites("c3", "go ahead")); ok {
 		t.Fatalf("a non-maintainer comment granted approval")
+	}
+	// Hard rule 13: every refusal path is queryable without log-scraping.
+	if got := testutil.ToFloat64(metrics.ApprovalRefusedCounter(ApprovalRefusedQuoteAbsent)); got != 1 {
+		t.Fatalf("operator_approval_refused_total{reason=quote-not-in-comment} = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.ApprovalRefusedCounter(ApprovalRefusedCitationNotMaintainer)); got != 1 {
+		t.Fatalf("operator_approval_refused_total{reason=citation-not-maintainer} = %v, want 1", got)
+	}
+
+	// A nil Metrics must not panic: the seam is wired with metrics in production
+	// but constructed bare in several tests.
+	bare := &GrammarVerifier{Client: c}
+	if _, ok := bare.VerifyApproval(ctx, proj, nonMaint, nil); ok {
+		t.Fatal("a nil-metrics verifier granted approval with no citation")
 	}
 }
 
