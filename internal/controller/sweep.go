@@ -99,7 +99,7 @@ const (
 
 	// SweepIssueKind is the Task kind a sweep-minted ISSUE Task carries. F.3 has
 	// NO triaging -> implementing edge: an issue Task enters clarifying, where the
-	// C.6 approval grammar gates it, and only an APPROVED Task implements.
+	// C.6 approval citation check gates it, and only an APPROVED Task implements.
 	SweepIssueKind = "clarify"
 	// SweepReviewKind is the Task kind minted for a HUMAN-authored PR in reaction
 	// scope. Every review-kind Task is non-bot-authored BY CONSTRUCTION (clause

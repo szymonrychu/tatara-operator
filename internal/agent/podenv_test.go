@@ -51,7 +51,7 @@ func TestAgentEnv_G9Contract(t *testing.T) {
 	require.Equal(t, "", env["TATARA_REPO"])
 	require.Equal(t, agent.TaskBranch(task), env["TASK_BRANCH"])
 	require.Equal(t, "3600", env["AGENT_POD_TTL_SECONDS"])
-	require.Equal(t, "2", env["TATARA_CONTRACT_VERSION"])
+	require.Equal(t, "3", env["TATARA_CONTRACT_VERSION"])
 }
 
 // TestAgentEnv_RepoOnlyForDocumentation: TATARA_REPO is the Repository CR name,
@@ -133,7 +133,7 @@ func TestBuildPod_CarriesG9Block(t *testing.T) {
 	require.Equal(t, "implement", env["TATARA_TOOL_PROFILE"])
 	require.Equal(t, "implement", env["TATARA_SKILL_PROFILE"])
 	require.Equal(t, "7200", env["AGENT_POD_TTL_SECONDS"])
-	require.Equal(t, "2", env["TATARA_CONTRACT_VERSION"])
+	require.Equal(t, "3", env["TATARA_CONTRACT_VERSION"])
 }
 
 // TestBuildPod_ProfileEnvBeatsExtraEnvs: the operator-set profile keys must win
@@ -148,5 +148,5 @@ func TestBuildPod_ProfileEnvBeatsExtraEnvs(t *testing.T) {
 	}
 	env := g9EnvMap(agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0].Env)
 	require.Equal(t, "review", env["TATARA_TOOL_PROFILE"])
-	require.Equal(t, "2", env["TATARA_CONTRACT_VERSION"])
+	require.Equal(t, "3", env["TATARA_CONTRACT_VERSION"])
 }

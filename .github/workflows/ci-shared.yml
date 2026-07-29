@@ -72,6 +72,19 @@ on:
         type: string
         required: false
         default: ''
+      enable-image:
+        description: >-
+          Run the shared `image` job (publishes `:SHORT_SHA` on push once
+          build/smoke/chart-validate pass). Default true preserves
+          tatara-operator's existing behaviour. Repos whose image publish is
+          more involved than a single `image-build-arg` (e.g. multiple
+          build-args, a build-guard stage, or a caller-owned
+          `PUSH_SHORT_SHA_TAG`-style tag toggle) set this false and keep their
+          own local `image` job downstream of this call, so the shared and
+          local jobs never both push the same immutable Harbor tag.
+        type: boolean
+        required: false
+        default: true
 
 # Single source of truth for the tool versions that used to be copy-pasted
 # inline in every repo. Bump here once.
@@ -212,7 +225,7 @@ jobs:
     # closed if they ran and failed. `always()` is required so a skipped
     # optional dependency does not skip this job.
     if: >-
-      ${{ always() && github.event_name == 'push'
+      ${{ always() && github.event_name == 'push' && inputs.enable-image
           && needs.build.result == 'success'
           && (needs.smoke.result == 'success' || needs.smoke.result == 'skipped')
           && (needs.chart-validate.result == 'success' || needs.chart-validate.result == 'skipped') }}
