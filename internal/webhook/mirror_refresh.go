@@ -114,8 +114,9 @@ func (s *Server) handleIssueEdited(ctx context.Context, w http.ResponseWriter, p
 				// Diff and write in the SAME fitForWrite transaction: keying the
 				// reaction on the actual mirror DIFF (not the action string) is what
 				// gives GitHub/GitLab parity across their divergent action vocabularies.
-				changed = i.Status.Body != ev.Body || i.Status.Title != ev.Title
-				i.Status.Body = ev.Body
+				body := tatarav1.TruncateUTF8(ev.Body, tatarav1.IssueBodyMaxBytes)
+				changed = i.Status.Body != body || i.Status.Title != ev.Title
+				i.Status.Body = body
 				i.Status.Title = ev.Title
 			}); ferr != nil {
 			// changed never flips true (the closure that sets it never ran), so the

@@ -27,6 +27,8 @@ type MergeRequestStatus struct {
 	Title string `json:"title,omitempty"`
 	// +optional
 	Author string `json:"author,omitempty"`
+	// Go-side twin: MergeRequestBodyMaxBytes (limits.go). Byte-capped, while the
+	// forge caps in characters - every writer clamps (issue #495).
 	// +optional
 	// +kubebuilder:validation:MaxLength=65536
 	Body string `json:"body,omitempty"`

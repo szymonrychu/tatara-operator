@@ -22,6 +22,13 @@ const (
 // rebuilds the Task from it verbatim on admission. Producers keep ownership of
 // label/goal/source construction so the dispatcher stays generic.
 type QueuedEventPayload struct {
+	// Goal is copied VERBATIM onto the rebuilt Task's Spec.Goal, which is capped
+	// at GoalMaxBytes - so it needed the same cap and did not have it. Without
+	// it an over-long goal was accepted here and only rejected at admission, one
+	// layer away from the producer that could still have done something about it
+	// (issue #495's class: a bounded field fed from an unbounded one).
+	// Go-side twin: GoalMaxBytes (limits.go).
+	// +kubebuilder:validation:MaxLength=16384
 	Goal          string            `json:"goal,omitempty"`
 	Kind          string            `json:"kind"`
 	RepositoryRef string            `json:"repositoryRef,omitempty"`
@@ -75,6 +82,7 @@ type QueuedTaskBlueprint struct {
 	Kind string `json:"kind"`
 	// Goal carries the SAME MaxLength=16384 cap as Task.spec.goal
 	// (task_types.go) - it is NON-EVICTABLE at the far end.
+	// Go-side twin: GoalMaxBytes (limits.go).
 	// +kubebuilder:validation:MaxLength=16384
 	Goal          string `json:"goal"`
 	ProjectRef    string `json:"projectRef"`

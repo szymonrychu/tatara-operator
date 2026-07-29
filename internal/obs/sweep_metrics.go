@@ -108,13 +108,24 @@ var SweepSkippedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 var sweepSkipReasons = []string{"mr_claimed_by_other_task"}
 
 // sweepSeedReasons is the closed fail(reason, ...) set for sweep.go's B.4 pass
-// (SweepActivity/SweepNightlyActivity), plus list_tasks. Literal here (not
-// imported from internal/controller) to avoid a reverse import; keep in sync
-// with sweep.go's constants and its fail(reason, ...) call sites.
+// (SweepActivity), plus list_tasks. Literal here (not imported from
+// internal/controller) to avoid a reverse import; kept in sync with sweep.go's
+// fail(reason, ...) call sites by TestSweepSeedReasonsCoverEveryFailSite, which
+// scans them out of the source - the prose version of that instruction had
+// already drifted from four of them.
+//
+// The drift was not cosmetic (issue #495). An unseeded reason has no series at
+// all until its first error, and a counter series born AT its first error has
+// no earlier sample to increase from, so increase(...[1h]) is blind to exactly
+// the first failure after every pod roll. reconcile_ownership failed once per
+// 4-hourly sweep for three days while its own counter read as silent, which is
+// why that class had to be alerted on from Loki ERROR lines instead.
 var sweepSeedReasons = []string{
 	"list_tasks", "owner_repo", "list_issues", "list_prs", "get_issue_cr",
 	"list_comments", "get_issue", "mint_issue_task", "clear_webhook_marker",
 	"get_owning_task", "get_mr_cr", "adopt_pr", "mint_review_task",
+	"reopen_retained_proposal", "get_mr_cr_post_classify", "list_pr_comments",
+	"reconcile_ownership",
 }
 
 // cronReasons/refineReasons are the closed reason sets for projectscan.go's

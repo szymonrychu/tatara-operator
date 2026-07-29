@@ -2,8 +2,11 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
@@ -139,4 +142,96 @@ func TestRedeliverMRComments_MintsOwnerWhenMissing(t *testing.T) {
 	if len(tk.Status.PendingEvents) != 1 {
 		t.Fatalf("mr_comment event not delivered to the newly-minted owner: %d pending", len(tk.Status.PendingEvents))
 	}
+}
+
+// TestRedeliverMRComments_OversizedBodyStillDelivers is the #495 regression.
+// TaskEvent.Body carries a CRD MaxLength of 4096 bytes; a forge comment larger
+// than that used to go into the event verbatim, so the API server 422-ed the
+// whole Task status write. That is not log noise: the write it rejects is the
+// mr_comment redelivery to a review Task parked awaiting-human, and because the
+// error returns BEFORE the cursor advances, the oversized comment poisons the
+// MR's redelivery cursor forever - every later comment on that MR is stuck
+// behind it, on every subsequent sweep.
+func TestRedeliverMRComments_OversizedBodyStillDelivers(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"exactly at the limit", strings.Repeat("a", tatarav1alpha1.TaskEventBodyMaxBytes)},
+		{"one byte over", strings.Repeat("a", tatarav1alpha1.TaskEventBodyMaxBytes+1)},
+		{"far over", strings.Repeat("a", 100_000)},
+		// The cut lands mid-rune: byte 4096 is the SECOND byte of a 2-byte
+		// rune, so a naive body[:4096] yields invalid UTF-8 that the API
+		// server's JSON encoder rejects even after the length is legal.
+		{"multi-byte rune split at the cut", strings.Repeat("a", tatarav1alpha1.TaskEventBodyMaxBytes-1) + strings.Repeat("é", 64)},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			d, proj, repo := newOwnershipDriver(t, ctx)
+			number := 60 + i
+			taskName := fmt.Sprintf("op12-oversize-task-%d", number)
+			mr := seedExternalMRWithReviewOwner(t, ctx, proj, repo, number, taskName)
+			incoming := []scm.IssueComment{
+				{ExternalID: "900", Author: "alice", Body: tc.body, CreatedAt: fixedTime(1)},
+			}
+			if err := d.redeliverMRComments(ctx, proj, repo, mr, incoming); err != nil {
+				t.Fatalf("redelivery of an oversized comment must not fail: %v", err)
+			}
+			got := getMR(t, ctx, proj, repo, number)
+			if got.Status.LastMirroredCommentID != "900" {
+				t.Fatalf("cursor = %q, want 900: an oversized comment must not freeze the redelivery cursor",
+					got.Status.LastMirroredCommentID)
+			}
+			tk := getTask(t, taskName)
+			if len(tk.Status.PendingEvents) != 1 {
+				t.Fatalf("mr_comment event not delivered: %d pending", len(tk.Status.PendingEvents))
+			}
+			ev := tk.Status.PendingEvents[0]
+			if len(ev.Body) > tatarav1alpha1.TaskEventBodyMaxBytes {
+				t.Fatalf("delivered body = %d bytes, want <= %d", len(ev.Body), tatarav1alpha1.TaskEventBodyMaxBytes)
+			}
+			if !utf8.ValidString(ev.Body) {
+				t.Fatalf("delivered body is not valid UTF-8: truncation split a rune")
+			}
+			if len(tc.body) > tatarav1alpha1.TaskEventBodyMaxBytes &&
+				!strings.Contains(ev.Body, taskEventTruncatedMarker) {
+				t.Fatalf("a truncated redelivery must say so; body tail = %q", tail(ev.Body, 80))
+			}
+		})
+	}
+}
+
+// TestRedeliverMRComments_OversizedCommentDoesNotAbortBatch covers the batch
+// half of #495: the append error returned mid-loop, so one oversized comment
+// also swallowed every comment after it in the same pass.
+func TestRedeliverMRComments_OversizedCommentDoesNotAbortBatch(t *testing.T) {
+	ctx := context.Background()
+	d, proj, repo := newOwnershipDriver(t, ctx)
+	mr := seedExternalMRWithReviewOwner(t, ctx, proj, repo, 70, "op12-oversize-task-70")
+	incoming := []scm.IssueComment{
+		{ExternalID: "910", Author: "alice", Body: strings.Repeat("a", 20_000), CreatedAt: fixedTime(1)},
+		{ExternalID: "911", Author: "alice", Body: "the short follow-up nobody ever saw", CreatedAt: fixedTime(2)},
+	}
+	if err := d.redeliverMRComments(ctx, proj, repo, mr, incoming); err != nil {
+		t.Fatal(err)
+	}
+	got := getMR(t, ctx, proj, repo, 70)
+	if got.Status.LastMirroredCommentID != "911" {
+		t.Fatalf("cursor = %q, want 911", got.Status.LastMirroredCommentID)
+	}
+	tk := getTask(t, "op12-oversize-task-70")
+	if len(tk.Status.PendingEvents) != 2 {
+		t.Fatalf("both comments must be delivered, got %d pending", len(tk.Status.PendingEvents))
+	}
+	if tk.Status.PendingEvents[1].Body != "the short follow-up nobody ever saw" {
+		t.Fatalf("the comment after the oversized one was dropped: %q", tk.Status.PendingEvents[1].Body)
+	}
+}
+
+func tail(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[len(s)-n:]
 }

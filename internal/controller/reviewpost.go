@@ -794,8 +794,22 @@ func (d *StageDriver) appendOperatorNote(ctx context.Context, proj *tatarav1alph
 
 // appendOperatorNoteTo is the driver-free form, for the call sites that hold a
 // bare client rather than a StageDriver (the red-CI gate runs from both).
+//
+// The body is clamped to Note.Body's CRD MaxLength first (issue #495's class),
+// and it is clamped HERE rather than in either caller so that EVERY path into a
+// note gets it. The review belt feeds reviewBeltNote, which concatenates up to
+// 30 findings whose own bodies are each permitted 8192 bytes into a 4096-capped
+// field - unclamped, the only request_changes -> implement handoff there is
+// could not be written at all on any non-trivial review. The red-CI gate's
+// bounce note enters through this same door and is clamped by the same line.
+//
+// THE CLAMP MUST HAPPEN BEFORE THE ALREADY-WRITTEN CHECK below. That check
+// compares the STORED body, which is the truncated one; clamping after it would
+// make a note that differs from the stored copy only in its cut-off tail compare
+// unequal and be re-appended on every single reconcile.
 func appendOperatorNoteTo(ctx context.Context, c client.Client, sp objbudget.Spiller,
 	task *tatarav1alpha1.Task, body string, now time.Time) error {
+	body = tatarav1alpha1.TruncateUTF8(body, tatarav1alpha1.NoteBodyMaxBytes)
 	at := metav1.NewTime(now)
 	key := client.ObjectKeyFromObject(task)
 	if err := objbudget.FitTask(ctx, c, sp, key, func(t *tatarav1alpha1.Task) {

@@ -94,6 +94,7 @@ spec:
                   it can never shrink the goal. It therefore needs a hard cap of its own
                   (fix L31) or it eats the budget the guard is defending.
                   The same cap applies to QueuedTaskBlueprint.Goal (B.7).
+                  Go-side twin: GoalMaxBytes (limits.go).
                 maxLength: 16384
                 type: string
               groupKey:
@@ -414,6 +415,8 @@ spec:
                       format: date-time
                       type: string
                     body:
+                      description: 'Go-side twin: NoteBodyMaxBytes (limits.go). Change
+                        both together.'
                       maxLength: 4096
                       type: string
                     kind:
@@ -457,6 +460,10 @@ spec:
                     author:
                       type: string
                     body:
+                      description: |-
+                        Go-side twin: TaskEventBodyMaxBytes (limits.go). Forge comments routinely
+                        run past it - this platform's own agents write multi-KB ones - so every
+                        writer MUST clamp. AppendTaskEvent does it for all of them (issue #495).
                       maxLength: 4096
                       type: string
                     kind:

@@ -1209,7 +1209,8 @@ func findingsFor(in []reviewFindingPayload, repo string, number int) []tatarav1a
 			continue
 		}
 		out = append(out, tatarav1alpha1.ReviewFinding{
-			Path: f.Path, Line: f.Line, Body: f.Body, Severity: f.Severity,
+			Path: f.Path, Line: f.Line, Severity: f.Severity,
+			Body: truncateValidUTF8(f.Body, tatarav1alpha1.ReviewFindingBodyMaxBytes),
 		})
 	}
 	return out
@@ -1507,7 +1508,8 @@ func (s *Server) queueIssueClose(ctx context.Context, proj *tatarav1alpha1.Proje
 			return
 		}
 		i.Status.PendingComments = append(i.Status.PendingComments, tatarav1alpha1.PendingComment{
-			RequestID: requestID, Action: "comment", Body: closeIntentBody(reason),
+			RequestID: requestID, Action: "comment",
+			Body: truncateValidUTF8(closeIntentBody(reason), tatarav1alpha1.PendingCommentBodyMaxBytes),
 		})
 	})
 }
@@ -1790,7 +1792,7 @@ func (s *Server) mintClarifyTask(ctx context.Context, proj *tatarav1alpha1.Proje
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: s.ns},
 		Spec: tatarav1alpha1.TaskSpec{
 			ProjectRef: proj.Name, RepositoryRef: repo.Name, Kind: "clarify",
-			Goal: pr.Title + "\n\n" + pr.Body,
+			Goal: truncateValidUTF8(pr.Title+"\n\n"+pr.Body, tatarav1alpha1.GoalMaxBytes),
 			Source: &tatarav1alpha1.TaskSource{
 				Provider: providerOf(proj), IssueRef: issueRef(repo, number),
 				URL: url, Number: number,

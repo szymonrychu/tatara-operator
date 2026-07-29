@@ -315,6 +315,14 @@ func EnqueueEvent(ctx context.Context, c client.Client, seq *SeqSource, proj *ta
 	for _, opt := range opts {
 		opt(&o)
 	}
+	// Clamp at the ONE funnel every producer goes through (issue #495's class).
+	// The incident goals are rendered from Grafana alert labels and annotations,
+	// which nothing in this repo bounds; an over-long one used to be accepted
+	// here and rejected two hops later when the dispatcher built the Task.
+	payload.Goal = tatarav1alpha1.TruncateUTF8(payload.Goal, tatarav1alpha1.GoalMaxBytes)
+	if payload.NewTask != nil {
+		payload.NewTask.Goal = tatarav1alpha1.TruncateUTF8(payload.NewTask.Goal, tatarav1alpha1.GoalMaxBytes)
+	}
 	dup, err := dedupExists(ctx, c, proj.Namespace, proj.Name, dedupKey, !o.ignoreOpenIssueDedup)
 	if err != nil {
 		return nil, false, err
@@ -422,7 +430,7 @@ func BuildTaskFromQueuedEvent(qe *tatarav1alpha1.QueuedEvent, proj *tatarav1alph
 	spec := tatarav1alpha1.TaskSpec{
 		ProjectRef:    proj.Name,
 		RepositoryRef: p.RepositoryRef,
-		Goal:          p.Goal,
+		Goal:          tatarav1alpha1.TruncateUTF8(p.Goal, tatarav1alpha1.GoalMaxBytes),
 		Kind:          p.Kind,
 		DedupKey:      p.DedupKey,
 		GroupKey:      p.GroupKey,

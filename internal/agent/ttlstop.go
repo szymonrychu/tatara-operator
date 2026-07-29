@@ -350,14 +350,14 @@ func (s *TTLStopper) writeSyntheticNote(ctx context.Context, task *tatarav1alpha
 // maxNoteBody is the Note.Body CRD MaxLength. A long finalText must not make the
 // synthetic note unwritable - an over-long note that the API server rejects is
 // an EMPTY notes journal, the exact failure this whole path exists to prevent.
-const maxNoteBody = 4096
+const maxNoteBody = tatarav1alpha1.NoteBodyMaxBytes
 
 func truncateNoteBody(s string) string {
 	if len(s) <= maxNoteBody {
 		return s
 	}
 	const ellipsis = "...(truncated)"
-	return s[:maxNoteBody-len(ellipsis)] + ellipsis
+	return tatarav1alpha1.TruncateUTF8(s, maxNoteBody-len(ellipsis)) + ellipsis
 }
 
 func earliest(a, b time.Time) time.Time {
