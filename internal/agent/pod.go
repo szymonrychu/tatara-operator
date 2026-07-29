@@ -170,78 +170,143 @@ func PodName(task *tatarav1alpha1.Task) string {
 	return "wrapper-" + task.Name
 }
 
-// providerAbbrev maps an SCM provider to its short Pod-name segment.
-func providerAbbrev(provider string) string {
-	switch provider {
-	case "github":
-		return "gh"
-	case "gitlab":
-		return "gl"
-	default:
-		return provider
-	}
+// typeAbbrevs maps a Task's agent kind to the fixed short type token that
+// leads the pod name (issue #507). Unknown kinds fall back to their first 3
+// lowercased chars (typeAbbrev), so a future kind never panics or produces an
+// empty token.
+var typeAbbrevs = map[string]string{
+	"brainstorm":    "brs",
+	"refine":        "ref",
+	"incident":      "inc",
+	"clarify":       "clr",
+	"review":        "rev",
+	"implement":     "imp",
+	"documentation": "doc",
+	"takeover":      "tko",
 }
 
-// podNameSuffix is the work-item segment of a wrapper Pod name: the brainstorm /
-// health-check marker, the issue/mr number, or "scan" for Tasks not bound to a
-// work item. The health-check activity reuses Kind "brainstorm", so it is
-// disambiguated by the activity label to avoid a pod-name collision when both
-// project-scoped activities target the same primary repo.
-func podNameSuffix(task *tatarav1alpha1.Task) string {
-	if task.Spec.Kind == "brainstorm" {
-		if task.Labels[tatarav1alpha1.LabelActivity] == "healthCheck" {
-			return "healthcheck"
-		}
-		return "brainstorm"
+// typeAbbrev resolves the fixed 3-char type token for a Task's agent kind.
+func typeAbbrev(kind string) string {
+	if a, ok := typeAbbrevs[kind]; ok {
+		return a
 	}
-	if task.Spec.Kind == "incident" {
-		if g := task.Spec.DedupKey; g != "" {
-			return "incident-" + g
-		}
-		return "incident"
+	k := strings.ToLower(kind)
+	if len(k) > 3 {
+		return k[:3]
 	}
-	if task.Spec.Kind == "refine" {
-		return "refine"
-	}
-	if task.Spec.Kind == "documentation" {
-		if sha := shortSourceHeadSHA(task); sha != "" {
-			return "docs-" + sha
-		}
-		return "docs"
-	}
+	return k
+}
+
+// podNameIDSegment is the trailing id segment of a wrapper Pod name: i<N> for
+// an issue, p<N> for a PR/MR (GitHub PR and GitLab MR fold into the single
+// "p" token per issue #507), or the pre-existing collision-avoidance
+// disambiguator for a kind with no issue/PR/MR number (incident's DedupKey,
+// documentation's short source-head-SHA, brainstorm's healthCheck marker).
+// Dropped entirely (empty string, no placeholder) for every other kind with
+// no number, per the maintainer's explicit "yes, drop".
+func podNameIDSegment(task *tatarav1alpha1.Task) string {
 	if s := task.Spec.Source; s != nil && s.Number > 0 {
 		if s.IsPR {
-			return fmt.Sprintf("mr-%d", s.Number)
+			return fmt.Sprintf("p%d", s.Number)
 		}
-		return fmt.Sprintf("issue-%d", s.Number)
+		return fmt.Sprintf("i%d", s.Number)
 	}
-	return "scan"
+	if task.Spec.Kind == "brainstorm" && task.Labels[tatarav1alpha1.LabelActivity] == "healthCheck" {
+		return "hc"
+	}
+	if task.Spec.Kind == "incident" {
+		return task.Spec.DedupKey
+	}
+	if task.Spec.Kind == "documentation" {
+		return shortSourceHeadSHA(task)
+	}
+	return ""
 }
 
 // BuildPodName composes the descriptive wrapper Pod/Service name for a Task:
 //
-//	tatara-<project>-<gh|gl>-<repo>-<issue-N|mr-N|brainstorm|scan>
+//	<type>-<project>-<repo>-<i|p><id>
 //
-// repoRef is dropped when empty (project-board items not bound to a repo). The
-// result is sanitized to a DNS-1123 label and capped at 63 chars (the Service
-// name limit).
-func BuildPodName(projectName, provider, repoRef string, task *tatarav1alpha1.Task) string {
-	parts := []string{"tatara", projectName, providerAbbrev(provider)}
-	if repoRef != "" {
-		parts = append(parts, repoRef)
+// project and repo are trimmed dynamically (splitTrimBudget) to use the full
+// 63-char DNS-1123 budget as efficiently as possible; the id segment is
+// dropped entirely when podNameIDSegment returns "". repoRef is dropped when
+// empty (project-board items not bound to a repo). sanitizeDNS1123 is the
+// final hard-cap backstop.
+func BuildPodName(projectName, repoRef string, task *tatarav1alpha1.Task) string {
+	typ := typeAbbrev(AgentKind(task))
+	id := podNameIDSegment(task)
+
+	fixed := len(typ)
+	if id != "" {
+		fixed += 1 + len(id) // "-" + id
 	}
-	parts = append(parts, podNameSuffix(task))
+	sepCount := 1 // typ-project
+	if repoRef != "" {
+		sepCount++ // project-repo
+	}
+	if id != "" {
+		sepCount++ // repo/project - id
+	}
+	fixed += sepCount
+
+	budget := 63 - fixed
+	if budget < 0 {
+		budget = 0
+	}
+
+	project, repo := splitTrimBudget(projectName, repoRef, budget)
+
+	parts := []string{typ, project}
+	if repo != "" {
+		parts = append(parts, repo)
+	}
+	if id != "" {
+		parts = append(parts, id)
+	}
 	return sanitizeDNS1123(strings.Join(parts, "-"))
+}
+
+// splitTrimBudget divides budget characters between project and repoRef,
+// proportional to their original lengths, so both stay as readable as
+// possible instead of one being truncated to nothing while the other keeps
+// unused headroom. repoRef == "" short-circuits: project gets the whole
+// budget and repo stays empty (BuildPodName omits it from the name).
+func splitTrimBudget(project, repoRef string, budget int) (string, string) {
+	if repoRef == "" {
+		return trimTo(project, budget), ""
+	}
+	total := len(project) + len(repoRef)
+	if total <= budget {
+		return project, repoRef
+	}
+	if total == 0 || budget <= 0 {
+		return "", ""
+	}
+	projectBudget := budget * len(project) / total
+	repoBudget := budget - projectBudget
+	return trimTo(project, projectBudget), trimTo(repoRef, repoBudget)
+}
+
+// trimTo caps s at n chars, trimming a trailing "-" left dangling by the cut
+// so the result never ends mid-separator.
+func trimTo(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if len(s) <= n {
+		return s
+	}
+	return strings.TrimRight(s[:n], "-")
 }
 
 // StampPodName sets the descriptive Pod-name annotation on a freshly-built Task,
 // creating the annotation map when absent. Call it at Task creation, after Kind
 // and Source are set.
-func StampPodName(task *tatarav1alpha1.Task, projectName, provider, repoRef string) {
+func StampPodName(task *tatarav1alpha1.Task, projectName, repoRef string) {
 	if task.Annotations == nil {
 		task.Annotations = map[string]string{}
 	}
-	task.Annotations[PodNameAnnotation] = BuildPodName(projectName, provider, repoRef, task)
+	task.Annotations[PodNameAnnotation] = BuildPodName(projectName, repoRef, task)
 }
 
 // sanitizeDNS1123 lowercases s, collapses every run of non-[a-z0-9] into a single

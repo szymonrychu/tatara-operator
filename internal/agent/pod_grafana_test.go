@@ -78,34 +78,36 @@ func incidentTask(groupHash string) *tatarav1alpha1.Task {
 	}
 }
 
-// TestIncidentPodSuffix_ContainsIncident verifies the suffix starts with "incident".
-func TestIncidentPodSuffix_ContainsIncident(t *testing.T) {
+// TestIncidentPodIDSegment_IsDedupKey verifies the id segment equals the
+// task's DedupKey.
+func TestIncidentPodIDSegment_IsDedupKey(t *testing.T) {
 	task := incidentTask("abc123")
-	suffix := podNameSuffix(task)
-	if len(suffix) < len("incident") || suffix[:8] != "incident" {
-		t.Fatalf("suffix %q does not start with 'incident'", suffix)
+	id := podNameIDSegment(task)
+	if id != "abc123" {
+		t.Fatalf("id segment = %q, want 'abc123'", id)
 	}
 }
 
-// TestIncidentPodSuffix_UniquePerAlertGroup verifies two tasks with different
-// Spec.DedupKey values produce different pod name suffixes (and thus different
-// pod names), preventing incident Tasks from colliding on the same pod name.
-func TestIncidentPodSuffix_UniquePerAlertGroup(t *testing.T) {
+// TestIncidentPodIDSegment_UniquePerAlertGroup verifies two tasks with
+// different Spec.DedupKey values produce different pod name id segments (and
+// thus different pod names), preventing incident Tasks from colliding on the
+// same pod name.
+func TestIncidentPodIDSegment_UniquePerAlertGroup(t *testing.T) {
 	taskA := incidentTask("group-hash-aaa")
 	taskB := incidentTask("group-hash-bbb")
-	suffixA := podNameSuffix(taskA)
-	suffixB := podNameSuffix(taskB)
-	if suffixA == suffixB {
-		t.Fatalf("incident tasks with different alert groups must produce different suffixes; both got %q", suffixA)
+	idA := podNameIDSegment(taskA)
+	idB := podNameIDSegment(taskB)
+	if idA == idB {
+		t.Fatalf("incident tasks with different alert groups must produce different id segments; both got %q", idA)
 	}
 }
 
-// TestIncidentPodSuffix_NoLabelFallback verifies a graceful fallback when
-// DedupKey is absent.
-func TestIncidentPodSuffix_NoLabelFallback(t *testing.T) {
+// TestIncidentPodIDSegment_NoLabelFallback verifies a graceful fallback (empty
+// id segment, dropped by BuildPodName) when DedupKey is absent.
+func TestIncidentPodIDSegment_NoLabelFallback(t *testing.T) {
 	task := incidentTask("")
-	suffix := podNameSuffix(task)
-	if suffix != "incident" {
-		t.Fatalf("incident task with no alert-group label should produce 'incident', got %q", suffix)
+	id := podNameIDSegment(task)
+	if id != "" {
+		t.Fatalf("incident task with no alert-group label should produce empty id segment, got %q", id)
 	}
 }

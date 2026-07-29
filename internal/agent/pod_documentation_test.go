@@ -55,18 +55,19 @@ func TestTaskBranch_DocumentationFallsBackWithoutSHA(t *testing.T) {
 	require.Equal(t, "tatara/task-documentation-abc123", TaskBranch(task))
 }
 
-// TestPodNameSuffix_Documentation asserts the pod-name suffix is SHA-derived
-// so concurrent documentation Tasks (SHA-keyed, no issue/PR Number) do not
-// collide on the pod-name slot.
-func TestPodNameSuffix_Documentation(t *testing.T) {
+// TestPodNameIDSegment_Documentation asserts the pod-name id segment is
+// SHA-derived so concurrent documentation Tasks (SHA-keyed, no issue/PR
+// Number) do not collide on the pod-name slot, and empty (dropped by
+// BuildPodName) when no SHA annotation is present.
+func TestPodNameIDSegment_Documentation(t *testing.T) {
 	withSHA := &tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{tatarav1alpha1.AnnSourceHeadSHA: "deadbeef1234"}},
 		Spec:       tatarav1alpha1.TaskSpec{Kind: "documentation"},
 	}
-	require.Equal(t, "docs-deadbee", podNameSuffix(withSHA))
+	require.Equal(t, "deadbee", podNameIDSegment(withSHA))
 
 	withoutSHA := &tatarav1alpha1.Task{Spec: tatarav1alpha1.TaskSpec{Kind: "documentation"}}
-	require.Equal(t, "docs", podNameSuffix(withoutSHA))
+	require.Equal(t, "", podNameIDSegment(withoutSHA))
 }
 
 // TestBuildPod_Documentation asserts the full per-kind wiring for a
