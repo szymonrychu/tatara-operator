@@ -75,6 +75,17 @@ func ReviewFindingDegradedCounter(provider, reason string) prometheus.Counter {
 	return reviewFindingDegradedTotal.WithLabelValues(provider, reason)
 }
 
+// CIRedExitTotal counts red-CI exits (issue #476), by the repo whose required
+// check failed and the stage the Task left for. `from` separates the two guards
+// that share the edge: `reviewing` is the promotion that never happened,
+// `merging` is the 4h poll that was cut short. A flat 0 on `merging` with a
+// non-zero `reviewing` is the intended steady state - the reviewing guard is
+// supposed to make the merging one unreachable.
+var CIRedExitTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "operator_ci_red_exit_total",
+	Help: "Tasks routed off a red required check at the reviewed head, by repo, source stage and target stage (issue #476).",
+}, []string{"repo", "from", "to"})
+
 // ClearMergeCursorStalled deletes every MergeCursorStalledSeconds series for a
 // Task. Called when the Task leaves merging, for any reason.
 func ClearMergeCursorStalled(task string) {
@@ -83,5 +94,5 @@ func ClearMergeCursorStalled(task string) {
 
 func init() {
 	ctrlmetrics.Registry.MustRegister(UnexpectedMergeTotal, MergeCursorStalledSeconds,
-		ReviewPostTotal, reviewFindingDegradedTotal)
+		ReviewPostTotal, reviewFindingDegradedTotal, CIRedExitTotal)
 }

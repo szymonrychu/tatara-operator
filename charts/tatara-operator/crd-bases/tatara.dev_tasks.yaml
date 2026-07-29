@@ -224,6 +224,16 @@ spec:
                   comments - and nothing was counting, so a human found it by reading the
                   thread. operator_bot_rounds is its fleet-wide view.
                 type: integer
+              ciRedReentries:
+                description: |-
+                  CIRedReentries bounds the FIFTH cycle: the red-CI bounce back to
+                  implementing (issue #476). A DETERMINISTICALLY red required check on the
+                  reviewed head can never merge, so the Task is routed back to the agent that
+                  can fix it instead of being promoted into merging (or left there polling a
+                  verdict that will never change until the 4h budget parks it). Like every
+                  other bounce it spawns pods, so it gets a counter.
+                  Cap 3 -> failed(ci-blocked).
+                type: integer
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current
@@ -529,6 +539,38 @@ spec:
                 - failed
                 - parked
                 type: string
+              stageElapsedCarrySeconds:
+                description: |-
+                  StageElapsedCarrySeconds is the WORK-clock time already spent in the
+                  current merging/deploying attempt, carried across a
+                  parked(merge-timeout|deploy-timeout) <-> merging|deploying round-trip
+                  (issue #480). stage.Enter re-stamps StageEnteredAt on EVERY transition
+                  (fix V7-4) - deliberately, for every OTHER edge - so a bare re-entry into
+                  the SAME stage after its OWN budget elapsed would otherwise buy a full
+                  fresh budget every lap: a capped 3-retry MergeReentries/DeployReentries
+                  cycle (this comment's own H7 fix, above) turned into ~16h of re-testing a
+                  deterministically red CI, because the counter that bounds the LOOP and the
+                  clock that measures the WORK were never the same field.
+
+                  Written in exactly two places, both in stage.Enter, never by a caller: (1)
+                  accumulated with THIS attempt's elapsed time the instant a podless stage's
+                  budget elapses into parked(merge-timeout|deploy-timeout) (before
+                  StageEnteredAt is overwritten), and (2) preserved as-is (not reset to zero
+                  like every other edge) on the matching un-park re-entry
+                  (parked(merge-timeout)->merging, parked(deploy-timeout)->deploying). Every
+                  OTHER transition resets it to zero, including a HEAD-MOVED merging exit
+                  (fix M3-9) or a maintainer-driven fresh implementation
+                  (enterFreshImplementing) - a genuinely fresh entry into merging/deploying
+                  must never inherit a stale carry from an unrelated earlier cycle.
+
+                  stage.ArmedClock's podless WORK clock, operator_task_stage_age_seconds and
+                  operator_merge_cursor_stalled_seconds all read this back (added to
+                  now.Sub(StageEnteredAt)) so the re-entered clock reads CONTINUOUS elapsed
+                  time rather than a sawtooth that resets every re-entry - which also means
+                  the very next reconcile pass after an un-park catches a still-red MR
+                  instead of waiting out another full budget, collapsing the ~16h worst case
+                  down to roughly one budget plus a few reconcile ticks.
+                type: integer
               stageEnteredAt:
                 description: |-
                   StageEnteredAt is stamped on EVERY stage transition. It is the clock for the

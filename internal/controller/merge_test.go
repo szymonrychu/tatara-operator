@@ -51,6 +51,9 @@ type fakeForge struct {
 	commentErr error
 	// mergeErr, when set, is what Merge returns.
 	mergeErr error
+	// prStateErr, when set, is what GetPRState returns. The red-CI gate's
+	// fail-open behaviour is asserted against it.
+	prStateErr error
 	// mergePanics makes Merge panic. The fork-PR test uses it: a kind=review
 	// Task must NEVER reach merging, unconditionally.
 	mergePanics bool
@@ -120,6 +123,9 @@ func (f *fakeForge) GetPRHead(_ context.Context, _, _ string, number int) (strin
 }
 
 func (f *fakeForge) GetPRState(_ context.Context, _, _ string, number int) (scm.PRState, error) {
+	if f.prStateErr != nil {
+		return scm.PRState{}, f.prStateErr
+	}
 	st, ok := f.state[number]
 	if !ok {
 		st = scm.PRState{CIStatus: "success", HeadSHA: f.head[number]}
