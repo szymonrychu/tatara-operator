@@ -72,8 +72,12 @@ func TestDeliverPendingEvent_UnownedMRStub_CommentDrivesUnpark(t *testing.T) {
 	if len(got.Status.PendingEvents) != 1 {
 		t.Fatalf("pendingEvents = %d, want 1 (event routed via the intake natural key)", len(got.Status.PendingEvents))
 	}
-	if got.Status.Stage != tatarav1.StageReviewing {
-		t.Fatalf("stage = %s(%s), want reviewing: the human comment must drive the unpark",
+	// conversing, not bare reviewing: the F.6 awaiting-human unpark prefers a
+	// live conversation over conversingHasRoom (reactive-agent-triggering,
+	// PR #475) whenever the project has room for one, which this project does
+	// by default. This assertion predates that feature landing.
+	if got.Status.Stage != tatarav1.StageConversing {
+		t.Fatalf("stage = %s(%s), want conversing: the human comment must drive the unpark",
 			got.Status.Stage, got.Status.StageReason)
 	}
 }

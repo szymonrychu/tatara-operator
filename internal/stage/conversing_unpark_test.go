@@ -36,8 +36,12 @@ func TestUnpark_ConversingTargets(t *testing.T) {
 			room: true, issues: []v1alpha1.Issue{openIssue("approved")}, target: v1alpha1.StageImplementing,
 		},
 		{
-			name: "review kind stays on the reviewing rule", reason: stage.ReasonAwaitingHuman, kind: "review",
-			room: true, target: v1alpha1.StageReviewing,
+			name: "review kind, awaiting-human, room: conversing like every other awaiting-human comment", reason: stage.ReasonAwaitingHuman, kind: "review",
+			room: true, target: v1alpha1.StageConversing,
+		},
+		{
+			name: "review kind, awaiting-human, NO room: falls back to the reviewing rule", reason: stage.ReasonAwaitingHuman, kind: "review",
+			room: false, target: v1alpha1.StageReviewing,
 		},
 	}
 
@@ -116,6 +120,62 @@ func TestUnpark_IdentityUnverifiedReviewKindGuardedLikeAwaitingHuman(t *testing.
 
 	t.Run("review kind, no merged MR, under the round cap: conversing, round incremented", func(t *testing.T) {
 		task := parkedTask("review", stage.ReasonIdentityUnverified)
+		humanEvent(task)
+		task.Status.HumanReviewRounds = 2
+		target, decline := stage.UnparkDetailed(stage.UnparkInput{
+			Task: task, MRs: []v1alpha1.MergeRequest{openMR()},
+			ConversingHasRoom: true, Now: now,
+		})
+		if target != v1alpha1.StageConversing {
+			t.Fatalf("target = %q (decline %q), want conversing", target, decline)
+		}
+		if task.Status.HumanReviewRounds != 3 {
+			t.Fatalf("HumanReviewRounds = %d, want 3 (2 + 1)", task.Status.HumanReviewRounds)
+		}
+	})
+
+	t.Run("review kind, an owned MR already merged: refused, never re-enters", func(t *testing.T) {
+		task := parkedTask("review", stage.ReasonAwaitingHuman)
+		humanEvent(task)
+		target, decline := stage.UnparkDetailed(stage.UnparkInput{
+			Task: task, MRs: []v1alpha1.MergeRequest{mergedMR()},
+			ConversingHasRoom: true, Now: now,
+		})
+		if target != "" || decline != stage.DeclineMergedMR {
+			t.Fatalf("target=%q decline=%q, want (\"\", %q)", target, decline, stage.DeclineMergedMR)
+		}
+	})
+
+	t.Run("review kind, at the round cap: refused, no runaway pod spawn", func(t *testing.T) {
+		task := parkedTask("review", stage.ReasonAwaitingHuman)
+		humanEvent(task)
+		task.Status.HumanReviewRounds = v1alpha1.MaxHumanReviewRounds
+		target, decline := stage.UnparkDetailed(stage.UnparkInput{
+			Task: task, MRs: []v1alpha1.MergeRequest{openMR()},
+			ConversingHasRoom: true, Now: now,
+		})
+		if target != "" || decline != stage.DeclineRoundsExhausted {
+			t.Fatalf("target=%q decline=%q, want (\"\", %q)", target, decline, stage.DeclineRoundsExhausted)
+		}
+		if task.Status.HumanReviewRounds != v1alpha1.MaxHumanReviewRounds {
+			t.Fatalf("HumanReviewRounds = %d, want unchanged at %d", task.Status.HumanReviewRounds, v1alpha1.MaxHumanReviewRounds)
+		}
+	})
+}
+
+// TestUnpark_AwaitingHumanReviewKindGuardedLikeIdentityUnverified is #508: the
+// awaiting-human arm used to hard-code StageReviewing for kind=review,
+// bypassing the conversing/idle-TTL path (and its ceiling) that every other
+// awaiting-human re-entry gets - the maintainer's "review agent stays alive on
+// a comment until approve or 1h" never had a mechanism under it. It now
+// carries the SAME three guards as the identity-unverified review arm above
+// (merged-MR, round cap, round increment), because it is spawning the exact
+// same review pod under the exact same runaway-loop risk.
+func TestUnpark_AwaitingHumanReviewKindGuardedLikeIdentityUnverified(t *testing.T) {
+	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+
+	t.Run("review kind, no merged MR, under the round cap: conversing, round incremented", func(t *testing.T) {
+		task := parkedTask("review", stage.ReasonAwaitingHuman)
 		humanEvent(task)
 		task.Status.HumanReviewRounds = 2
 		target, decline := stage.UnparkDetailed(stage.UnparkInput{

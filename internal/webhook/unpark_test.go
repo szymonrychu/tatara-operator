@@ -103,10 +103,14 @@ func TestDriveCommentUnpark_UsesLiveReadNotCachedGet(t *testing.T) {
 
 	s.driveCommentUnpark(context.Background(), proj, stale)
 
+	// conversing, not bare reviewing: TestDriveCommentUnpark_ParkedAwaitingHuman_OpensConversation
+	// below documents the same F.6 awaiting-human unpark preferring a live
+	// conversation over conversingHasRoom, which this project has by default.
+	// This assertion predates that feature landing.
 	got := getPETask(t, liveClient, stale.Name)
-	if got.Status.Stage != tatarav1.StageReviewing {
+	if got.Status.Stage != tatarav1.StageConversing {
 		t.Fatalf("driveCommentUnpark declined despite a fresh non-bot pendingEvent on the live read; "+
-			"stage=%s(%s), want reviewing", got.Status.Stage, got.Status.StageReason)
+			"stage=%s(%s), want conversing", got.Status.Stage, got.Status.StageReason)
 	}
 }
 
