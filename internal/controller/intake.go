@@ -127,7 +127,7 @@ func (m *Minter) MintForItem(ctx context.Context, proj *tatarav1alpha1.Project,
 		case PRReview:
 			stg, reason := MintReviewStage(cr)
 			return m.MintReviewTask(ctx, proj, repo, item.PR, cr, stg, reason, sp)
-		default: // PRAdopt (sweep-only) / PRIgnore
+		default: // PRAdopt / PRClaimed (both sweep-only) / PRIgnore
 			return nil, false, nil
 		}
 	}

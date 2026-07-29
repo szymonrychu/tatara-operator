@@ -283,6 +283,13 @@ prometheusRule:
   turnSubmitP95LatencyThreshold: 5
   ingestStaleAfterSeconds: 93600
   sweepStaleAfterSeconds: 10800
+  # sweepSkipWindow / sweepSkipPassThreshold gate TataraSweepSkipPersistent. The
+  # sweep runs on the project's issueScan cron (4h in practice), so 6 skips in
+  # 24h is "every pass for a full day" - long past a transient claim and into a
+  # Task that has stopped progressing. Raise the threshold, never the window
+  # alone, if a project sweeps more often.
+  sweepSkipWindow: "24h"
+  sweepSkipPassThreshold: 6
   additionalLabels: {}
 
 # dashboard ships the "Tatara Loop" Grafana dashboard as a ConfigMap labelled

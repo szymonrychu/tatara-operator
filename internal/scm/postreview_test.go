@@ -20,11 +20,32 @@ import (
 
 func readJSON(t *testing.T, r *http.Request) map[string]any {
 	t.Helper()
+	m, _ := readJSONRaw(t, r)
+	return m
+}
+
+// readJSONRaw also returns the request body verbatim, so a test can assert on a
+// key that must not appear ANYWHERE in the payload.
+func readJSONRaw(t *testing.T, r *http.Request) (map[string]any, string) {
+	t.Helper()
 	buf, err := io.ReadAll(r.Body)
 	require.NoError(t, err)
 	var m map[string]any
 	require.NoError(t, json.Unmarshal(buf, &m))
-	return m
+	return m, string(buf)
+}
+
+// ghFilesJSON is a GET /pulls/{n}/files response making every listed path fully
+// anchorable: one hunk covering new-side lines 1..10000.
+func ghFilesJSON(t *testing.T, paths ...string) string {
+	t.Helper()
+	files := make([]map[string]string, 0, len(paths))
+	for _, p := range paths {
+		files = append(files, map[string]string{"filename": p, "patch": "@@ -1,10000 +1,10000 @@\n context"})
+	}
+	buf, err := json.Marshal(files)
+	require.NoError(t, err)
+	return string(buf)
 }
 
 // ---------------------------------------------------------------------------
@@ -62,27 +83,40 @@ func TestGitHubPostReview_AlwaysCommentEvent_BothVerdicts(t *testing.T) {
 	}
 }
 
-// A file-level finding (no line; the CR->scm bridge lowers a nil *int to 0, #398)
-// must NOT be sent as a line=0 review comment - GitHub 422s that. It posts as a
-// file-level comment (subject_type=file, no line key) instead, so the finding
-// lands and the review does not park.
-func TestGitHubPostReview_FileLevelFindingPostsSubjectTypeFile(t *testing.T) {
+// MODE A (#482). `subject_type` is NOT a field on GitHub's
+// DraftPullRequestReviewComment - it exists only on the standalone
+// POST /pulls/{n}/comments endpoint. Sending it inside the ATOMIC create-review
+// comments[] array 422s the WHOLE review ("Field is not defined on
+// DraftPullRequestReviewComment"), and that 422 is TERMINAL, so an entire
+// completed review round is discarded because of one line-less finding. A
+// file-level finding (no line; the CR->scm bridge lowers a nil *int to 0, #398)
+// is therefore folded into the review BODY instead, where it still reaches the
+// author.
+func TestGitHubPostReview_NeverSendsSubjectTypeAndFoldsLinelessFindingIntoBody(t *testing.T) {
+	before := testutil.ToFloat64(obs.ReviewFindingDegradedCounter("github", "unanchorable"))
 	c := newGitHub(t, func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, "/repos/o/r/pulls/5/reviews", r.URL.Path)
-		in := readJSON(t, r)
-		comments, _ := in["comments"].([]any)
-		require.Len(t, comments, 2)
-		fileLevel := comments[0].(map[string]any)
-		require.Equal(t, "docs/README.md", fileLevel["path"])
-		require.Equal(t, "file", fileLevel["subject_type"])
-		_, hasLine := fileLevel["line"]
-		require.False(t, hasLine, "a file-level comment must carry NO line key: GitHub 422s line=0")
-		lineLevel := comments[1].(map[string]any)
-		require.Equal(t, float64(12), lineLevel["line"])
-		_, hasSubj := lineLevel["subject_type"]
-		require.False(t, hasSubj, "a line-anchored comment carries no subject_type")
-		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write([]byte(`{"id":7,"state":"COMMENTED"}`))
+		switch r.URL.Path {
+		case "/repos/o/r/pulls/5/files":
+			_, _ = w.Write([]byte(ghFilesJSON(t, "a.go")))
+		case "/repos/o/r/pulls/5/reviews":
+			in, raw := readJSONRaw(t, r)
+			require.NotContains(t, raw, "subject_type",
+				"subject_type is not defined on DraftPullRequestReviewComment: it 422s the WHOLE review")
+			comments, _ := in["comments"].([]any)
+			require.Len(t, comments, 1, "only the line-anchored finding is an inline comment")
+			lineLevel := comments[0].(map[string]any)
+			require.Equal(t, "a.go", lineLevel["path"])
+			require.Equal(t, float64(12), lineLevel["line"])
+
+			body, _ := in["body"].(string)
+			require.Contains(t, body, "file-level note", "the line-less finding must still reach the author")
+			require.Contains(t, body, "docs/README.md", "and must say which file it is about")
+			require.True(t, strings.HasPrefix(body, "body"), "the caller's body (and its round marker) stays first")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":7,"state":"COMMENTED"}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
 	})
 	findings := []ReviewFinding{
 		{Path: "docs/README.md", Line: 0, Body: "file-level note", Severity: "medium"},
@@ -91,6 +125,166 @@ func TestGitHubPostReview_FileLevelFindingPostsSubjectTypeFile(t *testing.T) {
 	id, err := c.PostReview(context.Background(), "https://github.com/o/r", "tok", 5, "body", findings)
 	require.NoError(t, err)
 	require.Equal(t, "7", id)
+
+	after := testutil.ToFloat64(obs.ReviewFindingDegradedCounter("github", "unanchorable"))
+	require.Equal(t, float64(1), after-before, "the folded finding is counted as a degrade, at parity with GitLab")
+}
+
+// MODE B (#482), and the root cause of both modes: the GitHub create-review call
+// is ATOMIC, so a single finding GitHub cannot anchor ("Line could not be
+// resolved") 422s the WHOLE review and the round is lost. Every finding is
+// therefore pre-checked against the PR's new-side diff hunks - exactly as the
+// GitLab path does - and the unanchorable ones degrade into the review body
+// rather than destroying the round.
+func TestGitHubPostReview_UnanchorableFindingDegradesToBodyAndRoundCompletes(t *testing.T) {
+	before := testutil.ToFloat64(obs.ReviewFindingDegradedCounter("github", "unanchorable"))
+	var filesHits int
+	c := newGitHub(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/o/r/pulls/5/files":
+			filesHits++
+			// a.go has a hunk at new-side lines 5..14; b.go is not in the diff at all.
+			// bin.png is in the PR but carries no patch (binary/too large).
+			_, _ = w.Write([]byte(`[
+              {"filename":"a.go","patch":"@@ -5,10 +5,10 @@ func f() {\n context"},
+              {"filename":"bin.png","status":"modified"}
+            ]`))
+		case "/repos/o/r/pulls/5/reviews":
+			in, raw := readJSONRaw(t, r)
+			require.NotContains(t, raw, "subject_type")
+			comments, _ := in["comments"].([]any)
+			require.Len(t, comments, 1, "only the anchorable finding is posted inline")
+			require.Equal(t, "a.go", comments[0].(map[string]any)["path"])
+			require.Equal(t, float64(10), comments[0].(map[string]any)["line"])
+
+			body, _ := in["body"].(string)
+			require.Contains(t, body, "line off the hunk")
+			require.Contains(t, body, "file not in the diff")
+			require.Contains(t, body, "file-level, no line")
+			require.Contains(t, body, "binary file, no patch")
+			require.NotContains(t, body, "anchorable inline", "an inline finding is NOT duplicated into the body")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":8,"state":"COMMENTED"}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	})
+	body := ReviewMarker("1", "head1") + "\n## Review: changes requested\n\ndetail"
+	findings := []ReviewFinding{
+		{Path: "a.go", Line: 10, Body: "anchorable inline", Severity: "high"},
+		{Path: "a.go", Line: 999, Body: "line off the hunk", Severity: "low"},
+		{Path: "b.go", Line: 3, Body: "file not in the diff", Severity: "low"},
+		{Path: "c.go", Line: 0, Body: "file-level, no line", Severity: "medium"},
+		{Path: "bin.png", Line: 2, Body: "binary file, no patch", Severity: "low"},
+	}
+	id, err := c.PostReview(context.Background(), "https://github.com/o/r", "tok", 5, body, findings)
+	require.NoError(t, err, "an unanchorable finding must NOT destroy the round")
+	require.Equal(t, "8", id)
+	require.Equal(t, 1, filesHits, "the diff is read ONCE per post")
+
+	after := testutil.ToFloat64(obs.ReviewFindingDegradedCounter("github", "unanchorable"))
+	require.Equal(t, float64(4), after-before, "one degrade metric per unanchorable finding")
+}
+
+// Every finding unanchorable means NO comments array at all - and the review must
+// still post, carrying all of them in its body, rather than sending comments:[]
+// or being skipped.
+func TestGitHubPostReview_AllFindingsUnanchorableStillPostsTheReview(t *testing.T) {
+	c := newGitHub(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/o/r/pulls/5/files":
+			_, _ = w.Write([]byte(`[]`))
+		case "/repos/o/r/pulls/5/reviews":
+			in := readJSON(t, r)
+			_, hasComments := in["comments"]
+			require.False(t, hasComments, "no anchorable finding means no comments key")
+			require.Contains(t, in["body"], "only finding")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":9,"state":"COMMENTED"}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	})
+	id, err := c.PostReview(context.Background(), "https://github.com/o/r", "tok", 5, "b",
+		[]ReviewFinding{{Path: "a.go", Line: 4, Body: "only finding"}})
+	require.NoError(t, err)
+	require.Equal(t, "9", id)
+}
+
+// The CRD permits 30 findings of 8 KiB each plus a 16 KiB body. Folding all of
+// them into the review body would blow past GitHub's 65536-character limit and
+// 422 - a TERMINAL 422, i.e. the exact review-destroying failure this path exists
+// to prevent. The degraded section is truncated so the round still lands.
+func TestGitHubPostReview_DegradedBodyStaysUnderGitHubsSizeLimit(t *testing.T) {
+	var gotBody string
+	c := newGitHub(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/o/r/pulls/5/files":
+			_, _ = w.Write([]byte(`[]`))
+		case "/repos/o/r/pulls/5/reviews":
+			in := readJSON(t, r)
+			gotBody, _ = in["body"].(string)
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":12,"state":"COMMENTED"}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	})
+	findings := make([]ReviewFinding, 30) // the CRD's MaxItems
+	for i := range findings {
+		findings[i] = ReviewFinding{Path: fmt.Sprintf("f%d.go", i), Line: i + 1,
+			Body: strings.Repeat("x", 8192)} // the CRD's MaxLength
+	}
+	_, err := c.PostReview(context.Background(), "https://github.com/o/r", "tok", 5,
+		strings.Repeat("b", 16384), findings)
+	require.NoError(t, err)
+	require.Less(t, len(gotBody), 65536, "GitHub rejects a review body over 65536 characters")
+	require.Contains(t, gotBody, "more finding(s) omitted", "and it says what it dropped")
+}
+
+// A verdict-only review (no findings) must not spend an API call on the diff.
+func TestGitHubPostReview_NoFindingsDoesNotReadTheDiff(t *testing.T) {
+	c := newGitHub(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/files") {
+			t.Fatalf("a review with no findings must not read the PR diff")
+		}
+		require.Equal(t, "/repos/o/r/pulls/5/reviews", r.URL.Path)
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"id":10,"state":"COMMENTED"}`))
+	})
+	id, err := c.PostReview(context.Background(), "https://github.com/o/r", "tok", 5, "b", nil)
+	require.NoError(t, err)
+	require.Equal(t, "10", id)
+}
+
+// The changed-files read is PAGINATED. A PR with more than 100 changed files
+// whose second page is never fetched would degrade every finding on it, silently
+// stripping a whole review of its inline anchors.
+func TestGitHubPostReview_AnchorabilityIndexFollowsPagination(t *testing.T) {
+	c := newGitHub(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/repos/o/r/pulls/5/files" && r.URL.Query().Get("page") != "2":
+			w.Header().Set("Link", `<http://`+r.Host+`/repos/o/r/pulls/5/files?per_page=100&page=2>; rel="next"`)
+			_, _ = w.Write([]byte(ghFilesJSON(t, "page1.go")))
+		case r.URL.Path == "/repos/o/r/pulls/5/files":
+			_, _ = w.Write([]byte(ghFilesJSON(t, "page2.go")))
+		case r.URL.Path == "/repos/o/r/pulls/5/reviews":
+			in := readJSON(t, r)
+			comments, _ := in["comments"].([]any)
+			require.Len(t, comments, 2, "a file on page 2 of the diff is anchorable too")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":11,"state":"COMMENTED"}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	})
+	findings := []ReviewFinding{
+		{Path: "page1.go", Line: 3, Body: "f0"},
+		{Path: "page2.go", Line: 4, Body: "f1"},
+	}
+	id, err := c.PostReview(context.Background(), "https://github.com/o/r", "tok", 5, "b", findings)
+	require.NoError(t, err)
+	require.Equal(t, "11", id)
 }
 
 // ---------------------------------------------------------------------------
@@ -174,6 +368,8 @@ func TestGitHubPostReview_CommentIDsComeFromSecondRead(t *testing.T) {
 	var createHits, listHits int
 	c := newGitHub(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
+		case "/repos/o/r/pulls/5/files":
+			_, _ = w.Write([]byte(ghFilesJSON(t, "a.go", "b.go")))
 		case "/repos/o/r/pulls/5/reviews":
 			createHits++
 			in := readJSON(t, r)
