@@ -23,6 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/controller"
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/queue"
@@ -599,7 +600,7 @@ func TestOutcome_Review_RecordsReviewOutcomeMetric(t *testing.T) {
 // --- clarify ---------------------------------------------------------------
 
 // Approval is in NO schema. The agent reports decision=implement with a reason;
-// the operator INDEPENDENTLY verifies the C.6 grammar over EVERY owned Issue.
+// the operator INDEPENDENTLY runs the C.6 citation check over EVERY owned Issue.
 func TestOutcome_Clarify_ImplementRequiresApprovalOnEveryOwnedIssue(t *testing.T) {
 	i1 := issueV2("tatara-operator", 291, "t1")
 	i2 := issueV2("tatara-operator", 292, "t1")
@@ -638,53 +639,41 @@ func TestOutcome_Clarify_ImplementRequiresApprovalOnEveryOwnedIssue(t *testing.T
 // 2026-07-28 security review IMPORTANT 7: the entire safety claim behind
 // Task 9's identity-unverified -> conversing widening is that conversing ->
 // approved is gated by THIS handler's verifyApprovalScope, which runs the
-// LIVE C.6 grammar and NEVER reads Task.status.approvalVerdict - so a Task
-// arriving at conversing with an absent, zero-value, or predating-the-park
-// verdict (all shapes the F.6 identity-unverified backstop treats as "not
-// authorized" - see unpark_backstop_test.go) must be refused here exactly
-// the same as a Task with no verdict at all. Note for accuracy: a clarify
-// agent standing at conversing CAN move a Task toward code execution, via
-// decision=implement -> approved -> admission to implementing - "cannot
-// reach implementing directly" only ever described the ONE edge, never the
-// two-hop path through a GENUINE grammar pass.
-func TestOutcome_Conversing_ApprovalVerdictIsNeverConsulted(t *testing.T) {
-	cases := []struct {
-		name    string
-		verdict *tatarav1alpha1.ApprovalVerdict
-	}{
-		{name: "absent verdict", verdict: nil},
-		{name: "zero-value verdict (no Author, no CommentExternalID)", verdict: &tatarav1alpha1.ApprovalVerdict{
-			At: metav1.NewTime(frozenNow.Add(-30 * time.Minute)),
-		}},
-		{name: "verdict predating the current park/stage-entry", verdict: &tatarav1alpha1.ApprovalVerdict{
-			At:       metav1.NewTime(frozenNow.Add(-2 * time.Hour)), // StageEnteredAt is frozenNow-1h
-			IssueRef: "iss-old", CommentExternalID: "999", Author: "szymonrychu", Phrase: "go ahead",
-		}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			i1 := issueV2("tatara-operator", 291, "t1")
-			task := taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageConversing, "clarify")
-			task.Status.ApprovalVerdict = tc.verdict
+// LIVE C.6 citation check per request. This test is what certifies that widening:
+// a Task standing at conversing gets NO credit for anything that happened
+// before it arrived there, so when the live citation check refuses, the Task
+// goes straight back to parked(identity-unverified) with no approval stamped.
+//
+// It replaces TestOutcome_Conversing_ApprovalVerdictIsNeverConsulted, which
+// made the same assertion three times over an absent / zero-value /
+// stale-dated Task.status.approvalVerdict. That field is gone as of
+// agent-judged-approval-gate step D, so "the stored verdict is never
+// consulted" is now a property of the type system rather than of this
+// handler, and one case carries the whole claim.
+//
+// Note for accuracy: a clarify agent standing at conversing CAN move a Task
+// toward code execution, via decision=implement -> approved -> admission to
+// implementing - "cannot reach implementing directly" only ever described
+// the ONE edge, never the two-hop path through a GENUINE citation-check pass.
+func TestOutcome_Conversing_ImplementRefusedWhenLiveCitationCheckFails(t *testing.T) {
+	i1 := issueV2("tatara-operator", 291, "t1")
+	task := taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageConversing, "clarify")
 
-			// fakeApproval grants NOTHING: the live C.6 grammar fails on this
-			// request regardless of what status.approvalVerdict claims.
-			e := buildV2(t, v2Opts{
-				writer:   panicForge{},
-				approval: &fakeApproval{grant: map[string]bool{}},
-			}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"), task, i1)
+	// fakeApproval grants NOTHING: the live C.6 citation check fails on this request.
+	e := buildV2(t, v2Opts{
+		writer:   panicForge{},
+		approval: &fakeApproval{grant: map[string]bool{}},
+	}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"), task, i1)
 
-			w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
-				`{"kind":"clarify","payload":{"decision":"implement","reason":"trust the stored verdict"}}`)
-			require.Equal(t, http.StatusOK, w.Code)
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"clarify","payload":{"decision":"implement","reason":"the maintainer surely meant yes"}}`)
+	require.Equal(t, http.StatusOK, w.Code)
 
-			got := e.task(t, "t1")
-			require.Equal(t, tatarav1alpha1.StageParked, got.Status.Stage,
-				"conversing -> approved must be refused: the stored verdict is never consulted")
-			require.Equal(t, "identity-unverified", got.Status.StageReason)
-			require.Empty(t, e.issue(t, i1.Name).Status.Approval, "nothing is stamped when the live scope gate fails")
-		})
-	}
+	got := e.task(t, "t1")
+	require.Equal(t, tatarav1alpha1.StageParked, got.Status.Stage,
+		"conversing -> approved must be refused when the live scope gate fails")
+	require.Equal(t, "identity-unverified", got.Status.StageReason)
+	require.Empty(t, e.issue(t, i1.Name).Status.Approval, "nothing is stamped when the live scope gate fails")
 }
 
 // An auto-approval through the clarify submit path (the primary auto-approve
@@ -713,6 +702,291 @@ func TestOutcome_Clarify_AutoApproveIncrementsCounter(t *testing.T) {
 	require.Equal(t, 1.0, testutil.ToFloat64(metrics.AutoApproveCounter(tatarav1alpha1.ProposalKindBrainstorm)))
 }
 
+// TestOutcome_Clarify_CitationsReachTheVerifierVerbatim: the handler is a pipe.
+// It parses the agent's citations off the clarify payload and hands them to the
+// verifier UNCHANGED, for every owned Issue - it never inspects, normalises or
+// judges them itself. The whole verification lives in controller.verifyOneIssue.
+func TestOutcome_Clarify_CitationsReachTheVerifierVerbatim(t *testing.T) {
+	i1 := issueV2("tatara-operator", 291, "t1")
+	i2 := issueV2("tatara-operator", 292, "t1")
+	fa := &fakeApproval{grant: map[string]bool{i1.Name: true, i2.Name: true}, needCitation: true}
+	e := buildV2(t, v2Opts{writer: panicForge{}, approval: fa},
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"), i1, i2)
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"clarify","payload":{"decision":"implement","reason":"maintainer approved",`+
+			`"approvalCitations":[{"id":"c-2","quote":"go ahead, I approve!"}]}}`)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, tatarav1alpha1.StageApproved, e.task(t, "t1").Status.Stage)
+
+	require.Len(t, fa.gotCitations, 2, "every owned Issue is offered the citation set")
+	for _, got := range fa.gotCitations {
+		require.Equal(t, []tatarav1alpha1.ApprovalCitation{{ID: "c-2", Quote: "go ahead, I approve!"}}, got)
+	}
+}
+
+// TestOutcome_Clarify_CitationRefusalIs200AndParks is the load-bearing contract
+// shape. A missing or failing citation is a REFUSAL, not a client error: 200 +
+// park at identity-unverified, exactly as a failed grammar check did. A
+// mis-instructed agent then parks ONE task instead of deadlocking the fleet.
+// Only malformed JSON and a missing decision / blank reason stay 4xx.
+func TestOutcome_Clarify_CitationRefusalIs200AndParks(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		body     string
+		approval *fakeApproval
+	}{
+		{
+			name:     "no citations at all",
+			body:     `{"decision":"implement","reason":"maintainer-1 approved"}`,
+			approval: &fakeApproval{grant: map[string]bool{"iss-tatara-operator-291": true}, needCitation: true},
+		},
+		{
+			name: "citations present but the verifier refuses them",
+			body: `{"decision":"implement","reason":"x","approvalCitations":[{"id":"c-1","quote":"go ahead"}]}`,
+			// The verifier refuses (a non-maintainer's comment, a fabricated
+			// quote, a replayed id - the reason is the controller's business).
+			approval: &fakeApproval{grant: map[string]bool{}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			i1 := issueV2("tatara-operator", 291, "t1")
+			e := buildV2(t, v2Opts{writer: panicForge{}, approval: tc.approval},
+				projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+				taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"), i1)
+
+			w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+				`{"kind":"clarify","payload":`+tc.body+`}`)
+			require.Equal(t, http.StatusOK, w.Code, "a refusal is never a 4xx")
+
+			got := e.task(t, "t1")
+			require.Equal(t, tatarav1alpha1.StageParked, got.Status.Stage)
+			require.Equal(t, "identity-unverified", got.Status.StageReason)
+			require.Empty(t, e.issue(t, i1.Name).Status.Approval, "nothing is stamped on a refusal")
+		})
+	}
+}
+
+// TestOutcome_Clarify_BadShapeStays4xx pins the OTHER side of the line: a
+// payload the operator cannot even read is still a client error.
+func TestOutcome_Clarify_BadShapeStays4xx(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"malformed json", `{"decision":`},
+		{"unknown field", `{"decision":"implement","reason":"x","approvalCitation":[]}`},
+		{"unknown field inside a citation", `{"decision":"implement","reason":"x","approvalCitations":[{"id":"c-1","text":"go ahead"}]}`},
+		{"missing decision", `{"reason":"x"}`},
+		{"blank reason", `{"decision":"implement","reason":"   "}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := buildV2(t, v2Opts{writer: panicForge{},
+				approval: &fakeApproval{grant: map[string]bool{"iss-tatara-operator-291": true}}},
+				projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+				taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"),
+				issueV2("tatara-operator", 291, "t1"))
+			w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+				`{"kind":"clarify","payload":`+tc.body+`}`)
+			require.GreaterOrEqual(t, w.Code, 400)
+			require.Less(t, w.Code, 500)
+		})
+	}
+}
+
+// TestOutcome_Clarify_GrantedWithNilEvidenceIsNotWritten: a LIVE Issue that the
+// verifier grants with NO evidence must not approve anything, at either of the
+// two places it could. status=approved with a nil approval is an approved Issue
+// with NO approver - it defeats the idempotence short-circuit, defeats the
+// single-use replay guard, and projects tatara-approved to the forge with nobody
+// behind it.
+//
+// WHICH GUARD ACTUALLY RUNS HERE, since this used to credit the wrong one. With
+// grantWithNilEvidence the request is refused by verifyApprovalScope's
+// `!ok || ev == nil` arm BEFORE the write loop is entered at all, so the
+// writer's own nil guard never executes on this path - deleting it leaves this
+// test green. Both assertions below still earn their place: they pin the OUTCOME
+// (no Issue write, no Task advance) rather than a particular guard, and the Task
+// half is the one that matters, because the earlier half-fix skipped the write
+// and then let control fall through to stage.Enter(approved) anyway. The writer
+// guard's own coverage is negative and lives in
+// TestOutcome_Clarify_ClosedIssueDoesNotBlockALiveOne.
+func TestOutcome_Clarify_GrantedWithNilEvidenceIsNotWritten(t *testing.T) {
+	i1 := issueV2("tatara-operator", 291, "t1")
+	e := buildV2(t, v2Opts{writer: panicForge{},
+		approval: &fakeApproval{grant: map[string]bool{i1.Name: true}, grantWithNilEvidence: true}},
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"), i1)
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"clarify","payload":{"decision":"implement","reason":"x",`+
+			`"approvalCitations":[{"id":"c-2","quote":"go ahead"}]}}`)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	got := e.issue(t, i1.Name)
+	require.Nil(t, got.Status.Approval)
+	require.NotEqual(t, "approved", got.Status.Status,
+		"an approver-less approval must never be written")
+	// Skipping the Issue write is only HALF the guard, and asserting only that
+	// half is what certified the hole below: control still fell through to
+	// stage.Enter(approved), so the Task advanced on an evidence map that
+	// approved nothing.
+	require.NotEqual(t, tatarav1alpha1.StageApproved, e.task(t, "t1").Status.Stage,
+		"the Task must not reach approved on an approver-less approval")
+}
+
+// TestOutcome_Clarify_ClosedIssueIsNotALicence is the gate hole this branch's
+// review found, and it is reachable by a HUMAN, not just a misbehaving agent.
+//
+// ownedIssues returns every owned Issue whatever its state. The verifier returns
+// (iss.Status.Approval, true) for an out-of-scope Issue - correct in isolation,
+// since a closed thread is not pending approval and must not block the others -
+// and that stored approval is routinely nil. verifyApprovalScope then refused
+// only on len(issues)==0, so a Task whose ONLY Issue a human had CLOSED produced
+// granted=true over an all-nil map: no citation, no maintainer comment, no
+// evidence, and decision=implement walked to approved and on to implementing.
+//
+// A human CLOSING the issue is the strongest veto they have. It must not be the
+// thing that releases the work. THE EMPTY SET IS NOT A LICENCE: all([]) == true
+// must never gate code execution, and after the Task-level twin was deleted this
+// loop is the only place that principle is enforced at all.
+func TestOutcome_Clarify_ClosedIssueIsNotALicence(t *testing.T) {
+	closed := issueV2("tatara-operator", 291, "t1", func(i *tatarav1alpha1.Issue) {
+		i.Status.State = "closed"
+	})
+	e := buildV2(t, v2Opts{writer: panicForge{}, approval: &fakeApproval{}},
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"), closed)
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"clarify","payload":{"decision":"implement","reason":"they closed it, so ship it",`+
+			`"approvalCitations":[{"id":"c-2","quote":"go ahead"}]}}`)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	got := e.task(t, "t1")
+	require.Equal(t, tatarav1alpha1.StageParked, got.Status.Stage,
+		"a Task whose only Issue is CLOSED must not reach approved")
+	require.Equal(t, "identity-unverified", got.Status.StageReason)
+	require.Nil(t, e.issue(t, closed.Name).Status.Approval)
+}
+
+// TestOutcome_Clarify_EmptyScopeRefusalIsAttributed covers the two refusal paths
+// that used to be INVISIBLE. Both return before verifyApprovalScope ever calls
+// VerifyApproval, and the reason constant, the
+// operator_approval_refused_total{reason} increment and the
+// action=approval_refused INFO line all live inside that call - so a Task with
+// no live Issue parked with NO attribution of any kind.
+//
+// The closed-issue row is the one that matters operationally: it is a human
+// CLOSING the only Issue of a clarify Task, the strongest veto they have, and
+// the exact gate hole fix L3-14 closed. The park itself was always alerted
+// (alerts/tatara-operator.yaml matches stageReason NEGATIVELY, so
+// identity-unverified is covered), but a park alert with no reason attribution,
+// next to a WARN naming the wrong cause, sent triage at the clarify agent
+// instead of at the human's veto.
+func TestOutcome_Clarify_EmptyScopeRefusalIsAttributed(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		objs    []client.Object
+		wantOwn float64
+	}{
+		{
+			name: "every owned Issue is out of scope",
+			objs: []client.Object{issueV2("tatara-operator", 291, "t1", func(i *tatarav1alpha1.Issue) {
+				i.Status.State = "closed"
+			})},
+			wantOwn: 1,
+		},
+		{
+			name:    "the Task owns no Issue at all",
+			objs:    nil,
+			wantOwn: 0,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := prometheus.NewRegistry()
+			metrics := obs.NewOperatorMetrics(reg)
+			var logBuf bytes.Buffer
+			base := []client.Object{projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+				taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify")}
+			e := buildV2(t, v2Opts{writer: panicForge{}, metrics: metrics,
+				logger:   slog.New(slog.NewJSONHandler(&logBuf, nil)),
+				approval: &fakeApproval{}},
+				append(base, tc.objs...)...)
+
+			w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+				`{"kind":"clarify","payload":{"decision":"implement","reason":"ship it",`+
+					`"approvalCitations":[{"id":"c-2","quote":"go ahead"}]}}`)
+			require.Equal(t, http.StatusOK, w.Code)
+			require.Equal(t, "identity-unverified", e.task(t, "t1").Status.StageReason)
+
+			require.Equal(t, float64(1),
+				testutil.ToFloat64(metrics.ApprovalRefusedCounter(controller.ApprovalRefusedNoLiveIssue)),
+				"the refusal must move operator_approval_refused_total{reason=no-live-issue}")
+
+			line := findLogLine(t, logBuf.Bytes(), "approval_refused")
+			require.Equal(t, controller.ApprovalRefusedNoLiveIssue, line["reason"])
+			require.Equal(t, "t1", line["task"])
+
+			// The WARN must name the condition and count LIVE Issues, not owned
+			// ones. Reporting len(issues) here counted the very Issues the
+			// refusal was about excluding.
+			warn := findLogLineAtLevel(t, logBuf.Bytes(), "WARN")
+			require.Equal(t, controller.ApprovalRefusedNoLiveIssue, warn["reason"])
+			require.Equal(t, float64(0), warn["live_issues"],
+				"no Issue was in scope; that is the whole refusal")
+			require.Equal(t, tc.wantOwn, warn["owned_issues"])
+		})
+	}
+}
+
+// TestOutcome_Clarify_ClosedIssueDoesNotBlockALiveOne is the other half of the
+// scope filter, and the reason it is a FILTER and not a blanket "every owned
+// Issue must produce evidence". A human closing ONE issue of a multi-issue Task
+// must not strand the rest: the closed thread drops out of the scope loop
+// entirely rather than contributing a nil that refuses the whole Task.
+//
+// It also pins the SECOND place that filter has to be applied. The write loop
+// iterates every OWNED Issue and looks each one up in the evidence map, which
+// deliberately contains no out-of-scope entry - so without the same skip there,
+// this ordinary SUCCESS logged "approval granted with nil evidence; refusing to
+// write an approver-less approval" at ERROR, once per closed Issue, about an
+// approver-less approval that never happened. Nothing was mis-written, but an
+// ERROR naming a security failure on the happy path is a triage trap and
+// violates hard rule 12's level discipline.
+func TestOutcome_Clarify_ClosedIssueDoesNotBlockALiveOne(t *testing.T) {
+	live := issueV2("tatara-operator", 291, "t1")
+	closed := issueV2("tatara-cli", 12, "t1", func(i *tatarav1alpha1.Issue) {
+		i.Status.State = "closed"
+	})
+	var logBuf bytes.Buffer
+	e := buildV2(t, v2Opts{writer: panicForge{},
+		logger:   slog.New(slog.NewJSONHandler(&logBuf, nil)),
+		approval: &fakeApproval{grant: map[string]bool{live.Name: true}, needCitation: true}},
+		projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"), repoV2("tatara-cli", "tatara"),
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"), live, closed)
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"clarify","payload":{"decision":"implement","reason":"maintainer-1 said go ahead",`+
+			`"approvalCitations":[{"id":"c-2","quote":"go ahead"}]}}`)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	require.Equal(t, tatarav1alpha1.StageApproved, e.task(t, "t1").Status.Stage)
+	require.Equal(t, "approved", e.issue(t, live.Name).Status.Status)
+	require.NotEqual(t, "approved", e.issue(t, closed.Name).Status.Status,
+		"the out-of-scope Issue is skipped, never written")
+	// NOT a vacuous absence assertion: deleting the write loop's scope skip
+	// makes this line RED (verified by mutation - the closed Issue's nil lookup
+	// fires the ERROR). It is the only coverage the writer's nil guard has, and
+	// it is what would catch the two scope filters drifting apart again.
+	require.NotContains(t, logBuf.String(), "approver-less approval",
+		"a successful approval alongside a closed Issue must not log an approver-less-approval ERROR")
+	require.NotContains(t, logBuf.String(), `"level":"ERROR"`,
+		"the happy path must log no ERROR at all")
+}
+
 // A nil verifier FAILS CLOSED.
 func TestOutcome_Clarify_NoVerifierFailsClosed(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
@@ -723,6 +997,134 @@ func TestOutcome_Clarify_NoVerifierFailsClosed(t *testing.T) {
 		`{"kind":"clarify","payload":{"decision":"implement","reason":"trust me"}}`)
 	require.Equal(t, http.StatusOK, w.Code)
 	require.Equal(t, "identity-unverified", e.task(t, "t1").Status.StageReason)
+}
+
+// TestOutcome_Clarify_GrantIsAuditedWithTheApprover is the counterpart to the
+// refusal telemetry, and the asymmetry it closes is not cosmetic. A REFUSAL is
+// recorded twice (operator_approval_refused_total{reason} and an
+// action=approval_refused INFO line); the GRANT was recorded only as
+// action=submit_outcome, outcome=implement, issues=N, which names neither the
+// approver nor the comment. The only other record of who approved is
+// Issue.Status.Approval, and that is ONE slot overwritten by the next approval
+// on the same Issue - so without this line, "who released this change into
+// push-CD" becomes unanswerable the moment a second approval lands. This is the
+// most security-relevant business action in the system; hard rule 12 wants it at
+// INFO with structured fields.
+//
+// The field names are pinned deliberately: they are exactly the ones the deleted
+// controller-side writer used, so a log consumer written against either sees one
+// shape rather than two.
+func TestOutcome_Clarify_GrantIsAuditedWithTheApprover(t *testing.T) {
+	i1 := issueV2("tatara-operator", 291, "t1")
+	var logBuf bytes.Buffer
+	e := buildV2(t, v2Opts{writer: panicForge{},
+		logger:   slog.New(slog.NewJSONHandler(&logBuf, nil)),
+		approval: &fakeApproval{grant: map[string]bool{i1.Name: true}, needCitation: true}},
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"), i1)
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"clarify","payload":{"decision":"implement","reason":"maintainer said go ahead",`+
+			`"approvalCitations":[{"id":"1","quote":"go ahead"}]}}`)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, tatarav1alpha1.StageApproved, e.task(t, "t1").Status.Stage)
+
+	line := findLogLine(t, logBuf.Bytes(), "approval_verified")
+	require.Equal(t, "INFO", line["level"], "the approval grant must be an INFO business action")
+	require.Equal(t, i1.Name, line["issue"])
+	require.Equal(t, "t1", line["task"])
+	require.Equal(t, "maintainer", line["maintainer_login"],
+		"the audit line must name the APPROVER; that is the whole point of it")
+	require.Equal(t, "1", line["cited_comment_id"],
+		"the audit line must name the comment the approval was built from")
+	require.Equal(t, false, line["auto"])
+}
+
+// findLogLine returns the ONE JSON log record whose "action" field matches, and
+// fails if there is not exactly one. Asserting on a substring of the buffer
+// would pass on a line that carried the action but none of the fields, which is
+// precisely the failure this test exists to catch.
+func findLogLine(t *testing.T, buf []byte, action string) map[string]any {
+	t.Helper()
+	var found []map[string]any
+	for _, raw := range bytes.Split(bytes.TrimSpace(buf), []byte("\n")) {
+		if len(raw) == 0 {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal(raw, &rec); err != nil {
+			continue
+		}
+		if rec["action"] == action {
+			found = append(found, rec)
+		}
+	}
+	require.Len(t, found, 1, "want exactly one action=%s log line, got %d", action, len(found))
+	return found[0]
+}
+
+// findLogLineAtLevel is findLogLine for a record that carries no action field.
+// The scope-refusal WARN is deliberately not an action= business-event line -
+// the action=approval_refused INFO beside it is - so it can only be found by
+// level.
+func findLogLineAtLevel(t *testing.T, buf []byte, level string) map[string]any {
+	t.Helper()
+	var found []map[string]any
+	for _, raw := range bytes.Split(bytes.TrimSpace(buf), []byte("\n")) {
+		if len(raw) == 0 {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal(raw, &rec); err != nil {
+			continue
+		}
+		if rec["level"] == level {
+			found = append(found, rec)
+		}
+	}
+	require.Len(t, found, 1, "want exactly one %s log line, got %d", level, len(found))
+	return found[0]
+}
+
+// TestOutcome_Clarify_AlreadyApprovedIssueNeedsNoFreshCitation exercises
+// verifyOneIssue's clause-2 idempotence THROUGH the handler. An Issue that
+// already carries evidence is approved - clause (2) asks whether every live
+// Issue CARRIES evidence, not whether it can be re-derived on this request -
+// which is what keeps the autoApproveTataraProposals evidence (no comment to
+// re-match) alive and stops a maintainer's later "thanks!" from revoking a grant
+// already given.
+//
+// SCOPE CAVEAT, so this is not read as more than it is: the assertion runs
+// against fakeApproval, so what it pins is the HANDLER's behaviour given a
+// verifier that reports an already-approved Issue as approved - not
+// verifyOneIssue's clause-2 idempotence itself, which is pinned directly in
+// internal/controller (TestVerifyOneIssue_CitationFailClosedMatrix). The fake's
+// already-approved arm is load-bearing for this test specifically: it grants
+// NOTHING here and demands a citation, so removing that arm refuses the request
+// and parks the Task.
+func TestOutcome_Clarify_AlreadyApprovedIssueNeedsNoFreshCitation(t *testing.T) {
+	approvedAt := metav1.NewTime(frozenNow.Add(-time.Hour))
+	i1 := issueV2("tatara-operator", 291, "t1", func(iss *tatarav1alpha1.Issue) {
+		iss.Status.Status = "approved"
+		iss.Status.Approval = &tatarav1alpha1.ApprovalEvidence{
+			Login: "maintainer-1", CommentID: "c-1", Phrase: "go ahead", CreatedAt: approvedAt,
+		}
+	})
+	e := buildV2(t, v2Opts{writer: panicForge{},
+		approval: &fakeApproval{grant: map[string]bool{}, needCitation: true}},
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"), i1)
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"clarify","payload":{"decision":"implement","reason":"already approved last turn"}}`)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, tatarav1alpha1.StageApproved, e.task(t, "t1").Status.Stage,
+		"an Issue that already carries evidence must not need a fresh citation")
+
+	got := e.issue(t, i1.Name).Status.Approval
+	require.NotNil(t, got)
+	require.Equal(t, "maintainer-1", got.Login, "the ORIGINAL approver must survive the re-verification")
+	require.Equal(t, "c-1", got.CommentID)
 }
 
 func TestOutcome_Clarify_DiscussParksAwaitingHuman(t *testing.T) {
@@ -1525,7 +1927,7 @@ func TestOutcome_Refine_FoldAdoptsVerifiesThenDeletes(t *testing.T) {
 	require.Equal(t, tatarav1alpha1.StageDelivered, got.Status.Stage)
 
 	// C4: adoption transfers the CONTROLLER ref, but every downstream consumer
-	// (the C.6 approval grammar, the reaper's owned-set, the agent bundle)
+	// (the C.6 approval citation check, the reaper's owned-set, the agent bundle)
 	// reads the umbrella's Status.IssueRefs/MRRefs SLICES, not ownerRefs. A
 	// fold that doesn't append there leaves adopted work unguarded and absent
 	// from the bundle.

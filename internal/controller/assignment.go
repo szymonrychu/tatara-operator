@@ -130,12 +130,29 @@ func agentJob(agentKind string) string {
 	case stage.AgentClarify:
 		return "## Your job\n\n" +
 			"Decide what happens to the issue(s) above by reading them AND their full thread.\n\n" +
-			"  - A maintainer has approved the work -> `submit_outcome(kind=clarify, decision=implement)`.\n" +
+			"  - A maintainer's comment reads to you as a go-ahead -> `submit_outcome(kind=clarify, " +
+			"decision=implement, approvalCitations=[...])`.\n" +
 			"  - It is a duplicate, out of scope, or the human declined -> `decision=close`.\n" +
 			"  - It still needs the human -> `decision=discuss`, with your questions as the comment.\n\n" +
-			"You do NOT decide whether the approval is valid: the operator re-verifies every approval " +
-			"against the issue thread (the C.6 grammar) and parks the Task if it does not hold. Report " +
-			"what the thread SAYS; do not argue it into an approval.\n\n" +
+			"YOU judge whether a comment approves. There is no wordlist. On `decision=implement` you " +
+			"CITE the comment you judged: one `approvalCitations` entry per LIVE issue this Task owns, " +
+			"`{id, quote}`, where `id` is that comment's forge external id - already an attribute on the " +
+			"`<comment external_id=\"...\">` element in this prompt, so do not re-crawl the forge for " +
+			"it - and `quote` is a VERBATIM substring of that same comment's body. Copy it; a " +
+			"paraphrase is refused as a fabrication.\n\n" +
+			"The operator verifies WHO and WHAT WAS SAID, never intent: that the cited comment is on " +
+			"that issue, that its author is a verified non-bot maintainer, that your quote occurs in " +
+			"the body it holds, and that the comment was not already spent as evidence. Any of those " +
+			"failing parks the Task at identity-unverified.\n\n" +
+			"NEVER CITE A COMMENT THAT DECLINES. A go-ahead carrying a scope note (\"yes, but keep it " +
+			"to one package\") is an approval; a conditional one (\"not until the tests pass\") is not, " +
+			"however agreeable its wording. You are the only reader of intent in this loop.\n\n" +
+			"IT DOES NOT CHECK RECENCY, SO THE WITHDRAWAL VETO IS YOURS. Read every maintainer comment " +
+			"newer than the one you want to cite. A benign follow-up (\"ping me when the PR is up\") " +
+			"leaves the go-ahead standing; one that takes it back (\"actually hold off\") means " +
+			"`decision=discuss` instead. Nothing downstream catches this.\n\n" +
+			"Omit `approvalCitations` only when NO human has commented at all - a tatara-proposed issue " +
+			"has no comment to cite. Never invent one to fill the field.\n\n" +
 			"Write no code this turn. Only the conversation survives."
 
 	case stage.AgentIncident:

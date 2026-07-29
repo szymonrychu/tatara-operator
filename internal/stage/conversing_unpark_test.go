@@ -58,40 +58,48 @@ func TestUnpark_ConversingTargets(t *testing.T) {
 	}
 }
 
-// identity-unverified with a passing grammar goes to implementing, never to
-// conversing: it is the one park reason sitting directly in front of "write code
-// and merge it to prod", and a conversation is not what a maintainer asked for
-// when they approved.
-func TestUnpark_IdentityUnverifiedNeverConverses(t *testing.T) {
-	task := parkedTask("clarify", stage.ReasonIdentityUnverified)
-	humanEvent(task)
-	target, _ := stage.UnparkDetailed(stage.UnparkInput{
-		Task:              task,
-		Issues:            []v1alpha1.Issue{openIssue("approved")},
-		GrammarPassed:     true,
-		ConversingHasRoom: true,
-		Now:               time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC),
-	})
-	if target != v1alpha1.StageImplementing {
-		t.Fatalf("target = %q, want implementing", target)
+// TestUnpark_IdentityUnverifiedAlwaysConverses is the Step C behaviour. The
+// arm no longer branches on a grammar verdict: a non-bot event on a parked
+// identity-unverified Task enters conversing when there is room, and declines
+// with no-conversing-room when there is not. It NEVER enters implementing -
+// the only grant path is restapi.verifyApprovalScope (#294: flip the DECISION
+// at the chokepoint, never add an EDGE).
+func TestUnpark_IdentityUnverifiedAlwaysConverses(t *testing.T) {
+	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	base := func() *v1alpha1.Task {
+		task := parkedTask("clarify", stage.ReasonIdentityUnverified)
+		humanEvent(task)
+		return task
 	}
-}
 
-// A failing grammar on identity-unverified with a human comment waiting is a
-// CONVERSATION, not a dead end: the human said something the grammar could not
-// read as approval, and an agent should read it.
-func TestUnpark_IdentityUnverifiedWithoutGrammarConversesWhenThereIsRoom(t *testing.T) {
-	task := parkedTask("clarify", stage.ReasonIdentityUnverified)
-	humanEvent(task)
-	target, _ := stage.UnparkDetailed(stage.UnparkInput{
-		Task:              task,
-		Issues:            []v1alpha1.Issue{openIssue("open")},
-		GrammarPassed:     false,
-		ConversingHasRoom: true,
-		Now:               time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC),
+	// Every open owned Issue already approved: the old code took this straight
+	// to implementing. It must not any more.
+	target, decline := stage.UnparkDetailed(stage.UnparkInput{
+		Task: base(), Issues: []v1alpha1.Issue{openIssue("approved")},
+		ActiveTasks: 1, MaxOpenTasks: 6, ConversingHasRoom: true, Now: now,
 	})
-	if target != v1alpha1.StageConversing {
-		t.Fatalf("target = %q, want conversing", target)
+	if target != v1alpha1.StageConversing || decline != stage.DeclineNone {
+		t.Fatalf("approved+room: target = %q decline = %q, want conversing/none", target, decline)
+	}
+
+	// No conversing room (D1): a truthful decline, not a lie about a grammar
+	// that no longer exists, and not a fallthrough into clarifying that would
+	// route around the conversing ceiling.
+	target, decline = stage.UnparkDetailed(stage.UnparkInput{
+		Task: base(), Issues: []v1alpha1.Issue{openIssue("approved")},
+		ActiveTasks: 1, MaxOpenTasks: 6, ConversingHasRoom: false, Now: now,
+	})
+	if target != "" || decline != stage.DeclineNoConversingRoom {
+		t.Fatalf("no room: target = %q decline = %q, want \"\"/no-conversing-room", target, decline)
+	}
+
+	// No non-bot event at all: unchanged, still the first guard.
+	target, decline = stage.UnparkDetailed(stage.UnparkInput{
+		Task:        parkedTask("clarify", stage.ReasonIdentityUnverified),
+		ActiveTasks: 1, MaxOpenTasks: 6, ConversingHasRoom: true, Now: now,
+	})
+	if target != "" || decline != stage.DeclineNoHumanEvent {
+		t.Fatalf("no event: target = %q decline = %q, want \"\"/no-human-event", target, decline)
 	}
 }
 
@@ -112,7 +120,7 @@ func TestUnpark_IdentityUnverifiedReviewKindGuardedLikeAwaitingHuman(t *testing.
 		task.Status.HumanReviewRounds = 2
 		target, decline := stage.UnparkDetailed(stage.UnparkInput{
 			Task: task, MRs: []v1alpha1.MergeRequest{openMR()},
-			GrammarPassed: false, ConversingHasRoom: true, Now: now,
+			ConversingHasRoom: true, Now: now,
 		})
 		if target != v1alpha1.StageConversing {
 			t.Fatalf("target = %q (decline %q), want conversing", target, decline)
@@ -127,7 +135,7 @@ func TestUnpark_IdentityUnverifiedReviewKindGuardedLikeAwaitingHuman(t *testing.
 		humanEvent(task)
 		target, decline := stage.UnparkDetailed(stage.UnparkInput{
 			Task: task, MRs: []v1alpha1.MergeRequest{mergedMR()},
-			GrammarPassed: false, ConversingHasRoom: true, Now: now,
+			ConversingHasRoom: true, Now: now,
 		})
 		if target != "" || decline != stage.DeclineMergedMR {
 			t.Fatalf("target=%q decline=%q, want (\"\", %q)", target, decline, stage.DeclineMergedMR)
@@ -140,7 +148,7 @@ func TestUnpark_IdentityUnverifiedReviewKindGuardedLikeAwaitingHuman(t *testing.
 		task.Status.HumanReviewRounds = v1alpha1.MaxHumanReviewRounds
 		target, decline := stage.UnparkDetailed(stage.UnparkInput{
 			Task: task, MRs: []v1alpha1.MergeRequest{openMR()},
-			GrammarPassed: false, ConversingHasRoom: true, Now: now,
+			ConversingHasRoom: true, Now: now,
 		})
 		if target != "" || decline != stage.DeclineRoundsExhausted {
 			t.Fatalf("target=%q decline=%q, want (\"\", %q)", target, decline, stage.DeclineRoundsExhausted)

@@ -399,7 +399,7 @@ func (r *ProjectReconciler) ReapTerminal(ctx context.Context, proj *tatarav1alph
 	conversingRoom := false
 	for i := range tl.Items {
 		t := &tl.Items[i]
-		if t.Spec.ProjectRef == proj.Name && t.Status.Stage == tatarav1alpha1.StageParked && needsConversingRoom(t.Status.StageReason) {
+		if t.Spec.ProjectRef == proj.Name && t.Status.Stage == tatarav1alpha1.StageParked && NeedsConversingRoom(t.Status.StageReason) {
 			room, roomErr := ConversingHasRoom(ctx, r.Client, proj)
 			if roomErr != nil {
 				l.Error(roomErr, "reap: conversing capacity check failed; treating this pass as no room",
@@ -1272,22 +1272,23 @@ func (r *ProjectReconciler) deleteReapedTask(ctx context.Context, proj *tatarav1
 // Task that can still come back is never reaped. stage.Unpark MUTATES its Task, so
 // it is asked on a DeepCopy: this is a probe, not a transition.
 //
-// GrammarPassed is resolved by grammarPassedFor (unpark.go), the SAME helper
-// driveUnparks' ApplyUnpark uses, on the SAME probe copy - so this probe cannot
-// disagree with the driver about whether a given identity-unverified verdict
-// counts (2026-07-27 security review finding 3: before this, the probe built
-// UnparkInput with no GrammarPassed field at all, which defaults to false, so a
-// Task the driver was about to re-enter on its very next pass could read here
-// as non-re-entryable and be reaped out from under it).
+// GrammarPassed no longer exists to be set or missed. It used to be resolved by
+// a grammarPassedFor helper off the durable Task.status.approvalVerdict, and
+// leaving it unset here while ApplyUnpark set it meant a Task the driver was
+// about to re-enter could read here as non-re-entryable and be reaped out from
+// under it (2026-07-27 security review finding 3). The agent-judged-approval-gate
+// sequence deleted every writer of that field (step A), then the reader (step
+// B), then the UnparkInput field itself (step C). The divergence class is now
+// structurally impossible for this one field: there is nothing to thread.
 //
 // conversingRoom is the SAME reasoning applied to Task 9's ConversingHasRoom
-// field (2026-07-28 security review CRITICAL 1): unparkFires is a FOURTH
-// UnparkInput builder (after ApplyUnpark, reverifyParked, and stage.UnparkDetailed
-// itself), and it used to leave ConversingHasRoom at its zero value (false).
-// The window this reopened: parked(identity-unverified), a non-bot event, no
-// valid verdict, and the ceiling has room. driveUnparks' ApplyUnpark (room=true)
-// would send the Task to conversing and save it; this probe (room=false, before
-// the fix) would return DeclineGrammarNotPassed, fires=false, and reapParked -
+// field (2026-07-28 security review CRITICAL 1): unparkFires is a THIRD
+// UnparkInput builder (after ApplyUnpark and stage.UnparkDetailed itself), and
+// it used to leave ConversingHasRoom at its zero value (false).
+// The window this reopened: parked(identity-unverified), a non-bot event, and
+// the ceiling has room. driveUnparks' ApplyUnpark (room=true) would send the
+// Task to conversing and save it; this probe (room=false, before
+// the fix) would decline, fires=false, and reapParked -
 // once past ParkRetention - would delete a Task the driver was about to save,
 // exactly the class of bug finding 3 already fixed once for GrammarPassed.
 // driveUnparksPaced and ReapTerminalPaced are paced INDEPENDENTLY, so a pass
@@ -1306,38 +1307,51 @@ func (r *ProjectReconciler) deleteReapedTask(ctx context.Context, proj *tatarav1
 // Identical failure class to the ConversingHasRoom fix above, on a different
 // field and reason).
 //
-// FIELD-BY-FIELD AUDIT (2026-07-28 security review NEW-1), every UnparkInput
-// field against this package's three production UnparkInput builders
-// (ApplyUnpark, reverifyParked - internal/webhook/pending_events.go, and this
+// FIELD-BY-FIELD AUDIT (2026-07-28 security review NEW-1; refreshed for
+// agent-judged-approval-gate step C), every UnparkInput field against this
+// package's two production UnparkInput builders (ApplyUnpark and this
 // function), so the next reader does not have to re-derive which fields each
-// reason actually consults:
-//   - Task, Now: set by all three. Always required.
-//   - Issues: set by all three. Read by ReasonAwaitingHuman (non-review) and
-//     ReasonIdentityUnverified (grammar-passed branch).
-//   - MRs: set by all three (reverifyParked as of the NEW-2 fix below). Read by
-//     ReasonAwaitingHuman (review kind), ReasonIdentityUnverified (review kind,
-//     Task 9), ReasonNoOutcome, ReasonHandoffStalled - all via anyMerged.
-//   - BotLogin: set by all three. Read by hasNonBotEvent in every comment-driven
-//     reason (backlog-sweep, awaiting-human, identity-unverified, handoff-stalled).
-//   - GrammarPassed: set by all three (reverifyParked/ApplyUnpark compute it via
-//     grammarPassedFor; this probe the same). Read ONLY by ReasonIdentityUnverified.
-//   - ConversingHasRoom: set by all three as of the CRITICAL 1 fix above. Read by
-//     ReasonAwaitingHuman and ReasonIdentityUnverified.
-//   - MaxTurnsPerTask: set by ApplyUnpark and this function (as of NEW-1). NOT set
-//     by reverifyParked - harmless, because reverifyParked only ever drives
-//     ReasonIdentityUnverified, and MaxTurnsPerTask is read ONLY by ReasonNoOutcome,
-//     which reverifyParked never handles (task.Status.StageReason is checked
-//     before it is ever called).
-//   - ActiveTasks, MaxOpenTasks: set by ApplyUnpark and this function. NOT set by
-//     reverifyParked - same reasoning: both are read ONLY by ReasonBacklogSweep,
-//     which reverifyParked never handles either.
+// reason actually consults. There used to be a third - a bespoke webhook limb
+// that drove ReasonIdentityUnverified on its own and left four of these fields
+// unset - and every "NOT set by" caveat this audit carried was about it. It is
+// gone: identity-unverified now goes through ApplyUnpark like every other
+// comment-driven reason.
 //
-// With MaxTurnsPerTask now threaded, this probe and driveUnparks' ApplyUnpark
-// read the IDENTICAL set of UnparkInput fields for every reason either of them
-// actually handles, off the same helpers (grammarPassedFor, ConversingHasRoom,
-// taskMaxTurns) - so the two cannot silently diverge again without a new field
-// being added to UnparkInput and only one builder threading it, which this audit
-// exists to make an easy diff to catch.
+// NINE fields, SET BY BOTH builders, off the same helpers - no divergence
+// possible without a tenth appearing and only one builder threading it,
+// which is exactly the diff this audit exists to make obvious:
+//   - Task, Now: always required.
+//   - Issues: read by ReasonAwaitingHuman (non-review kind, via
+//     openIssues/allApproved). ReasonIdentityUnverified does NOT read it at all
+//     any more: step C deleted that arm's openIssues/allApproved tail along with
+//     the implementing edge it fed, so no Issue's approval state can influence
+//     an identity-unverified re-entry.
+//   - MRs: read by ReasonAwaitingHuman (review kind), ReasonIdentityUnverified
+//     (review kind, Task 9), ReasonNoOutcome, ReasonHandoffStalled - all via
+//     anyMerged.
+//   - BotLogin: read by hasNonBotEvent in every comment-driven reason
+//     (backlog-sweep, awaiting-human, identity-unverified, handoff-stalled).
+//   - ConversingHasRoom: set by both as of the CRITICAL 1 fix above. Read by
+//     ReasonAwaitingHuman and ReasonIdentityUnverified. For a NON-REVIEW-kind
+//     identity-unverified Task it is now the ONLY thing that decides re-entry
+//     after hasNonBotEvent - false is DeclineNoConversingRoom and true is
+//     conversing, with nothing else in between - so the probe and the driver
+//     agreeing on it is more load-bearing than before, not less. A kind=review
+//     Task still passes the same two extra guards ReasonAwaitingHuman's review
+//     branch carries - anyMerged(in.MRs) and HumanReviewRounds >=
+//     MaxHumanReviewRounds - so for that kind the MRs bullet above stays live
+//     too.
+//   - MaxTurnsPerTask: set by both (as of NEW-1), off the SAME taskMaxTurns.
+//     Read ONLY by ReasonNoOutcome.
+//   - ActiveTasks, MaxOpenTasks: read ONLY by ReasonBacklogSweep.
+//
+// NO fields set by neither. There is no longer any UnparkInput field that both
+// builders leave at its zero value: GrammarPassed was the last one, and step C
+// removed it from the struct rather than leaving a slot a future builder could
+// start filling in again. Every field the struct HAS is threaded by both
+// builders, which is the strongest form of the lockstep property this audit
+// exists to hold - a new field cannot be added without a compile-visible
+// decision about both call sites.
 func (r *ProjectReconciler) unparkFires(ctx context.Context, proj *tatarav1alpha1.Project,
 	t *tatarav1alpha1.Task, now time.Time, conversingRoom bool) (bool, error) {
 
@@ -1366,7 +1380,6 @@ func (r *ProjectReconciler) unparkFires(ctx context.Context, proj *tatarav1alpha
 		MaxOpenTasks:      maxOpen,
 		BotLogin:          botLoginOf(proj),
 		MaxTurnsPerTask:   taskMaxTurns(proj, t),
-		GrammarPassed:     grammarPassedFor(probe, false),
 		ConversingHasRoom: conversingRoom,
 		Now:               now,
 	})
