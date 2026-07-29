@@ -14,9 +14,12 @@ const (
 	// owners (worked by nobody, re-minted by nobody: the orphan predicate sees
 	// an OWNED Issue).
 	GCBlockedNoControllerOwner = "no_controller_owner"
-	// GCBlockedFoldInFlight: the Task is named in a LIVE Task's
-	// status.foldInFlight. Reaping a fold member mid-adoption destroys the
-	// artifacts the umbrella is halfway through adopting (B.3).
+	// GCBlockedFoldInFlight: the Task is named in the status.foldInFlight of an
+	// umbrella whose adoption CAN STILL COMPLETE (v1alpha1.FoldInFlightActive).
+	// Reaping a fold member mid-adoption destroys the artifacts the umbrella is
+	// halfway through adopting (B.3). Counted only once the hold has outlived
+	// FoldInFlightGrace: the adoption is one request, so a hold inside that
+	// window is healthy and counting it alerted on every ordinary fold.
 	GCBlockedFoldInFlight = "fold_in_flight"
 	// GCBlockedDocReference: a delivered Task whose work is not documented yet
 	// (documentedBy == "" with >= 1 merged MR). It is held until the nightly
@@ -86,6 +89,40 @@ var DocReferenceBlockedTasks = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Help: "Delivered Tasks stuck past their documentation-hold window, by project (issue #423).",
 }, []string{"project"})
 
+// FoldInFlightBlockedTasks is the number of Tasks currently held off the reaper
+// by a fold adoption that has outlived FoldInFlightGrace, per project - the
+// DISTINCT stuck-object count, the same thing DocReferenceBlockedTasks is for
+// doc_reference. Issue #467's alert read "334 object(s)" against 26 real ones,
+// because operator_gc_blocked_total counts one EVENT per reconcile pass per held
+// Task and the rule summed that across pod replicas. Alert on this instead.
+var FoldInFlightBlockedTasks = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "operator_fold_in_flight_blocked_tasks",
+	Help: "Tasks held off the reaper past their fold-adoption window, by project (issue #467).",
+}, []string{"project"})
+
+// FoldStrandedReleasedTotal counts fold markers the reaper REFUSED to honour
+// because the adoption can never complete, by why. It is the observability half
+// of FoldInFlightActive: a release is always an anomaly upstream (an umbrella
+// that died mid-adoption, or a request that never reached step 5), and without
+// this counter the fix is silent - the members simply start getting collected
+// and nobody learns that an adoption was lost.
+var FoldStrandedReleasedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "operator_fold_stranded_released_total",
+	Help: "Stranded fold markers released by the reaper, by reason (issue #467).",
+}, []string{"reason"})
+
+// Stranded-fold release reasons (closed set).
+const (
+	// FoldStrandedUmbrellaDone: the umbrella is delivered/rejected/failed/parked.
+	// It runs no agent pod and will never submit another outcome, so nothing can
+	// finish the adoption. This is issue #467's shape exactly.
+	FoldStrandedUmbrellaDone = "umbrella_done"
+	// FoldStrandedTTLExpired: the umbrella is still live but its adoption started
+	// more than FoldInFlightTTL ago. A fold is one request; an hour means the
+	// request died without reaching step 5.
+	FoldStrandedTTLExpired = "ttl_expired"
+)
+
 // DocTaskAbandonedTotal counts nightly documentation batches that reached their
 // terminal without delivering docs.
 //
@@ -100,5 +137,6 @@ var DocTaskAbandonedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 
 func init() {
 	ctrlmetrics.Registry.MustRegister(GCBlockedTotal, DocTaskAbandonedTotal,
-		DocBatchMintTotal, DocReferenceBlockedTasks)
+		DocBatchMintTotal, DocReferenceBlockedTasks,
+		FoldInFlightBlockedTasks, FoldStrandedReleasedTotal)
 }

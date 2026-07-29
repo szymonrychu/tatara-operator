@@ -26,6 +26,10 @@ import (
 //     may never reach implementing or merging, by any path) and the C.5.3
 //     pendingReview gate. An illegal edge is an ERROR log plus
 //     operator_illegal_stage_transition_total{from,to}, and IT DOES NOT HAPPEN.
+//     An edge that was LEGAL from the caller's from and is illegal only from
+//     the fresher from the in-write re-read found is a LOST RACE, not a table
+//     bug: it is dropped silently onto operator_stage_race_lost_total instead
+//     (issue #478).
 //  2. stage.Enter stamps stageEnteredAt and CLEARS BOTH podStartedAt AND
 //     stageWorkStartedAt (fix V7-4). v6 forgot podStartedAt and it is
 //     load-bearing: a stale one leaves the Task under NO CLOCK while it queues on
@@ -112,8 +116,37 @@ func EnterStage(ctx context.Context, c client.Client, sp objbudget.Spiller, m *o
 					"stage", to, "stage_reason", reason, "kind", task.Spec.Kind)
 				return nil
 			}
-			// Reachable only when another writer moved the stage between the
-			// pre-check and the write. It is still an illegal edge and still a bug.
+			if ill.From != from {
+				// THE LOST RACE (issue #478). The edge this caller computed was
+				// LEGAL from the stage it pre-checked, and the pre-check above
+				// proved it. Another writer moved the stage between that check
+				// and this write, so the edge is illegal only from the stage the
+				// Task now ACTUALLY has - the caller's intent is stale, not
+				// wrong. Two controllers legitimately racing for the same exit
+				// (the task controller's review_finalize_terminal_mr against the
+				// mergerequest controller's review_advance, in the incident that
+				// found this) is not a code bug, and it must not be charged to
+				// operator_illegal_stage_transition_total, whose alert declares
+				// ANY non-zero value a bug in the F.3 table. That counter keeps
+				// its documented meaning: the from it counts is the from the
+				// caller really had.
+				//
+				// Dropping the loser is the correct outcome, not merely the
+				// convenient one: the winner wrote a stage this caller never
+				// evaluated, so re-applying an edge derived from the old one
+				// would overwrite a decision made on fresher facts. Whoever
+				// still owes work re-derives it from the winner's stage on the
+				// next reconcile - every stage exit in F.3 is level-triggered.
+				l.Info("stage transition lost a race and was dropped",
+					"action", "stage_race_lost", "resource_id", task.Name,
+					"expected_from", from, "live_from", ill.From, "to", to,
+					"stage_reason", reason, "kind", task.Spec.Kind)
+				obs.StageRaceLost(ill.From, ill.To)
+				return nil
+			}
+			// The caller's own from was live and the edge is still not in the
+			// F.3 table: a genuine table bug, which is exactly what the counter
+			// is for.
 			obs.IllegalStageTransition(ill.From, ill.To)
 		}
 		return fmt.Errorf("stage: enter %s(%s) on %s: %w", to, reason, key.Name, enterErr)

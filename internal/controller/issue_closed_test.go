@@ -3,9 +3,11 @@ package controller
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -79,6 +81,47 @@ func TestIssueClosed_ParkedNoStop(t *testing.T) {
 	got := getTaskCR(t, c, task.Name)
 	require.Equal(t, tatarav1alpha1.StageParked, got.Status.Stage)
 	require.False(t, issueGone(t, c, issName))
+}
+
+// TestIssueClosed_FoldInFlightDefersTheStop asserts the fold barrier (issue
+// #467): the stop edge exists for a HUMAN closing the driving issue, and it
+// must not fire while a B.3 adoption is running. It fired at 06:26:17Z on a
+// refine umbrella mid-fold, which stranded 26 member Tasks against an umbrella
+// that could never finish adopting them.
+//
+// The stop is DEFERRED, not cancelled: FoldInFlightActive is TTL-bounded, so
+// the very same close stops the Task once the adoption settles or times out.
+func TestIssueClosed_FoldInFlightDefersTheStop(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		since   time.Time
+		stopped bool
+	}{
+		{"adoption running", time.Now(), false},
+		{"adoption past its TTL", time.Now().Add(-2 * tatarav1alpha1.FoldInFlightTTL), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, c, task, issName := closedIssueSetup(t, tatarav1alpha1.StageRefining, "", true)
+
+			live := getTaskCR(t, c, task.Name)
+			live.Status.FoldInFlight = []string{"member-task"}
+			since := metav1.NewTime(tc.since)
+			live.Status.FoldInFlightSince = &since
+			require.NoError(t, c.Status().Update(context.Background(), live))
+
+			reconcileIssue(t, r, issName)
+
+			got := getTaskCR(t, c, task.Name)
+			if tc.stopped {
+				require.Equal(t, tatarav1alpha1.StageRejected, got.Status.Stage)
+				require.Equal(t, stage.ReasonIssueClosed, got.Status.StageReason)
+				return
+			}
+			require.Equal(t, tatarav1alpha1.StageRefining, got.Status.Stage,
+				"an umbrella mid-adoption must not be stopped by the close of an issue")
+			require.False(t, issueGone(t, c, issName), "nothing is severed while the stop is deferred")
+		})
+	}
 }
 
 // TestIssueClosed_ReSeverCompletesAfterCrash asserts review addition (a): a
