@@ -1268,7 +1268,18 @@ func UnparkDetailed(in UnparkInput) (target string, decline string) {
 				return "", DeclineRoundsExhausted // STAY PARKED. Do not spawn another review pod.
 			}
 			t.Status.HumanReviewRounds++
-			target, decline := enter(v1alpha1.StageReviewing, "")
+			// #508: a maintainer comment on an awaiting-human review Task used to
+			// cold-respawn straight into reviewing, bypassing conversing (and its
+			// idle-TTL/warm-pod behaviour) entirely - the same gap the sibling
+			// identity-unverified review arm above already closed. Prefer conversing
+			// when the project has room for it, exactly like the clarify arm below;
+			// fall back to the pre-existing cold respawn when the ceiling is full so
+			// a full ceiling degrades the experience rather than dropping the event.
+			to := v1alpha1.StageReviewing
+			if in.ConversingHasRoom {
+				to = v1alpha1.StageConversing
+			}
+			target, decline := enter(to, "")
 			if decline != DeclineNone {
 				t.Status.HumanReviewRounds--
 			}
