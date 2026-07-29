@@ -17,6 +17,7 @@ import (
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
+	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
 // THE DEPLOYING STAGE HAS AN ACTOR, AND THE MERGEREQUEST CR IS THE LEDGER.
@@ -69,28 +70,33 @@ func (d *StageDriver) ReconcileDeploying(ctx context.Context, proj *tatarav1alph
 	// THE EMPTY SET IS NOT A LICENCE (C.4): a Task in deploying that owns no
 	// MergeRequest has delivered nothing. Its budget parks it.
 	if len(mrs) == 0 {
+		d.logDeployWaiting(ctx, task, "the task owns no merge requests", 0, nil)
 		return ctrl.Result{RequeueAfter: deployStageRequeue}, nil
 	}
 
 	pending := 0
+	var pendingRefs []string
 	for i := range mrs {
 		mr := &mrs[i]
 		if mr.Status.State != "merged" {
 			pending++
+			pendingRefs = append(pendingRefs, pendingDeployRef(mr, "not merged yet, state "+mr.Status.State))
 			continue
 		}
 		if mr.Status.DeployedAt != nil {
 			continue
 		}
-		deployed, err := d.resolveDeployed(ctx, proj, task, mr)
+		deployed, why, err := d.resolveDeployed(ctx, proj, task, mr)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
 		if !deployed {
 			pending++
+			pendingRefs = append(pendingRefs, pendingDeployRef(mr, why))
 		}
 	}
 	if pending > 0 {
+		d.logDeployWaiting(ctx, task, "owned merge requests carry no deployedAt yet", pending, pendingRefs)
 		return ctrl.Result{RequeueAfter: deployStageRequeue}, nil
 	}
 
@@ -102,28 +108,67 @@ func (d *StageDriver) ReconcileDeploying(ctx context.Context, proj *tatarav1alph
 	return ctrl.Result{}, nil
 }
 
+// mrDeployRef names one owned MergeRequest the way every other log line in this
+// file does: its repository plus its PR number.
+func mrDeployRef(mr *tatarav1alpha1.MergeRequest) string {
+	return fmt.Sprintf("%s#%d", mr.Spec.RepositoryRef, mr.Spec.Number)
+}
+
+// pendingDeployRef names one still-pending MergeRequest AND why it is pending.
+// The WHY is the whole point (see logDeployWaiting): the count alone does not
+// distinguish "the apply never went green" from "the pin is behind us".
+func pendingDeployRef(mr *tatarav1alpha1.MergeRequest, why string) string {
+	if why == "" {
+		return mrDeployRef(mr)
+	}
+	return mrDeployRef(mr) + " (" + why + ")"
+}
+
+// logDeployWaiting is the deploying counterpart of stallMerge's merge_waiting
+// (merge.go). deploying was NOT wholly silent - resolveDeployed narrates
+// deploy_unsupervised, deploy_not_pinned, deploy_await_tag and every failed SCM
+// read (deploy_poll) - but its THREE most likely waits returned a bare false
+// with no line at all: no green tatara-helmfile apply run on main, a green apply
+// that predates the merge, and an applied pin still behind our tag. The first of
+// those IS issue #513 (the apply never went green: the ARC runner was out of
+// disk), which is why 2h07m of deploying produced zero evidence and the first
+// anyone heard of it was parked(deploy-timeout). So every pending MR now carries
+// resolveDeployed's own sub-reason in pending_mrs, not just its name.
+//
+// stalled_seconds is carry-adjusted for the same reason stallMerge's is: a
+// deploy-timeout un-park re-stamps StageEnteredAt, so a bare
+// now.Sub(StageEnteredAt) would report the wait as reset on every re-entry.
+func (d *StageDriver) logDeployWaiting(ctx context.Context, task *tatarav1alpha1.Task,
+	why string, pending int, pendingRefs []string) {
+	log.FromContext(ctx).Info("deploy: waiting",
+		"action", "deploy_waiting", "resource_id", task.Name, "reason", why,
+		"pending", pending, "pending_mrs", strings.Join(pendingRefs, ","),
+		"stalled_seconds", stage.StageElapsedSeconds(task, d.now()))
+}
+
 // resolveDeployed reports whether one merged MR's change is live on the cluster,
 // stamping deployedAt + deployedVersion when it is. A false with a nil error is
-// "not yet": the caller polls.
+// "not yet", and the string is WHY: the caller polls, and puts that why in
+// deploy_waiting's pending_mrs. It is empty on a true.
 func (d *StageDriver) resolveDeployed(ctx context.Context, proj *tatarav1alpha1.Project,
-	task *tatarav1alpha1.Task, mr *tatarav1alpha1.MergeRequest) (bool, error) {
+	task *tatarav1alpha1.Task, mr *tatarav1alpha1.MergeRequest) (bool, string, error) {
 	l := log.FromContext(ctx)
 
 	var repo tatarav1alpha1.Repository
 	if err := d.Get(ctx, types.NamespacedName{Namespace: mr.Namespace, Name: mr.Spec.RepositoryRef}, &repo); err != nil {
-		return false, fmt.Errorf("deploy: get repository %s: %w", mr.Spec.RepositoryRef, err)
+		return false, "", fmt.Errorf("deploy: get repository %s: %w", mr.Spec.RepositoryRef, err)
 	}
 	owner, name, err := scm.OwnerRepo(repo.Spec.URL)
 	if err != nil {
-		return false, fmt.Errorf("deploy: owner/repo for %s: %w", repo.Name, err)
+		return false, "", fmt.Errorf("deploy: owner/repo for %s: %w", repo.Name, err)
 	}
 	_, token, provider, err := d.forge(ctx, proj)
 	if err != nil {
-		return false, err
+		return false, "", err
 	}
 	reader, err := d.reader(provider, token)
 	if err != nil {
-		return false, err
+		return false, "", err
 	}
 
 	dw, isWatcher := reader.(scm.DeployWatcher)
@@ -135,7 +180,7 @@ func (d *StageDriver) resolveDeployed(ctx context.Context, proj *tatarav1alpha1.
 		l.Info("deploy: no observable cascade for this Project; the merge IS the delivery",
 			"action", "deploy_unsupervised", "resource_id", task.Name, "repo", name,
 			"pr", mr.Spec.Number, "provider", provider, "deploy_watcher", isWatcher, "helmfile_enrolled", hfFound)
-		return true, d.stampDeployed(ctx, proj, task, mr, "")
+		return true, "", d.stampDeployed(ctx, proj, task, mr, "")
 	}
 
 	// The terminal CD repo itself (a helmfile revert MR): it cuts no tag and
@@ -144,10 +189,16 @@ func (d *StageDriver) resolveDeployed(ctx context.Context, proj *tatarav1alpha1.
 	// contains it.
 	if name == helmfileRepoName {
 		run, ok, err := d.applyRun(ctx, dw, task, owner, name)
-		if err != nil || !ok || !applyPostdatesMerge(run, mr) {
-			return false, err
+		if err != nil {
+			return false, "", err
 		}
-		return true, d.stampDeployed(ctx, proj, task, mr, helmfileRepoName+"@"+shortSHA(run.HeadSHA))
+		if !ok {
+			return false, "no completed successful " + helmfileRepoName + " apply run on main yet", nil
+		}
+		if !applyPostdatesMerge(run, mr) {
+			return false, "the latest green apply predates this merge", nil
+		}
+		return true, "", d.stampDeployed(ctx, proj, task, mr, helmfileRepoName+"@"+shortSHA(run.HeadSHA))
 	}
 
 	// The version the merged component cut. ReconcileMerging already waited for
@@ -158,7 +209,7 @@ func (d *StageDriver) resolveDeployed(ctx context.Context, proj *tatarav1alpha1.
 	if err != nil {
 		l.Error(err, "deploy: read latest semver tag (requeue)",
 			"action", "deploy_poll", "resource_id", task.Name, "repo", name)
-		return false, nil
+		return false, "reading the latest semver tag failed", nil
 	}
 
 	// FAIL-OPEN 2: is this repo deployed by the helmfile AT ALL? Probed at the
@@ -168,36 +219,42 @@ func (d *StageDriver) resolveDeployed(ctx context.Context, proj *tatarav1alpha1.
 	if err != nil {
 		l.Error(err, "deploy: read helmfile pin state at main (requeue)",
 			"action", "deploy_poll", "resource_id", task.Name, "repo", name)
-		return false, nil
+		return false, "reading the helmfile pin state at main failed", nil
 	}
 	if !pinArtifactPresent(mainPin, name) {
 		l.Info("deploy: the helmfile carries no pin for this repo; the merge IS the delivery",
 			"action", "deploy_not_pinned", "resource_id", task.Name, "repo", name, "pr", mr.Spec.Number)
-		return true, d.stampDeployed(ctx, proj, task, mr, tag)
+		return true, "", d.stampDeployed(ctx, proj, task, mr, tag)
 	}
 	if !tagFound {
 		l.Info("deploy: component tag not cut yet; waiting",
 			"action", "deploy_await_tag", "resource_id", task.Name, "repo", name)
-		return false, nil
+		return false, "the component release tag is not cut yet", nil
 	}
 
 	run, ok, err := d.applyRun(ctx, dw, task, hfOwner, hfRepo)
-	if err != nil || !ok || !applyPostdatesMerge(run, mr) {
-		return false, err
+	if err != nil {
+		return false, "", err
+	}
+	if !ok {
+		return false, "no completed successful " + helmfileRepoName + " apply run on main yet", nil
+	}
+	if !applyPostdatesMerge(run, mr) {
+		return false, "the latest green apply predates this merge", nil
 	}
 	appliedPin, err := helmfilePinState(ctx, dw, hfOwner, hfRepo, run.HeadSHA)
 	if err != nil {
 		l.Error(err, "deploy: read applied helmfile pin state (requeue)",
 			"action", "deploy_poll", "resource_id", task.Name, "sha", run.HeadSHA)
-		return false, nil
+		return false, "reading the applied helmfile pin state failed", nil
 	}
 	if !pinAtOrPastArtifactVersion(appliedPin, name, tag) {
-		return false, nil
+		return false, "the applied helmfile pin is behind " + tag, nil
 	}
 	l.Info("deploy: the apply carried this change",
 		"action", "deploy_applied", "resource_id", task.Name, "repo", name,
 		"pr", mr.Spec.Number, "version", tag, "apply_sha", run.HeadSHA, "run_url", run.HTMLURL)
-	return true, d.stampDeployed(ctx, proj, task, mr, tag)
+	return true, "", d.stampDeployed(ctx, proj, task, mr, tag)
 }
 
 // applyRun returns the latest COMPLETED, SUCCESSFUL tatara-helmfile apply run on

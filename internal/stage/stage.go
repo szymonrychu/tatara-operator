@@ -792,6 +792,20 @@ func OnElapse(stage string) (Edge, bool) {
 // admission-starved clock could never reach merge-timeout, and the bounded merge
 // re-entry cycle would never engage at all.
 //
+// ONE pod-less refinement, and it is a SPLIT of two things issue #480 conflated
+// (issue #513). On a merge-timeout/deploy-timeout un-park re-entry (merging or
+// deploying with StageElapsedCarrySeconds > 0):
+//
+//	the DEADLINE           -> a FRESH bounded window per re-entry: from
+//	                          stageEnteredAt, no carry subtraction, against
+//	                          v1alpha1.TimeoutReentryBudget, not the stage budget
+//	the REPORTED RESIDENCY -> still CUMULATIVE across the whole round trip, via
+//	                          StageElapsedSeconds and its metric readers
+//
+// A carry-adjusted deadline is self-defeating: the park it resumes only happens
+// once the budget is spent, so the re-entry is over budget the instant it
+// arrives. The residency number is what #480 measured and it is unchanged.
+//
 // paused is Project.spec.maxConcurrentAgents == 0. It disarms the ADMISSION
 // clock - clock 1 on every pod stage, and the pod-less `approved` stage, whose
 // budget elapses to the same admission-starved reason. It is the ONLY deadline
@@ -839,17 +853,62 @@ func ArmedClock(t *v1alpha1.Task, paused bool) (clock string, since time.Time, b
 	}
 
 	if v1alpha1.StagePodless(stg) {
-		// CLOCK 3 ONLY, from stageEnteredAt, against its own budget - CARRY-
-		// ADJUSTED (issue #480): since is pulled back by StageElapsedCarrySeconds
-		// so now.Sub(since) reads the WHOLE merge-timeout/deploy-timeout
-		// round-trip's elapsed time, not just the time since the latest
-		// re-entry. Zero for every stage/cycle Enter did not mark to preserve, so
-		// this is a no-op everywhere else.
+		// CLOCK 3 ONLY, from stageEnteredAt, against its own budget.
 		if paused && elapse.Reason == ReasonAdmissionStarved {
 			return ClockNone, time.Time{}, 0, Edge{}
 		}
-		carry := time.Duration(t.Status.StageElapsedCarrySeconds) * time.Second
-		return ClockWork, t.Status.StageEnteredAt.Add(-carry), budget, elapse
+		// A merge-timeout/deploy-timeout un-park RE-ENTRY. carry > 0 IN merging or
+		// deploying is the discriminator, and it is exact: Enter accumulates the
+		// carry on those two park edges only, preserves it on exactly the matching
+		// un-park edges, and zeroes it on every other edge (including a HEAD-MOVED
+		// merging exit and enterFreshImplementing), so a genuinely fresh entry into
+		// merging/deploying can never land here. MergeReentries/DeployReentries are
+		// NOT usable for this - they are cumulative counters that stay set across an
+		// unrelated later cycle. The STAGE half of the condition matters just as
+		// much: the carry is live while the Task is still PARKED (Enter accumulates
+		// it on the way in), and parked's own budget is the 7-day ParkRetention reap
+		// clock, which a bare carry check would replace with a 30-minute one.
+		//
+		// EdgeS, plural: there are TWO callers that produce a
+		// parked(merge-timeout) -> merging re-entry, and both land here. Unpark is
+		// the periodic one (driveUnparks); reenterParkedOnReview is the
+		// review-driven one, taken when a maintainer requests changes on a Task
+		// parked at merge-timeout. Both are reason-gated and both burn a
+		// MergeReentries lap, so the carry, the lap accounting and this window are
+		// identical on either - Enter derives the preservation from the live
+		// (from, reason, to) triple, not from which function called it, which is
+		// precisely why neither caller has to know about this.
+		//
+		// The re-entry gets its OWN bounded window measured from THIS entry, with
+		// NO carry subtraction, against TimeoutReentryBudget (issue #513). Issue
+		// #480 conflated two things and this splits them:
+		//
+		//   - the DEADLINE gets a fresh bounded window per re-entry, because a
+		//     timeout park happens only once the budget is ALREADY spent, so a
+		//     carry-adjusted `since` puts the re-entry over budget on arrival and
+		//     it re-parks on the same reconcile pass. Live in #513: re-entry
+		//     lifetimes of 7.2ms/8.8ms/11.3ms and terminal failed 107s after the
+		//     first timeout, with all three MaxDeployReentries laps spent and zero
+		//     deploy time bought.
+		//   - the REPORTED RESIDENCY stays cumulative, via StageElapsedSeconds
+		//     (below) and the metrics that read it, which is what #480 actually
+		//     measured.
+		//
+		// THE BOUND IS PER TIMEOUT CYCLE: base budget + 3 x 30m. It is NOT a total
+		// wall-clock bound on the stage, and merging is where that distinction
+		// bites. A HEAD-MOVED exit (HeadMoved) or the ci-red exit (CIRed) leaves
+		// merging via reviewing/implementing, and Enter ZEROES the carry on those
+		// edges - deliberately, so an unrelated attempt is never handed the short
+		// window - so the NEXT merging entry starts a new cycle with a fresh full 4h
+		// base. Those bounces have their own counters (MaxHeadMoveReentries,
+		// MaxCIRedReentries), which is what bounds the number of cycles; the
+		// multi-cycle worst case is therefore hours, not one 5h30m cycle. That is
+		// unchanged from #480, which laundered the carry on exactly the same edges.
+		reentered := stg == v1alpha1.StageMerging || stg == v1alpha1.StageDeploying
+		if reentered && t.Status.StageElapsedCarrySeconds > 0 {
+			return ClockWork, t.Status.StageEnteredAt.Time, v1alpha1.TimeoutReentryBudget, elapse
+		}
+		return ClockWork, t.Status.StageEnteredAt.Time, budget, elapse
 	}
 
 	// A POD stage. Which of the three is armed depends ENTIRELY on the stamps.
@@ -884,9 +943,11 @@ func Elapsed(t *v1alpha1.Task, paused bool, now time.Time) (Edge, bool) {
 
 // StageElapsedSeconds is the carry-adjusted (issue #480) elapsed time since
 // Status.StageEnteredAt: now.Sub(StageEnteredAt) plus StageElapsedCarrySeconds.
-// ArmedClock's podless WORK clock applies the same adjustment inline (it needs
-// an adjusted `since`, not a bare elapsed float); this is the form every OTHER
-// caller that reports or compares stage age must use instead of a bare
+// This is THE ONLY carry-adjusted reading left, and it is deliberately a
+// REPORTING number, not a deadline: ArmedClock's podless WORK clock stopped
+// subtracting the carry in issue #513 (a timeout re-entry gets its own
+// TimeoutReentryBudget window instead), so this is the form every caller that
+// reports or compares true stage RESIDENCY must use instead of a bare
 // now.Sub(StageEnteredAt) - operator_task_stage_age_seconds
 // (project_controller.go's updateTaskStageGauges) and
 // operator_merge_cursor_stalled_seconds (merge.go's stallMerge) both do, or

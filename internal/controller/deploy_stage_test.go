@@ -2,12 +2,15 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // THE DEPLOYING STAGE HAS AN ACTOR (gap G3).
@@ -233,6 +236,181 @@ func TestDeployingNeverDeliversAnUnmergedMR(t *testing.T) {
 	}
 	if got := mdGetTask(t, c, "t1"); got.Status.Stage != tatarav1alpha1.StageDeploying {
 		t.Fatalf("stage = %q, want deploying", got.Status.Stage)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// DEPLOYING MUST NARRATE ITS WAIT (issue #513).
+//
+// merging logs merge_waiting on every poll pass (stallMerge). deploying logged
+// NOTHING, so a wedged deploy was silent for its whole 2h budget and the first
+// evidence anyone got was parked(deploy-timeout), 2h07m after the fact - with no
+// record of WHICH owned MR never got its deployedAt.
+// ---------------------------------------------------------------------------
+
+// kvLogEntry is one recorded log line WITH its structured fields.
+// recordingSink (unpark_decline_test.go) keeps only the message; these
+// assertions are about the FIELDS.
+type kvLogEntry struct {
+	msg string
+	kv  map[string]any
+}
+
+func (e kvLogEntry) field(key string) any { return e.kv[key] }
+
+type kvSink struct{ entries *[]kvLogEntry }
+
+func (s kvSink) Init(logr.RuntimeInfo)        {}
+func (s kvSink) Enabled(int) bool             { return true }
+func (s kvSink) WithName(string) logr.LogSink { return s }
+
+func (s kvSink) WithValues(kv ...any) logr.LogSink { return s }
+
+func (s kvSink) Info(_ int, msg string, kv ...any) {
+	*s.entries = append(*s.entries, kvLogEntry{msg: msg, kv: kvPairs(kv)})
+}
+
+func (s kvSink) Error(_ error, msg string, kv ...any) {
+	*s.entries = append(*s.entries, kvLogEntry{msg: msg, kv: kvPairs(kv)})
+}
+
+func kvPairs(kv []any) map[string]any {
+	out := map[string]any{}
+	for i := 0; i+1 < len(kv); i += 2 {
+		if k, ok := kv[i].(string); ok {
+			out[k] = kv[i+1]
+		}
+	}
+	return out
+}
+
+func kvLoggingCtx() (context.Context, *[]kvLogEntry) {
+	var entries []kvLogEntry
+	return log.IntoContext(context.Background(), logr.New(kvSink{entries: &entries})), &entries
+}
+
+// oneLoggedAction returns the single entry carrying action=want.
+func oneLoggedAction(t *testing.T, entries []kvLogEntry, want string) kvLogEntry {
+	t.Helper()
+	var found []kvLogEntry
+	for _, e := range entries {
+		if e.field("action") == want {
+			found = append(found, e)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("logged action=%q %d times, want exactly 1; entries: %+v", want, len(found), entries)
+	}
+	return found[0]
+}
+
+// An owned MR still lacking deployedAt must be NAMED on every poll pass, AND the
+// line must say WHY it is still pending: the count alone does not distinguish an
+// apply that never went green (issue #513) from a pin that is merely behind.
+func TestDeployingLogsWaitingWithThePendingMRs(t *testing.T) {
+	task := mdTask("t1", "implement", tatarav1alpha1.StageDeploying)
+	task.Status.StageEnteredAt = &mdMergedAt // 11:00; mdNewDriver's clock is 12:00
+	// A deploy-timeout un-park already folded 2h into the carry. stalled_seconds
+	// must ADD it, not report the bare hour since this entry - without a non-zero
+	// carry here the assertion below passes identically for an UN-adjusted reading.
+	task.Status.StageElapsedCarrySeconds = 7200
+	mrA := mdDeployingMR(task, "tatara-operator", 7)
+	mrB := mdDeployingMR(task, "tatara-cli", 9)
+	c := newMirrorClient(t, mdProject(), mdSecret(), mdRepo("tatara-operator"), mdRepo("tatara-cli"),
+		mdHelmfileRepo(), task, mrA, mrB)
+
+	f := newFakeForge(t)
+	rd := mdNewReader(f)
+	rd.tags["tatara-operator"] = "v1.4.0"
+	rd.tags["tatara-cli"] = "v0.9.1"
+	rd.runs[helmfileRepoName] = mdSuccessfulApply("apply-sha")
+	// The apply carries the operator's v1.4.0; the cli is still a version back.
+	rd.pin["main"] = mdPin("tatara-operator", "1.3.0") + mdImagePin("tatara-cli", "0.9.0")
+	rd.pin["apply-sha"] = mdPin("tatara-operator", "1.4.0") + mdImagePin("tatara-cli", "0.9.0")
+	d := mdNewDriverWithReader(t, f, c, rd)
+
+	ctx, entries := kvLoggingCtx()
+	res, err := d.ReconcileDeploying(ctx, mdProject(), task)
+	if err != nil {
+		t.Fatalf("ReconcileDeploying: %v", err)
+	}
+	if res.RequeueAfter == 0 {
+		t.Fatalf("an undeployed MR must keep the deploying poll alive")
+	}
+
+	e := oneLoggedAction(t, *entries, "deploy_waiting")
+	if got := e.field("pending"); got != 1 {
+		t.Fatalf("pending = %v, want 1 (only tatara-cli is undeployed)", got)
+	}
+	const wantRef = "tatara-cli#9 (the applied helmfile pin is behind v0.9.1)"
+	if got, ok := e.field("pending_mrs").(string); !ok || got != wantRef {
+		t.Fatalf("pending_mrs = %v, want %q: a wait that does not say WHY cannot be triaged",
+			e.field("pending_mrs"), wantRef)
+	}
+	if got := e.field("stalled_seconds"); got != 10800.0 {
+		t.Fatalf("stalled_seconds = %v, want 10800 (1h since stageEnteredAt PLUS the 2h carry)", got)
+	}
+	if got := e.field("resource_id"); got != "t1" {
+		t.Fatalf("resource_id = %v, want t1", got)
+	}
+}
+
+// THIS IS ISSUE #513's OWN WAIT. The ARC runner that runs tatara-helmfile's
+// apply.yaml ran out of disk, so the apply never went green and no pin ever
+// moved. That branch of resolveDeployed returned a bare false and logged nothing
+// at all, which is why 2h07m of deploying produced no evidence whatsoever: the
+// pending count says an MR is not deployed, it never said the apply is the thing
+// that is broken.
+func TestDeployingLogsWaitingWhenNoApplyRunWentGreen(t *testing.T) {
+	task := mdTask("t1", "implement", tatarav1alpha1.StageDeploying)
+	task.Status.StageEnteredAt = &mdMergedAt
+	mr := mdDeployingMR(task, "tatara-operator", 7)
+	c := newMirrorClient(t, mdProject(), mdSecret(), mdRepo("tatara-operator"), mdHelmfileRepo(), task, mr)
+
+	f := newFakeForge(t)
+	rd := mdNewReader(f)
+	rd.tags["tatara-operator"] = "v1.4.0"
+	rd.pin["main"] = mdPin("tatara-operator", "1.3.0")
+	// rd.runs is deliberately EMPTY: no completed successful apply run exists.
+	d := mdNewDriverWithReader(t, f, c, rd)
+
+	ctx, entries := kvLoggingCtx()
+	if _, err := d.ReconcileDeploying(ctx, mdProject(), task); err != nil {
+		t.Fatalf("ReconcileDeploying: %v", err)
+	}
+
+	e := oneLoggedAction(t, *entries, "deploy_waiting")
+	refs, _ := e.field("pending_mrs").(string)
+	if !strings.HasPrefix(refs, "tatara-operator#7 (") || !strings.Contains(refs, "apply run on main yet") {
+		t.Fatalf("pending_mrs = %q, want tatara-operator#7 named WITH \"no ... apply run on main yet\": "+
+			"this is the branch that was silent for issue #513's whole 2h07m", refs)
+	}
+}
+
+// THE EMPTY SET (C.4) is the silent wedge that ends at parked(deploy-timeout)
+// with no explanation at all: it must say that it owns none.
+func TestDeployingLogsWaitingWhenItOwnsNoMergeRequests(t *testing.T) {
+	task := mdTask("t1", "implement", tatarav1alpha1.StageDeploying)
+	task.Status.StageEnteredAt = &mdMergedAt
+	c := newMirrorClient(t, mdProject(), mdSecret(), mdRepo("tatara-operator"), mdHelmfileRepo(), task)
+
+	d := mdNewDriver(t, newFakeForge(t), c)
+	ctx, entries := kvLoggingCtx()
+	res, err := d.ReconcileDeploying(ctx, mdProject(), task)
+	if err != nil {
+		t.Fatalf("ReconcileDeploying: %v", err)
+	}
+	if res.RequeueAfter == 0 {
+		t.Fatalf("the empty set must keep the deploying poll alive")
+	}
+
+	e := oneLoggedAction(t, *entries, "deploy_waiting")
+	if got := e.field("pending"); got != 0 {
+		t.Fatalf("pending = %v, want 0", got)
+	}
+	reason, _ := e.field("reason").(string)
+	if !strings.Contains(reason, "no merge requests") {
+		t.Fatalf("reason = %q, want it to say the Task owns no merge requests", reason)
 	}
 }
 

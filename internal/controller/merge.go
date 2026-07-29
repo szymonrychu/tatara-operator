@@ -458,13 +458,11 @@ func (d *StageDriver) headMoved(ctx context.Context, proj *tatarav1alpha1.Projec
 // that cannot, a failed required check, is intercepted before this (issue #476).
 func (d *StageDriver) stallMerge(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task,
 	repo string, cursor int, why string) (ctrl.Result, error) {
-	stalledFor := 0.0
-	if task.Status.StageEnteredAt != nil {
-		// Carry-adjusted (issue #480): a merge-timeout un-park re-stamps
-		// StageEnteredAt, so a bare now.Sub would read the stall clock as reset to
-		// near-zero on every re-entry instead of the whole stuck cycle.
-		stalledFor = stage.StageElapsedSeconds(task, d.now())
-	}
+	// Carry-adjusted (issue #480): a merge-timeout un-park re-stamps
+	// StageEnteredAt, so a bare now.Sub would read the stall clock as reset to
+	// near-zero on every re-entry instead of the whole stuck cycle.
+	// StageElapsedSeconds returns 0 for a nil stamp itself, so no guard here.
+	stalledFor := stage.StageElapsedSeconds(task, d.now())
 	obs.MergeCursorStalledSeconds.WithLabelValues(task.Name, repo).Set(stalledFor)
 	log.FromContext(ctx).Info("merge: waiting",
 		"action", "merge_waiting", "resource_id", task.Name, "repo", repo,
