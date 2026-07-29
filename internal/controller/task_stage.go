@@ -180,16 +180,19 @@ func (r *TaskReconciler) reconcileClocks(ctx context.Context, proj *tatarav1alph
 		// own advance costs at most one illegal-edge counter, never a double
 		// transition.
 		if edge, ready := reviewAdvanceEdge(task, mrs, maxReviewRounds(proj)); ready {
-			// The SAME red-CI gate the edge-triggered advance applies (issue #476).
-			// This backstop is the path that actually runs when the one-shot advance
-			// errored out - including when it errored out ON this very gate - so a
-			// guard only on the primary path would be a guard the retry walks past.
+			// The SAME red-CI gate the edge-triggered advance applies (issue #476),
+			// and it FAILS OPEN here for a sharper reason than it does there: this
+			// block runs BEFORE the HandoffDeadline below and BEFORE stage.ArmedClock,
+			// so returning an error from it is a Task that reaches neither - wedged in
+			// reviewing, holding its admitted concurrency ticket, in the one function
+			// whose whole job is that no stage lacks an exit deadline.
 			if edge.To == tatarav1alpha1.StageMerging {
 				red, cerr := ciRedAtReviewedHead(ctx, r.Client, r.SCMFor, r.Metrics, proj, mrs)
-				if cerr != nil {
-					return ctrl.Result{}, true, cerr
-				}
-				if red != nil {
+				switch {
+				case cerr != nil:
+					l.Error(cerr, "review: could not read live CI at the reviewed head; advancing anyway (the merging gate re-checks every 60s)",
+						"action", "ci_red_check_failed", "resource_id", task.Name, "kind", task.Spec.Kind)
+				case red != nil:
 					return ctrl.Result{}, true, enterCIRed(ctx, r.Client, r.spiller(proj), r.Metrics, task, mrs, red, now)
 				}
 			}

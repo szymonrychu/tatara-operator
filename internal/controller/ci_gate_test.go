@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -94,6 +96,50 @@ func TestReviewAdvanceIgnoresRedCIOnAnUnreviewedHead(t *testing.T) {
 	if got := mdGetTask(t, c, "t1"); got.Status.Stage != tatarav1alpha1.StageMerging {
 		t.Fatalf("stage = %q(%q), want merging: the red head is not the reviewed head",
 			got.Status.Stage, got.Status.StageReason)
+	}
+}
+
+// THE GATE FAILS OPEN. reconcileClocks evaluates the reviewing advance BEFORE
+// the HandoffDeadline and BEFORE stage.ArmedClock, so an error here would be a
+// Task that reaches neither. A forge blip costs one pointless promotion instead
+// - and merging re-checks the same status within 60s.
+func TestReviewAdvanceFailsOpenWhenCICannotBeRead(t *testing.T) {
+	_, mr, f, c := ciRedFixture(t, tatarav1alpha1.StageReviewing, "failure", "sha-a", true)
+	f.prStateErr = errors.New("502 bad gateway")
+	d := mdNewDriver(t, f, c)
+	if err := d.DrainPendingReview(context.Background(), mdGetMR(t, c, mr.Name)); err != nil {
+		t.Fatalf("DrainPendingReview: %v", err)
+	}
+	if got := mdGetTask(t, c, "t1"); got.Status.Stage != tatarav1alpha1.StageMerging {
+		t.Fatalf("stage = %q(%q), want merging: an unreadable CI must not wedge the advance",
+			got.Status.Stage, got.Status.StageReason)
+	}
+}
+
+// THE IMPLEMENT POD HAS TO KNOW WHY. The bundle renders mr.status.ciStatus - the
+// STALE mirror value this whole gate exists because of - so the bounce carries an
+// operator note naming the repo, PR and reviewed SHA, exactly as the
+// request_changes path carries reviewBeltNote.
+func TestCIRedLeavesANoteForTheImplementPod(t *testing.T) {
+	task, _, f, c := ciRedFixture(t, tatarav1alpha1.StageMerging, "failure", "sha-a", false)
+	d := mdNewDriver(t, f, c)
+	if _, err := d.ReconcileMerging(context.Background(), mdProject(), task); err != nil {
+		t.Fatalf("ReconcileMerging: %v", err)
+	}
+	got := mdGetTask(t, c, "t1")
+	found := ""
+	for _, n := range got.Status.Notes {
+		if n.Agent == "operator" && strings.Contains(n.Body, "CI is RED") {
+			found = n.Body
+		}
+	}
+	if found == "" {
+		t.Fatalf("no operator note on the ci-red bounce; notes = %+v", got.Status.Notes)
+	}
+	for _, want := range []string{"tatara-operator!7", "sha-a", "attempt 1 of 3"} {
+		if !strings.Contains(found, want) {
+			t.Fatalf("note %q does not name %q", found, want)
+		}
 	}
 }
 
@@ -211,5 +257,42 @@ func TestCIRedParksWhenAnEarlierRepoAlreadyMerged(t *testing.T) {
 	}
 	if stage.HasReentry(stage.ReasonCIRed) {
 		t.Fatal("parked(ci-red) must have no F.6 re-entry: a human decides")
+	}
+}
+
+// THE MERGED BOUNDARY IS READ LIVE TOO. anyMerged() reads the MIRROR, and the
+// mirror sweep is hourly, so an MR merged out of band (the C.9 accepted risk)
+// still reads "open" there. Left alone, a red sibling would route the Task to
+// implementing and re-propose merged code. The gate folds the live observation
+// onto the in-memory copy so the routing sees the truth.
+func TestCIRedParksOnAnMRMergedOutOfBandWhileTheMirrorStillSaysOpen(t *testing.T) {
+	task := mdTask("t1", "implement", tatarav1alpha1.StageReviewing)
+	task.Spec.MergeOrder = []string{"tatara-cli", "tatara-operator"}
+	// The mirror says open for BOTH; only the forge knows tatara-cli!5 landed.
+	first := mdMR(task, "tatara-cli", 5)
+	first.Status.ReviewedSHA = "sha-cli"
+	first.Status.Status = "approved"
+	second := mdMR(task, "tatara-operator", 7)
+	second.Status.ReviewedSHA = "sha-a"
+	second.Status.Status = "approved"
+	pr := pendingReviewFixture("approve", 1, "sha-a")
+	pr.Findings = nil
+	second.Status.PendingReview = pr
+	c := newMirrorClient(t, mdProject(), mdSecret(), mdRepo("tatara-cli"), mdRepo("tatara-operator"),
+		task, first, second)
+
+	f := newFakeForge(t)
+	f.head[5], f.head[7] = "sha-cli", "sha-a"
+	f.state[5] = scm.PRState{Merged: true, HeadSHA: "sha-cli"}
+	f.state[7] = scm.PRState{CIStatus: "failure", HeadSHA: "sha-a"}
+	d := mdNewDriver(t, f, c)
+
+	if err := d.DrainPendingReview(context.Background(), mdGetMR(t, c, second.Name)); err != nil {
+		t.Fatalf("DrainPendingReview: %v", err)
+	}
+	got := mdGetTask(t, c, "t1")
+	if got.Status.Stage != tatarav1alpha1.StageParked || got.Status.StageReason != stage.ReasonCIRed {
+		t.Fatalf("stage = %q(%q), want parked(ci-red): a merged sibling outranks the red one",
+			got.Status.Stage, got.Status.StageReason)
 	}
 }
