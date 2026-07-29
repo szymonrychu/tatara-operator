@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"time"
 )
 
@@ -97,6 +98,49 @@ func HasReviewMarker(body, round, sha string) bool {
 // the review body; the providers parse it back out to derive per-finding markers.
 func ReviewMarker(round, sha string) string {
 	return fmt.Sprintf("<!-- tatara-review round=%s sha=%s -->", round, sha)
+}
+
+// hunkIndex maps a new-side file path to the ranges of new-side line numbers
+// present in the change's diff. NEITHER forge can anchor a comment to a line
+// outside those ranges: GitLab 400s "line_code can't be blank" (#394) and GitHub
+// 422s "Line could not be resolved" (#482). Both providers therefore build this
+// index once per post and degrade the findings it rejects.
+type hunkIndex map[string][][2]int
+
+func (h hunkIndex) anchorable(path string, line int) bool {
+	if line <= 0 {
+		return false
+	}
+	for _, r := range h[path] {
+		if line >= r[0] && line <= r[1] {
+			return true
+		}
+	}
+	return false
+}
+
+// hunkHeaderRE captures the new-side start and (optional) count from a unified
+// diff hunk header: "@@ -a,b +c,d @@" -> c, d. A missing count means 1 line.
+var hunkHeaderRE = regexp.MustCompile(`@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@`)
+
+// addPatch indexes every new-side hunk range in one file's unified diff. An empty
+// patch (GitHub omits it for binary and very large files) adds nothing, so every
+// finding on that file is unanchorable and degrades.
+func (h hunkIndex) addPatch(path, patch string) {
+	for _, m := range hunkHeaderRE.FindAllStringSubmatch(patch, -1) {
+		start, err := strconv.Atoi(m[1])
+		if err != nil {
+			continue
+		}
+		count := 1
+		if m[2] != "" {
+			count, _ = strconv.Atoi(m[2])
+		}
+		if count <= 0 {
+			continue // a pure-deletion hunk has no new-side line to anchor to
+		}
+		h[path] = append(h[path], [2]int{start, start + count - 1})
+	}
 }
 
 // findingMarker renders the per-finding marker GitLab needs, because GitLab's

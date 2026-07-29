@@ -149,6 +149,14 @@ type ProjectReconciler struct {
 	// path (MaxConcurrentReconciles=1); no mutex required.
 	memoryUnhealthyCycles map[string]int
 
+	// memoryApplyTransientSince records, per project, when the current run of
+	// RETRYABLE applyMemoryStack failures started (issue #439). reconcileMemory
+	// absorbs those failures - no phase=Failed, no returned reconcile error -
+	// until the run outlasts memoryApplyTransientGrace. Read/written only on the
+	// serialised reconcile path (MaxConcurrentReconciles: 1); no mutex required,
+	// same as memoryUnhealthyCycles.
+	memoryApplyTransientSince map[string]time.Time
+
 	// ToolSurfaceHTTP is the client used by updateToolSurfaceProbe to probe the
 	// operator-write tool backend. Nil falls back to a short-timeout
 	// default; tests inject an httptest-backed client.
@@ -314,6 +322,13 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	r.maybeRecomputeGauges(ctx)
+
+	// Make this project's queue-saturation gauges EXIST (at 0) even before its
+	// first QueuedEvent reconcile writes one, so "idle" reads 0 instead of the
+	// series vanishing (issue #496). Idempotent and value-preserving.
+	for _, class := range []string{tataradevv1alpha1.QueueClassNormal, tataradevv1alpha1.QueueClassAlert} {
+		r.Metrics.SeedQueueGauges(project.Name, class)
+	}
 
 	r.ensureLabelColors(ctx, &project)
 

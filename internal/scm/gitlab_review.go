@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -88,50 +87,18 @@ func (c *GitLab) glMRDiffsOf(ctx context.Context, proj, token string, number int
 	return glDoPaged[glMRDiff](ctx, c.base(), path, token)
 }
 
-// glHunkIndex maps a new-side file path to the ranges of new-side line numbers
-// present in the MR diff. A GitLab text position anchors ONLY to a line inside one
-// of these ranges; a finding outside them (or with no line) has no line_code and
-// the POST 400s "line_code can't be blank" (#394), so it must not be posted as a
-// discussion.
-type glHunkIndex map[string][][2]int
-
-func (h glHunkIndex) anchorable(path string, line int) bool {
-	if line <= 0 {
-		return false
-	}
-	for _, r := range h[path] {
-		if line >= r[0] && line <= r[1] {
-			return true
-		}
-	}
-	return false
-}
-
-// glHunkHeaderRE captures the new-side start and (optional) count from a unified
-// diff hunk header: "@@ -a,b +c,d @@" -> c, d. A missing count means 1 line.
-var glHunkHeaderRE = regexp.MustCompile(`@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@`)
-
-func glBuildHunkIndex(diffs []glMRDiff) glHunkIndex {
-	idx := make(glHunkIndex, len(diffs))
+// glBuildHunkIndex indexes the MR diff by new-side path. A GitLab text position
+// anchors ONLY to a line inside one of those ranges; a finding outside them (or
+// with no line) has no line_code and the POST 400s "line_code can't be blank"
+// (#394), so it must not be posted as a discussion.
+func glBuildHunkIndex(diffs []glMRDiff) hunkIndex {
+	idx := make(hunkIndex, len(diffs))
 	for _, d := range diffs {
 		path := d.NewPath
 		if path == "" {
 			path = d.OldPath
 		}
-		for _, m := range glHunkHeaderRE.FindAllStringSubmatch(d.Diff, -1) {
-			start, err := strconv.Atoi(m[1])
-			if err != nil {
-				continue
-			}
-			count := 1
-			if m[2] != "" {
-				count, _ = strconv.Atoi(m[2])
-			}
-			if count <= 0 {
-				continue // a pure-deletion hunk has no new-side line to anchor to
-			}
-			idx[path] = append(idx[path], [2]int{start, start + count - 1})
-		}
+		idx.addPatch(path, d.Diff)
 	}
 	return idx
 }
@@ -255,7 +222,7 @@ func (c *GitLab) PostReview(ctx context.Context, repoURL, token string, number i
 	// #398) - can NEVER be a GitLab text position: the discussion POST 400s
 	// "line_code can't be blank" (#394). Such findings degrade to a plain note
 	// below rather than being posted inline and looping the caller forever.
-	var hunks glHunkIndex
+	var hunks hunkIndex
 	if len(findings) > 0 {
 		diffs, derr := c.glMRDiffsOf(ctx, proj, token, number)
 		if derr != nil {

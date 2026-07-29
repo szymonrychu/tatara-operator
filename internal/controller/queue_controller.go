@@ -122,6 +122,18 @@ func effectivePriority(q *tatarav1alpha1.QueuedEvent) int {
 	return tatarav1alpha1.EffectiveQueuePriority(q.Spec)
 }
 
+// queueOrderBefore reports whether a is admitted ahead of b: (effective
+// priority, seq) ascending, so FIFO is preserved WITHIN a priority. Shared by
+// admitPool's sort and the backstop's per-pool head pick (pendingPoolHeads) so
+// both agree on which event is the head of a pool.
+func queueOrderBefore(a, b *tatarav1alpha1.QueuedEvent) bool {
+	pa, pb := effectivePriority(a), effectivePriority(b)
+	if pa != pb {
+		return pa < pb
+	}
+	return a.Spec.Seq < b.Spec.Seq
+}
+
 // hasStarvingPriority2 reports whether queued (already filtered to one
 // class, Queued state) contains a priority-2 event that has waited longer
 // than starvationBudget.
@@ -391,13 +403,7 @@ func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.P
 		// a human waiting on a thread) is admitted ahead of cron/sweep work
 		// (priority 2) queued earlier; incidents (priority 0) also sort first
 		// here, though the alert pool above already reserves their capacity.
-		sort.Slice(queued, func(i, j int) bool {
-			pi, pj := effectivePriority(queued[i]), effectivePriority(queued[j])
-			if pi != pj {
-				return pi < pj
-			}
-			return queued[i].Spec.Seq < queued[j].Spec.Seq
-		})
+		sort.Slice(queued, func(i, j int) bool { return queueOrderBefore(queued[i], queued[j]) })
 		// Priority-2 starvation reservation (contract B.7 fix M21): the normal
 		// pool reserves at least one slot for priority 2 once a priority-2
 		// event has waited > starvationBudget, so priority 0/1 work cannot
@@ -414,6 +420,14 @@ func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.P
 				// indistinguishable from an empty one. Reached only from inside the
 				// loop, so queued is non-empty and this fires at most once per pool
 				// per pass. Admission behaviour is unchanged.
+				//
+				// Since #496 removed the per-event self-poll, this counts ADMISSION
+				// PASSES that found the pool full, not wasted retries: its rate is now
+				// a measure of how often admission is attempted against a saturated
+				// pool, and no longer scales with queue depth. HOW saturated, and for
+				// how long, is carried by operator_queue_depth / operator_queue_inflight
+				// / operator_queue_age_seconds{state="Queued"} - gauges of the actual
+				// condition, which is what the alert rule should key on.
 				if r.Metrics != nil {
 					r.Metrics.AdmissionBlocked(proj.Name, class, "", "pool_full")
 				}
@@ -825,8 +839,9 @@ func (r *DispatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			r.Metrics.SetTokenBudgetUsedRatio(proj.Name, "emergency", float64(emg)/100)
 		}
 	}
-	// Backstop: if any pool has waiting (Queued/empty-state) work and is at capacity,
-	// requeue to catch missed Task-terminal watch events.
+	// Pool-full hold: does any pool have waiting (Queued/empty-state) work while
+	// at capacity? Only ever turns into a self-poll when NO admission backstop is
+	// wired to catch a missed Task-terminal watch event (see blockedPoll).
 	waiting := false
 	for _, class := range []string{tatarav1alpha1.QueueClassNormal, tatarav1alpha1.QueueClassAlert} {
 		cap := proj.QueueCapacity()
@@ -862,9 +877,53 @@ func (r *DispatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{RequeueAfter: r.usageRequeueAfter()}, nil
 	}
 	if waiting {
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		if d := r.blockedPoll(); d > 0 {
+			return ctrl.Result{RequeueAfter: d}, nil
+		}
 	}
 	return ctrl.Result{}, nil
+}
+
+// blockedPollInterval is the self-poll cadence a pool_full-blocked reconcile
+// falls back to when NO admission backstop is wired (BackstopEvents nil: unit
+// tests, and any wiring that does not run the leader-only sweep). With no
+// backstop there is nothing to heal a lost Task-watch event, so the poll is
+// the only thing standing between a missed wakeup and a permanently stalled
+// queue - it must stay.
+const blockedPollInterval = 30 * time.Second
+
+// blockedPoll is how long this reconcile waits before re-attempting admission
+// on its own after a pool_full hold. ZERO when the backstop is wired.
+//
+// Issue #496: a reconcile of ANY QueuedEvent walks and admits the WHOLE
+// project pool, so N events blocked behind a full pool each scheduling their
+// own poll produced N copies of one answer - measured at 40/min for a queue of
+// depth 20, each pass burning a reconcile and one INFO line, and scaling up
+// precisely when the operator is most loaded. Nothing about a blocked event is
+// time-dependent: the only things that can change the answer are a slot
+// freeing, a new event arriving, or a capacity change, and admission is woken
+// for all three:
+//
+//   - a slot freeing wakes it through Watches(&Task{}, mapTaskToQE) - the
+//     finishing Task carries queue.LabelQueuedEvent naming the ticket it was
+//     admitted through, and that reconcile GCs the spent ticket and admits the
+//     next waiting event in the same pass;
+//   - a new event wakes it through For(&QueuedEvent{});
+//   - the leader-only backstop (RunBackstop/EnqueuePending) re-enqueues one
+//     representative per pool every dispatcherBackstopInterval UNCONDITIONALLY,
+//     whether or not the pool is full.
+//
+// That last one is why dropping the poll cannot lose a wakeup: the backstop is
+// a level-triggered sweep over authoritative cluster state, not an edge, so the
+// worst case for a dropped watch event is one sweep interval of latency rather
+// than an indefinite stall. Making the backstop SKIP already-blocked events
+// would break exactly that property, which is why it does not (see
+// TestBackstop_DoesNotSkipASaturatedPool).
+func (r *DispatcherReconciler) blockedPoll() time.Duration {
+	if r.BackstopEvents != nil {
+		return 0
+	}
+	return blockedPollInterval
 }
 
 // poolHasQueued reports whether the pool of the given class has any Queued
@@ -986,13 +1045,56 @@ func (r *DispatcherReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return b.Complete(r)
 }
 
+// pendingPoolHeads picks ONE representative pending QueuedEvent per pool class
+// from a single project's events: the head, by the same (priority, seq)
+// ordering admitPool admits in. Classes are returned in a stable order.
+//
+// Issue #496: the backstop used to push every pending QueuedEvent on every
+// sweep, which at the observed depth of 20 was 20 re-enqueues/minute of pure
+// duplication - a reconcile of ANY QueuedEvent walks and admits the WHOLE
+// project pool, so one representative drives an IDENTICAL, complete admit pass
+// for the project at O(1) cost instead of O(queue depth).
+//
+// One per POOL rather than one per project purely for redundancy: the pass
+// covers both pools whichever event triggers it, but a representative deleted
+// between this list and its reconcile would waste the sweep, and the two pools
+// drain independently. Two is still O(1).
+func pendingPoolHeads(qes []tatarav1alpha1.QueuedEvent) []*tatarav1alpha1.QueuedEvent {
+	heads := map[string]*tatarav1alpha1.QueuedEvent{}
+	for i := range qes {
+		q := &qes[i]
+		if !isQueued(q.Status.State) {
+			continue
+		}
+		if cur, ok := heads[q.Spec.Class]; !ok || queueOrderBefore(q, cur) {
+			heads[q.Spec.Class] = q
+		}
+	}
+	classes := make([]string, 0, len(heads))
+	for class := range heads {
+		classes = append(classes, class)
+	}
+	sort.Strings(classes)
+	out := make([]*tatarav1alpha1.QueuedEvent, 0, len(classes))
+	for _, class := range classes {
+		out = append(out, heads[class])
+	}
+	return out
+}
+
 // EnqueuePending is the leader-only admission backstop's list-and-push step
-// (issue #395): it lists every Project and, for each, its queued/pending
-// QueuedEvents, pushing a GenericEvent per pending QE onto BackstopEvents so
-// DispatcherReconciler.Reconcile runs for it even if no watch event ever
-// fired (a rollout/leader-handoff race can otherwise strand a QueuedEvent in
-// Queued indefinitely). It returns the number of events pushed. A nil
-// BackstopEvents is a no-op returning (0, nil).
+// (issue #395): it lists every Project and, for each, pushes a GenericEvent for
+// ONE representative pending QueuedEvent per pool class (pendingPoolHeads) onto
+// BackstopEvents, so DispatcherReconciler.Reconcile runs a full project admit
+// pass even if no watch event ever fired (a rollout/leader-handoff race can
+// otherwise strand a QueuedEvent in Queued indefinitely). It returns the number
+// of events pushed. A nil BackstopEvents is a no-op returning (0, nil).
+//
+// The sweep is UNCONDITIONAL: it does not skip a project whose pool is already
+// full. That is the whole point - a slot can free at any moment, and if the
+// Task watch event for that release is lost, this sweep is the only thing that
+// notices. Skipping saturated pools would turn a bounded one-sweep delay into
+// an indefinite stall (issue #496).
 //
 // The push is guarded by ctx: source.Channel's consumer (wired in
 // SetupWithManager) stops reading once the manager's runnable ctx is
@@ -1017,11 +1119,7 @@ func (r *DispatcherReconciler) EnqueuePending(ctx context.Context) (int, error) 
 			return n, err
 		}
 		qesInProject := filterQEsByProject(qel.Items, proj.Name)
-		for j := range qesInProject {
-			q := &qesInProject[j]
-			if !isQueued(q.Status.State) {
-				continue
-			}
+		for _, q := range pendingPoolHeads(qesInProject) {
 			select {
 			case r.BackstopEvents <- event.GenericEvent{Object: q}:
 			case <-ctx.Done():
