@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -548,15 +549,30 @@ func TestRepoReconcile_ScheduleStampsAnnotationWhenDue(t *testing.T) {
 	}
 }
 
+// cronAtOffsetHours returns a daily cron whose fire is offsetHours away from
+// now. Any test asserting "not due yet" MUST use this instead of hard-coding
+// an hour: with a literal "0 6 * * *" the assertion is true for 1439 minutes a
+// day and FALSE for the 60 seconds after 06:00 UTC, when the boundary really
+// has passed and the operator is right to fire. CI run 30426381616 landed
+// exactly there - lastScheduledReingest seeded at 05:59:55Z, reconcile at
+// 06:00:55Z - and TestRepoReconcile_ScheduleNoDoubleFireWithinInterval failed
+// on correct production behaviour. Because the returned hour is never the
+// current or the preceding hour for offsetHours in [2,22], no fire boundary
+// can fall inside the seeded [base, now] window whatever the wall clock reads.
+func cronAtOffsetHours(offsetHours int) string {
+	return fmt.Sprintf("0 %d * * *", (time.Now().UTC().Hour()+offsetHours)%24)
+}
+
 func TestRepoReconcile_ScheduleRequeuesWhenNotDue(t *testing.T) {
 	mkProject(t, "rp-sch2", "rp-sch2-scm")
 	mkSecret(t, "rp-sch2-scm", map[string][]byte{"token": []byte("x"), "webhookSecret": []byte("y")})
 	mkRepo(t, "sch2", "rp-sch2")
 	setProjectMemoryReady(t, "rp-sch2", "http://mem-rp-sch2.tatara.svc:8080")
 
-	// Far-future daily schedule + a fresh ingest => not due; expect a requeue.
+	// Far-future daily schedule + a fresh ingest => not due; expect a requeue,
+	// clamped to maxScheduleRequeue because the fire is ~12h out.
 	r := getRepo(t, "sch2")
-	r.Spec.ReingestSchedule = "0 6 * * *"
+	r.Spec.ReingestSchedule = cronAtOffsetHours(12)
 	if err := k8sClient.Update(context.Background(), r); err != nil {
 		t.Fatalf("set schedule: %v", err)
 	}
@@ -613,7 +629,7 @@ func TestRepoReconcile_ScheduleNoDoubleFireWithinInterval(t *testing.T) {
 	setProjectMemoryReady(t, "rp-sch4", "http://mem-rp-sch4.tatara.svc:8080")
 
 	r := getRepo(t, "sch4")
-	r.Spec.ReingestSchedule = "0 6 * * *"
+	r.Spec.ReingestSchedule = cronAtOffsetHours(6)
 	if err := k8sClient.Update(context.Background(), r); err != nil {
 		t.Fatalf("set schedule: %v", err)
 	}

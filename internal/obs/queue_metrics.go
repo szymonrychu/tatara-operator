@@ -39,11 +39,16 @@ func newQueueMetrics(reg prometheus.Registerer) *queueMetrics {
 		// is otherwise purely watch-driven, so a QueuedEvent left Queued across a
 		// rollout/leader-handoff window with no fresh watch trigger can stall
 		// admission indefinitely. This counts backstop-driven (not watch-driven)
-		// re-enqueues per project, so a non-zero rate flags that the watch path
-		// is missing events and admission depends on the 60s backstop sweep.
+		// re-enqueues per project.
+		//
+		// Since issue #496 the sweep pushes ONE representative per pool with
+		// pending work, not one per pending event, so this is bounded at 2 per
+		// project per sweep and no longer scales with queue depth - it reads as
+		// "the backstop swept this project", not "the queue is deep". Depth
+		// belongs to operator_queue_depth.
 		dispatcherBackstopEnqueued: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_dispatcher_backstop_enqueued_total",
-			Help: "QueuedEvents re-enqueued by the leader-only admission backstop sweep, by project.",
+			Help: "Dispatcher re-enqueues by the leader-only admission backstop sweep, one per pool with pending work, by project.",
 		}, []string{"project"}),
 		// The EVENT-DRIVEN WAKE on a ticket reaching Admitted (task_ticket_watch.go).
 		// Before this edge existed, the dispatcher's Task write woke TaskReconciler
@@ -107,6 +112,26 @@ func (m *queueMetrics) SetQueueDepth(project, class string, n int) {
 // SetQueueInflight sets operator_queue_inflight for a project and pool class to n (in-flight admitted count).
 func (m *queueMetrics) SetQueueInflight(project, class string, n int) {
 	m.queueInflight.WithLabelValues(project, class).Set(float64(n))
+}
+
+// SeedQueueGauges creates the operator_queue_depth / operator_queue_inflight
+// series for a project's two pools if they do not exist yet, leaving any value
+// already set untouched (WithLabelValues creates at 0 and is idempotent).
+//
+// Both gauges are only ever written from DispatcherReconciler.Reconcile, so a
+// project with no QueuedEvent activity has NO series at all rather than a series
+// reading 0 - which is exactly the state a saturation alert most wants to read.
+// Absence and zero are indistinguishable on a dashboard, no baseline is
+// graphable across a restart, and a depth-based alert cannot tell "idle" from
+// "the exporter went away" (issue #496: the tatara/normal series vanished for
+// 5.4h after a rollout). Called per project from the ProjectReconciler gauge
+// recompute, which every enrolled project reaches.
+func (m *OperatorMetrics) SeedQueueGauges(project, class string) {
+	if m == nil || m.queueDepth == nil || m.queueInflight == nil {
+		return
+	}
+	m.queueDepth.WithLabelValues(project, class)
+	m.queueInflight.WithLabelValues(project, class)
 }
 
 // ResetQueueAge clears operator_queue_age_seconds so a recompute pass leaves

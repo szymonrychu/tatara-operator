@@ -324,6 +324,13 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	r.maybeRecomputeGauges(ctx)
 
+	// Make this project's queue-saturation gauges EXIST (at 0) even before its
+	// first QueuedEvent reconcile writes one, so "idle" reads 0 instead of the
+	// series vanishing (issue #496). Idempotent and value-preserving.
+	for _, class := range []string{tataradevv1alpha1.QueueClassNormal, tataradevv1alpha1.QueueClassAlert} {
+		r.Metrics.SeedQueueGauges(project.Name, class)
+	}
+
 	r.ensureLabelColors(ctx, &project)
 
 	// Consume any standing resume signal BEFORE runScans. The manual-override
