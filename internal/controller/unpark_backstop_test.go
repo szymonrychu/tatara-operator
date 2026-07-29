@@ -69,6 +69,13 @@ func TestApplyUnpark_IdentityUnverifiedNeverReachesImplementing(t *testing.T) {
 		Author: "szymonrychu", Body: "go ahead",
 	}}
 	// Owned AND approved live: the other half of the old fast path's condition.
+	// NOT a live fault injection any more, and the docs on this file used to
+	// imply it was. Step C stopped ApplyUnpark reading in.Issues for the
+	// identity-unverified arm at all, so flipping "approved" to "new" here
+	// changes NOTHING - the arm asks only hasNonBotEvent and ConversingHasRoom.
+	// It is kept as a CANARY: if this Task shape ever reaches implementing
+	// again, an approved owned Issue is what the old fast path needed, so the
+	// test would be sitting on the exact input that used to be dangerous.
 	iss := &tatarav1alpha1.Issue{}
 	iss.Namespace = "tatara"
 	iss.Name = "iss-helmfile-26"

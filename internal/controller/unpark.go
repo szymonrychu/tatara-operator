@@ -46,10 +46,14 @@ import (
 // cannot pass one even by accident. internal/stage does no approval reasoning
 // whatsoever.
 //
-// What that leaves for parked(identity-unverified): a non-bot pendingEvent
-// un-parks it to CONVERSING when the project is under its conversing ceiling,
-// and otherwise it declines no-conversing-room and stays exactly where it is
-// with its pendingEvent retained. IMPLEMENTING is UNREACHABLE from this driver
+// What that leaves for parked(identity-unverified): a non-bot pendingEvent of
+// ANY KIND un-parks it to CONVERSING when the project is under its conversing
+// ceiling, and otherwise it declines no-conversing-room and stays exactly where
+// it is with its pendingEvent retained. ANY KIND is not a slip: stage's
+// hasNonBotEvent tests Author != botLogin and does NOT look at Kind, so an
+// issue_edited event re-engages exactly like an issue_comment does. That is
+// correct, because re-entry here is a RESPONSIVENESS decision and not an
+// authorization one. IMPLEMENTING is UNREACHABLE from this driver
 // for that reason - stage.go's ReasonIdentityUnverified arm has no implementing
 // branch left to reach. The ONE surviving grant path into implementing is
 // restapi's verifyApprovalScope (internal/restapi/outcome.go), which runs the

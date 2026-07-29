@@ -190,15 +190,19 @@ func TestVerifyOneIssue_CitationFailClosedMatrix(t *testing.T) {
 			wantReason:  ApprovalRefusedCitationNotMaintainer,
 		},
 		{
-			// THE SECOND BOT DISJUNCT, ON ITS OWN. Every other bot row sets
-			// IsBot:true and short-circuits isMaintainerComment at the FIRST
-			// disjunct, so `Author == botLogin` had no test of its own - a live
-			// arm of a security check with nothing pinning it. Here the mirror
-			// did NOT flag the comment (IsBot false: mirrorComments computes it
-			// from the project's botLogin, so a botLogin added or corrected
-			// AFTER the comment was mirrored leaves stale rows unflagged), and
-			// the bot is in maintainerLogins. The login comparison is what has
-			// to refuse it.
+			// The mirror did NOT flag this comment (IsBot false: mirrorComments
+			// computes it from the project's botLogin, so a botLogin added or
+			// corrected AFTER the comment was mirrored leaves stale rows
+			// unflagged), and the bot is in maintainerLogins.
+			//
+			// THIS ROW DOES NOT PIN THE botLogin DISJUNCT, though it was added
+			// believing it did. Removing that disjunct leaves this row green,
+			// because withoutBotLogin has already stripped "bot-1" out of
+			// maintainerLogins and IsMaintainer rejects it a second time. What
+			// the row actually proves is the property that matters - the shape
+			// is refused - via whichever layer gets there first.
+			// TestVerifyOneIssue_BotLoginDisjunctIsTheLastLayer pins the
+			// disjunct itself.
 			name: "cited comment is the bot's, UNFLAGGED by the mirror, and the bot is in maintainerLogins",
 			iss: citIssue(
 				cmt("c-1", "bot-1", "go ahead", false, t0),
@@ -296,6 +300,40 @@ func TestVerifyOneIssue_CitationFailClosedMatrix(t *testing.T) {
 				t.Fatalf("ev.Auto = %v, want %v", ev.Auto, tc.wantAuto)
 			}
 		})
+	}
+}
+
+// TestVerifyOneIssue_BotLoginDisjunctIsTheLastLayer pins isMaintainerComment's
+// `botLogin != "" && c.Author == botLogin` disjunct, which nothing pinned before:
+// every bot row in the fail-closed matrix is refused by withoutBotLogin or by
+// IsMaintainer first, so deleting the disjunct - and then IsMaintainer's own bot
+// test as well - left the whole suite green.
+//
+// The botLogin here is one the OTHER TWO LAYERS CANNOT SEE. withoutBotLogin and
+// IsMaintainer both read proj.Spec.Scm.BotLogin ("bot-1"); verifyOneIssue is
+// GIVEN botLogin as a parameter, and this call passes "ci-runner", which is in
+// maintainerLogins and is therefore a maintainer as far as both other layers are
+// concerned. The disjunct is the only thing left that can refuse it.
+//
+// That configuration is not production-reachable today - the one production
+// caller derives botLogin from the same field - and it is not meant to be. This
+// pins a DEFENCE-IN-DEPTH layer at the boundary where it is still a real
+// parameter, so the layer cannot be deleted tomorrow with CI green.
+func TestVerifyOneIssue_BotLoginDisjunctIsTheLastLayer(t *testing.T) {
+	t0 := time.Date(2026, 7, 28, 10, 0, 0, 0, time.UTC)
+	iss := citIssue(
+		cmt("c-1", "ci-runner", "go ahead", false, t0),
+		cmt("c-2", "maintainer-1", "let me look", false, t0.Add(time.Minute)),
+	)
+	proj := citProject("bot-1", "maintainer-1", "ci-runner")
+
+	ev, reason := verifyOneIssue(iss, proj, citRepo(), "ci-runner", cit("c-1", "go ahead"))
+	if reason != ApprovalRefusedCitationNotMaintainer {
+		t.Fatalf("reason = %q, want %q: the botLogin disjunct is the only layer that can refuse this",
+			reason, ApprovalRefusedCitationNotMaintainer)
+	}
+	if ev != nil {
+		t.Fatal("a refusal returned non-nil evidence")
 	}
 }
 

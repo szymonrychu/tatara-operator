@@ -1288,7 +1288,7 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 		writeClientErr(o.w, err)
 		return
 	}
-	granted, evidence := s.verifyApprovalScope(ctx, o.proj, issues, p.ApprovalCitations)
+	granted, evidence, refusal := s.verifyApprovalScope(ctx, o.proj, issues, p.ApprovalCitations)
 	if !granted {
 		if !o.commit(func(t *tatarav1alpha1.Task) error {
 			if err := stage.Enter(t, mrs, tatarav1alpha1.StageParked, stage.ReasonIdentityUnverified, s.now()); err != nil {
@@ -1299,8 +1299,29 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 		}) {
 			return
 		}
-		s.log.WarnContext(ctx, "restapi: clarify reported approval but the citation did not verify on every owned issue",
-			append(reqLogFields(o.r), "task", o.task.Name, "issues", len(issues))...)
+		// A SCOPE-LEVEL refusal has no per-Issue verifier call behind it, so this
+		// is the only place its reason can be counted and logged. The per-Issue
+		// path leaves refusal empty because VerifyApproval already did both.
+		if refusal != "" {
+			s.metrics.ApprovalRefused(refusal)
+			s.log.InfoContext(ctx, "restapi: approval refused",
+				append(reqLogFields(o.r), "action", "approval_refused",
+					"task", o.task.Name, "reason", refusal)...)
+		}
+		// The WARN names WHICH condition refused and counts LIVE Issues beside
+		// owned ones. It used to assert "the citation did not verify on every
+		// owned issue" with issues=len(issues) unconditionally: the WRONG cause
+		// for the no-live-issue shape, where no citation was evaluated at all,
+		// and a count that included the very Issues the refusal was about
+		// excluding. An operator reading it triaged the clarify agent and the
+		// skills pin instead of noticing that a human had closed the issue.
+		reason := refusal
+		if reason == "" {
+			reason = "citation-not-verified"
+		}
+		s.log.WarnContext(ctx, "restapi: clarify reported approval but the scope check refused",
+			append(reqLogFields(o.r), "task", o.task.Name, "reason", reason,
+				"owned_issues", len(issues), "live_issues", liveIssueCount(issues))...)
 		o.ok("implement-unverified")
 		return
 	}
@@ -1326,14 +1347,25 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 			}
 		}
 		if ev == nil {
-			// Genuinely defensive, and only because of the scope skip above:
-			// granted==true means every LIVE issue produced evidence, and this
-			// loop now sees only those. Writing status=approved with a nil
-			// approval would produce an approved Issue with NO approver - it
-			// defeats the idempotence short-circuit, defeats the single-use
-			// replay guard, and projects tatara-approved to the forge with
-			// nobody behind it. The controller's own writer already guards this;
-			// this one did not.
+			// UNREACHABLE AT HEAD, AND KEPT ANYWAY AS A DRIFT DETECTOR. It is
+			// unreachable because verifyApprovalScope refuses the whole request
+			// on !ok || ev == nil and this loop walks exactly the in-scope keys
+			// its map holds - so deleting this arm leaves the package green.
+			// That is not an argument for deleting it. It is reachable again the
+			// moment the scope skip five lines above drifts from the identical
+			// one inside verifyApprovalScope, which is a ONE-LINE regression that
+			// has already happened once: the two filters were out of step until
+			// fix L3-14, and this ERROR is what made it visible. Writing
+			// status=approved with a nil approval produces an approved Issue with
+			// NO approver - it defeats the idempotence short-circuit, defeats the
+			// single-use replay guard, and projects tatara-approved to the forge
+			// with nobody behind it.
+			//
+			// It is pinned in the NEGATIVE, not the positive: no test can reach
+			// this line through the handler, but
+			// TestOutcome_Clarify_ClosedIssueDoesNotBlockALiveOne asserts the
+			// ERROR is absent on the happy path and goes RED the instant the two
+			// filters drift (verified by deleting the skip).
 			s.log.ErrorContext(ctx, "restapi: approval granted with nil evidence; refusing to write an approver-less approval",
 				append(reqLogFields(o.r), "task", o.task.Name, "issue", iss.Name)...)
 			continue
@@ -1403,11 +1435,24 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 // an approval can be granted.
 //
 // A nil verifier FAILS CLOSED.
+//
+// THE THIRD RETURN IS THE REFUSAL REASON, and it is empty on a grant AND on the
+// per-Issue refusal path. That asymmetry is deliberate: VerifyApproval emits
+// action=approval_refused and moves operator_approval_refused_total itself, so
+// re-reporting its refusal here would double-count one refusal into two series.
+// Only the two EMPTY-SET shapes have no per-Issue verifier call behind them, and
+// those are exactly the two that used to refuse with no telemetry at all.
 func (s *Server) verifyApprovalScope(ctx context.Context, proj *tatarav1alpha1.Project,
 	issues []tatarav1alpha1.Issue,
-	citations []tatarav1alpha1.ApprovalCitation) (bool, map[string]*tatarav1alpha1.ApprovalEvidence) {
-	if len(issues) == 0 || s.approval == nil {
-		return false, nil
+	citations []tatarav1alpha1.ApprovalCitation) (bool, map[string]*tatarav1alpha1.ApprovalEvidence, string) {
+	// NOT production-reachable - cmd/manager/wire.go always sets Approval - so it
+	// gets no reason rather than a lie about the Task's Issues. Kept because a
+	// nil verifier must fail closed if the wiring ever regresses (fix W1).
+	if s.approval == nil {
+		return false, nil, ""
+	}
+	if len(issues) == 0 {
+		return false, nil, controller.ApprovalRefusedNoLiveIssue
 	}
 	out := make(map[string]*tatarav1alpha1.ApprovalEvidence, len(issues))
 	for i := range issues {
@@ -1422,14 +1467,31 @@ func (s *Server) verifyApprovalScope(ctx context.Context, proj *tatarav1alpha1.P
 		// fall through to stage.Enter(approved), so an approver-less grant
 		// advanced the Task while writing nothing that recorded it.
 		if !ok || ev == nil {
-			return false, nil
+			return false, nil, ""
 		}
 		out[issues[i].Name] = ev
 	}
+	// Owned Issues exist but every one of them is out of scope. This is the
+	// human-veto shape: closing the only Issue of a clarify Task.
 	if len(out) == 0 {
-		return false, nil
+		return false, nil, controller.ApprovalRefusedNoLiveIssue
 	}
-	return true, out
+	return true, out, ""
+}
+
+// liveIssueCount is the number of issues the scope check would actually have
+// judged. It exists so the refusal WARN can report that rather than len(issues),
+// which for the no-live-issue shape counts the very Issues the refusal was about
+// excluding. controller.ApprovalInScope is called rather than restated for the
+// same reason the scope loop and the write loop call it: one definition.
+func liveIssueCount(issues []tatarav1alpha1.Issue) int {
+	n := 0
+	for i := range issues {
+		if controller.ApprovalInScope(&issues[i]) {
+			n++
+		}
+	}
+	return n
 }
 
 func (s *Server) queueIssueClose(ctx context.Context, proj *tatarav1alpha1.Project, iss *tatarav1alpha1.Issue, taskName, reason string) error {

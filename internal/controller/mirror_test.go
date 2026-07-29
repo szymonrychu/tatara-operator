@@ -504,12 +504,18 @@ func taskAtStage(stage, reason string) *tatarav1alpha1.Task {
 }
 
 // TestSyncIssueOnDemand is fix M11. A non-bot pendingEvent on a parked Task
-// triggers EXACTLY ONE forge read of that thread, BEFORE the C.6 citation check
-// runs. Clause (d) enforces single-use evidence against
-// Comment.ExternalID; TaskEvent carries no externalId; and the parked cadence is
-// DAILY. Without this sync the check re-runs against a thread that does not
-// contain the comment that triggered it, and silently fails - restoring the
-// exact 7-day dead end the redesign removes.
+// triggers EXACTLY ONE forge read of that thread.
+//
+// The ORDERING this used to assert - "BEFORE the C.6 citation check runs" - no
+// longer describes anything. Nothing verifies an approval at un-park time any
+// more; the check moved to restapi.verifyApprovalScope on a live pod's
+// submit_outcome. The sync's PURPOSE survives the move intact and is the real
+// reason it is load-bearing: it is what puts the triggering comment into the
+// mirror the operator later verifies the agent's citation against. Clause (d)
+// enforces single-use evidence against Comment.ExternalID; TaskEvent carries no
+// externalId; and the parked cadence is DAILY. Without this sync the agent cites
+// a comment the operator does not hold, the quote check refuses it as absent,
+// and the Task parks again - the exact 7-day dead end the redesign removes.
 func TestSyncIssueOnDemand(t *testing.T) {
 	ctx := context.Background()
 	proj, repo := mirrorProject("tatara-bot"), mirrorRepo()

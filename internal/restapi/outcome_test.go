@@ -23,6 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/controller"
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/queue"
@@ -801,11 +802,16 @@ func TestOutcome_Clarify_BadShapeStays4xx(t *testing.T) {
 // single-use replay guard, and projects tatara-approved to the forge with nobody
 // behind it.
 //
-// Both halves are asserted deliberately. The writer's own nil guard (Task 5)
-// stops the ISSUE write; verifyApprovalScope's ok-but-nil refusal stops the TASK
-// advancing, which the writer guard alone did not - it skipped the write and let
-// control fall through to stage.Enter(approved). Asserting only the Issue write
-// is what let that half-fix look complete.
+// WHICH GUARD ACTUALLY RUNS HERE, since this used to credit the wrong one. With
+// grantWithNilEvidence the request is refused by verifyApprovalScope's
+// `!ok || ev == nil` arm BEFORE the write loop is entered at all, so the
+// writer's own nil guard never executes on this path - deleting it leaves this
+// test green. Both assertions below still earn their place: they pin the OUTCOME
+// (no Issue write, no Task advance) rather than a particular guard, and the Task
+// half is the one that matters, because the earlier half-fix skipped the write
+// and then let control fall through to stage.Enter(approved) anyway. The writer
+// guard's own coverage is negative and lives in
+// TestOutcome_Clarify_ClosedIssueDoesNotBlockALiveOne.
 func TestOutcome_Clarify_GrantedWithNilEvidenceIsNotWritten(t *testing.T) {
 	i1 := issueV2("tatara-operator", 291, "t1")
 	e := buildV2(t, v2Opts{writer: panicForge{},
@@ -865,6 +871,76 @@ func TestOutcome_Clarify_ClosedIssueIsNotALicence(t *testing.T) {
 	require.Nil(t, e.issue(t, closed.Name).Status.Approval)
 }
 
+// TestOutcome_Clarify_EmptyScopeRefusalIsAttributed covers the two refusal paths
+// that used to be INVISIBLE. Both return before verifyApprovalScope ever calls
+// VerifyApproval, and the reason constant, the
+// operator_approval_refused_total{reason} increment and the
+// action=approval_refused INFO line all live inside that call - so a Task with
+// no live Issue parked with NO attribution of any kind.
+//
+// The closed-issue row is the one that matters operationally: it is a human
+// CLOSING the only Issue of a clarify Task, the strongest veto they have, and
+// the exact gate hole fix L3-14 closed. The park itself was always alerted
+// (alerts/tatara-operator.yaml matches stageReason NEGATIVELY, so
+// identity-unverified is covered), but a park alert with no reason attribution,
+// next to a WARN naming the wrong cause, sent triage at the clarify agent
+// instead of at the human's veto.
+func TestOutcome_Clarify_EmptyScopeRefusalIsAttributed(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		objs    []client.Object
+		wantOwn float64
+	}{
+		{
+			name: "every owned Issue is out of scope",
+			objs: []client.Object{issueV2("tatara-operator", 291, "t1", func(i *tatarav1alpha1.Issue) {
+				i.Status.State = "closed"
+			})},
+			wantOwn: 1,
+		},
+		{
+			name:    "the Task owns no Issue at all",
+			objs:    nil,
+			wantOwn: 0,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := prometheus.NewRegistry()
+			metrics := obs.NewOperatorMetrics(reg)
+			var logBuf bytes.Buffer
+			base := []client.Object{projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+				taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify")}
+			e := buildV2(t, v2Opts{writer: panicForge{}, metrics: metrics,
+				logger:   slog.New(slog.NewJSONHandler(&logBuf, nil)),
+				approval: &fakeApproval{}},
+				append(base, tc.objs...)...)
+
+			w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+				`{"kind":"clarify","payload":{"decision":"implement","reason":"ship it",`+
+					`"approvalCitations":[{"id":"c-2","quote":"go ahead"}]}}`)
+			require.Equal(t, http.StatusOK, w.Code)
+			require.Equal(t, "identity-unverified", e.task(t, "t1").Status.StageReason)
+
+			require.Equal(t, float64(1),
+				testutil.ToFloat64(metrics.ApprovalRefusedCounter(controller.ApprovalRefusedNoLiveIssue)),
+				"the refusal must move operator_approval_refused_total{reason=no-live-issue}")
+
+			line := findLogLine(t, logBuf.Bytes(), "approval_refused")
+			require.Equal(t, controller.ApprovalRefusedNoLiveIssue, line["reason"])
+			require.Equal(t, "t1", line["task"])
+
+			// The WARN must name the condition and count LIVE Issues, not owned
+			// ones. Reporting len(issues) here counted the very Issues the
+			// refusal was about excluding.
+			warn := findLogLineAtLevel(t, logBuf.Bytes(), "WARN")
+			require.Equal(t, controller.ApprovalRefusedNoLiveIssue, warn["reason"])
+			require.Equal(t, float64(0), warn["live_issues"],
+				"no Issue was in scope; that is the whole refusal")
+			require.Equal(t, tc.wantOwn, warn["owned_issues"])
+		})
+	}
+}
+
 // TestOutcome_Clarify_ClosedIssueDoesNotBlockALiveOne is the other half of the
 // scope filter, and the reason it is a FILTER and not a blanket "every owned
 // Issue must produce evidence". A human closing ONE issue of a multi-issue Task
@@ -901,6 +977,10 @@ func TestOutcome_Clarify_ClosedIssueDoesNotBlockALiveOne(t *testing.T) {
 	require.Equal(t, "approved", e.issue(t, live.Name).Status.Status)
 	require.NotEqual(t, "approved", e.issue(t, closed.Name).Status.Status,
 		"the out-of-scope Issue is skipped, never written")
+	// NOT a vacuous absence assertion: deleting the write loop's scope skip
+	// makes this line RED (verified by mutation - the closed Issue's nil lookup
+	// fires the ERROR). It is the only coverage the writer's nil guard has, and
+	// it is what would catch the two scope filters drifting apart again.
 	require.NotContains(t, logBuf.String(), "approver-less approval",
 		"a successful approval alongside a closed Issue must not log an approver-less-approval ERROR")
 	require.NotContains(t, logBuf.String(), `"level":"ERROR"`,
@@ -983,6 +1063,29 @@ func findLogLine(t *testing.T, buf []byte, action string) map[string]any {
 	return found[0]
 }
 
+// findLogLineAtLevel is findLogLine for a record that carries no action field.
+// The scope-refusal WARN is deliberately not an action= business-event line -
+// the action=approval_refused INFO beside it is - so it can only be found by
+// level.
+func findLogLineAtLevel(t *testing.T, buf []byte, level string) map[string]any {
+	t.Helper()
+	var found []map[string]any
+	for _, raw := range bytes.Split(bytes.TrimSpace(buf), []byte("\n")) {
+		if len(raw) == 0 {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal(raw, &rec); err != nil {
+			continue
+		}
+		if rec["level"] == level {
+			found = append(found, rec)
+		}
+	}
+	require.Len(t, found, 1, "want exactly one %s log line, got %d", level, len(found))
+	return found[0]
+}
+
 // TestOutcome_Clarify_AlreadyApprovedIssueNeedsNoFreshCitation exercises
 // verifyOneIssue's clause-2 idempotence THROUGH the handler. An Issue that
 // already carries evidence is approved - clause (2) asks whether every live
@@ -991,9 +1094,14 @@ func findLogLine(t *testing.T, buf []byte, action string) map[string]any {
 // re-match) alive and stops a maintainer's later "thanks!" from revoking a grant
 // already given.
 //
-// It is also what makes fakeApproval's already-approved arm load-bearing rather
-// than a restatement nothing runs: the fake grants NOTHING here and demands a
-// citation, so if that arm is removed this request is refused and the Task parks.
+// SCOPE CAVEAT, so this is not read as more than it is: the assertion runs
+// against fakeApproval, so what it pins is the HANDLER's behaviour given a
+// verifier that reports an already-approved Issue as approved - not
+// verifyOneIssue's clause-2 idempotence itself, which is pinned directly in
+// internal/controller (TestVerifyOneIssue_CitationFailClosedMatrix). The fake's
+// already-approved arm is load-bearing for this test specifically: it grants
+// NOTHING here and demands a citation, so removing that arm refuses the request
+// and parks the Task.
 func TestOutcome_Clarify_AlreadyApprovedIssueNeedsNoFreshCitation(t *testing.T) {
 	approvedAt := metav1.NewTime(frozenNow.Add(-time.Hour))
 	i1 := issueV2("tatara-operator", 291, "t1", func(iss *tatarav1alpha1.Issue) {

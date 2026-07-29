@@ -76,6 +76,18 @@ const (
 	// ApprovalRefusedEvidenceReplayed: that comment was already consumed as
 	// evidence once. A later approval must cite a DIFFERENT comment.
 	ApprovalRefusedEvidenceReplayed = "evidence-replayed"
+	// ApprovalRefusedNoLiveIssue: the Task has NO live owned Issue to approve -
+	// it owns none at all, or a human has closed/done/rejected every one of them.
+	//
+	// THE ONLY REASON EMITTED OUTSIDE verifyOneIssue. It is a property of the
+	// SCOPE, not of any one Issue, so there is nothing for the per-Issue verifier
+	// to blame it on; restapi's verifyApprovalScope emits and counts it. Before
+	// it existed those two paths refused SILENTLY - no reason, no counter, no
+	// action=approval_refused line - because they return before ever calling
+	// VerifyApproval, where all three live. A human closing the only Issue of a
+	// clarify Task, which is the strongest veto they have and the exact gate hole
+	// fix L3-14 closed, was therefore the one refusal with no attribution at all.
+	ApprovalRefusedNoLiveIssue = "no-live-issue"
 )
 
 // ApprovalInScope is C.6 clause (2), narrowed to LIVE issues (fix L3-14): a
@@ -96,9 +108,27 @@ func ApprovalInScope(iss *tatarav1alpha1.Issue) bool {
 }
 
 // isMaintainerComment is the operator's WHO check on one comment: a verified
-// maintainer wrote it and it is structurally NOT the bot. The bot exclusion runs
-// BEFORE IsMaintainer, so a bot login misconfigured into maintainerLogins still
-// cannot approve.
+// maintainer wrote it and it is structurally NOT the bot.
+//
+// THREE LAYERS REFUSE A BOT-AUTHORED APPROVAL, AND THIS FILE USED TO CREDIT THE
+// WRONG ONE. For "the bot login is misconfigured INTO maintainerLogins", the
+// layer that actually refuses is neither of the two here: EffectiveMaintainerLogins
+// runs withoutBotLogin (api/v1alpha1/logins.go), which strips the bot from the
+// project list AND from a per-Repository override before IsMaintainer ever looks.
+// IsMaintainer then rejects the bot login again on its own. Delete BOTH explicit
+// checks and the misconfiguration is still refused - verified by mutation.
+//
+// The botLogin disjunct below is therefore DEFENCE IN DEPTH, not the operative
+// check, and it is kept as such: at the one production call site
+// (GrammarVerifier.VerifyApproval) botLogin is proj.Spec.Scm.BotLogin, making it
+// byte-equivalent to IsMaintainer's own test, but it is the parameter this
+// function is given rather than a value it derives, so it is the layer that
+// survives a change to either of the other two. TestVerifyOneIssue_BotLoginDisjunctIsTheLastLayer
+// pins it by passing a botLogin the other two layers cannot see.
+//
+// Ordering still matters for the OTHER bot shape: c.IsBot is the mirror's
+// structural flag, and checking it before IsMaintainer is what refuses a
+// bot-authored comment on a project that names no maintainers at all.
 func isMaintainerComment(c *tatarav1alpha1.Comment, proj *tatarav1alpha1.Project,
 	repo *tatarav1alpha1.Repository, botLogin string) bool {
 	if c.IsBot || c.Author == "" || (botLogin != "" && c.Author == botLogin) {
