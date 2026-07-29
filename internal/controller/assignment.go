@@ -93,6 +93,7 @@ func assignmentFor(agentKind string, task *tatarav1alpha1.Task, proj *tatarav1al
 		b.WriteString(d)
 	}
 	b.WriteString(promptguidance.PlatformProblemGuidance)
+	b.WriteString(promptguidance.ConcisenessGuidance)
 	// LAST, so it overrides PlatformProblemGuidance's stop-on-blocked rule for
 	// the memory tools. Only when recall is actually down: a healthy turn must
 	// not be told to expect failures it will not see.
