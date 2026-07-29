@@ -689,6 +689,15 @@ func (r *DispatcherReconciler) admitTicket(ctx context.Context, q *tatarav1alpha
 			fresh.Status.PodStartedAt = task.Status.PodStartedAt
 			fresh.Status.StageWorkStartedAt = task.Status.StageWorkStartedAt
 			fresh.Status.Stats.PodRecreations = task.Status.Stats.PodRecreations
+			// StageElapsedCarrySeconds is deliberately NOT copied, and that is safe
+			// only because of what this branch's ONE edge is. approved -> implementing
+			// always arrives with a carry of 0 (stage.Enter only ever accumulates one
+			// on a merging/deploying -> parked(merge-timeout|deploy-timeout) edge) and
+			// lands on a POD stage, whose clocks never read the field at all
+			// (ArmedClock's carry branch is podless-only). The NEXT podless admission
+			// edge added here must revisit this: dropping a live carry would hand a
+			// timeout re-entry the full stage budget instead of TimeoutReentryBudget
+			// and under-report its residency by a whole lap (issues #480, #513).
 			// ConversationLastEventAt: target here is always implementing today (the
 			// bug-catcher above notes approved -> implementing is the only edge that
 			// reaches this branch), so stage.Enter never actually stamped it on this

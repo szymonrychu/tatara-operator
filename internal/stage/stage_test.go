@@ -1194,16 +1194,24 @@ func TestCycleCap_DeployReentriesBounded(t *testing.T) {
 }
 
 // ===========================================================================
-// 9b. THE PARK CLOCK MUST SURVIVE RE-ENTRY (issue #480).
+// 9b. A TIMEOUT RE-ENTRY: CUMULATIVE RESIDENCY, BOUNDED FRESH WINDOW
+// (issues #480 and #513, which pull in OPPOSITE directions and are two
+// different numbers, not one).
 //
-// MergeReentries/DeployReentries bound the LOOP (9, above). They never bounded
-// the COST of each lap: Enter() re-stamps StageEnteredAt on EVERY transition,
-// including the un-park re-entry into the SAME stage, so each lap bought a
-// full fresh 4h/2h budget - turning a capped 3-retry into ~16h of re-testing a
-// deterministically red CI (merging) or a stuck deploy (deploying), and
-// re-arming the CD alert rules every cycle. StageElapsedCarrySeconds must
-// close that gap: the re-entered clock must read AT OR PAST budget the instant
-// the Task re-enters, not near-zero.
+// #480: MergeReentries/DeployReentries bound the LOOP (9, above), never the
+// COST of each lap. Enter re-stamps StageEnteredAt on EVERY transition,
+// including the un-park re-entry into the SAME stage, so the REPORTED age reset
+// to near-zero each lap - a gauge reading 2h20m for a Task that had been
+// merging 10h21m, and CD alert rules re-arming every cycle. The carry fixes
+// that number, and StageElapsedSeconds is where it is read.
+//
+// #513: the fix ALSO pulled the DEADLINE back by the carry, and a timeout park
+// happens only once the budget is already spent - so every re-entry arrived over
+// budget and re-parked on the same reconcile pass. Live: re-entry lifetimes of
+// 7.2ms, 8.8ms and 11.3ms, then terminal failed 107s after the first timeout,
+// all three MaxDeployReentries laps spent buying zero deploy time. The DEADLINE
+// therefore gets a fresh v1alpha1.TimeoutReentryBudget window measured from THIS
+// entry, while the residency number stays cumulative.
 // ===========================================================================
 
 func TestMergeTimeoutClockSurvivesUnpark(t *testing.T) {
@@ -1226,14 +1234,31 @@ func TestMergeTimeoutClockSurvivesUnpark(t *testing.T) {
 		t.Fatalf("unpark(merge-timeout) = (%q, %v), want (merging, true)", target, ok)
 	}
 
+	// #480, the REPORTED residency: still the whole round trip.
+	if got := stage.StageElapsedSeconds(task, h.now); got < budget.Seconds() {
+		t.Fatalf("re-entered merging REPORTS %.0fs residency, want >= %s: the un-park lost the "+
+			"spent time (issue #480)", got, budget)
+	}
+
+	// #513, the DEADLINE: a fresh bounded window, measured from THIS entry.
 	clock, since, gotBudget, _ := stage.ArmedClock(task, false)
 	if clock != stage.ClockWork {
 		t.Fatalf("clock = %q, want work", clock)
 	}
-	elapsed := h.now.Sub(since)
-	if elapsed < gotBudget {
-		t.Fatalf("re-entered merging reads elapsed=%s < budget=%s: the un-park bought a FRESH clock "+
-			"instead of resuming the spent one (issue #480)", elapsed, gotBudget)
+	if gotBudget != v1alpha1.TimeoutReentryBudget {
+		t.Fatalf("re-entry budget = %s, want TimeoutReentryBudget %s", gotBudget, v1alpha1.TimeoutReentryBudget)
+	}
+	if !since.Equal(h.now) {
+		t.Fatalf("re-entry clock starts at %s, want the re-entry stamp %s (no carry subtraction on the "+
+			"DEADLINE: the park it resumes only happens once the budget is spent, issue #513)", since, h.now)
+	}
+	if _, elapsed := stage.Elapsed(task, false, h.now); elapsed {
+		t.Fatal("the merge-timeout re-entry is over budget the instant it arrives: it re-parks on the " +
+			"same reconcile pass and buys zero merge time (issue #513)")
+	}
+	if _, elapsed := stage.Elapsed(task, false, h.now.Add(v1alpha1.TimeoutReentryBudget+time.Second)); !elapsed {
+		t.Fatalf("the merge-timeout re-entry outlives TimeoutReentryBudget %s: the window is unbounded",
+			v1alpha1.TimeoutReentryBudget)
 	}
 }
 
@@ -1257,21 +1282,37 @@ func TestDeployTimeoutClockSurvivesUnpark(t *testing.T) {
 		t.Fatalf("unpark(deploy-timeout) = (%q, %v), want (deploying, true)", target, ok)
 	}
 
+	if got := stage.StageElapsedSeconds(task, h.now); got < budget.Seconds() {
+		t.Fatalf("re-entered deploying REPORTS %.0fs residency, want >= %s: the un-park lost the "+
+			"spent time (issue #480)", got, budget)
+	}
+
 	clock, since, gotBudget, _ := stage.ArmedClock(task, false)
 	if clock != stage.ClockWork {
 		t.Fatalf("clock = %q, want work", clock)
 	}
-	elapsed := h.now.Sub(since)
-	if elapsed < gotBudget {
-		t.Fatalf("re-entered deploying reads elapsed=%s < budget=%s: the un-park bought a FRESH clock "+
-			"instead of resuming the spent one (issue #480)", elapsed, gotBudget)
+	if gotBudget != v1alpha1.TimeoutReentryBudget {
+		t.Fatalf("re-entry budget = %s, want TimeoutReentryBudget %s", gotBudget, v1alpha1.TimeoutReentryBudget)
+	}
+	if !since.Equal(h.now) {
+		t.Fatalf("re-entry clock starts at %s, want the re-entry stamp %s (issue #513)", since, h.now)
+	}
+	if _, elapsed := stage.Elapsed(task, false, h.now); elapsed {
+		t.Fatal("the deploy-timeout re-entry is over budget the instant it arrives: it re-parks on the " +
+			"same reconcile pass and buys zero deploy time (issue #513)")
+	}
+	if _, elapsed := stage.Elapsed(task, false, h.now.Add(v1alpha1.TimeoutReentryBudget+time.Second)); !elapsed {
+		t.Fatalf("the deploy-timeout re-entry outlives TimeoutReentryBudget %s: the window is unbounded",
+			v1alpha1.TimeoutReentryBudget)
 	}
 }
 
 // TestMergeTimeoutCarryAccumulatesAcrossMultipleLaps: the carry must ADD, not
 // overwrite, across successive merge-timeout laps, so a Task that survives two
-// full parks and re-entries reads roughly 2x budget elapsed on the third lap -
-// proving the clock keeps counting the WHOLE cycle, not just the latest lap.
+// full parks and re-entries REPORTS roughly 2x budget of residency on the third
+// lap - proving the reported number keeps counting the WHOLE cycle, not just the
+// latest lap. It is StageElapsedSeconds, not ArmedClock, that carries this:
+// since #513 the deadline deliberately does not.
 func TestMergeTimeoutCarryAccumulatesAcrossMultipleLaps(t *testing.T) {
 	task := newTask("implement", v1alpha1.StageMerging, "")
 	h := newHarness(t, task)
@@ -1290,11 +1331,168 @@ func TestMergeTimeoutCarryAccumulatesAcrossMultipleLaps(t *testing.T) {
 		}
 	}
 
-	_, since, _, _ := stage.ArmedClock(task, false)
-	elapsed := h.now.Sub(since)
-	if elapsed < 2*budget {
-		t.Fatalf("after 2 laps elapsed=%s, want >= %s (carry must ACCUMULATE, not just survive one lap)",
-			elapsed, 2*budget)
+	if got := stage.StageElapsedSeconds(task, h.now); got < 2*budget.Seconds() {
+		t.Fatalf("after 2 laps the REPORTED residency is %.0fs, want >= %s (the carry must ACCUMULATE, "+
+			"not just survive one lap)", got, 2*budget)
+	}
+}
+
+// TestFreshPodlessEntryGetsItsFullStageBudget: only a timeout re-entry gets the
+// short window. A genuinely fresh entry into deploying/merging carries no carry,
+// so it must still get the full F.4 budget - the short window must never leak
+// onto a first attempt.
+func TestFreshPodlessEntryGetsItsFullStageBudget(t *testing.T) {
+	for _, stg := range []string{v1alpha1.StageDeploying, v1alpha1.StageMerging} {
+		t.Run(stg, func(t *testing.T) {
+			task := newTask("implement", v1alpha1.StageReviewing, "")
+			h := newHarness(t, task)
+			h.mrs = []v1alpha1.MergeRequest{openMR()}
+			if stg == v1alpha1.StageDeploying {
+				h.mrs = []v1alpha1.MergeRequest{mergedMR()}
+				if err := h.enter(v1alpha1.StageMerging, ""); err != nil {
+					t.Fatalf("reviewing -> merging: %v", err)
+				}
+			}
+			if err := h.enter(stg, ""); err != nil {
+				t.Fatalf("-> %s: %v", stg, err)
+			}
+
+			want, _ := stage.Budget(stg)
+			_, since, gotBudget, _ := stage.ArmedClock(task, false)
+			if gotBudget != want {
+				t.Fatalf("fresh %s budget = %s, want the full stage budget %s", stg, gotBudget, want)
+			}
+			if !since.Equal(h.now) {
+				t.Fatalf("fresh %s clock starts at %s, want the entry stamp %s", stg, since, h.now)
+			}
+		})
+	}
+}
+
+// TestParkedWithACarryKeepsParkRetention: the carry is already live while the
+// Task is still PARKED - Enter accumulates it on the way in - and parked's budget
+// is the 7-day ParkRetention reap clock. A Task that parks at deploy-timeout and
+// is never un-parked (Unpark can decline) must still get its full retention, not
+// the 30-minute re-entry window: that window belongs to merging/deploying only.
+func TestParkedWithACarryKeepsParkRetention(t *testing.T) {
+	task := newTask("implement", v1alpha1.StageDeploying, "")
+	h := newHarness(t, task)
+	h.mrs = []v1alpha1.MergeRequest{mergedMR()}
+
+	budget, _ := stage.Budget(v1alpha1.StageDeploying)
+	h.now = h.now.Add(budget + time.Second)
+	if err := h.enter(v1alpha1.StageParked, stage.ReasonDeployTimeout); err != nil {
+		t.Fatalf("deploying -> parked(deploy-timeout): %v", err)
+	}
+	if task.Status.StageElapsedCarrySeconds == 0 {
+		t.Fatal("the park edge must have accumulated a carry; this test proves nothing without one")
+	}
+
+	_, since, gotBudget, _ := stage.ArmedClock(task, false)
+	if gotBudget != v1alpha1.ParkRetention {
+		t.Fatalf("parked budget = %s, want ParkRetention %s", gotBudget, v1alpha1.ParkRetention)
+	}
+	if !since.Equal(h.now) {
+		t.Fatalf("parked clock starts at %s, want the park stamp %s: retention measures the PARK", since, h.now)
+	}
+	if _, elapsed := stage.Elapsed(task, false, h.now.Add(v1alpha1.TimeoutReentryBudget+time.Minute)); elapsed {
+		t.Fatalf("a Task parked with a carry is reap-eligible after TimeoutReentryBudget %s, "+
+			"losing %s of retention", v1alpha1.TimeoutReentryBudget, v1alpha1.ParkRetention)
+	}
+}
+
+// TestDeployTimeoutReentryOutlivesAReconcilePass IS issue #513. It walks the
+// whole loop the reconciler walks - poll, breach, park, un-park - and measures
+// what each re-entry actually BUYS. Before the fix every lap died in
+// milliseconds and the Task was terminal failed(deploy-blocked) inside two
+// minutes of the first timeout, with MaxDeployReentries fully spent.
+func TestDeployTimeoutReentryOutlivesAReconcilePass(t *testing.T) {
+	task := newTask("implement", v1alpha1.StageDeploying, "")
+	h := newHarness(t, task)
+	h.mrs = []v1alpha1.MergeRequest{mergedMR()}
+
+	const reconcilePass = 60 * time.Second // deployStageRequeue
+	// Wall clock STARTS at the deploying entry stamp: this test measures total
+	// wall-clock-to-terminal, so the simulated clock and status.stageEnteredAt
+	// must be the same instant.
+	h.now = task.Status.StageEnteredAt.Time
+	start := h.now
+	enteredAt := h.now
+	var lapLifetimes []time.Duration
+	terminalAt := time.Time{}
+
+	for range 10000 {
+		edge, elapsed := stage.Elapsed(task, false, h.now)
+		if !elapsed {
+			h.now = h.now.Add(reconcilePass) // ReconcileDeploying requeued
+			continue
+		}
+		lapLifetimes = append(lapLifetimes, h.now.Sub(enteredAt))
+		if err := h.enter(edge.To, edge.Reason); err != nil {
+			t.Fatalf("lap %d: deploying -> %s(%s): %v", len(lapLifetimes), edge.To, edge.Reason, err)
+		}
+		h.now = h.now.Add(5 * time.Second) // the reaper/queue un-parks moments later
+		target, ok := h.unpark(stage.UnparkInput{MaxOpenTasks: 6, BotLogin: botLogin, MaxTurnsPerTask: 300})
+		if !ok {
+			t.Fatalf("lap %d: unpark(deploy-timeout) refused without a terminal", len(lapLifetimes))
+		}
+		if target == v1alpha1.StageFailed {
+			terminalAt = h.now
+			break
+		}
+		if target != v1alpha1.StageDeploying {
+			t.Fatalf("lap %d: deploy-timeout re-entered %q", len(lapLifetimes), target)
+		}
+		enteredAt = h.now
+	}
+
+	if terminalAt.IsZero() {
+		t.Fatal("the deploying <-> parked(deploy-timeout) cycle never reached a terminal")
+	}
+	// Lap 1 is the base budget; laps 2..n are the re-entries.
+	if len(lapLifetimes) != v1alpha1.MaxDeployReentries+1 {
+		t.Fatalf("laps = %d, want %d (base attempt + MaxDeployReentries)",
+			len(lapLifetimes), v1alpha1.MaxDeployReentries+1)
+	}
+	// EVERY bound here is TWO-SIDED on purpose. Lower bounds alone would ALSO pass
+	// against the pre-#480 behaviour this fix must not restore (a full fresh 2h
+	// budget every lap: 2h > 30m, and 8h total > 3h30m), so a one-sided test
+	// certifies the very regression it is named after.
+	for i, life := range lapLifetimes[1:] {
+		if life <= reconcilePass {
+			t.Fatalf("re-entry %d lived %s, which is NOT MORE than ONE %s reconcile pass: the re-entry "+
+				"arrived already over budget and re-parked immediately (issue #513, where live laps "+
+				"lasted 7.2ms, 8.8ms and 11.3ms)", i+1, life, reconcilePass)
+		}
+		if life <= v1alpha1.TimeoutReentryBudget {
+			t.Fatalf("re-entry %d lived %s, want more than TimeoutReentryBudget %s", i+1, life,
+				v1alpha1.TimeoutReentryBudget)
+		}
+		if life > 2*v1alpha1.TimeoutReentryBudget {
+			t.Fatalf("re-entry %d lived %s, want at most ~2x TimeoutReentryBudget %s: this lap got a "+
+				"FULL fresh stage budget, which is exactly the ~16h unbounded cycle issue #480 killed",
+				i+1, life, 2*v1alpha1.TimeoutReentryBudget)
+		}
+	}
+	base, _ := stage.Budget(v1alpha1.StageDeploying)
+	wantTotal := base + v1alpha1.MaxDeployReentries*v1alpha1.TimeoutReentryBudget
+	// The clock only breaches ON a reconcile pass, and each un-park costs 5s, so
+	// the real total overshoots wantTotal by a handful of passes. Anything beyond
+	// that is a lap that bought more than TimeoutReentryBudget.
+	maxTotal := wantTotal + 5*reconcilePass
+	total := terminalAt.Sub(start)
+	if total < wantTotal {
+		t.Fatalf("failed(deploy-blocked) after %s, want at least %s (base %s + %d x %s): the re-entries "+
+			"bought no deploy time at all (issue #513: terminal 107s after the first timeout)",
+			total, wantTotal, base, v1alpha1.MaxDeployReentries, v1alpha1.TimeoutReentryBudget)
+	}
+	if total > maxTotal {
+		t.Fatalf("failed(deploy-blocked) after %s, want at most %s (base %s + %d x %s + slack): the "+
+			"re-entries bought MORE than TimeoutReentryBudget each",
+			total, maxTotal, base, v1alpha1.MaxDeployReentries, v1alpha1.TimeoutReentryBudget)
+	}
+	if task.Status.StageReason != stage.ReasonDeployBlocked {
+		t.Fatalf("terminal reason = %q, want deploy-blocked", task.Status.StageReason)
 	}
 }
 
@@ -1332,10 +1530,15 @@ func TestMergeTimeoutCarryDoesNotLeakIntoAFreshMergingEntry(t *testing.T) {
 		t.Fatalf("stageElapsedCarrySeconds = %d after a fresh re-entry via reviewing, want 0 (a stale carry "+
 			"would silently shrink an UNRELATED merging attempt's real budget)", task.Status.StageElapsedCarrySeconds)
 	}
-	_, since, _, _ := stage.ArmedClock(task, false)
-	elapsed := h.now.Sub(since)
-	if elapsed >= budget {
-		t.Fatalf("fresh merging entry already reads elapsed=%s >= budget=%s: a stale carry leaked in", elapsed, budget)
+	// Since #513 a leaked carry no longer shows up as INFLATED elapsed time - the
+	// deadline stopped subtracting the carry from `since` - it shows up as the
+	// 30-minute TimeoutReentryBudget in place of the full 4h stage budget. An
+	// elapsed-vs-budget comparison here would be vacuous: `since` is this entry's
+	// stamp either way, so elapsed is 0 whether the carry leaked or not.
+	_, _, gotBudget, _ := stage.ArmedClock(task, false)
+	if gotBudget != budget {
+		t.Fatalf("fresh merging entry armed against %s, want the full stage budget %s: a stale carry "+
+			"leaked in and handed an UNRELATED attempt the short re-entry window", gotBudget, budget)
 	}
 }
 

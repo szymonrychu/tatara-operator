@@ -106,6 +106,13 @@ const (
 	MaxMergeReentries = 3
 	// MaxDeployReentries bounds the deploying re-entry cycle (fix H7).
 	MaxDeployReentries = 3
+	// TimeoutReentryBudget is the work-clock budget ONE merge-timeout/
+	// deploy-timeout un-park re-entry gets, replacing the full stage budget for
+	// that attempt (issue #513). The carry from stage.Enter makes the reported
+	// residency cumulative; without a fresh window here the re-entry arrives
+	// already over budget and re-parks on the same reconcile pass, spending all
+	// MaxMergeReentries/MaxDeployReentries laps in milliseconds.
+	TimeoutReentryBudget = 30 * time.Minute
 	// MaxHeadMoveReentries bounds the head-moving re-entry cycle; the FOURTH
 	// cycle is refused (fix M3-9).
 	MaxHeadMoveReentries = 3

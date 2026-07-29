@@ -570,13 +570,34 @@ spec:
                   (enterFreshImplementing) - a genuinely fresh entry into merging/deploying
                   must never inherit a stale carry from an unrelated earlier cycle.
 
-                  stage.ArmedClock's podless WORK clock, operator_task_stage_age_seconds and
-                  operator_merge_cursor_stalled_seconds all read this back (added to
-                  now.Sub(StageEnteredAt)) so the re-entered clock reads CONTINUOUS elapsed
-                  time rather than a sawtooth that resets every re-entry - which also means
-                  the very next reconcile pass after an un-park catches a still-red MR
-                  instead of waiting out another full budget, collapsing the ~16h worst case
-                  down to roughly one budget plus a few reconcile ticks.
+                  READ BACK BY REPORTING, NOT BY THE DEADLINE (issue #513 split this).
+                  operator_task_stage_age_seconds, operator_merge_cursor_stalled_seconds and
+                  deploy_waiting's stalled_seconds all add it to now.Sub(StageEnteredAt), via
+                  stage.StageElapsedSeconds, so reported residency is CONTINUOUS across the
+                  whole round trip instead of a sawtooth that resets every re-entry. That is
+                  what #480 measured and it is the only thing this field decides.
+
+                  stage.ArmedClock's podless WORK clock does NOT subtract it. It used to, and
+                  the deadline it produced was self-defeating: a timeout park happens only
+                  once the budget is ALREADY spent, so every re-entry arrived over budget and
+                  re-parked on the SAME reconcile pass (live in #513: laps of 7.2ms, 8.8ms and
+                  11.3ms, terminal failed 107s after the first timeout, all three
+                  MaxDeployReentries spent buying zero deploy time). ArmedClock instead uses
+                  "carry > 0 while IN merging or deploying" as the "this is a timeout
+                  re-entry" discriminator - exact, because Enter zeroes the carry on every
+                  non-timeout edge, whereas MergeReentries/DeployReentries stay set across an
+                  unrelated later cycle, and stage-scoped because the carry is also live while
+                  the Task is still PARKED, whose budget is the 7-day ParkRetention reap clock
+                  - and gives that re-entry a fresh TimeoutReentryBudget window measured from
+                  THIS entry.
+
+                  ONE TIMEOUT CYCLE is therefore bounded at base budget + 3 x 30m (deploying
+                  3h30m, merging 5h30m), far below the ~16h #480 killed. That is a PER-CYCLE
+                  bound, not a total for the stage: a HEAD-MOVED or ci-red exit from merging
+                  leaves via reviewing/implementing, where Enter zeroes this field (see above),
+                  so the next merging entry opens a NEW cycle with a fresh full 4h base. The
+                  number of such cycles is what MaxHeadMoveReentries / MaxCIRedReentries bound.
+                  Unchanged from #480, which zeroed the carry on exactly the same edges.
                 type: integer
               stageEnteredAt:
                 description: |-
