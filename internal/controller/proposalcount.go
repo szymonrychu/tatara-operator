@@ -16,7 +16,7 @@ import (
 const systemicLabelPrefix = "tatara/systemic-"
 
 // issueAuthoredByBot is the STRUCTURAL bot check, the same shape the approval
-// grammar and the pendingEvents enqueue filter rely on (mirror.go
+// citation check and the pendingEvents enqueue filter rely on (mirror.go
 // mirrorCommentFrom): an EMPTY author, or an unconfigured bot login, is NEVER the
 // bot. Both halves must be non-empty, so it fails CLOSED.
 func issueAuthoredByBot(iss *tatarav1alpha1.Issue, botLogin string) bool {

@@ -5744,23 +5744,6 @@ spec:
                 description: ScmSpec binds a Project to one SCM provider and its board/merge
                   policy.
                 properties:
-                  approvalPhrases:
-                    description: |-
-                      ApprovalPhrases is the closed, per-project wordlist an approving
-                      maintainer comment must match. The match is an ANCHORED WHOLE-LINE
-                      match, NOT a substring (fix C3 / D-B, USER DECISION): some LINE of the
-                      normalised body must match ^\s*(<phrase>)[\s.!]*$ - the comment must
-                      CONSIST OF the phrase, not merely contain it. Substring matching meant
-                      "I can't approve this until the tests pass" APPROVED - and because the
-                      grammar takes the maintainer's MOST RECENT comment, their corrective
-                      follow-up approved too. Anchored, "go ahead" approves and "don't go
-                      ahead with this" does not. Empty means the DEFAULT list
-                      (DefaultApprovalPhrases); it can NEVER mean "any text approves".
-                    items:
-                      minLength: 2
-                      type: string
-                    maxItems: 20
-                    type: array
                   approvedLabel:
                     default: tatara-approved
                     description: ApprovedLabel marks an issue approved for implementation.
