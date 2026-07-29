@@ -40,6 +40,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"time"
 )
 
@@ -77,6 +78,12 @@ type RetryableError struct {
 	Body   string
 	Path   string
 	Err    error
+	// RetryAfter is the server's own requested wait, parsed from a
+	// Retry-After response header (delta-seconds or an HTTP-date) and capped
+	// at maxRetryAfter. Zero when the response carried no Retry-After header
+	// or it was empty - a transport-level failure never has one either, since
+	// there is no response to read a header from.
+	RetryAfter time.Duration
 }
 
 func (e *RetryableError) Error() string {
@@ -106,15 +113,50 @@ func (e *TerminalError) Is(target error) bool { return target == ErrTerminal }
 
 // classify turns an HTTP status plus a truncated body into a RetryableError
 // (5xx, 429) or a TerminalError (any other 4xx). Only call it for non-2xx.
-func classify(status int, body []byte, path string) error {
+// retryAfterHeader is the raw Retry-After header value (may be empty); it is
+// parsed and attached to a RetryableError only, since a TerminalError is
+// never retried and the value would be meaningless there.
+func classify(status int, body []byte, path string, retryAfterHeader string) error {
 	b := string(body)
 	if len(b) > errBodyLimit {
 		b = b[:errBodyLimit] + "...[truncated]"
 	}
 	if status >= 500 || status == http.StatusTooManyRequests {
-		return &RetryableError{Status: status, Body: b, Path: path}
+		return &RetryableError{Status: status, Body: b, Path: path, RetryAfter: parseRetryAfter(retryAfterHeader)}
 	}
 	return &TerminalError{Status: status, Body: b, Path: path}
+}
+
+// parseRetryAfter parses an HTTP Retry-After header value into a wait
+// duration, capped at maxRetryAfter. Returns 0 for an empty, unparseable, or
+// non-positive value - the caller then falls back to the fixed retryBackoff
+// schedule exactly as if no header had been sent.
+//
+// Retry-After (RFC 9110 section 10.2.3) is either delta-seconds ("120") or an
+// HTTP-date ("Wed, 21 Oct 2026 07:28:00 GMT"); both forms are accepted.
+func parseRetryAfter(header string) time.Duration {
+	if header == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(header); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		return capRetryAfter(time.Duration(secs) * time.Second)
+	}
+	if when, err := http.ParseTime(header); err == nil {
+		if d := time.Until(when); d > 0 {
+			return capRetryAfter(d)
+		}
+	}
+	return 0
+}
+
+func capRetryAfter(d time.Duration) time.Duration {
+	if d > maxRetryAfter {
+		return maxRetryAfter
+	}
+	return d
 }
 
 // memoryObject is the operator-side mirror of tatara-memory's memory.Memory.
@@ -232,7 +274,22 @@ func (c *Client) Fetch(ctx context.Context, trackID string) (json.RawMessage, er
 // before the first retry, ~1s before the second, so at most 2 retries (3
 // attempts total) add ~1.2s worst case. A package-level var, not a const, so
 // a test can shrink it and keep the retry-path suite fast.
+//
+// This is only the FALLBACK schedule. When a retryable response carries a
+// Retry-After header, do waits that long instead (issue #466 part b):
+// tatara-memory answers a shed 503/429 with an explicit Retry-After, and a
+// hardcoded ~200ms/1s budget against a server asking for several seconds
+// converts recoverable backpressure into a hard failure. Retry-After takes
+// priority per attempt; retryBackoff still bounds how many attempts happen
+// (len(retryBackoff) retries) regardless of which wait was used.
 var retryBackoff = []time.Duration{200 * time.Millisecond, time.Second}
+
+// maxRetryAfter caps how long do will honour a server-supplied Retry-After
+// value. Without a cap, a misconfigured or hostile server could park a
+// reconcile goroutine indefinitely; 30s comfortably covers the observed
+// real-world value (tatara-memory's Retry-After: 5) with headroom. A
+// package-level var, not a const, so a test can shrink it.
+var maxRetryAfter = 30 * time.Second
 
 // do issues an HTTP request against the memory service, attaching the bearer
 // token and reading a bounded response body. It returns the raw response body
@@ -267,8 +324,15 @@ func (c *Client) do(ctx context.Context, method, path string, body []byte) ([]by
 		if !errors.Is(err, ErrRetryable) || attempt >= len(retryBackoff) {
 			return nil, err
 		}
+
+		wait := retryBackoff[attempt]
+		var re *RetryableError
+		if errors.As(err, &re) && re.RetryAfter > 0 {
+			wait = re.RetryAfter
+		}
+
 		slog.WarnContext(ctx, "memclient: retrying after transient error",
-			"attempt", attempt+1, "path", path, "status", retryableStatus(err), "error", err)
+			"attempt", attempt+1, "path", path, "status", retryableStatus(err), "wait", wait, "error", err)
 
 		select {
 		case <-ctx.Done():
@@ -277,7 +341,7 @@ func (c *Client) do(ctx context.Context, method, path string, body []byte) ([]by
 			// stopped (deadline exceeded / cancelled) instead of replaying a
 			// 503 that is no longer the reason the request failed.
 			return nil, fmt.Errorf("memclient: %s: %w", path, ctx.Err())
-		case <-time.After(retryBackoff[attempt]):
+		case <-time.After(wait):
 		}
 	}
 }
@@ -310,7 +374,7 @@ func (c *Client) doOnce(ctx context.Context, method, path string, body []byte, t
 		return nil, &RetryableError{Path: path, Err: fmt.Errorf("read response body: %w", err)}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, classify(resp.StatusCode, respBody, path)
+		return nil, classify(resp.StatusCode, respBody, path, resp.Header.Get("Retry-After"))
 	}
 	return respBody, nil
 }
