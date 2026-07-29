@@ -151,9 +151,10 @@ func truncateCommentBody(body string) (string, bool) {
 // mirrorCommentFrom maps one forge comment onto the CR mirror's Comment,
 // truncating the body and computing IsBot from Project.spec.scm.botLogin.
 //
-// IsBot is the STRUCTURAL bot exclusion the approval grammar (C.6 clause 3a) and
-// the pendingEvents enqueue filter (E.3) rely on. An EMPTY author is never the
-// bot: a deleted account must not pass an equality gate.
+// IsBot is the STRUCTURAL bot exclusion the C.6 approval citation check (clause
+// (a) of verifyOneIssue) and the pendingEvents enqueue filter (E.3) rely on. An
+// EMPTY author is never the bot: a deleted account must not pass an equality
+// gate.
 func mirrorCommentFrom(proj *tatarav1alpha1.Project, c scm.IssueComment) tatarav1alpha1.Comment {
 	body, truncated := truncateCommentBody(c.Body)
 	botLogin := ""
@@ -358,7 +359,7 @@ func ensureMergeRequestCR(ctx context.Context, c client.Client, proj *tatarav1al
 // rate-limited read path (C.8).
 //
 // It never writes status.status: that is the platform's decision state, owned by
-// the C.6 approval grammar and the operator's own lifecycle writes. The mirror
+// the C.6 approval citation check and the operator's own lifecycle writes. The mirror
 // carries SCM TRUTH (state/labels/comments) and nothing else.
 func SyncIssue(ctx context.Context, c client.Client, sp objbudget.Spiller, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, ext scm.Issue) error {
 	if err := ensureIssueCR(ctx, c, proj, repo, ext.Number, ext.URL); err != nil {
@@ -566,15 +567,20 @@ func syncMergeRequestThread(ctx context.Context, c client.Client, sp objbudget.S
 }
 
 // SyncIssueOnDemand re-reads ONE issue's thread NOW - one forge read, off
-// cadence. It is run whenever a NON-BOT pendingEvent arrives on a parked Task
-// (fix M11), and it is NOT an optimisation.
+// cadence. It is NOT an optimisation, and it survived the deletion of the
+// re-verify-on-unpark path that used to call it (owner decision D2): its caller
+// is now the WEBHOOK COMMENT PATH, which runs it for every non-bot comment on a
+// thread the Task owns (webhook.syncOwnedIssueThread, scoped by TaskOwnsIssue).
 //
-// The C.6 grammar re-evaluation that releases parked(identity-unverified) (F.6)
-// needs the approving comment IN THE MIRROR, with its ExternalID: clause 3d
-// enforces single-use evidence against it, and TaskEvent carries no externalId.
-// The parked cadence is DAILY. Without this sync the grammar re-runs against a
-// thread that does not contain the comment that triggered it, and silently fails
-// - restoring the exact 7-day dead end the redesign removes.
+// It is mandatory because Issue.Status.Comments is the ONLY thing BOTH halves of
+// the approval gate read. The agent copies the comment's external_id out of the
+// turn-0 bundle, which is rendered from that field; the operator then re-derives
+// the citation against that same field (verifyOneIssue), and the single-use
+// clause is enforced against Comment.ExternalID, which a TaskEvent does not
+// carry. Nothing else on the webhook path writes it - mirror_refresh.go touches
+// Body/Title only, and the full-thread cadence for a parked Task is DAILY. So
+// without this sync the agent has no id to cite, and could not be verified if it
+// invented one: the exact 7-day dead end the redesign removes.
 //
 // issueKey is the A.3 index key ("<repositoryRef>#<number>"), so the lookup is
 // an indexed field lookup, never a hashed name.

@@ -44,6 +44,7 @@ type OperatorMetrics struct {
 	memoryProvisionDuration       prometheus.Histogram
 	memoryStacks                  *prometheus.GaugeVec
 	autoApproveTotal              *prometheus.CounterVec
+	approvalRefusedTotal          *prometheus.CounterVec
 	tasksInflightKind             *prometheus.GaugeVec
 	agentBootRaceRequeue          prometheus.Counter
 	agentSessionBusyRequeue       prometheus.Counter
@@ -154,6 +155,10 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_auto_approve_total",
 			Help: "Auto-approve releases (item 4a) by proposal kind (brainstorm|incident|refine).",
 		}, []string{"kind"}),
+		approvalRefusedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_approval_refused_total",
+			Help: "Approval verifications the operator refused, by structural reason.",
+		}, []string{"reason"}),
 		tasksInflightKind: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "tatara_tasks_inflight",
 			Help: "In-flight Tasks by kind.",
@@ -493,6 +498,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.memoryProvisionDuration,
 		m.memoryStacks,
 		m.autoApproveTotal,
+		m.approvalRefusedTotal,
 		m.tasksInflightKind,
 		m.agentBootRaceRequeue,
 		m.agentSessionBusyRequeue,
@@ -839,7 +845,26 @@ func (m *OperatorMetrics) IncidentTrackerCommentCounter(result string) prometheu
 // AutoApproveTotal increments operator_auto_approve_total for a proposal kind
 // (item 4a auto-approve release path).
 func (m *OperatorMetrics) AutoApproveTotal(kind string) {
+	if m == nil {
+		return
+	}
 	m.autoApproveTotal.WithLabelValues(kind).Inc()
+}
+
+// ApprovalRefused increments operator_approval_refused_total for one structural
+// refusal reason. Hard rule 13: the approval gate must be queryable without
+// log-scraping, and this is the counterpart of operator_auto_approve_total on
+// the refusal side.
+func (m *OperatorMetrics) ApprovalRefused(reason string) {
+	if m == nil {
+		return
+	}
+	m.approvalRefusedTotal.WithLabelValues(reason).Inc()
+}
+
+// ApprovalRefusedCounter returns the counter for reason for test assertions.
+func (m *OperatorMetrics) ApprovalRefusedCounter(reason string) prometheus.Counter {
+	return m.approvalRefusedTotal.WithLabelValues(reason)
 }
 
 // AutoApproveCounter returns the counter for kind for test assertions.

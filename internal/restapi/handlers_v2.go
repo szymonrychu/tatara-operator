@@ -60,17 +60,22 @@ type NoteFetcher interface {
 	Fetch(ctx context.Context, trackID string) (json.RawMessage, error)
 }
 
-// ApprovalVerifier is the C.6 approval grammar. The /outcome clarify path calls
-// it for EVERY owned Issue (fix H9); it is NOT in any agent-facing schema. The
-// implementation lives in internal/controller (Task 10); this is the seam the
-// REST layer owns so the two can land independently.
+// ApprovalVerifier is the STRUCTURAL verification of the agent's approval
+// citation. The /outcome clarify path calls it for EVERY owned Issue (fix H9);
+// the citation itself is NOT in any agent-facing schema beyond the clarify
+// payload, and the verifier never reads intent - the agent judged that, the
+// operator only re-derives WHO wrote the cited comment and whether the quote is
+// really in it. The implementation lives in internal/controller; this is the
+// seam the REST layer owns so the two can land independently.
 //
 // A nil verifier FAILS CLOSED: decision=implement then parks the Task at
 // identity-unverified rather than granting an unverified mandate.
 type ApprovalVerifier interface {
-	// VerifyApproval reports whether iss carries a valid human approval, and
-	// the single-use evidence that proves it.
-	VerifyApproval(ctx context.Context, proj *tatarav1alpha1.Project, iss *tatarav1alpha1.Issue) (*tatarav1alpha1.ApprovalEvidence, bool)
+	// VerifyApproval reports whether iss carries a valid human approval that the
+	// supplied citations resolve to, and the single-use evidence that proves it.
+	VerifyApproval(ctx context.Context, proj *tatarav1alpha1.Project,
+		iss *tatarav1alpha1.Issue,
+		citations []tatarav1alpha1.ApprovalCitation) (*tatarav1alpha1.ApprovalEvidence, bool)
 }
 
 // --- shared lookups -------------------------------------------------------

@@ -16,6 +16,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/require"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
+	"github.com/szymonrychu/tatara-operator/internal/controller"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -148,12 +149,46 @@ func (f *fakeMemory) Fetch(_ context.Context, trackID string) (json.RawMessage, 
 type fakeApproval struct {
 	grant map[string]bool // issue CR name -> granted
 	auto  bool            // when set, granted issues return Auto evidence
+	// needCitation makes the fake behave like the real verifier's shape: it
+	// refuses unless the agent cited something. It is what proves the citations
+	// actually reach the seam.
+	needCitation bool
+	// grantWithNilEvidence exercises the defensive nil-evidence guard in the
+	// clarify writer: ok=true with a nil evidence must never write an
+	// approver-less approval.
+	grantWithNilEvidence bool
+	gotCitations         [][]tatarav1alpha1.ApprovalCitation
 }
 
 func (f *fakeApproval) VerifyApproval(_ context.Context, _ *tatarav1alpha1.Project,
-	iss *tatarav1alpha1.Issue) (*tatarav1alpha1.ApprovalEvidence, bool) {
+	iss *tatarav1alpha1.Issue,
+	citations []tatarav1alpha1.ApprovalCitation) (*tatarav1alpha1.ApprovalEvidence, bool) {
+	f.gotCitations = append(f.gotCitations, citations)
+	// MIRRORS THE PRODUCTION SEAM, and it is load-bearing that it does. The real
+	// verifier (controller.GrammarVerifier.VerifyApproval) returns the Issue's
+	// STORED approval with ok=TRUE for an out-of-scope Issue - it is not pending
+	// approval, so it must not block the scope check. That stored approval is
+	// routinely nil. A fake that refused instead would certify a gate production
+	// does not have.
+	if !controller.ApprovalInScope(iss) {
+		return iss.Status.Approval, true
+	}
+	// ALSO MIRRORS THE SEAM: verifyOneIssue's clause-2 idempotence returns an
+	// already-approved Issue's STORED evidence before any citation clause runs,
+	// so an Issue that already carries evidence needs no citation. Without this
+	// arm needCitation was STRICTER than production for exactly that Issue, and a
+	// test built on it would certify a refusal the real verifier never makes.
+	if iss.Status.Status == "approved" && iss.Status.Approval != nil {
+		return iss.Status.Approval, true
+	}
 	if !f.grant[iss.Name] {
 		return nil, false
+	}
+	if f.needCitation && len(citations) == 0 {
+		return nil, false
+	}
+	if f.grantWithNilEvidence {
+		return nil, true
 	}
 	if f.auto {
 		return &tatarav1alpha1.ApprovalEvidence{

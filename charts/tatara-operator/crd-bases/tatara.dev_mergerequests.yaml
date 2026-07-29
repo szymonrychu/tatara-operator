@@ -155,7 +155,7 @@ spec:
                     isBot:
                       description: |-
                         IsBot is true when Author == Project.spec.scm.botLogin. It is the
-                        STRUCTURAL bot exclusion relied on by the approval grammar (C.6) and by
+                        STRUCTURAL bot exclusion relied on by the C.6 approval citation check and by
                         the pendingEvents enqueue filter (E.3).
                       type: boolean
                     line:

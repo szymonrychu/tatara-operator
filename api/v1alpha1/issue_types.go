@@ -59,7 +59,7 @@ type Comment struct {
 	Body      string      `json:"body"`
 	CreatedAt metav1.Time `json:"createdAt"`
 	// IsBot is true when Author == Project.spec.scm.botLogin. It is the
-	// STRUCTURAL bot exclusion relied on by the approval grammar (C.6) and by
+	// STRUCTURAL bot exclusion relied on by the C.6 approval citation check and by
 	// the pendingEvents enqueue filter (E.3).
 	IsBot bool `json:"isBot,omitempty"`
 	// AgentKind is the RESOLVED authorship of an OPERATOR-AUTHORED comment: the
@@ -158,17 +158,58 @@ type PendingComment struct {
 }
 
 // ApprovalEvidence is the single-use, auditable record of the ONE maintainer
-// comment the operator verified before setting Status=approved (fix 15). It is
-// consumed once: a later approval must cite a NEWER comment (a replayed
-// evidence id is refused).
+// comment the operator verified before setting Status=approved (fix 15). A
+// later approval must cite a DIFFERENT comment: re-citing the id recorded here
+// is refused (ApprovalRefusedEvidenceReplayed).
+//
+// THE GUARD IS AGAINST THIS FIELD, NOT AGAINST HISTORY. This is ONE slot,
+// overwritten by each new approval, so nothing remembers the ids consumed before
+// the current one: after TWO approve-then-leave-approved cycles the FIRST
+// comment is citable again, because the second overwrote it. Nothing reaches
+// that sequence today. Storing a list of consumed ids would close it and is the
+// fix if a path to it ever appears; the doc is worded to the code rather than
+// the other way round so the gap is visible instead of denied.
 type ApprovalEvidence struct {
 	Login     string      `json:"login"`     // verified maintainer, never the bot
-	CommentID string      `json:"commentId"` // the Comment.ExternalID whose TEXT matched
+	CommentID string      `json:"commentId"` // the cited Comment.ExternalID
 	CreatedAt metav1.Time `json:"createdAt"`
-	Phrase    string      `json:"phrase"` // the matched approvalPhrases entry
+	// Phrase is the agent's VERBATIM quote from that comment, re-verified by the
+	// operator against the body it holds itself.
+	Phrase string `json:"phrase"`
 	// Auto is the autoApproveTataraProposals path; Login is then the sentinel
 	// "<tatara:auto>" and CommentID is empty.
 	Auto bool `json:"auto,omitempty"`
+}
+
+// ApprovalCitation is the agent's CITATION of ONE maintainer comment it judged
+// to approve the work. It is a CLAIM, never a grant: the operator re-derives
+// every structural fact for itself against its OWN mirror - that the comment
+// exists on the Issue, that its author is a verified non-bot maintainer, that
+// it has not already been consumed as evidence, and that Quote really occurs in
+// the body the operator holds.
+//
+// There is deliberately NO recency clause: the cited comment need not be the
+// newest maintainer comment. Requiring that deadlocks an ordinary thread, where
+// "go ahead, I approve!" is followed by "thanks - ping me when the PR is up"
+// and nothing would be citable. A later comment that WITHDRAWS the approval is
+// the agent's call - it reads the whole thread and submits discuss instead.
+//
+// The agent judges WHAT THE COMMENT MEANS and nothing else. There is no string
+// matching anywhere in the operator's decision: the literal wordlist could not
+// read "go ahead, I approve!" and that matcher was the defect.
+//
+// It is deliberately NOT a CRD field. It crosses the /outcome wire and the
+// restapi -> controller seam and is verified in the same request; the durable
+// record of a PASS is ApprovalEvidence.
+type ApprovalCitation struct {
+	// ID is the forge comment ExternalID, copied verbatim from the turn-0
+	// bundle's <comment external_id="..."> attribute. The agent never re-crawls
+	// to get it; internal/prompt/bundle.go already renders it on every comment.
+	ID string `json:"id"`
+	// Quote is a VERBATIM substring of that comment's body. It closes
+	// FABRICATION (the operator re-reads the body itself) but NOT selective
+	// quoting - see the residual-risk note in MEMORY.md.
+	Quote string `json:"quote"`
 }
 
 // IssueStatus defines the observed state of an Issue.

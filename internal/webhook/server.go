@@ -47,12 +47,11 @@ type Config struct {
 	Seq       *queue.SeqSource
 	// Spiller is the A.7 byte-budget eviction sink (internal/memclient in
 	// production). Required for the task-centric pendingEvents path (E.3): the
-	// webhook mirrors comments onto Issue/MergeRequest CRs and re-syncs a
-	// parked(identity-unverified) Task's thread on demand, both of which go
-	// through the objbudget.Fit* guard. A nil Spiller degrades gracefully: the
-	// mirror/re-verify side effects are skipped (logged at ERROR) and the
-	// A nil Spiller degrades gracefully: the mirror side effects are skipped and
-	// logged at ERROR.
+	// webhook mirrors comments onto Issue/MergeRequest CRs and re-syncs an owned
+	// Issue's thread on demand, both of which go through the objbudget.Fit*
+	// guard. A nil Spiller degrades gracefully: both side effects are skipped
+	// and logged at ERROR, and the comment still reaches the owning Task's
+	// pendingEvents.
 	Spiller objbudget.Spiller
 	// SpillerFor resolves the A.7 spill client PER PROJECT (the tatara-memory
 	// endpoint is per-project). Production wires it (fix W1); it takes precedence
@@ -60,12 +59,11 @@ type Config struct {
 	// returning the single Spiller, so existing single-Spiller callers/tests keep
 	// working unchanged.
 	SpillerFor func(*tatarav1.Project) objbudget.Spiller
-	// ReaderFor builds a token-bound scm.SCMReader for the C3-3 on-demand
+	// ReaderFor builds a token-bound scm.SCMReader for the M11 on-demand
 	// re-sync (internal/webhook/pending_events.go's scmReader). Same idiom as
 	// internal/controller/issue_controller.go's field of the same name. Nil
 	// defaults to scm.ReaderByProvider (production); tests inject a fake
-	// reader so the identity-unverified re-verify path never needs a live
-	// forge call.
+	// reader so the comment path never needs a live forge call.
 	ReaderFor func(provider, token string) (scm.SCMReader, error)
 	// IncidentRefireCommentCooldown rate-limits the coalesced refire comment (A4).
 	IncidentRefireCommentCooldown time.Duration
@@ -735,8 +733,8 @@ func (s *Server) handleMROpened(ctx context.Context, w http.ResponseWriter, prov
 //
 // The surviving comment is handed to deliverPendingEvent (contract E.3), which
 // mirrors it onto the Issue/MergeRequest CR, queues a TaskEvent on the owning
-// Task's pendingEvents, and - for a Task parked(identity-unverified) - re-runs
-// the C.6 approval grammar right now.
+// Task's pendingEvents, re-syncs an owned Issue's thread from the forge, and
+// drives the shared F.6 comment unpark.
 func (s *Server) handleIssueComment(ctx context.Context, w http.ResponseWriter, provider string, proj tatarav1.Project, ev scm.WebhookEvent) {
 	// ActorLogin is the sender of the event (comment author for issue_comment).
 	if isBotActor(&proj, ev.ActorLogin) {
@@ -744,7 +742,7 @@ func (s *Server) handleIssueComment(ctx context.Context, w http.ResponseWriter, 
 		// work, but ONLY for a DIFFERENT agent kind than the one that wrote it, and
 		// only when that authorship is resolved from the operator's own ledger. It
 		// never falls through to the human intake below: no mint, no unpark, no
-		// approval grammar - just a queued event and, when the rule passes, a
+		// approval citation check - just a queued event and, when the rule passes, a
 		// conversation. botRepo is resolved locally (the human path below computes
 		// its own commentRepo further down, which does not exist yet at this point
 		// in the function) - matchRepo is a cheap cached-client Get, not a forge call.

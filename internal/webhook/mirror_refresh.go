@@ -62,9 +62,24 @@ func (s *Server) handleIssueClosed(ctx context.Context, w http.ResponseWriter, p
 // the mirror Body/Title (safe MIRROR write - the agent's scm_read is served from
 // the mirror), and (b) if the body or title actually CHANGED, appends an
 // issue_edited pending event on the owning Task. It does NOT drive the unpark:
-// the leader-only driveUnparks/Task reconcile consumes the fresh pending event
-// (awaiting-human / backlog-sweep re-engage; identity-unverified needs an
-// approval phrase, not an edit, so it stays parked - correct).
+// the leader-only driveUnparks/Task reconcile consumes the fresh pending event.
+//
+// AN EDIT DOES RE-ENGAGE A PARKED TASK, INCLUDING identity-unverified. This
+// comment used to claim the opposite ("identity-unverified needs a recorded
+// approval, not an edit, so it stays parked"), and that stopped being true when
+// the durable approval verdict was deleted. The actual behaviour: the bot-actor
+// early return above means any surviving event is HUMAN-authored;
+// stage.hasNonBotEvent tests only Author != botLogin and does NOT filter on
+// Kind, so an issue_edited event re-engages exactly like a comment does; and the
+// identity-unverified arm's only remaining question after that is conversing
+// room. So a human editing an issue body un-parks the Task to CONVERSING.
+//
+// That is benign, and the reason it is benign is the part worth carrying: for
+// EVERY comment-driven re-entry reason, re-engagement is a RESPONSIVENESS
+// decision, not an authorization one. identity-unverified re-enters conversing
+// ONLY - never implementing - and the approval decision happens later and
+// elsewhere, at restapi.verifyApprovalScope, against a live pod's
+// submit_outcome. No event class reaching this file can approve anything.
 func (s *Server) handleIssueEdited(ctx context.Context, w http.ResponseWriter, provider string, proj tatarav1.Project, ev scm.WebhookEvent) {
 	if isBotActor(&proj, ev.ActorLogin) {
 		s.accept(w, provider, ev.Kind, ev.Action, "ignored")

@@ -88,7 +88,7 @@ func reconcileIssue(t *testing.T, r *IssueReconciler, name string) ctrl.Result {
 }
 
 // TestIssueControllerNeverWritesStatusFromLabel is fix 16, as a GENUINE FAULT
-// INJECTION: a label appears on the mirror with no webhook and no grammar run,
+// INJECTION: a label appears on the mirror with no webhook and no citation check,
 // and status.status MUST NOT move. Labels are a ONE-WAY PROJECTION of
 // status.status (C.6). There is NO label -> status path at all. The only label
 // READ anywhere in the control path is tatara-parked (B.4), and it decides COST,

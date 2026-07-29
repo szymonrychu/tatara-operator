@@ -419,53 +419,6 @@ type TaskEvent struct {
 	Body string `json:"body"`
 }
 
-// ApprovalVerdict is the DURABLE record that the C.6 approval grammar PASSED
-// for this Task, against one specific comment.
-//
-// It exists because the periodic un-park backstop (driveUnparks) can re-derive
-// everything else about an identity-unverified park from live cluster state -
-// which owned Issues are open, which are approved - but it can NEVER re-run the
-// grammar: the grammar needs a freshly SYNCED forge thread and a webhook payload
-// the backstop did not see. The verdict is that one missing input, made durable
-// at the moment the fast path establishes it, so a fast path that then loses a
-// cache race costs a DELAY rather than a permanent stall.
-//
-// It is evidence of a PAST pass, not a licence: the backstop still re-checks
-// every owned Issue's live approval state before re-entering implementing, AND
-// scopes the verdict to the CURRENT park - a verdict stamped before the Task's
-// current StageEnteredAt is treated as stale and refused, so an approval
-// consumed by an earlier park can never satisfy a later, unrelated one
-// (grammarPassedFor, internal/controller/unpark.go).
-type ApprovalVerdict struct {
-	// At is when the grammar passed.
-	At metav1.Time `json:"at"`
-	// IssueRef is the Issue CR name whose thread carried the approving comment.
-	// +kubebuilder:validation:MaxLength=253
-	IssueRef string `json:"issueRef,omitempty"`
-	// CommentExternalID is the forge comment id the grammar matched, i.e. the
-	// Comment.ExternalID the C.6 single-use-evidence clause consumed. It is what
-	// makes this verdict traceable back to a real human action. Empty for the
-	// AutoApproveTataraProposals carve-out below, which cites no comment.
-	// +kubebuilder:validation:MaxLength=128
-	CommentExternalID string `json:"commentExternalId,omitempty"`
-	// Author is the verified maintainer login whose comment passed - never the
-	// bot login. EXCEPTION: under Project.spec.AutoApproveTataraProposals, a
-	// bot-authored, integrity-anchor-verified proposal with ZERO maintainer
-	// comments auto-approves (autoApproveApplies/autoApprovalEvidence,
-	// internal/controller/approval_grammar.go) and is recorded here with
-	// Author=AutoApproveLogin ("<tatara:auto>") - a deliberate, narrowly-gated
-	// carve-out, not a maintainer approval. Required non-empty: it is the one
-	// field every verdict this codebase ever writes always carries, so a
-	// consumer refusing an empty Author cannot be fooled by a schema-legal but
-	// otherwise-empty verdict.
-	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=128
-	Author string `json:"author,omitempty"`
-	// Phrase is the matched approvalPhrases entry.
-	// +kubebuilder:validation:MaxLength=128
-	Phrase string `json:"phrase,omitempty"`
-}
-
 // TaskStatus defines the observed state of a Task.
 type TaskStatus struct {
 	// +optional
@@ -556,12 +509,6 @@ type TaskStatus struct {
 	// from a pre-implement stage cannot auto-escalate straight into implementing.
 	// +optional
 	ParkedFromStage string `json:"parkedFromStage,omitempty"`
-	// ApprovalVerdict is the durable C.6 grammar pass (see ApprovalVerdict). It is
-	// written by the webhook fast path the moment the grammar passes, and read by
-	// the periodic driveUnparks backstop, which cannot re-run the grammar itself.
-	// Nil means no approving comment has ever been verified for this Task.
-	// +optional
-	ApprovalVerdict *ApprovalVerdict `json:"approvalVerdict,omitempty"`
 	// ConversationLastEventAt is the IDLE CLOCK BASE for the conversing stage. It
 	// is stamped on entry into conversing and RE-STAMPED by AppendTaskEvent on
 	// every non-bot event queued while conversing, so the clock measures silence
