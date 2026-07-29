@@ -119,9 +119,23 @@ type headMovedResponse struct {
 	Message         string `json:"message"`
 }
 
+// clarifyPayload is the /outcome clarify wire shape.
+//
+// ApprovalCitations is the agent's EVIDENCE for decision=implement, and it is
+// NOT unconditionally required. The autoApproveTataraProposals carve-out fires
+// only when NO maintainer has commented, so there is literally no comment to
+// cite; requiring the field would kill that path. The operator decides, per
+// Issue, whether a citation was needed - see controller.verifyOneIssue.
+//
+// A missing or failing citation is a REFUSAL, not a 400: this handler returns
+// 200 + "implement-unverified" and parks at identity-unverified, exactly as a
+// failed grammar check did. Only malformed JSON and a missing decision / blank
+// reason stay 4xx. That matches existing behaviour AND means a mis-instructed
+// agent parks one Task instead of deadlocking the fleet.
 type clarifyPayload struct {
-	Decision string `json:"decision"`
-	Reason   string `json:"reason"`
+	Decision          string                            `json:"decision"`
+	Reason            string                            `json:"reason"`
+	ApprovalCitations []tatarav1alpha1.ApprovalCitation `json:"approvalCitations,omitempty"`
 }
 
 type proposalPayload struct {
@@ -1265,16 +1279,16 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 		return
 	}
 
-	// decision=implement. APPROVAL IS IN NO SCHEMA: the agent reports its
-	// decision and the operator INDEPENDENTLY verifies the C.6 grammar - both
-	// the TEXT (anchored whole-line) and the SCOPE (EVERY owned Issue, not one:
-	// fix H9).
+	// decision=implement. The agent reports its decision and CITES the comment
+	// it judged to approve; the operator INDEPENDENTLY re-derives the structural
+	// facts - WHO wrote the cited comment, whether the quote is really in it -
+	// and the SCOPE (EVERY owned Issue, not one: fix H9). It never reads intent.
 	issues, err := s.ownedIssues(ctx, o.task)
 	if err != nil {
 		writeClientErr(o.w, err)
 		return
 	}
-	granted, evidence := s.verifyApprovalScope(ctx, o.proj, issues)
+	granted, evidence, refusal := s.verifyApprovalScope(ctx, o.proj, issues, p.ApprovalCitations)
 	if !granted {
 		if !o.commit(func(t *tatarav1alpha1.Task) error {
 			if err := stage.Enter(t, mrs, tatarav1alpha1.StageParked, stage.ReasonIdentityUnverified, s.now()); err != nil {
@@ -1285,14 +1299,43 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 		}) {
 			return
 		}
-		s.log.WarnContext(ctx, "restapi: clarify reported approval but the C.6 grammar did not pass on every owned issue",
-			append(reqLogFields(o.r), "task", o.task.Name, "issues", len(issues))...)
+		// A SCOPE-LEVEL refusal has no per-Issue verifier call behind it, so this
+		// is the only place its reason can be counted and logged. The per-Issue
+		// path leaves refusal empty because VerifyApproval already did both.
+		if refusal != "" {
+			s.metrics.ApprovalRefused(refusal)
+			s.log.InfoContext(ctx, "restapi: approval refused",
+				append(reqLogFields(o.r), "action", "approval_refused",
+					"task", o.task.Name, "reason", refusal)...)
+		}
+		// The WARN names WHICH condition refused and counts LIVE Issues beside
+		// owned ones. It used to assert "the citation did not verify on every
+		// owned issue" with issues=len(issues) unconditionally: the WRONG cause
+		// for the no-live-issue shape, where no citation was evaluated at all,
+		// and a count that included the very Issues the refusal was about
+		// excluding. An operator reading it triaged the clarify agent and the
+		// skills pin instead of noticing that a human had closed the issue.
+		reason := refusal
+		if reason == "" {
+			reason = "citation-not-verified"
+		}
+		s.log.WarnContext(ctx, "restapi: clarify reported approval but the scope check refused",
+			append(reqLogFields(o.r), "task", o.task.Name, "reason", reason,
+				"owned_issues", len(issues), "live_issues", liveIssueCount(issues))...)
 		o.ok("implement-unverified")
 		return
 	}
 
 	for i := range issues {
 		iss := &issues[i]
+		// The SAME filter verifyApprovalScope applied, and it must be the same:
+		// that function deliberately puts no out-of-scope Issue in the map, so
+		// without this an ordinary success - one closed Issue alongside one live
+		// approved one - looked up a nil and fired the approver-less-approval
+		// ERROR below once per closed Issue on every approval that WORKED.
+		if !controller.ApprovalInScope(iss) {
+			continue
+		}
 		ev := evidence[iss.Name]
 		// Count the auto-approval TRANSITION (an issue not already approved): the
 		// last human gate is being removed, so it must be queryable without
@@ -1303,6 +1346,30 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 				s.metrics.AutoApproveTotal(kind)
 			}
 		}
+		if ev == nil {
+			// UNREACHABLE AT HEAD, AND KEPT ANYWAY AS A DRIFT DETECTOR. It is
+			// unreachable because verifyApprovalScope refuses the whole request
+			// on !ok || ev == nil and this loop walks exactly the in-scope keys
+			// its map holds - so deleting this arm leaves the package green.
+			// That is not an argument for deleting it. It is reachable again the
+			// moment the scope skip five lines above drifts from the identical
+			// one inside verifyApprovalScope, which is a ONE-LINE regression that
+			// has already happened once: the two filters were out of step until
+			// fix L3-14, and this ERROR is what made it visible. Writing
+			// status=approved with a nil approval produces an approved Issue with
+			// NO approver - it defeats the idempotence short-circuit, defeats the
+			// single-use replay guard, and projects tatara-approved to the forge
+			// with nobody behind it.
+			//
+			// It is pinned in the NEGATIVE, not the positive: no test can reach
+			// this line through the handler, but
+			// TestOutcome_Clarify_ClosedIssueDoesNotBlockALiveOne asserts the
+			// ERROR is absent on the happy path and goes RED the instant the two
+			// filters drift (verified by deleting the skip).
+			s.log.ErrorContext(ctx, "restapi: approval granted with nil evidence; refusing to write an approver-less approval",
+				append(reqLogFields(o.r), "task", o.task.Name, "issue", iss.Name)...)
+			continue
+		}
 		key := types.NamespacedName{Namespace: s.ns, Name: iss.Name}
 		if err := objbudget.FitIssue(ctx, s.c, s.spillerForOrNil(o.proj), key, func(is *tatarav1alpha1.Issue) {
 			is.Status.Status = "approved"
@@ -1311,6 +1378,20 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 			writeClientErr(o.w, err)
 			return
 		}
+		// THE GRANT NEEDS ITS OWN AUDIT LINE, and after step F this is the only
+		// place left that can emit one. Every REFUSAL is covered twice -
+		// operator_approval_refused_total{reason} AND action=approval_refused -
+		// while the grant had only action=submit_outcome,outcome=implement,
+		// which names no approver and no comment. Issue.Status.Approval is ONE
+		// slot, overwritten by the next approval on that Issue, so the
+		// durable record of WHO released a change into push-CD is destroyed by
+		// the next one; this line is the append-only trace. Field names are
+		// exactly those the deleted controller-side writer used, so a consumer
+		// built against either sees one shape.
+		s.log.InfoContext(ctx, "restapi: approval verified",
+			append(reqLogFields(o.r), "action", "approval_verified", "task", o.task.Name,
+				"issue", iss.Name, "maintainer_login", ev.Login,
+				"cited_comment_id", ev.CommentID, "auto", ev.Auto)...)
 	}
 	if !o.commit(func(t *tatarav1alpha1.Task) error {
 		if err := stage.Enter(t, mrs, tatarav1alpha1.StageApproved, "", s.now()); err != nil {
@@ -1321,28 +1402,96 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 	}) {
 		return
 	}
-	o.ok("implement", "issues", len(issues))
+	// len(evidence), not len(issues): the map holds exactly the IN-SCOPE Issues
+	// that produced evidence, which is what this outcome actually approved. Owned
+	// but out-of-scope Issues are filtered out of both the scope check and the
+	// write loop above, so reporting every owned Issue overstated the grant.
+	o.ok("implement", "issues", len(evidence))
 }
 
-// verifyApprovalScope runs the C.6 grammar over EVERY owned Issue. The empty
-// set is NOT a licence: a clarify Task with no Issue has nothing to approve and
-// is refused.
+// verifyApprovalScope re-derives the approval over every LIVE owned Issue,
+// offering each of them the SAME citation set the agent submitted.
+//
+// THE EMPTY SET IS NOT A LICENCE, and it has two shapes here, not one. A clarify
+// Task with NO Issue has nothing to approve and is refused; so is a Task whose
+// every owned Issue is OUT OF SCOPE (closed / done / rejected). The second shape
+// was a live gate hole: ownedIssues returns every owned Issue whatever its
+// state, and the verifier answers (Issue.Status.Approval, true) for an
+// out-of-scope one - correct in isolation, since a closed thread is not pending
+// approval and must not block the others, but that stored approval is routinely
+// nil. Refusing only on len(issues)==0 therefore reported granted=true over an
+// all-nil map, and a Task whose ONLY Issue a HUMAN HAD CLOSED walked to approved
+// with no citation, no maintainer comment and no evidence. Closing the issue is
+// the strongest veto a human has; it must not be the thing that releases the
+// work.
+//
+// The out-of-scope Issues are FILTERED rather than required to produce evidence,
+// which is what keeps a human closing ONE issue of a multi-issue Task from
+// stranding the rest. controller.ApprovalInScope is called rather than restated
+// so the scope filter here, the one in the write loop below, and the one inside
+// the verifier's own carve-out cannot drift. There is no controller-side twin of
+// this loop any more: the Task-level VerifyApprovalDetailed/ApprovalPassed pair
+// lost its last production caller and was deleted, leaving this the single place
+// an approval can be granted.
 //
 // A nil verifier FAILS CLOSED.
+//
+// THE THIRD RETURN IS THE REFUSAL REASON, and it is empty on a grant AND on the
+// per-Issue refusal path. That asymmetry is deliberate: VerifyApproval emits
+// action=approval_refused and moves operator_approval_refused_total itself, so
+// re-reporting its refusal here would double-count one refusal into two series.
+// Only the two EMPTY-SET shapes have no per-Issue verifier call behind them, and
+// those are exactly the two that used to refuse with no telemetry at all.
 func (s *Server) verifyApprovalScope(ctx context.Context, proj *tatarav1alpha1.Project,
-	issues []tatarav1alpha1.Issue) (bool, map[string]*tatarav1alpha1.ApprovalEvidence) {
-	if len(issues) == 0 || s.approval == nil {
-		return false, nil
+	issues []tatarav1alpha1.Issue,
+	citations []tatarav1alpha1.ApprovalCitation) (bool, map[string]*tatarav1alpha1.ApprovalEvidence, string) {
+	// NOT production-reachable - cmd/manager/wire.go always sets Approval - so it
+	// gets no reason rather than a lie about the Task's Issues. Kept because a
+	// nil verifier must fail closed if the wiring ever regresses (fix W1).
+	if s.approval == nil {
+		return false, nil, ""
+	}
+	if len(issues) == 0 {
+		return false, nil, controller.ApprovalRefusedNoLiveIssue
 	}
 	out := make(map[string]*tatarav1alpha1.ApprovalEvidence, len(issues))
 	for i := range issues {
-		ev, ok := s.approval.VerifyApproval(ctx, proj, &issues[i])
-		if !ok {
-			return false, nil
+		if !controller.ApprovalInScope(&issues[i]) {
+			continue
+		}
+		ev, ok := s.approval.VerifyApproval(ctx, proj, &issues[i], citations)
+		// A LIVE Issue that granted with NO evidence is a refusal, not a pass.
+		// The verifier is not supposed to answer that way for an in-scope Issue,
+		// which is exactly why it is caught here rather than trusted: the
+		// downstream writer's nil guard skips the Issue write and lets control
+		// fall through to stage.Enter(approved), so an approver-less grant
+		// advanced the Task while writing nothing that recorded it.
+		if !ok || ev == nil {
+			return false, nil, ""
 		}
 		out[issues[i].Name] = ev
 	}
-	return true, out
+	// Owned Issues exist but every one of them is out of scope. This is the
+	// human-veto shape: closing the only Issue of a clarify Task.
+	if len(out) == 0 {
+		return false, nil, controller.ApprovalRefusedNoLiveIssue
+	}
+	return true, out, ""
+}
+
+// liveIssueCount is the number of issues the scope check would actually have
+// judged. It exists so the refusal WARN can report that rather than len(issues),
+// which for the no-live-issue shape counts the very Issues the refusal was about
+// excluding. controller.ApprovalInScope is called rather than restated for the
+// same reason the scope loop and the write loop call it: one definition.
+func liveIssueCount(issues []tatarav1alpha1.Issue) int {
+	n := 0
+	for i := range issues {
+		if controller.ApprovalInScope(&issues[i]) {
+			n++
+		}
+	}
+	return n
 }
 
 func (s *Server) queueIssueClose(ctx context.Context, proj *tatarav1alpha1.Project, iss *tatarav1alpha1.Issue, taskName, reason string) error {
@@ -2229,7 +2378,7 @@ func (s *Server) foldMembers(ctx context.Context, proj *tatarav1alpha1.Project, 
 				return err
 			}
 			// The umbrella's Status.IssueRefs is what every downstream
-			// consumer reads (the C.6 approval grammar, the reaper's
+			// consumer reads (the C.6 approval citation check, the reaper's
 			// owned-set, the agent bundle) - NOT ownerRefs. Adoption without
 			// this leaves adopted work unguarded and absent from the bundle.
 			if err := s.appendTaskRefFor(ctx, proj, umbrella.Name, &iss); err != nil {

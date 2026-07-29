@@ -254,8 +254,8 @@ type SCMWriter interface {
 type IssueComment struct {
 	// ExternalID is the provider's comment id as a STRING (GitHub int64, GitLab
 	// note id; the two disagree on width). It is the mirror's dedup key
-	// (Comment.ExternalID) and the single-use evidence id the approval grammar's
-	// clause 3d enforces against, so it is populated on every read path.
+	// (Comment.ExternalID) and the single-use evidence id the approval citation
+	// check's clause (d) enforces against, so it is populated on every read path.
 	ExternalID string
 	Author     string
 	Body       string

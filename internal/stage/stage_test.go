@@ -1606,73 +1606,76 @@ func TestUnpark_AwaitingHumanRequiresANonBotEvent(t *testing.T) {
 	}
 }
 
+// F.6 does NO approval reasoning. parked(identity-unverified) re-enters
+// CONVERSING when a human commented and the project is under its conversing
+// ceiling, and declines no-conversing-room when it is not. It has no other
+// outcome, and in particular no path to implementing: the grant moved wholly to
+// restapi.verifyApprovalScope on a live submit_outcome(decision=implement).
 func TestUnpark_IdentityUnverified(t *testing.T) {
 	t.Run("a BOT comment changes NOTHING", func(t *testing.T) {
 		task := newTask("clarify", v1alpha1.StageParked, stage.ReasonIdentityUnverified)
 		botEvent(task)
 		h := newHarness(t, task)
+		// Room is deliberately TRUE: the bot-event guard must be what refuses,
+		// not the ceiling, or this would pass without testing anything.
 		if _, ok := h.unpark(stage.UnparkInput{
-			Issues: []v1alpha1.Issue{openIssue("approved")}, GrammarPassed: true,
+			Issues: []v1alpha1.Issue{openIssue("approved")}, ConversingHasRoom: true,
 			ActiveTasks: 1, MaxOpenTasks: 6, BotLogin: botLogin, MaxTurnsPerTask: 300,
 		}); ok {
 			t.Fatal("a BOT comment un-parked an identity-unverified Task")
 		}
 	})
 
-	t.Run("a maintainer comment that PASSES the grammar reaches implementing in ONE comment", func(t *testing.T) {
+	t.Run("a maintainer comment reaches CONVERSING, never implementing", func(t *testing.T) {
 		task := newTask("clarify", v1alpha1.StageParked, stage.ReasonIdentityUnverified)
 		humanEvent(task)
 		h := newHarness(t, task)
-		// The caller has ALREADY synced the thread from the forge and re-run the
-		// C.6 grammar; it passed, and it stamped the Issue approved.
+		// Every owned Issue is APPROVED, which is exactly the input the old arm
+		// took straight to implementing. It must reach conversing instead: an
+		// Issue's recorded approval state is a record, and F.6 no longer acts on
+		// records.
 		target, ok := h.unpark(stage.UnparkInput{
-			Issues: []v1alpha1.Issue{openIssue("approved")}, GrammarPassed: true,
+			Issues: []v1alpha1.Issue{openIssue("approved")}, ConversingHasRoom: true,
 			ActiveTasks: 1, MaxOpenTasks: 6, BotLogin: botLogin, MaxTurnsPerTask: 300,
 		})
-		if !ok || target != v1alpha1.StageImplementing {
-			t.Fatalf("got (%q,%v), want (implementing,true): human approval must not take 7 days and two comments", target, ok)
+		if !ok || target != v1alpha1.StageConversing {
+			t.Fatalf("got (%q,%v), want (conversing,true): a human comment must put a live agent in front of the human", target, ok)
 		}
-		if h.pods.spawned[stage.AgentImplement] != 1 {
-			t.Fatal("no implement pod spawned")
+		if h.pods.spawned[stage.AgentImplement] != 0 {
+			t.Fatalf("implement pods spawned = %d, want 0: F.6 cannot grant implementing from identity-unverified", h.pods.spawned[stage.AgentImplement])
 		}
 	})
 
-	t.Run("a maintainer comment that FAILS the grammar stays parked", func(t *testing.T) {
+	t.Run("an UNAPPROVED owned Issue reaches conversing just the same", func(t *testing.T) {
+		task := newTask("clarify", v1alpha1.StageParked, stage.ReasonIdentityUnverified)
+		humanEvent(task)
+		h := newHarness(t, task)
+		// The discrimination pair for the subtest above: approval state is not
+		// read on this arm at all, so flipping it must change nothing.
+		target, ok := h.unpark(stage.UnparkInput{
+			Issues: []v1alpha1.Issue{openIssue("approved"), openIssue("new")}, ConversingHasRoom: true,
+			ActiveTasks: 1, MaxOpenTasks: 6, BotLogin: botLogin, MaxTurnsPerTask: 300,
+		})
+		if !ok || target != v1alpha1.StageConversing {
+			t.Fatalf("got (%q,%v), want (conversing,true)", target, ok)
+		}
+	})
+
+	t.Run("D1: no conversing room declines and STAYS PARKED", func(t *testing.T) {
 		task := newTask("clarify", v1alpha1.StageParked, stage.ReasonIdentityUnverified)
 		humanEvent(task)
 		h := newHarness(t, task)
 		if target, ok := h.unpark(stage.UnparkInput{
-			Issues: []v1alpha1.Issue{openIssue("new")}, GrammarPassed: false,
+			Issues: []v1alpha1.Issue{openIssue("approved")}, ConversingHasRoom: false,
 			ActiveTasks: 1, MaxOpenTasks: 6, BotLogin: botLogin, MaxTurnsPerTask: 300,
 		}); ok {
-			t.Fatalf("a comment that FAILED the grammar un-parked the Task to %q. A comment ALONE cannot un-park it", target)
+			t.Fatalf("a full conversing ceiling un-parked the Task to %q: it must decline, not fall through to another stage", target)
 		}
 		if task.Status.Stage != v1alpha1.StageParked {
 			t.Fatal("the Task left parked")
 		}
-	})
-
-	t.Run("H9: EVERY owned Issue must be approved", func(t *testing.T) {
-		task := newTask("clarify", v1alpha1.StageParked, stage.ReasonIdentityUnverified)
-		humanEvent(task)
-		h := newHarness(t, task)
-		if _, ok := h.unpark(stage.UnparkInput{
-			Issues: []v1alpha1.Issue{openIssue("approved"), openIssue("new")}, GrammarPassed: true,
-			ActiveTasks: 1, MaxOpenTasks: 6, BotLogin: botLogin, MaxTurnsPerTask: 300,
-		}); ok {
-			t.Fatal("un-parked to implementing with an UNAPPROVED owned Issue")
-		}
-	})
-
-	t.Run("the EMPTY owned-Issue set is not a licence here either", func(t *testing.T) {
-		task := newTask("clarify", v1alpha1.StageParked, stage.ReasonIdentityUnverified)
-		humanEvent(task)
-		h := newHarness(t, task)
-		if _, ok := h.unpark(stage.UnparkInput{
-			Issues: nil, GrammarPassed: true,
-			ActiveTasks: 1, MaxOpenTasks: 6, BotLogin: botLogin, MaxTurnsPerTask: 300,
-		}); ok {
-			t.Fatal("an EMPTY owned-Issue set satisfied the universal quantifier and spawned an implement pod")
+		if len(task.Status.PendingEvents) != 1 {
+			t.Fatalf("pendingEvents = %d, want 1: the event is RETAINED and the next pass retries", len(task.Status.PendingEvents))
 		}
 	})
 }
@@ -1791,7 +1794,7 @@ func TestUnpark_DefaultReasonsHaveNoReentry(t *testing.T) {
 			humanEvent(task) // even WITH a human comment
 			h := newHarness(t, task)
 			if target, ok := h.unpark(stage.UnparkInput{
-				Issues: []v1alpha1.Issue{openIssue("approved")}, GrammarPassed: true,
+				Issues: []v1alpha1.Issue{openIssue("approved")}, ConversingHasRoom: true,
 				ActiveTasks: 0, MaxOpenTasks: 6, BotLogin: botLogin, MaxTurnsPerTask: 300,
 			}); ok {
 				t.Fatalf("parked(%s) re-entered %q. It has NO re-entry: it ages out and is reaped", reason, target)

@@ -39,8 +39,9 @@ type Config struct {
 	// notes for task_context(notes=all). Same per-project reasoning as
 	// SpillerFor: one tatara-memory endpoint per Project.
 	MemoryFor func(proj *tatarav1alpha1.Project) NoteFetcher
-	// Approval is the C.6 grammar. A nil verifier FAILS CLOSED: a clarify
-	// decision=implement then parks at identity-unverified.
+	// Approval structurally re-verifies the agent's approval citation. A nil
+	// verifier FAILS CLOSED: a clarify decision=implement then parks at
+	// identity-unverified.
 	Approval ApprovalVerifier
 	// Minter mints/unparks the OP5 takeover Task behind OP9's
 	// POST /projects/{p}/scm/mr-takeover. A nil Minter fails the endpoint at
