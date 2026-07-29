@@ -20,15 +20,19 @@ var IllegalStageTransitionTotal = prometheus.NewCounterVec(prometheus.CounterOpt
 }, []string{"from", "to"})
 
 func init() {
-	ctrlmetrics.Registry.MustRegister(IllegalStageTransitionTotal, StageDriftTotal)
+	ctrlmetrics.Registry.MustRegister(IllegalStageTransitionTotal, StageDriftTotal, StageRaceLostTotal)
 	// Pre-seed every stage so a healthy operator (0 drift, the expected
 	// steady state) exposes a zero baseline from startup instead of no
 	// series at all - a sustained-rate alert added later has something to
 	// evaluate against on the very first real drift (metric-wiring audit,
-	// issue #370). IllegalStageTransitionTotal is NOT pre-seeded: its
-	// {from,to} cardinality (15x15) is unbounded-by-comparison for a metric
-	// with no consuming alert yet, and K.1 cardinality discipline argues
-	// against seeding a matrix nobody reads.
+	// issue #370). IllegalStageTransitionTotal and StageRaceLostTotal are NOT
+	// pre-seeded: their {from,to} cardinality (16x16) makes a full matrix
+	// 256 series apiece against K.1 cardinality discipline, and no rule reads
+	// a pair that has never fired. The cost is real and known: an alert using
+	// increase() sees a series BORN mid-window and has no zero to extrapolate
+	// from, so it under-reports the true count (issue #478 - the counter had
+	// reached 2 while the 15m increase() reported 1). Under-reporting a
+	// must-be-zero counter is acceptable; 256 idle series are not.
 	for _, stg := range []string{
 		tatarav1alpha1.StageTriaging, tatarav1alpha1.StageBrainstorming, tatarav1alpha1.StageClarifying,
 		tatarav1alpha1.StageInvestigating, tatarav1alpha1.StageRefining, tatarav1alpha1.StageApproved,
@@ -79,6 +83,44 @@ func StageDrift(cachedStage string) {
 // StageDriftCounter returns the counter for the cached stage for test assertions.
 func StageDriftCounter(cachedStage string) prometheus.Counter {
 	return StageDriftTotal.WithLabelValues(cachedStage)
+}
+
+// StageRaceLostTotal counts transitions DROPPED because another writer moved
+// status.stage between the caller's pre-check and the write, leaving the
+// caller's (legal, correctly computed) edge illegal from the stage the Task
+// ACTUALLY has by the time the write lands (issue #478).
+//
+// It is the third member of the family, and the distinction is the whole point:
+//
+//   - StageDriftTotal      - drift DETECTED before the edge is computed, then
+//     adopted. Nothing was lost.
+//   - StageRaceLostTotal   - drift materialised INSIDE the write. The loser's
+//     edge is dropped. NOT a code bug: two controllers legitimately raced for
+//     the same exit and one of them wrote first. A trickle is the expected
+//     cost of concurrency; a sustained rate on one {from,to} pair means two
+//     writers are fighting over an edge that needs an owner.
+//   - IllegalStageTransitionTotal - the caller computed an edge that is not in
+//     the F.3 table AT ALL, from the stage the Task really had. THAT is the
+//     code bug, and charging lost races to it (which is what shipped before
+//     #478) made the alert's "any non-zero value is a code bug" annotation a
+//     lie the first time two controllers raced.
+//
+// The labels are the LIVE from (the winner's stage) and the loser's intended
+// to, i.e. the edge that was refused - not the stale from the loser started
+// out believing.
+var StageRaceLostTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "operator_stage_race_lost_total",
+	Help: "Stage transitions dropped because another writer moved status.stage between the caller's pre-check and the write. Labelled by the live (winner's) from and the dropped to. A trickle is normal concurrency, not a code bug.",
+}, []string{"from", "to"})
+
+// StageRaceLost increments operator_stage_race_lost_total for one lost race.
+func StageRaceLost(liveFrom, droppedTo string) {
+	StageRaceLostTotal.WithLabelValues(liveFrom, droppedTo).Inc()
+}
+
+// StageRaceLostCounter returns the counter for test assertions.
+func StageRaceLostCounter(liveFrom, droppedTo string) prometheus.Counter {
+	return StageRaceLostTotal.WithLabelValues(liveFrom, droppedTo)
 }
 
 // TaskTerminalEntry is the D1 emit: operator_task_terminal_total
