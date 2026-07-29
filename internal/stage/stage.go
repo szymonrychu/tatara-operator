@@ -1264,6 +1264,18 @@ func UnparkDetailed(in UnparkInput) (target string, decline string) {
 				// out at parkRetention and is reaped.
 				return "", DeclineMergedMR
 			}
+			// #511: an externally-owned MR (a stand-down: a commit outside
+			// tatara landed, or a maintainer never let tatara own it in the
+			// first place) is not an ordinary review round - it is the ONE
+			// state a "take over" comment can arrive in, and the round cap was
+			// sized to bound review ping-pong, not to swallow a maintainer's
+			// take-over request. Skip the cap and DO NOT spend a round: this
+			// re-entry either finds nothing to take over (idempotent no-op in
+			// restapi.mrTakeover) or hands ownership back, neither of which is
+			// the review ping-pong the cap exists to bound.
+			if anyExternallyOwned(in.MRs) {
+				return enter(v1alpha1.StageReviewing, "")
+			}
 			if t.Status.HumanReviewRounds >= v1alpha1.MaxHumanReviewRounds {
 				return "", DeclineRoundsExhausted // STAY PARKED. Do not spawn another review pod.
 			}
@@ -1503,6 +1515,18 @@ func allApproved(issues []v1alpha1.Issue) bool {
 func anyMerged(mrs []v1alpha1.MergeRequest) bool {
 	for i := range mrs {
 		if mrs[i].Status.State == "merged" || mrs[i].Status.MergedAt != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// anyExternallyOwned reports whether any of mrs is currently Ownership==
+// external - a stand-down state (#511) where a human comment is plausibly a
+// take-over request, not an ordinary review round.
+func anyExternallyOwned(mrs []v1alpha1.MergeRequest) bool {
+	for i := range mrs {
+		if mrs[i].Status.Ownership == v1alpha1.OwnershipExternal {
 			return true
 		}
 	}
