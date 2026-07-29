@@ -45,6 +45,18 @@ const ToolingNoteGuidance = "\n\n## Tooling you needed\n" +
 	"to the repo's .mise.toml. Do not file a separate issue for tooling; fold it into the issue " +
 	"you are proposing."
 
+// ConcisenessGuidance is appended to every agent turn-0 directive. Issue #506:
+// tatara's own forge-visible writing (issue/MR bodies, clarify/discuss
+// messages, comments) was too long for its actual audience.
+const ConcisenessGuidance = "\n\n## Writing style for your own output\n" +
+	"Audience is a senior dev/devops reader, not a beginner. For every issue " +
+	"comment, MR body, clarify/discuss message, and outcome body you write:\n" +
+	"  - Bullets and tables over prose. No restated context the reader already has " +
+	"(the diff, the thread, the goal).\n" +
+	"  - Skip explaining what is obvious from the diff or from standard terms in " +
+	"the domain. State conclusions and decisions, not the reasoning that got you there.\n" +
+	"  - Less is more: shorter and precise beats thorough and long."
+
 // ToolingConsumeGuidance is appended to implementer-agent prompts. It
 // instructs the agent to pick up any '## Tooling' section from the issue body
 // and add each tool to the repo's .mise.toml as part of the implementation.
