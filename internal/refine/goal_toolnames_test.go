@@ -6,15 +6,14 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/promptguidance"
 )
 
-// KNOWN GAP, stated so nobody reads this pass as a clean bill of health:
-// GoalProject's prose instructs the agent to call list_issues, list_commits,
-// close_issue, edit_issue, submit_turn and exit_plan_mode. None of those exist
-// (the first four are in tatara-cli's TestReapedToolsAreGone), and the goal
-// never names submit_outcome, which is how a refine stage actually ends. They
-// are NOT backticked, so UnknownToolNames cannot see them and this test passes
-// vacuously today. Rewriting that prose needs a decision about which real call
-// shapes replace them (scm_read? issue_write?) and is tracked separately. This
-// test still earns its place: it catches the next backticked name to drift.
+// GoalProject used to instruct the agent to call list_issues, list_commits,
+// close_issue, edit_issue, submit_turn and exit_plan_mode - none of which
+// exist (the first four are reaped by tatara-cli's TestReapedToolsAreGone),
+// and it never named submit_outcome, which is how a refine task actually
+// ends. Those names were never backticked, so UnknownToolNames could not see
+// them and this test passed vacuously. GoalProject now names only real tools
+// (scm_read, issue_write, task_list, submit_outcome), backticked so this test
+// actually guards them: the next name to drift here fails the build.
 func TestRefineGoalNamesOnlyRealTools(t *testing.T) {
 	goal := GoalProject([]string{"o/a", "o/b"}, 14)
 	if bad := promptguidance.UnknownToolNames(goal); len(bad) > 0 {
