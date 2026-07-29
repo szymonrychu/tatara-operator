@@ -10,9 +10,12 @@ import (
 func TestGoalProject_GroomsExistingBacklogOnly(t *testing.T) {
 	g := refine.GoalProject([]string{"szymonrychu/tatara-operator", "szymonrychu/tatara-cli"}, 30)
 
-	// Input + the close/dedup/edit action set.
+	// Input + the close/dedup/edit action set, in terms of the real tools:
+	// scm_read to read the backlog, issue_write to narrow scope in-turn, and
+	// submit_outcome's closes/links/folds arrays as the only way to close or
+	// cross-reference an issue.
 	for _, want := range []string{
-		"list_issues", "list_commits", "close_issue", "edit_issue",
+		"scm_read", "issue_write", "submit_outcome", "closes", "links", "folds",
 		"duplicate", "already", "commit", "30",
 		"tatara-operator", "tatara-cli",
 	} {
@@ -21,11 +24,15 @@ func TestGoalProject_GroomsExistingBacklogOnly(t *testing.T) {
 		}
 	}
 
-	// No issue creation: refine grooms the existing backlog, it does not file new
-	// issues (followups/splits) that would cascade into triage agents.
-	for _, absent := range []string{"create_issue", "Followup", "Split"} {
+	// No stale tool names, and no issue creation: refine grooms the existing
+	// backlog, it does not file new issues (followups/splits) that would
+	// cascade into triage agents.
+	for _, absent := range []string{
+		"list_issues", "list_commits", "close_issue", "edit_issue", "submit_turn", "exit_plan_mode",
+		"create_issue", "Followup", "Split",
+	} {
 		if strings.Contains(g, absent) {
-			t.Fatalf("goal must not mention %q (no issue creation)", absent)
+			t.Fatalf("goal must not mention %q", absent)
 		}
 	}
 
