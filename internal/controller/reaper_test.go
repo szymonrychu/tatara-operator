@@ -1427,33 +1427,164 @@ func TestReapDeliveredDocReferenceLogFetchFailureIsNonBlocking(t *testing.T) {
 	}
 }
 
-// TestReapSkipsFoldInFlight: the reaper SKIP list. Any Task named in a LIVE
-// Task's status.foldInFlight is skipped, and operator_gc_blocked_total records
-// why. Reaping a fold member mid-adoption destroys the artifacts the umbrella is
-// halfway through adopting.
-func TestReapSkipsFoldInFlight(t *testing.T) {
+// TestReapFoldInFlightGate is the whole B.6 fold gate in one table: a member is
+// held ONLY while the umbrella's adoption can still complete, the hold is only
+// COUNTED once it has outlived its healthy window, and a hold that can never
+// complete RELEASES rather than pinning the member forever (issue #467).
+func TestReapFoldInFlightGate(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		umbrella func() *tatarav1alpha1.Task
+		held     bool
+		counted  bool
+	}{
+		{
+			// The B.3 window itself: an adoption started seconds ago. Reaping a
+			// member here destroys artifacts the umbrella is halfway through
+			// adopting, so it is held - and NOT counted, because a healthy hold
+			// that trips a warning alert is the #424 defect all over again.
+			name: "live umbrella, fresh adoption: held, not counted",
+			umbrella: func() *tatarav1alpha1.Task {
+				u := reapTask("foldskip", "umbrella-task", "refine",
+					tatarav1alpha1.StageRefining, "", time.Now())
+				since := metav1.NewTime(time.Now())
+				u.Status.FoldInFlightSince = &since
+				return u
+			},
+			held: true, counted: false,
+		},
+		{
+			// Still inside the TTL, so still held - but a single request has no
+			// business taking ten minutes, and that IS the anomaly the counter
+			// exists to surface.
+			name: "live umbrella, adoption past its grace: held and counted",
+			umbrella: func() *tatarav1alpha1.Task {
+				u := reapTask("foldskip", "umbrella-task", "refine",
+					tatarav1alpha1.StageRefining, "", time.Now())
+				since := metav1.NewTime(time.Now().Add(-10 * time.Minute))
+				u.Status.FoldInFlightSince = &since
+				return u
+			},
+			held: true, counted: true,
+		},
+		{
+			// Issue #467 exactly: the umbrella closed an issue it owned and was
+			// stopped at rejected(issue-closed) mid-adoption. It runs no pod and
+			// will never submit another outcome, so nothing will ever finish the
+			// fold. Holding the member is holding it forever.
+			name: "terminal umbrella: released",
+			umbrella: func() *tatarav1alpha1.Task {
+				u := reapTask("foldskip", "umbrella-task", "refine",
+					tatarav1alpha1.StageRejected, stage.ReasonIssueClosed, time.Now())
+				since := metav1.NewTime(time.Now())
+				u.Status.FoldInFlightSince = &since
+				return u
+			},
+			held: false, counted: false,
+		},
+		{
+			// A PARKED umbrella is the worst shape of the same bug: parked
+			// (backlog-sweep) is never aged out at all, so its marker outlives
+			// every retention the reaper has.
+			name: "parked umbrella: released",
+			umbrella: func() *tatarav1alpha1.Task {
+				u := reapTask("foldskip", "umbrella-task", "refine",
+					tatarav1alpha1.StageParked, stage.ReasonBacklogSweep, time.Now())
+				since := metav1.NewTime(time.Now())
+				u.Status.FoldInFlightSince = &since
+				return u
+			},
+			held: false, counted: false,
+		},
+		{
+			// The backstop for every way an adoption can die that leaves the
+			// umbrella live: past the TTL the marker is stale by construction.
+			name: "live umbrella, adoption past its TTL: released",
+			umbrella: func() *tatarav1alpha1.Task {
+				u := reapTask("foldskip", "umbrella-task", "refine",
+					tatarav1alpha1.StageRefining, "", time.Now())
+				since := metav1.NewTime(time.Now().Add(-2 * tatarav1alpha1.FoldInFlightTTL))
+				u.Status.FoldInFlightSince = &since
+				return u
+			},
+			held: false, counted: false,
+		},
+		{
+			// A marker written by a build that predates FoldInFlightSince: the
+			// anchor falls back to the stage clock, so the 26 Tasks already
+			// stranded in the cluster release on the first pass after rollout
+			// with no manual surgery.
+			name: "no anchor, stage clock past the TTL: released",
+			umbrella: func() *tatarav1alpha1.Task {
+				return reapTask("foldskip", "umbrella-task", "refine",
+					tatarav1alpha1.StageRefining, "", time.Now().Add(-2*tatarav1alpha1.FoldInFlightTTL))
+			},
+			held: false, counted: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			proj := reapProject("foldskip")
+
+			member := reapTask("foldskip", "member-task", "clarify",
+				tatarav1alpha1.StageFailed, stage.ReasonOperatorError, time.Now().Add(-30*24*time.Hour))
+			umbrella := tc.umbrella()
+			umbrella.Status.FoldInFlight = []string{"member-task"}
+
+			c := newMirrorClient(t, proj, reapSecret(), member, umbrella)
+			r := reapReconciler(c, &reapWriter{}) // any forge write here is a bug
+
+			before := testutil.ToFloat64(obs.GCBlockedTotal.WithLabelValues(obs.GCBlockedFoldInFlight))
+			if err := r.ReapTerminal(ctx, proj); err != nil {
+				t.Fatalf("ReapTerminal: %v", err)
+			}
+
+			_, alive := mustGetTask(t, c, "member-task")
+			if alive != tc.held {
+				t.Fatalf("member-task alive = %v, want %v", alive, tc.held)
+			}
+			counted := testutil.ToFloat64(obs.GCBlockedTotal.WithLabelValues(obs.GCBlockedFoldInFlight)) > before
+			if counted != tc.counted {
+				t.Fatalf("operator_gc_blocked_total{reason=fold_in_flight} moved = %v, want %v", counted, tc.counted)
+			}
+			want := 0.0
+			if tc.counted {
+				want = 1
+			}
+			if got := testutil.ToFloat64(obs.FoldInFlightBlockedTasks.WithLabelValues("foldskip")); got != want {
+				t.Fatalf("operator_fold_in_flight_blocked_tasks = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+// TestReapTerminalUmbrellaClearsItsFoldMarker: releaseTerminal releases a
+// terminal Task's ISSUES and MRS, and issue #467 is what it costs to leave its
+// FOLDS out of that list. The marker is cleared BEFORE any fallible step, so an
+// umbrella whose forge writes keep failing still stops pinning its members.
+func TestReapTerminalUmbrellaClearsItsFoldMarker(t *testing.T) {
 	ctx := context.Background()
-	proj := reapProject("foldskip")
+	proj := reapProject("foldclear")
 
-	member := reapTask("foldskip", "member-task", "clarify",
-		tatarav1alpha1.StageFailed, stage.ReasonOperatorError, time.Now().Add(-30*24*time.Hour))
-	umbrella := reapTask("foldskip", "umbrella-task", "refine",
-		tatarav1alpha1.StageRefining, "", time.Now())
+	umbrella := reapTask("foldclear", "umbrella-task", "refine",
+		tatarav1alpha1.StageRejected, stage.ReasonIssueClosed, time.Now())
 	umbrella.Status.FoldInFlight = []string{"member-task"}
+	since := metav1.NewTime(time.Now())
+	umbrella.Status.FoldInFlightSince = &since
 
-	c := newMirrorClient(t, proj, reapSecret(), member, umbrella)
-	w := &reapWriter{} // any forge write here is a bug
-	r := reapReconciler(c, w)
+	c := newMirrorClient(t, proj, reapSecret(), umbrella)
+	r := reapReconciler(c, &reapWriter{})
 
-	before := testutil.ToFloat64(obs.GCBlockedTotal.WithLabelValues(obs.GCBlockedFoldInFlight))
 	if err := r.ReapTerminal(ctx, proj); err != nil {
 		t.Fatalf("ReapTerminal: %v", err)
 	}
-	if _, ok := mustGetTask(t, c, "member-task"); !ok {
-		t.Fatal("a Task named in a live Task's foldInFlight was reaped")
+	got, ok := mustGetTask(t, c, "umbrella-task")
+	if !ok {
+		t.Fatal("the umbrella is inside RejectedRetention and must survive as a debugging artifact")
 	}
-	if got := testutil.ToFloat64(obs.GCBlockedTotal.WithLabelValues(obs.GCBlockedFoldInFlight)); got <= before {
-		t.Fatalf("operator_gc_blocked_total{reason=fold_in_flight} = %v, want > %v", got, before)
+	if len(got.Status.FoldInFlight) != 0 || got.Status.FoldInFlightSince != nil {
+		t.Fatalf("a terminal umbrella must release its folds; got %v / %v",
+			got.Status.FoldInFlight, got.Status.FoldInFlightSince)
 	}
 }
 

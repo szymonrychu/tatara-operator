@@ -235,7 +235,7 @@ func (r *TaskReconciler) reconcileStage(ctx context.Context, project *tatarav1al
 	// from a stage this Task has already left (issue #324, the residue after the
 	// #347 mint fix: same race, one step later in the machine). See the
 	// APIReader field's comment.
-	if err := r.refreshTaskFromAPI(ctx, task); err != nil {
+	if err := refreshTaskFromAPI(ctx, r.APIReader, task); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -358,14 +358,19 @@ func (r *TaskReconciler) mintedAlready(ctx context.Context, task *tatarav1alpha1
 //
 // A live Task gone entirely (NotFound) is deliberately NOT a bail, and this
 // too differs from mintedAlready: the reaper already owns it, or the enter
-// below surfaces a real NotFound of its own. Nil APIReader (unit tests) falls
+// below surfaces a real NotFound of its own. Nil api reader (unit tests) falls
 // back to trusting the cached read.
-func (r *TaskReconciler) refreshTaskFromAPI(ctx context.Context, task *tatarav1alpha1.Task) error {
-	if r.APIReader == nil {
+//
+// It is package-level rather than a TaskReconciler method because the SAME
+// check-on-cache / act-on-live asymmetry exists in StageDriver's reviewing exit
+// (issue #478), and one copy of "adopt the live Task, count the drift" is the
+// only way both stay honest.
+func refreshTaskFromAPI(ctx context.Context, api client.Reader, task *tatarav1alpha1.Task) error {
+	if api == nil {
 		return nil
 	}
 	var live tatarav1alpha1.Task
-	if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(task), &live); err != nil {
+	if err := api.Get(ctx, client.ObjectKeyFromObject(task), &live); err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil
 		}
