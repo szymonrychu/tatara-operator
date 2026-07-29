@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -335,6 +336,24 @@ func (d *StageDriver) advanceAfterReview(ctx context.Context, proj *tatarav1alph
 	edge, ready := reviewAdvanceEdge(task, mrs, maxReviewRounds(proj))
 	if !ready {
 		return nil
+	}
+	// THE RED-CI GATE (issue #476). An approve is a statement about the code, not
+	// about the checks. Promoting a red change into POD-LESS merging costs the
+	// whole 4h budget and re-discovers a verdict that was already final.
+	//
+	// It FAILS OPEN, on purpose: this is the optimisation, not the guard. The
+	// merging gate re-reads the same status within 60s and leaves through this
+	// same edge, so a forge blip here costs one pointless promotion - whereas an
+	// error return costs the advance itself, and the advance is a ONE-SHOT.
+	if edge.To == tatarav1alpha1.StageMerging {
+		red, cerr := ciRedAtReviewedHead(ctx, d.Client, d.SCMFor, d.Metrics, proj, mrs)
+		switch {
+		case cerr != nil:
+			log.FromContext(ctx).Error(cerr, "review: could not read live CI at the reviewed head; advancing anyway (the merging gate re-checks every 60s)",
+				"action", "ci_red_check_failed", "resource_id", task.Name, "kind", task.Spec.Kind)
+		case red != nil:
+			return enterCIRed(ctx, d.Client, d.spiller(proj), d.Metrics, task, mrs, red, d.now())
+		}
 	}
 	log.FromContext(ctx).Info("review: task advancing off reviewing",
 		"action", "review_advance", "resource_id", task.Name,
@@ -768,25 +787,39 @@ func (d *StageDriver) owningTask(ctx context.Context, obj client.Object) (*tatar
 
 // appendOperatorNote appends ONE operator note, idempotently: a re-run of phase
 // 2 must not write the belt twice.
-//
-// The body is clamped to Note.Body's CRD MaxLength first (issue #495's class).
-// Its caller feeds it reviewBeltNote, which concatenates up to 30 findings whose
-// own bodies are each permitted 8192 bytes, so an unclamped belt note routinely
-// could not be written at all - and the clamp must happen BEFORE the
-// already-written check, since that compares the STORED body.
 func (d *StageDriver) appendOperatorNote(ctx context.Context, proj *tatarav1alpha1.Project,
 	task *tatarav1alpha1.Task, body string) error {
+	return appendOperatorNoteTo(ctx, d.Client, d.spiller(proj), task, body, d.now())
+}
+
+// appendOperatorNoteTo is the driver-free form, for the call sites that hold a
+// bare client rather than a StageDriver (the red-CI gate runs from both).
+//
+// The body is clamped to Note.Body's CRD MaxLength first (issue #495's class),
+// and it is clamped HERE rather than in either caller so that EVERY path into a
+// note gets it. The review belt feeds reviewBeltNote, which concatenates up to
+// 30 findings whose own bodies are each permitted 8192 bytes into a 4096-capped
+// field - unclamped, the only request_changes -> implement handoff there is
+// could not be written at all on any non-trivial review. The red-CI gate's
+// bounce note enters through this same door and is clamped by the same line.
+//
+// THE CLAMP MUST HAPPEN BEFORE THE ALREADY-WRITTEN CHECK below. That check
+// compares the STORED body, which is the truncated one; clamping after it would
+// make a note that differs from the stored copy only in its cut-off tail compare
+// unequal and be re-appended on every single reconcile.
+func appendOperatorNoteTo(ctx context.Context, c client.Client, sp objbudget.Spiller,
+	task *tatarav1alpha1.Task, body string, now time.Time) error {
 	body = tatarav1alpha1.TruncateUTF8(body, tatarav1alpha1.NoteBodyMaxBytes)
-	now := metav1.NewTime(d.now())
+	at := metav1.NewTime(now)
 	key := client.ObjectKeyFromObject(task)
-	if err := objbudget.FitTask(ctx, d.Client, d.spiller(proj), key, func(t *tatarav1alpha1.Task) {
+	if err := objbudget.FitTask(ctx, c, sp, key, func(t *tatarav1alpha1.Task) {
 		for _, n := range t.Status.Notes {
 			if n.Agent == "operator" && n.Body == body {
 				return
 			}
 		}
 		t.Status.Notes = append(t.Status.Notes, tatarav1alpha1.Note{
-			At: now, Agent: "operator", Kind: "note", Body: body,
+			At: at, Agent: "operator", Kind: "note", Body: body,
 		})
 	}); err != nil {
 		return fmt.Errorf("review: append operator note to %s: %w", key.Name, err)

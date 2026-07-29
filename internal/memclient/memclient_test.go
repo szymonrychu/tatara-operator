@@ -573,3 +573,199 @@ func TestSpill_RetryReplaysBodyIntact(t *testing.T) {
 		t.Fatalf("retry body differs from first attempt:\nattempt1=%s\nattempt2=%s", bodies[0], bodies[1])
 	}
 }
+
+// --- Retry-After coverage (issue #466 part b): the server's own Retry-After
+// answer must win over the fixed retryBackoff schedule, for both 503 and 429. ---
+
+// TestDo_HonoursRetryAfterHeader_503 is the regression guard for the reported
+// defect: tatara-memory answers a 503 with "Retry-After: 5", but the client
+// used to wait a fixed ~200ms/1s regardless. retryBackoff is inflated to 5s
+// here so an unfixed client - which ignores the header - blows well past the
+// 3s context deadline and the call fails; a fixed client waits ~1s (the
+// header's value) and succeeds well inside the deadline.
+func TestDo_HonoursRetryAfterHeader_503(t *testing.T) {
+	orig := retryBackoff
+	retryBackoff = []time.Duration{5 * time.Second, 5 * time.Second}
+	t.Cleanup(func() { retryBackoff = orig })
+
+	var mu sync.Mutex
+	count := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		count++
+		n := count
+		mu.Unlock()
+		if n == 1 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("upstream temporarily unavailable"))
+			return
+		}
+		var m serverMemory
+		if !decodeStrictOrReject(w, r, &m) {
+			return
+		}
+		m.ID = "trk-retry-after-503-ok"
+		m.CreatedAt = time.Now().UTC()
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(m)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	c := New(srv.URL, staticToken("tok"), nil)
+	start := time.Now()
+	trackID, err := c.Spill(ctx, "Issue", "issue-1", "payload")
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Spill: want the server's Retry-After: 1 honoured (~1s wait), got error after %s: %v", elapsed, err)
+	}
+	if trackID != "trk-retry-after-503-ok" {
+		t.Fatalf("trackID = %q, want trk-retry-after-503-ok", trackID)
+	}
+	if elapsed >= 3*time.Second {
+		t.Fatalf("elapsed = %s, want < 3s (Retry-After: 1 must win over the 5s fallback backoff)", elapsed)
+	}
+	if elapsed < 900*time.Millisecond {
+		t.Fatalf("elapsed = %s, want >= ~1s (Retry-After: 1 must actually be honoured, not skipped)", elapsed)
+	}
+}
+
+// TestDo_HonoursRetryAfterHeader_429 mirrors the 503 case for 429: the shed
+// signal tatara-memory's bulk admission control is expected to use going
+// forward (see tatara-memory branch fix/bulk-admission-control) must be
+// honoured exactly like a 503's.
+func TestDo_HonoursRetryAfterHeader_429(t *testing.T) {
+	orig := retryBackoff
+	retryBackoff = []time.Duration{5 * time.Second, 5 * time.Second}
+	t.Cleanup(func() { retryBackoff = orig })
+
+	var mu sync.Mutex
+	count := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		count++
+		n := count
+		mu.Unlock()
+		if n == 1 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte("shed"))
+			return
+		}
+		var m serverMemory
+		if !decodeStrictOrReject(w, r, &m) {
+			return
+		}
+		m.ID = "trk-retry-after-429-ok"
+		m.CreatedAt = time.Now().UTC()
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(m)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	c := New(srv.URL, staticToken("tok"), nil)
+	start := time.Now()
+	trackID, err := c.Spill(ctx, "Issue", "issue-1", "payload")
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Spill: want the server's Retry-After: 1 honoured (~1s wait), got error after %s: %v", elapsed, err)
+	}
+	if trackID != "trk-retry-after-429-ok" {
+		t.Fatalf("trackID = %q, want trk-retry-after-429-ok", trackID)
+	}
+	if elapsed >= 3*time.Second {
+		t.Fatalf("elapsed = %s, want < 3s (Retry-After: 1 must win over the 5s fallback backoff)", elapsed)
+	}
+}
+
+// TestDo_RetryAfterHeader_Capped guards against a misbehaving or hostile
+// server parking a reconcile goroutine indefinitely: an absurd Retry-After is
+// capped at maxRetryAfter rather than honoured verbatim. maxRetryAfter is
+// shrunk for the test the same way retryBackoff is.
+func TestDo_RetryAfterHeader_Capped(t *testing.T) {
+	origBackoff := retryBackoff
+	retryBackoff = []time.Duration{5 * time.Second, 5 * time.Second}
+	t.Cleanup(func() { retryBackoff = origBackoff })
+
+	origCap := maxRetryAfter
+	maxRetryAfter = 200 * time.Millisecond
+	t.Cleanup(func() { maxRetryAfter = origCap })
+
+	var mu sync.Mutex
+	count := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		count++
+		n := count
+		mu.Unlock()
+		if n == 1 {
+			w.Header().Set("Retry-After", "3600")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		var m serverMemory
+		if !decodeStrictOrReject(w, r, &m) {
+			return
+		}
+		m.ID = "trk-capped-ok"
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(m)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	c := New(srv.URL, staticToken("tok"), nil)
+	start := time.Now()
+	_, err := c.Spill(ctx, "Issue", "issue-1", "payload")
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Spill: want the 1-hour Retry-After capped to maxRetryAfter, got error after %s: %v", elapsed, err)
+	}
+	if elapsed >= 2*time.Second {
+		t.Fatalf("elapsed = %s, want < 2s (a 3600s Retry-After must be capped, not honoured verbatim)", elapsed)
+	}
+}
+
+// TestDo_MissingRetryAfter_UsesFallbackBackoff is the compatibility guard: a
+// 503/429 with no Retry-After header must fall back to the existing fixed
+// retryBackoff schedule exactly as before this change.
+func TestDo_MissingRetryAfter_UsesFallbackBackoff(t *testing.T) {
+	shrinkRetryBackoff(t)
+	var mu sync.Mutex
+	count := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		count++
+		n := count
+		mu.Unlock()
+		if n == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		var m serverMemory
+		if !decodeStrictOrReject(w, r, &m) {
+			return
+		}
+		m.ID = "trk-no-header-ok"
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(m)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, staticToken("tok"), nil)
+	trackID, err := c.Spill(context.Background(), "Issue", "issue-1", "payload")
+	if err != nil {
+		t.Fatalf("Spill: unexpected error: %v", err)
+	}
+	if trackID != "trk-no-header-ok" {
+		t.Fatalf("trackID = %q, want trk-no-header-ok", trackID)
+	}
+}
