@@ -21,6 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/controller"
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
@@ -1799,6 +1800,9 @@ func (s *Server) mintClarifyTask(ctx context.Context, proj *tatarav1alpha1.Proje
 			},
 		},
 	}
+	// Issue #517's descriptive pod name, stamped at creation like every other
+	// mint path; without it this Task falls back to the legacy wrapper-<name>.
+	agent.StampPodName(t, proj.Name, repo.Name)
 	if err := s.c.Create(ctx, t); err != nil {
 		return nil, fmt.Errorf("create clarify task %s: %w", name, err)
 	}

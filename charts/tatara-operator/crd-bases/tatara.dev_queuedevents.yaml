@@ -169,8 +169,10 @@ spec:
                   podRepo:
                     type: string
                   provider:
-                    description: Provider + PodRepo feed agent.StampPodName on the
-                      rebuilt Task.
+                    description: |-
+                      PodRepo feeds agent.StampPodName on the rebuilt Task. Provider is no
+                      longer consumed for pod naming (issue #507 dropped the gh/gl segment)
+                      but is kept for other callers.
                     type: string
                   repositoryRef:
                     type: string

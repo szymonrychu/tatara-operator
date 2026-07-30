@@ -15,6 +15,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
@@ -116,6 +117,10 @@ func (r *ProjectReconciler) MintDocBatch(ctx context.Context, proj *tatarav1alph
 			Goal:         docBatchGoal(covered),
 		},
 	}
+	// Issue #517's descriptive pod name. The batch IS repo-bound - it writes to
+	// the docs repo - so it stamps docsRepo.Name, the same repo ref the queue
+	// path's documentation event carries as PodRepo.
+	agent.StampPodName(batch, proj.Name, docsRepo.Name)
 	if err := controllerutil.SetControllerReference(proj, batch, r.Scheme); err != nil {
 		return fmt.Errorf("docbatch: set task ownerref: %w", err)
 	}

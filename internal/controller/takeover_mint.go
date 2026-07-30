@@ -12,6 +12,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
@@ -121,6 +122,9 @@ func (m *Minter) MintOrUnparkTakeoverTask(ctx context.Context, proj *tatarav1alp
 			},
 		},
 	}
+	// Issue #517's descriptive pod name (see MintIssueTask). The literal already
+	// carries an annotation map, which StampPodName adds to rather than replaces.
+	agent.StampPodName(task, proj.Name, repo.Name)
 	if err := controllerutil.SetControllerReference(proj, task, m.Scheme); err != nil {
 		return nil, fmt.Errorf("takeover: set task ownerref: %w", err)
 	}

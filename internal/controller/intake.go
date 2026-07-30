@@ -15,6 +15,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/own"
@@ -171,6 +172,12 @@ func (m *Minter) MintIssueTask(ctx context.Context, proj *tatarav1alpha1.Project
 			},
 		},
 	}
+	// Issue #517's descriptive pod name, stamped ONCE here (Kind and Source are
+	// set). createTaskRaceSafe is ADOPT-OR-CREATE and never writes this literal
+	// on the adopt path, so an existing twin keeps whatever it was minted with -
+	// including nothing at all, where agent.PodName's wrapper-<name> fallback
+	// still applies.
+	agent.StampPodName(task, proj.Name, repo.Name)
 	if err := controllerutil.SetControllerReference(proj, task, m.Scheme); err != nil {
 		return nil, false, fmt.Errorf("intake: set task ownerref: %w", err)
 	}
@@ -246,6 +253,9 @@ func (m *Minter) MintReviewTask(ctx context.Context, proj *tatarav1alpha1.Projec
 			},
 		},
 	}
+	// See MintIssueTask: same stamp, same repo ref, so the two intake mints and
+	// the queue path all name the same repo the same way.
+	agent.StampPodName(task, proj.Name, repo.Name)
 	if err := controllerutil.SetControllerReference(proj, task, m.Scheme); err != nil {
 		return nil, false, fmt.Errorf("intake: set task ownerref: %w", err)
 	}

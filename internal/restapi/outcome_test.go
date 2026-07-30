@@ -23,6 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/controller"
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
@@ -2523,4 +2524,29 @@ func TestOutcome_Review_OpenMR_NotNoOp(t *testing.T) {
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
 		`{"kind":"review","payload":{"verdict":"approve","reviewedSHAs":[{"repo":"tatara-agent-skills","number":33,"sha":"s"}]}}`)
 	require.NotContains(t, w.Body.String(), `"reason":"mr-terminal"`, "an open MR is never the terminal no-op")
+}
+
+// The clarify Task a brainstorm proposal becomes is minted directly here, and
+// carried the same issue #517 pod-name gap as the intake, docbatch and
+// takeover mints: no annotation, so it fell back to wrapper-<task-name>.
+func TestOutcome_Brainstorm_ProposedClarifyTaskCarriesPodName(t *testing.T) {
+	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StageBrainstorming, "brainstorm"))
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"brainstorm","payload":{
+	  "action":"propose","proposals":[
+	    {"repo":"tatara-operator","title":"one","body":"b","kind":"bug"}]}}`)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var tasks tatarav1alpha1.TaskList
+	require.NoError(t, e.c.List(context.Background(), &tasks, client.InNamespace(ns)))
+	var clarify *tatarav1alpha1.Task
+	for i := range tasks.Items {
+		if tasks.Items[i].Spec.Kind == "clarify" {
+			clarify = &tasks.Items[i]
+		}
+	}
+	require.NotNil(t, clarify)
+	// recordingForge.nextNumber starts at 100; the first CreateIssue yields 101.
+	require.Equal(t, "clr-tatara-tatara-operator-i101", agent.PodName(clarify))
 }

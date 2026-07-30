@@ -588,3 +588,33 @@ func TestMintDocBatchRecordsOutcome(t *testing.T) {
 		t.Fatalf("result=deferred = %v, want > %v", got, beforeDefer)
 	}
 }
+
+// The nightly documentation batch is minted DIRECTLY (not through the queue),
+// so it was one of the Task-creation paths that never stamped issue #517's
+// pod-name annotation. It is repo-bound to the docs repo, exactly like the
+// queue-path documentation event's PodRepo.
+func TestDocBatchMint_StampsPodName(t *testing.T) {
+	ctx := context.Background()
+	proj := reapProject("docmint")
+	src := reapRepo("docmint", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
+	docs := reapRepo("docmint", "tatara-documentation", docsRepoURL)
+
+	tk, mr := deliveredWithMergedMR(t, "docmint", src.Name, "task-a", 1, time.Now().Add(-3*time.Hour))
+	c := newMirrorClient(t, proj, src, docs, reapSecret(), tk, mr)
+	r := reapReconciler(c, &reapWriter{})
+
+	if err := r.MintDocBatch(ctx, proj); err != nil {
+		t.Fatalf("MintDocBatch: %v", err)
+	}
+	batches := docBatches(t, c, "docmint")
+	if len(batches) != 1 {
+		t.Fatalf("minted %d batches, want 1", len(batches))
+	}
+	got := batches[0].Annotations[agent.PodNameAnnotation]
+	if want := "doc-docmint-tatara-documentation"; got != want {
+		t.Fatalf("pod-name annotation = %q, want %q", got, want)
+	}
+	if n := agent.PodName(&batches[0]); n != "doc-docmint-tatara-documentation" {
+		t.Fatalf("PodName = %q, want the stamped descriptive name", n)
+	}
+}

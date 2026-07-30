@@ -12,6 +12,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/own"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
@@ -232,4 +233,119 @@ func TestOwnMergeRequest_ExpectFromAtomicHandover(t *testing.T) {
 	ctrl2, ok2 := own.ControllerOwner(&after)
 	require.True(t, ok2)
 	require.Equal(t, "task-c", ctrl2, "controller must remain unchanged on refusal")
+}
+
+// --- pod-name stamping on the intake mints --------------------------------
+//
+// Issue #517's descriptive pod name (<type>-<project>-<repo>-<i|p><id>) is
+// carried by the tatara.dev/pod-name annotation, stamped at Task CREATION.
+// agent.StampPodName only ever ran on the queue path, so every Task the
+// reactive intake minted carried NO annotation and fell back to the legacy
+// wrapper-<task-name>. Both intake mints must stamp the SAME name the queue
+// path produces for the same (project, repo, kind, number).
+
+func TestMintIssueTask_StampsPodName(t *testing.T) {
+	proj := sweepProject("p")
+	repo := sweepRepo("p")
+	m, c := minterFor(t, proj, repo)
+
+	item := ForgeItem{Issue: scm.Issue{Number: 353, State: "open", Author: "alice"}}
+	task, created, err := m.MintForItem(context.Background(), proj, repo, item, true, nil)
+	require.NoError(t, err)
+	require.True(t, created)
+	require.Equal(t, "clr-p-tatara-operator-i353", task.Annotations[agent.PodNameAnnotation])
+
+	var stored tatarav1alpha1.Task
+	require.NoError(t, c.Get(context.Background(), client.ObjectKeyFromObject(task), &stored))
+	require.Equal(t, "clr-p-tatara-operator-i353", agent.PodName(&stored),
+		"the stamp must land on the STORED Task, not just the local literal")
+}
+
+func TestMintReviewTask_StampsPodName(t *testing.T) {
+	proj := sweepProject("p")
+	repo := sweepRepo("p")
+	m, c := minterFor(t, proj, repo)
+
+	item := ForgeItem{IsPR: true, PR: scm.PRRef{Number: 59, Author: "alice",
+		HeadSHA: "abc", HeadBranch: "fix", Repo: "o/r"}}
+	task, created, err := m.MintForItem(context.Background(), proj, repo, item, false, nil)
+	require.NoError(t, err)
+	require.True(t, created)
+	require.Equal(t, "rev-p-tatara-operator-p59", task.Annotations[agent.PodNameAnnotation])
+
+	var stored tatarav1alpha1.Task
+	require.NoError(t, c.Get(context.Background(), client.ObjectKeyFromObject(task), &stored))
+	require.Equal(t, "rev-p-tatara-operator-p59", agent.PodName(&stored))
+}
+
+// The longest real repo name on the platform (tatara-memory-repo-ingester)
+// still fits the 63-char DNS-1123 budget untrimmed: the live legacy pod name
+// mt-r-tatara-memory-repo-inges-34-... is what showed repo names here get long.
+func TestMintReviewTask_StampedPodNameFitsDNS1123(t *testing.T) {
+	proj := sweepProject("tatara")
+	repo := sweepRepo("tatara")
+	repo.Name = "tatara-memory-repo-ingester"
+	m, _ := minterFor(t, proj, repo)
+
+	item := ForgeItem{IsPR: true, PR: scm.PRRef{Number: 34, Author: "alice", HeadSHA: "abc", Repo: "o/r"}}
+	task, created, err := m.MintForItem(context.Background(), proj, repo, item, false, nil)
+	require.NoError(t, err)
+	require.True(t, created)
+	name := task.Annotations[agent.PodNameAnnotation]
+	require.Equal(t, "rev-tatara-tatara-memory-repo-ingester-p34", name)
+	require.LessOrEqual(t, len(name), 63)
+}
+
+// createTaskRaceSafe is ADOPT-OR-CREATE: on a live natural-key twin it creates
+// NOTHING. Stamping the local literal before the call must therefore never
+// reach the adopted Task, and a legacy twin minted before #517 must keep
+// working through agent.PodName's wrapper-<name> fallback.
+func TestMintIssueTask_AdoptedLegacyTwin_KeepsFallbackPodName(t *testing.T) {
+	proj := sweepProject("p")
+	repo := sweepRepo("p")
+	legacy := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      tatarav1alpha1.IntakeTaskName("p", SweepIssueKind, "tatara-operator", 353),
+			Namespace: testNS,
+		},
+		Spec: tatarav1alpha1.TaskSpec{ProjectRef: "p", Kind: SweepIssueKind},
+	}
+	m, c := minterFor(t, proj, repo, legacy)
+
+	item := ForgeItem{Issue: scm.Issue{Number: 353, State: "open", Author: "alice"}}
+	_, created, err := m.MintForItem(context.Background(), proj, repo, item, true, nil)
+	require.NoError(t, err)
+	require.False(t, created, "a live natural-key twin is adopted, not re-minted")
+
+	var stored tatarav1alpha1.Task
+	require.NoError(t, c.Get(context.Background(), client.ObjectKeyFromObject(legacy), &stored))
+	require.NotContains(t, stored.Annotations, agent.PodNameAnnotation,
+		"adoption must not stamp a pod name onto a pre-existing Task")
+	require.Equal(t, "wrapper-"+legacy.Name, agent.PodName(&stored))
+}
+
+// The stamp is written ONCE at creation and never recomputed, so the pod name
+// is stable even after the Task's agent kind advances (agent.AgentKind prefers
+// status.agentKind, which BuildPodName would otherwise re-read).
+func TestMintIssueTask_StampedPodNameStableAcrossStageChange(t *testing.T) {
+	proj := sweepProject("p")
+	repo := sweepRepo("p")
+	m, c := minterFor(t, proj, repo)
+
+	item := ForgeItem{Issue: scm.Issue{Number: 12, State: "open", Author: "alice"}}
+	task, created, err := m.MintForItem(context.Background(), proj, repo, item, true, nil)
+	require.NoError(t, err)
+	require.True(t, created)
+	want := agent.PodName(task)
+
+	var fresh tatarav1alpha1.Task
+	require.NoError(t, c.Get(context.Background(), client.ObjectKeyFromObject(task), &fresh))
+	fresh.Status.AgentKind = "implement"
+	fresh.Status.Stage = tatarav1alpha1.StageImplementing
+	require.NoError(t, c.Status().Update(context.Background(), &fresh))
+
+	var after tatarav1alpha1.Task
+	require.NoError(t, c.Get(context.Background(), client.ObjectKeyFromObject(task), &after))
+	require.Equal(t, want, agent.PodName(&after),
+		"the annotation is written once at creation; it must not follow status.agentKind")
 }
