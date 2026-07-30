@@ -11,6 +11,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/own"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
@@ -277,4 +278,39 @@ func stampTaskStatus(t *testing.T, ctx context.Context, task *tatarav1alpha1.Tas
 		t.Fatalf("stamp task %s stage=%s reason=%s: %v", task.Name, stg, reason, err)
 	}
 	*task = fresh
+}
+
+// The takeover mint is a direct Task create too, and carried the same #517
+// pod-name gap as the intake and docbatch mints. The envtest project/repo names
+// are derived from the test name and are deliberately long, so this also covers
+// BuildPodName's 63-char trim: the type and id segments survive intact, the
+// project and repo segments are what give.
+func TestMintOrUnparkTakeoverTask_StampsPodName(t *testing.T) {
+	ctx := context.Background()
+	proj, repo := seedProjectRepo(t, ctx)
+	mr := seedOpenExternalMR(t, ctx, proj, repo, 11, "renovate/baz", "octocat")
+
+	m := newTestMinter(t)
+	task, err := m.MintOrUnparkTakeoverTask(ctx, proj, repo, mr, "alice", "take over", testSpiller(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := task.Annotations[agent.PodNameAnnotation]
+	if got == "" {
+		t.Fatalf("takeover mint stamped no pod name; it would fall back to wrapper-%s", task.Name)
+	}
+	if len(got) > 63 {
+		t.Fatalf("pod name %q is %d chars, over the DNS-1123 budget", got, len(got))
+	}
+	if !strings.HasPrefix(got, "tko-") || !strings.HasSuffix(got, "-p11") {
+		t.Fatalf("pod name = %q, want tko-<project>-<repo>-p11", got)
+	}
+	if got != agent.PodName(task) {
+		t.Fatalf("PodName = %q, want the stamped %q", agent.PodName(task), got)
+	}
+	// The takeover head-branch annotation the literal already carried must
+	// survive the stamp (StampPodName adds to the map, never replaces it).
+	if task.Annotations[tatarav1alpha1.AnnTakeoverHeadBranch] != "renovate/baz" {
+		t.Fatalf("stamping clobbered the takeover head-branch annotation: %+v", task.Annotations)
+	}
 }
