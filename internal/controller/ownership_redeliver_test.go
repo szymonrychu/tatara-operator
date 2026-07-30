@@ -10,6 +10,7 @@ import (
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
+	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
 // fixedTime returns a deterministic, monotonically-increasing timestamp for
@@ -226,6 +227,49 @@ func TestRedeliverMRComments_OversizedCommentDoesNotAbortBatch(t *testing.T) {
 	}
 	if tk.Status.PendingEvents[1].Body != "the short follow-up nobody ever saw" {
 		t.Fatalf("the comment after the oversized one was dropped: %q", tk.Status.PendingEvents[1].Body)
+	}
+}
+
+// TestRedeliverMRComments_DrivesTakeoverReentryOnParkedAwaitingHuman is the
+// tatara-operator#519 regression: a "take over" comment on a stood-down MR
+// that only reaches the operator via OP12 sweep convergence (the webhook
+// delivery was missed or never fired) must still re-engage the parked review
+// Task, exactly like the webhook fast path's deliverPendingEvent ->
+// driveCommentUnpark does. Before this fix, redeliverMRComments only mirrored
+// the comment and appended a TaskEvent - it never called ApplyUnpark, so a
+// parked(awaiting-human) review Task with its round cap already spent stayed
+// parked forever whenever its "take over" comment was delivered by the sweep
+// instead of the webhook.
+func TestRedeliverMRComments_DrivesTakeoverReentryOnParkedAwaitingHuman(t *testing.T) {
+	ctx := context.Background()
+	d, proj, repo := newOwnershipDriver(t, ctx)
+	mr := seedExternalMRWithReviewOwner(t, ctx, proj, repo, 80, "op12-takeover-task-80")
+
+	mr.Status.Ownership = tatarav1alpha1.OwnershipExternal
+	if err := k8sClient.Status().Update(ctx, mr); err != nil {
+		t.Fatalf("seed ownership: %v", err)
+	}
+
+	tk := getTask(t, "op12-takeover-task-80")
+	tk.Status.Stage = tatarav1alpha1.StageParked
+	tk.Status.StageReason = stage.ReasonAwaitingHuman
+	tk.Status.HumanReviewRounds = tatarav1alpha1.MaxHumanReviewRounds
+	tk.Status.MRRefs = []string{mr.Name}
+	if err := k8sClient.Status().Update(ctx, tk); err != nil {
+		t.Fatalf("seed task park state: %v", err)
+	}
+
+	incoming := []scm.IssueComment{
+		{ExternalID: "500", Author: "alice", Body: "take over!", CreatedAt: fixedTime(1)},
+	}
+	if err := d.redeliverMRComments(ctx, proj, repo, mr, incoming); err != nil {
+		t.Fatal(err)
+	}
+
+	got := getTask(t, "op12-takeover-task-80")
+	if got.Status.Stage != tatarav1alpha1.StageReviewing {
+		t.Fatalf("stage = %q, want reviewing: a take-over comment delivered only via OP12 sweep convergence must still re-engage the parked review Task",
+			got.Status.Stage)
 	}
 }
 

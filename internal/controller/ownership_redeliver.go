@@ -2,15 +2,18 @@ package controller
 
 import (
 	"context"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/own"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
+	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
 // redeliverMRComments is OP12's job: replaying comments an external MR missed
@@ -57,6 +60,7 @@ func (d *StageDriver) redeliverMRComments(ctx context.Context, proj *tatarav1alp
 	}
 
 	newest := mr.Status.LastMirroredCommentID
+	delivered := false
 	for _, c := range incoming {
 		if c.ExternalID == "" || c.ExternalID == mr.Status.LastMirroredCommentID {
 			continue
@@ -81,11 +85,26 @@ func (d *StageDriver) redeliverMRComments(ctx context.Context, proj *tatarav1alp
 				if err := AppendTaskEvent(ctx, d.Client, &task, ev); err != nil {
 					return err
 				}
+				delivered = true
 			} else if !apierrors.IsNotFound(err) {
 				return err
 			}
 		}
 		newest = c.ExternalID
+	}
+	// #519: redeliverMRComments used to stop at AppendTaskEvent, leaving a
+	// parked(awaiting-human) review Task's own re-entry rule (#511/#515's
+	// anyExternallyOwned round-cap bypass) with nothing to drive it - the
+	// webhook fast path calls driveCommentUnpark right after its own
+	// AppendTaskEvent (pending_events.go), but this sweep-convergence path
+	// never called the ApplyUnpark equivalent at all. A "take over" comment
+	// delivered ONLY through OP12 (a missed/late webhook delivery) then never
+	// re-engaged the bot, no matter how many sweeps ran, because nothing here
+	// ever re-evaluated the park. Mirror the webhook's own gate: an owner
+	// Task parked for a comment-driven reason gets exactly one ApplyUnpark
+	// pass per redelivery batch.
+	if delivered {
+		d.driveOwnerReentry(ctx, proj, ownerName)
 	}
 	if newest != mr.Status.LastMirroredCommentID {
 		key := client.ObjectKeyFromObject(mr)
@@ -94,4 +113,71 @@ func (d *StageDriver) redeliverMRComments(ctx context.Context, proj *tatarav1alp
 		})
 	}
 	return nil
+}
+
+// driveOwnerReentry is redeliverMRComments' counterpart to the webhook fast
+// path's driveCommentUnpark (pending_events.go): after delivering a fresh
+// non-bot mr_comment TaskEvent to ownerName, re-evaluate that Task's park
+// exactly once, for the SAME three comment-driven reasons the webhook drives
+// (awaiting-human, backlog-sweep, identity-unverified) - most importantly
+// awaiting-human on a kind=review Task, which is where #511/#515's
+// anyExternallyOwned round-cap bypass lives. A live (non-parked) owner is left
+// alone: OP12 has no EnterConversing counterpart here, and the webhook's own
+// delivery already covers a live pod's follow-up turn.
+//
+// Best-effort, matching every other side effect ReconcileOwnership's callers
+// tolerate: a failure here is logged and never fails the sweep/webhook
+// request that triggered the redelivery, since the comment is already
+// mirrored and queued and a later pass (this same function, or the periodic
+// driveUnparks backstop) gets another chance.
+func (d *StageDriver) driveOwnerReentry(ctx context.Context, proj *tatarav1alpha1.Project, ownerName string) {
+	var task tatarav1alpha1.Task
+	if err := d.Get(ctx, client.ObjectKey{Namespace: proj.Namespace, Name: ownerName}, &task); err != nil {
+		if !apierrors.IsNotFound(err) {
+			log.FromContext(ctx).Error(err, "redeliver: get owner task for reentry failed",
+				"action", "redeliver_reentry_get_failed", "resource_id", ownerName)
+		}
+		return
+	}
+	if task.Status.Stage != tatarav1alpha1.StageParked ||
+		(task.Status.StageReason != stage.ReasonAwaitingHuman &&
+			task.Status.StageReason != stage.ReasonBacklogSweep &&
+			task.Status.StageReason != stage.ReasonIdentityUnverified) {
+		return
+	}
+	active, err := CountActiveTasks(ctx, d.Client, proj)
+	if err != nil {
+		log.FromContext(ctx).Error(err, "redeliver: count active tasks failed",
+			"action", "redeliver_reentry_count_failed", "resource_id", ownerName)
+		return
+	}
+	maxOpen := proj.Spec.MaxOpenTasks
+	if maxOpen <= 0 {
+		maxOpen = 6
+	}
+	conversingRoom := false
+	if NeedsConversingRoom(task.Status.StageReason) {
+		room, roomErr := ConversingHasRoom(ctx, d.Client, proj)
+		if roomErr != nil {
+			log.FromContext(ctx).Error(roomErr, "redeliver: conversing capacity check failed; treating as no room",
+				"action", "redeliver_reentry_room_failed", "resource_id", ownerName)
+		} else {
+			conversingRoom = room
+		}
+	}
+	target, decline, err := ApplyUnpark(ctx, d.Client, d.APIReader, proj, &task, active, maxOpen, conversingRoom, time.Now())
+	if err != nil {
+		log.FromContext(ctx).Error(err, "redeliver: comment-driven unpark failed",
+			"action", "redeliver_reentry_failed", "resource_id", ownerName)
+		return
+	}
+	if target == "" {
+		log.FromContext(ctx).Info("redeliver: comment-driven unpark declined",
+			"action", "redeliver_reentry_declined", "resource_id", ownerName,
+			"stage_reason", task.Status.StageReason, "decline_kind", string(decline))
+		return
+	}
+	log.FromContext(ctx).Info("redeliver: unparked task on sweep-delivered comment",
+		"action", "redeliver_reentry", "resource_id", ownerName, "stage", target,
+		"reason_from", task.Status.StageReason)
 }
