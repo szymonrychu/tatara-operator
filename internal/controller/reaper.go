@@ -195,20 +195,34 @@ func (s *CallbackServer) orphanReason(pod *corev1.Pod, tasks map[string]*tatarav
 	// flight. Conversation persistence lets a still-live Task re-spawn a fresh pod
 	// and resume, so reaping is safe.
 	if s.IdlePodReapAfter > 0 && !taskHasInflightTurn(task) {
-		// PAST t0 THE G.7 STOP OWNS THIS POD (issue #527). The stop sequence needs
-		// the wrapper ALIVE: it is the only thing that can offer the agent its one
-		// handoff turn, and Task.status.notes is the only continuation state the
-		// next pod gets. Reaping here wins the race - idlePodReapMinutes (30) is
-		// less than agentPodTTLSeconds (3600), so any pod idle since before
-		// t0-30m is deleted first - and the stop then runs against a corpse,
-		// captures nothing, and reports force_deleted for a pod nobody forced.
-		// The two clocks were unaware of each other; this is the awareness.
+		// INSIDE ITS TTL-STOP WINDOW THE G.7 STOP OWNS THIS POD (issue #527). The
+		// stop sequence needs the wrapper ALIVE: it is the only thing that can
+		// offer the agent its one handoff turn, and Task.status.notes is the only
+		// continuation state the next pod gets. Reaping here wins the race -
+		// idlePodReapMinutes (30) is less than agentPodTTLSeconds (3600), so any
+		// pod idle since before t0-30m is deleted first - and the stop then runs
+		// against a corpse, captures nothing, and reports force_deleted for a pod
+		// nobody forced. The two clocks were unaware of each other; this is the
+		// awareness.
 		//
-		// Only from t0, deliberately. Before t0 no stop is pending and the #237
-		// backstop keeps its full reach; a pod reaped then simply respawns through
-		// the ordinary pod-gone path, which has nothing to hand off anyway.
-		if t0, ok := agent.PodTTLDeadlineFromSpec(pod, task); ok && !time.Now().Before(t0) {
-			return "", false
+		// A WINDOW, not everything from t0 onward. The stand-down is exclusive
+		// ownership and is only sound while the stop could still legitimately be
+		// running: reconcilePodStage early-returns before the TTL gate on a
+		// committed handoff or an unadmitted ticket, and any persistent error
+		// upstream of the gate never reaches ttlStop either. An open-ended
+		// stand-down would trade this backstop for the ASSUMPTION that a reconcile
+		// is doing its job - on exactly the wedged reconciles issue #237 exists
+		// for, leaving a live claude session holding a node slot indefinitely with
+		// nothing recording that it is stuck. PodTTLStopWindowFromSpec ends at the
+		// stopper's own step-4 hard cap; past it, #237 re-arms with its full reach.
+		//
+		// Before t0 the reach is unchanged too: no stop is pending, and a pod
+		// reaped then simply respawns through the ordinary pod-gone path, which
+		// has nothing to hand off anyway.
+		if from, until, ok := agent.PodTTLStopWindowFromSpec(pod, task); ok {
+			if now := time.Now(); !now.Before(from) && now.Before(until) {
+				return "", false
+			}
 		}
 		if time.Since(podLastActivity(pod, task)) > s.IdlePodReapAfter {
 			return "idle no live turn", true

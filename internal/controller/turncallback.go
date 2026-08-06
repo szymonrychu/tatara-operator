@@ -420,7 +420,8 @@ const maxLastTurnPushedRepos = 20
 // string "Last turn's final text: (none). Repos pushed: none." and the next pod
 // resumed from a bundle with no continuation state at all.
 //
-// Guarded exactly like recordUsage: a stale or duplicate callback for a turn the
+// Guarded exactly like recordUsage - all three of stale turn, already-processed
+// completion, and terminal Task: a stale or duplicate callback for a turn the
 // Task has already moved past must not overwrite the live turn's payload, and a
 // Task whose work is over is not written at all.
 func (s *CallbackServer) recordLastTurn(ctx context.Context, task *tatarav1alpha1.Task,
@@ -435,6 +436,15 @@ func (s *CallbackServer) recordLastTurn(ctx context.Context, task *tatarav1alpha
 			return fmt.Errorf("reload task for last turn: %w", err)
 		}
 		if fresh.Annotations[annCurrentTurn] != turnID || tatarav1alpha1.TaskDone(fresh) {
+			return nil
+		}
+		// annTurnComplete non-empty means recordResult already processed THIS
+		// turn's completion. ttlStop clears status.lastTurn once it has been spent
+		// on the synthetic note but leaves annCurrentTurn alone, so without this a
+		// replayed callback resurrects the stopped pod's payload onto a Task that
+		// now belongs to a fresh pod. task_stage.go deletes the annotation on every
+		// new turn submit, so this never gags a live turn.
+		if fresh.Annotations[annTurnComplete] != "" {
 			return nil
 		}
 		fresh.Status.LastTurn = &tatarav1alpha1.LastTurn{

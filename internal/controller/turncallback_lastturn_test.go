@@ -113,3 +113,44 @@ func TestTurnComplete_StaleCallbackDoesNotOverwriteLastTurn(t *testing.T) {
 		t.Fatalf("lastTurn = %+v, want the live turn's payload", lt)
 	}
 }
+
+// TestTurnComplete_ReplayAfterTTLStopDoesNotResurrectLastTurn covers the
+// duplicate-callback guard recordUsage has and recordLastTurn was missing.
+//
+// ttlStop clears status.lastTurn (it has just been spent on the synthetic note)
+// but does not touch annCurrentTurn, so a replayed turn-complete callback for
+// the SAME turn still matches. Without the annTurnComplete guard it resurrects
+// the stopped pod's payload onto a Task that now belongs to a fresh pod - and if
+// that pod TTL-stops before completing a turn of its own, its synthetic note
+// carries the dead pod's final text and counts handoff=synthetic. That is the
+// runbook's benign "stopped before its first turn" case reporting as a captured
+// handoff.
+func TestTurnComplete_ReplayAfterTTLStopDoesNotResurrectLastTurn(t *testing.T) {
+	mkTaskProject(t, "p-lt4", 3)
+	mkTaskRepository(t, "r-lt4", "p-lt4")
+	mkTask(t, "t-lt4", "p-lt4", "r-lt4")
+	annotate(t, "t-lt4", map[string]string{annCurrentTurn: "turn-lt4"})
+
+	cb := newCallbackServer()
+	postTurnComplete(t, cb, map[string]any{
+		"turnId": "turn-lt4", "taskName": "t-lt4", "state": "completed",
+		"finalText": "the stopped pod's work",
+	})
+
+	// The TTL stop spends lastTurn on the synthetic note and re-arms the Task.
+	// annCurrentTurn is deliberately left alone, exactly as ttlStop leaves it.
+	tk := getTask(t, "t-lt4")
+	tk.Status.LastTurn = nil
+	if err := k8sClient.Status().Update(t.Context(), tk); err != nil {
+		t.Fatalf("clear lastTurn: %v", err)
+	}
+
+	postTurnComplete(t, cb, map[string]any{
+		"turnId": "turn-lt4", "taskName": "t-lt4", "state": "completed",
+		"finalText": "the stopped pod's work",
+	})
+
+	if lt := getTask(t, "t-lt4").Status.LastTurn; lt != nil {
+		t.Errorf("lastTurn = %+v after a replayed callback: the stopped pod's payload was resurrected", lt)
+	}
+}

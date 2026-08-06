@@ -68,7 +68,7 @@ func (r *TaskReconciler) conversingHandoffAndPark(ctx context.Context, proj *tat
 		// Same material as the TTL path: without it the synthetic note is a
 		// placeholder (issue #527).
 		if lt := task.Status.LastTurn; lt != nil {
-			in.LastFinalText, in.PushedRepos = lt.FinalText, lt.PushedRepos
+			in.LastFinalText, in.PushedRepos, in.LastTurnAt = lt.FinalText, lt.PushedRepos, lt.At.Time
 		}
 		res, err := stopper.StopWithHandoff(ctx, task, in)
 		if err != nil {

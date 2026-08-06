@@ -284,7 +284,7 @@ func TestTTLStop_SyntheticHandoff_On410(t *testing.T) {
 	require.Contains(t, notes[0].Body, "TTL stop.")
 	require.Contains(t, notes[0].Body, "wired the reconciler, tests still red")
 	require.Contains(t, notes[0].Body, "tatara-operator, tatara-cli", "the note is BUILT from pushedRepos")
-	require.Contains(t, notes[0].Body, "No agent handoff was captured.")
+	require.Contains(t, notes[0].Body, "No agent handoff was captured")
 	require.False(t, h.podExists(t))
 }
 

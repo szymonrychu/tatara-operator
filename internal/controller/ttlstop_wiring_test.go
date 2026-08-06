@@ -102,3 +102,49 @@ func TestTTLStop_LongFinalTextStillFitsTheNote(t *testing.T) {
 	require.Len(t, fresh.Status.Notes, 1)
 	require.LessOrEqual(t, len(fresh.Status.Notes[0].Body), tatarav1alpha1.NoteBodyMaxBytes)
 }
+
+// TestRespawnLostPod_KeepsLastTurn locks a DELIBERATE divergence, not a
+// convenience. ttlStop nils status.lastTurn because it has just spent the
+// payload on a synthetic note; respawnLostPod writes no note at all, so the same
+// nil here would turn a recoverable crash into guaranteed loss. The field
+// therefore outlives its pod on this path only, and the two sites say so.
+func TestRespawnLostPod_KeepsLastTurn(t *testing.T) {
+	task := ttlStopTask("t-respawn-lt", &tatarav1alpha1.LastTurn{
+		At:          metav1.Now(),
+		FinalText:   "the vanished pod's only surviving trace",
+		PushedRepos: []string{"tatara-operator"},
+	})
+	c := newMirrorClient(t, task)
+	r := tsReconciler(c)
+
+	_, err := r.respawnLostPod(context.Background(), ttlStopProject(), task, time.Now())
+	require.NoError(t, err)
+
+	fresh := mdGetTask(t, c, "t-respawn-lt")
+	require.Nil(t, fresh.Status.PodStartedAt, "the respawn re-arms the pod clock")
+	require.NotNil(t, fresh.Status.LastTurn,
+		"respawnLostPod writes no handoff note, so clearing lastTurn discards the dead pod's only trace")
+	require.Equal(t, "the vanished pod's only surviving trace", fresh.Status.LastTurn.FinalText)
+	require.Empty(t, fresh.Status.Notes, "the respawn path writes no note; that is why lastTurn must survive it")
+}
+
+// TestTTLStop_SyntheticNoteDatesItsPayload: because lastTurn can outlive its pod
+// (see above), the note must date the turn it was built from rather than imply
+// it is the stopped pod's own work.
+func TestTTLStop_SyntheticNoteDatesItsPayload(t *testing.T) {
+	at := metav1.NewTime(time.Now().Add(-90 * time.Minute).Truncate(time.Second))
+	task := ttlStopTask("t-ttlwire-dated", &tatarav1alpha1.LastTurn{
+		At:        at,
+		FinalText: "work from a pod that already crashed",
+	})
+	c := newMirrorClient(t, task)
+	r := tsReconciler(c)
+
+	_, err := r.ttlStop(context.Background(), ttlStopProject(), task, "implement", time.Now())
+	require.NoError(t, err)
+
+	fresh := mdGetTask(t, c, "t-ttlwire-dated")
+	require.Len(t, fresh.Status.Notes, 1)
+	require.Contains(t, fresh.Status.Notes[0].Body, at.UTC().Format(time.RFC3339),
+		"ttlStop did not pass status.lastTurn.at into TTLStopInput")
+}

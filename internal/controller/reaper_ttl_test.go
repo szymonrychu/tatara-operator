@@ -18,10 +18,19 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/agent"
 )
 
-// mkWrapperPodSvcTTL is mkWrapperPodSvc with AGENT_POD_TTL_SECONDS stamped on
-// the wrapper container, exactly as agent.PodSpec stamps it. That env is the
-// pod's own copy of the Project's TTL and the only handle the reaper has on it:
-// the reaper resolves no Projects. ttlSeconds <= 0 stamps nothing.
+// ttlStopTestTurnTimeoutSeconds is the turn timeout every pod in this file
+// carries, so the G.7 stop's own hard cap - t0 + 2*turnTimeout + TTLGrace - is
+// t0 + 31m. Deliberately the stock value: it is LONGER than the 30m idle
+// backstop, which is why the stand-down window is bounded by the cap rather
+// than by IdlePodReapAfter.
+const ttlStopTestTurnTimeoutSeconds = 900
+
+// mkWrapperPodSvcTTL is mkWrapperPodSvc with AGENT_POD_TTL_SECONDS and
+// TURN_TIMEOUT_SECONDS stamped on the wrapper container, exactly as
+// agent.PodSpec stamps them. They are the pod's own copy of the Project's TTL
+// and turn timeout, and the only handle the reaper has on either: the reaper
+// resolves no Projects. Together they bound the window in which the G.7 stop
+// owns this pod. ttlSeconds <= 0 stamps neither.
 func mkWrapperPodSvcTTL(t *testing.T, name, taskName, taskUID string, ttlSeconds int) {
 	t.Helper()
 	labels := map[string]string{
@@ -32,7 +41,10 @@ func mkWrapperPodSvcTTL(t *testing.T, name, taskName, taskUID string, ttlSeconds
 	}
 	var env []corev1.EnvVar
 	if ttlSeconds > 0 {
-		env = []corev1.EnvVar{{Name: "AGENT_POD_TTL_SECONDS", Value: strconv.Itoa(ttlSeconds)}}
+		env = []corev1.EnvVar{
+			{Name: agent.EnvAgentPodTTLSeconds, Value: strconv.Itoa(ttlSeconds)},
+			{Name: agent.EnvTurnTimeoutSeconds, Value: strconv.Itoa(ttlStopTestTurnTimeoutSeconds)},
+		}
 	}
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS, Labels: labels},
@@ -63,10 +75,10 @@ func setPodStartedAt(t *testing.T, taskName string, at time.Time) {
 	}
 }
 
-// TestReapOrphans_PastTTLPodLeftToTTLStop: the pod is idle AND past t0. The TTL
-// stop owns it from t0 onward, so the idle backstop must stand down. This is the
-// race the incident caught live: reap at 12:10:19Z, TTL stop at 12:37:58Z
-// against a pod that no longer existed, reported as force_deleted.
+// TestReapOrphans_PastTTLPodLeftToTTLStop: the pod is idle AND inside the window
+// the TTL stop owns, so the idle backstop must stand down. This is the race the
+// incident caught live: reap at 12:10:19Z, TTL stop at 12:37:58Z against a pod
+// that no longer existed, reported as force_deleted.
 func TestReapOrphans_PastTTLPodLeftToTTLStop(t *testing.T) {
 	mkTaskProject(t, "p-reap-ttl", 3)
 	mkTaskRepository(t, "r-reap-ttl", "p-reap-ttl")
@@ -77,11 +89,38 @@ func TestReapOrphans_PastTTLPodLeftToTTLStop(t *testing.T) {
 		annTurnComplete: time.Now().Add(-time.Hour).UTC().Format(time.RFC3339),
 	})
 	mkWrapperPodSvcTTL(t, "reap-ttl", "t-reap-ttl", string(getTask(t, "t-reap-ttl").UID), 3600)
-	setPodStartedAt(t, "t-reap-ttl", time.Now().Add(-2*time.Hour)) // t0 was an hour ago
+	setPodStartedAt(t, "t-reap-ttl", time.Now().Add(-70*time.Minute)) // t0 was 10m ago; the cap is 31m out
 
 	idleReaperServer().ReapOrphans(context.Background())
 	if !podExists(t, "reap-ttl") {
-		t.Error("a pod past its TTL was idle-reaped: the G.7 stop now has no wrapper to offer the handoff turn to")
+		t.Error("a pod inside its TTL-stop window was idle-reaped: the G.7 stop now has no wrapper to offer the handoff turn to")
+	}
+}
+
+// TestReapOrphans_PastTTLStopHardCapReapedAgain is the far end of that window.
+// The stand-down is exclusive OWNERSHIP, not an exemption: it is only sound
+// while the stop could still legitimately be running. reconcilePodStage
+// early-returns before the TTL gate on a committed handoff or an unadmitted
+// ticket, and any persistent error upstream of the gate never reaches ttlStop
+// either - so "past t0" alone would disarm issue #237's backstop forever on
+// exactly the wedged reconciles it exists for, leaving a live claude session
+// holding a node slot with nothing recording that it is stuck.
+func TestReapOrphans_PastTTLStopHardCapReapedAgain(t *testing.T) {
+	mkTaskProject(t, "p-reap-cap", 3)
+	mkTaskRepository(t, "r-reap-cap", "p-reap-cap")
+	mkTask(t, "t-reap-cap", "p-reap-cap", "r-reap-cap")
+	setTaskStage(t, "t-reap-cap", tatarav1alpha1.StageImplementing)
+	setTaskAnns(t, "t-reap-cap", map[string]string{
+		annCurrentTurn:  "turn-1",
+		annTurnComplete: time.Now().Add(-3 * time.Hour).UTC().Format(time.RFC3339),
+	})
+	mkWrapperPodSvcTTL(t, "reap-cap", "t-reap-cap", string(getTask(t, "t-reap-cap").UID), 3600)
+	// t0 was 2h ago and the stop's hard cap 89m ago: no stop is coming.
+	setPodStartedAt(t, "t-reap-cap", time.Now().Add(-3*time.Hour))
+
+	idleReaperServer().ReapOrphans(context.Background())
+	if podExists(t, "reap-cap") {
+		t.Error("an idle pod well past the TTL stop's own hard cap was kept: the issue #237 backstop never re-arms")
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 	"context"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
@@ -189,4 +190,49 @@ func TestTTLStop_MidSequencePodLossIsNotAForcedStop(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, agent.TTLOutcomeGraceful, res.Outcome)
 	require.Equal(t, agent.TTLHandoffSynthetic, res.Handoff)
+}
+
+// TestTTLStop_SyntheticNoteDatesItsPayload covers the review finding on
+// respawnLostPod: status.lastTurn deliberately OUTLIVES the pod it describes on
+// the respawn path (nothing else captured that turn, so carrying it beats
+// handing the next pod a placeholder). That makes "the last turn" ambiguous
+// about WHICH pod, so the note has to say when the payload is from. A reader who
+// cannot date it cannot tell fresh continuation from a carry-over across a crash
+// and a respawn.
+func TestTTLStop_SyntheticNoteDatesItsPayload(t *testing.T) {
+	sess := &stopSession{
+		states:     []string{agent.SessionStateReady},
+		handoffErr: &agent.HTTPError{Status: http.StatusGone},
+	}
+	h := newTTLHarness(t, sess)
+	in := h.input()
+	in.LastTurnAt = h.now.Add(-42 * time.Minute)
+
+	res, err := h.stopper.StopWithHandoff(context.Background(), h.task, in)
+	require.NoError(t, err)
+	require.Equal(t, agent.TTLHandoffSynthetic, res.Handoff)
+
+	notes := h.notes(t)
+	require.Len(t, notes, 1)
+	require.Contains(t, notes[0].Body, "2026-07-12T11:18:00Z",
+		"the synthetic note must date the turn it was built from")
+}
+
+// A payload with no timestamp - nothing wrote status.lastTurn.At - must not
+// render a zero time as though it were a real instant.
+func TestTTLStop_SyntheticNoteOmitsAnUnknownPayloadDate(t *testing.T) {
+	sess := &stopSession{
+		states:     []string{agent.SessionStateReady},
+		handoffErr: &agent.HTTPError{Status: http.StatusGone},
+	}
+	h := newTTLHarness(t, sess)
+	in := h.input()
+	in.LastTurnAt = time.Time{}
+
+	_, err := h.stopper.StopWithHandoff(context.Background(), h.task, in)
+	require.NoError(t, err)
+
+	notes := h.notes(t)
+	require.Len(t, notes, 1)
+	require.NotContains(t, notes[0].Body, "0001-01-01")
 }

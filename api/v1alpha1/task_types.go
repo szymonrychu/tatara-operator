@@ -413,8 +413,18 @@ type Note struct {
 	Body string `json:"body"`
 }
 
-// LastTurn is the continuation payload of the most recently COMPLETED turn on
-// the CURRENT pod: what the agent said, and what it pushed.
+// LastTurn is the continuation payload of the most recently COMPLETED turn in
+// the CURRENT STAGE OCCUPANCY: what the agent said, and what it pushed.
+//
+// Stage occupancy, not pod. It normally describes the live pod, but it OUTLIVES
+// one on the respawn path: respawnLostPod writes no handoff note - a pod that
+// vanished mid-turn produced nothing to write - so this is the only surviving
+// trace of that pod's work, and clearing it there would turn a recoverable crash
+// into guaranteed loss. ttlStop DOES clear it, because that path has just spent
+// the payload on a synthetic note. Both sites carry the argument.
+//
+// So At is load-bearing, not incidental: the synthetic note renders it, because
+// a payload that may predate the pod being stopped must not read as that pod's.
 //
 // It exists for exactly one consumer, G.7's synthetic handoff note. A TTL stop
 // that the agent cannot answer has to write the handoff FOR it, and it can only
@@ -426,9 +436,9 @@ type Note struct {
 // invariant was satisfied VACUOUSLY and the next pod resumed from a bundle whose
 // only note said nothing (issue #527).
 //
-// CLEARED ON EVERY STAGE TRANSITION, alongside PodStartedAt (see there). It
-// describes THIS pod's last turn; carrying it across a transition would let a
-// TTL stop in implementing hand the next pod a clarify pod's final text.
+// CLEARED ON EVERY STAGE TRANSITION, alongside PodStartedAt (see there). That
+// boundary is hard: carrying it across a transition would let a TTL stop in
+// implementing hand the next pod a clarify pod's final text.
 type LastTurn struct {
 	// At is when the turn-complete callback landed.
 	At metav1.Time `json:"at"`

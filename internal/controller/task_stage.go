@@ -1129,7 +1129,7 @@ func (r *TaskReconciler) ttlStop(ctx context.Context, proj *tatarav1alpha1.Proje
 	// that the invariant "still holds" - is what made every synthetic note the
 	// same content-free string.
 	if lt := task.Status.LastTurn; lt != nil {
-		in.LastFinalText, in.PushedRepos = lt.FinalText, lt.PushedRepos
+		in.LastFinalText, in.PushedRepos, in.LastTurnAt = lt.FinalText, lt.PushedRepos, lt.At.Time
 	}
 	res, err := stopper.StopWithHandoff(ctx, task, in)
 	if err != nil {
@@ -1233,6 +1233,17 @@ func (r *TaskReconciler) respawnLostPod(ctx context.Context, proj *tatarav1alpha
 			"pod_recreations", recreations)
 		return ctrl.Result{}, r.enter(ctx, proj, task, nil, edge.To, edge.Reason, now)
 	}
+	// Status.LastTurn is DELIBERATELY left standing here, unlike ttlStop's
+	// structurally identical patch, which nils it. What differs is what each path
+	// already did with it: ttlStop has just SPENT it on the synthetic handoff
+	// note, so keeping it would replay one turn onto a second pod. respawnLostPod
+	// writes NO note at all - a pod that vanished mid-turn produced nothing to
+	// write - so status.lastTurn is the only surviving trace of the dead pod's
+	// work, and clearing it would turn a recoverable crash into guaranteed loss.
+	//
+	// The cost is that the field can then outlive the pod it describes, which is
+	// why the synthetic note DATES its payload (agent.TTLStopInput.LastTurnAt)
+	// instead of implying it is this pod's.
 	if err := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 		fresh.Status.Stats.PodRecreations = recreations
 		fresh.Status.PodStartedAt = nil
