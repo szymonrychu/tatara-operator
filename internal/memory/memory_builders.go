@@ -48,7 +48,7 @@ func MemoryDeployment(p *tatarav1alpha1.Project, cfg Config) *appsv1.Deployment 
 				Spec: corev1.PodSpec{
 					ImagePullSecrets:          imagePullSecrets(cfg),
 					Affinity:                  componentAffinity(p.Name, "memory", cfg),
-					TopologySpreadConstraints: topologySpreadConstraints(p.Name, "memory", cfg),
+					TopologySpreadConstraints: topologySpreadConstraints(p.Name, "memory", cfg, replicas),
 					Containers: []corev1.Container{{
 						Name:  "tatara-memory",
 						Image: cfg.MemoryImage,
@@ -77,9 +77,11 @@ func MemoryDeployment(p *tatarav1alpha1.Project, cfg Config) *appsv1.Deployment 
 							ProbeHandler:     corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromString("http")}},
 							PeriodSeconds:    5,
 							FailureThreshold: 20,
+							TimeoutSeconds:   5,
 						},
-						// Both timeouts are set EXPLICITLY. Kubernetes defaults an unset
-						// probe timeoutSeconds to 1, which is wrong for both probes here:
+						// All THREE probe timeouts are set EXPLICITLY (startup above,
+						// liveness and readiness below). Kubernetes defaults an unset probe
+						// timeoutSeconds to 1, which is wrong for every probe here:
 						// /readyz pings Postgres AND does a LightRAG HTTP round-trip, and
 						// liveness KILLS the container, so a 1s budget turns any dependency
 						// or node-level slowdown into flapping readiness and restart storms.

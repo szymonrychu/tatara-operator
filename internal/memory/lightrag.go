@@ -136,9 +136,11 @@ func LightragDeployment(p *tatarav1alpha1.Project, cfg Config) *appsv1.Deploymen
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
 				Spec: corev1.PodSpec{
-					ImagePullSecrets:          imagePullSecrets(cfg),
-					Affinity:                  componentAffinity(p.Name, "lightrag", cfg),
-					TopologySpreadConstraints: topologySpreadConstraints(p.Name, "lightrag", cfg),
+					ImagePullSecrets: imagePullSecrets(cfg),
+					Affinity:         componentAffinity(p.Name, "lightrag", cfg),
+					// Literal 1: lightrag is pinned to one replica by its RWO data PVC
+					// and Recreate strategy, so it never takes the hard spread form.
+					TopologySpreadConstraints: topologySpreadConstraints(p.Name, "lightrag", cfg, 1),
 					InitContainers:            lightragInitContainers(n, cfg),
 					Containers: []corev1.Container{{
 						Name:  "lightrag",
