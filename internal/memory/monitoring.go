@@ -375,17 +375,75 @@ func memoryAlertRules(p *tatarav1alpha1.Project, cluster, namespace string, back
 	onPrimary := fmt.Sprintf(`and on(pod) (cnpg_pg_replication_in_recovery{%s} == 0)`, podSelector)
 	instances := PgInstances(p)
 	walRetentionWarnBytes := pgSlotWalRetentionWarnBytes(p)
+	apiReplicas := APIReplicas(p)
+	// apiSelector keys the API-availability rules on kube-state-metrics'
+	// Deployment series, which carries namespace and deployment labels, so each
+	// Project's rule produces its own Alertmanager fingerprint.
+	//
+	// Deliberately NOT the `(count(up{...} == 1) or vector(0))` shape
+	// MemoryPostgresInstancesBelowDeclared uses. That shape is right for cnpg and
+	// wrong here for two independent reasons:
+	//
+	//  1. `up == 1` is TRUE for a NotReady API replica. The API serves /metrics
+	//     from the same HTTP server as /readyz, and the ServiceMonitor keeps
+	//     scraping a pod already dropped from the Service's endpoints. Verified
+	//     against the incident window itself:
+	//       count(up{job="tatara-memory"} == 1
+	//             and on(pod) (kube_pod_status_ready{condition="true"} == 0))
+	//       2026-08-01T19:10:00Z -> 1
+	//     A count(up == 1) rule would have scored the exact failure it is being
+	//     written for as healthy.
+	//  2. count() returns a LABEL-LESS sample. All three Projects in this
+	//     namespace would then share one Alertmanager fingerprint and dedupe into
+	//     a single notification.
+	apiSelector := fmt.Sprintf(`namespace=%q, deployment=%q`, namespace, NamesFor(p.Name).Memory)
+	// apiScrapeSelector scopes the scrape-reachability deadman to THIS Project.
+	// `jobLabel` pins job="tatara-memory" for all three Projects in the shared
+	// namespace (verified live), so job alone does not distinguish them; the
+	// `service` label, which is the Service name mem-<project>, does.
+	apiScrapeSelector := fmt.Sprintf(`job=~".*tatara-memory.*", namespace=%q, service=%q`, namespace, NamesFor(p.Name).Memory)
 
 	rules := []monitoringv1.Rule{
 		{
 			// Class-A deadman: the recall backbone has no scrape target up.
+			//
+			// absent(), not `up == 0`. The bare form is unaggregated, so it yields
+			// one series per scrape target: at apiReplicas > 1 a single replica
+			// whose node is rebooting - the literal 2026-08-01 scenario - would
+			// fire this CRITICAL page, whose description says no instance is
+			// scrapeable, while the remaining replicas serve every request.
+			// absent() collapses that to one signal that means what the
+			// description claims. Scoping it to this Project's `service` also
+			// fixes a pre-existing bug: the selector was cluster-wide inside a
+			// per-Project PrometheusRule.
 			Alert:  "MemoryDown",
-			Expr:   intstr.FromString(`up{job=~".*tatara-memory.*"} == 0`),
+			Expr:   intstr.FromString(fmt.Sprintf(`absent(up{%s} == 1)`, apiScrapeSelector)),
 			For:    dur("5m"),
 			Labels: map[string]string{"severity": memorySeverityCritical},
 			Annotations: map[string]string{
-				"summary":     "tatara-memory is down (no scrape target up)",
-				"description": "No tatara-memory instance has been scrapeable for 5m. The recall/retrieval backbone of the autonomous loop is unavailable.",
+				"summary":     "tatara-memory of " + p.Name + " is down (no scrape target up)",
+				"description": "No tatara-memory instance of Project " + p.Name + " has been scrapeable for 5m. The recall/retrieval backbone of the autonomous loop is unavailable.",
+			},
+		},
+		{
+			// Total loss of the Project's memory API: the Deployment reports zero
+			// available replicas.
+			//
+			// This is the rule that would have caught 2026-08-01 (#528) on its own
+			// terms: the pod was Running and scrapeable the whole time, just never
+			// Ready, so no scrape-health rule saw it.
+			//
+			// It also backfills what deploymentTemplateConverged deliberately gave
+			// up. That predicate no longer demands AvailableReplicas == Replicas, so
+			// a Project serving 0 of 1 (or 2 of 3) no longer demotes its own phase;
+			// the alerting layer owns that signal now.
+			Alert:  "MemoryAPIUnavailable",
+			Expr:   intstr.FromString(fmt.Sprintf(`kube_deployment_status_replicas_available{%s} == 0`, apiSelector)),
+			For:    dur("10m"),
+			Labels: map[string]string{"severity": memorySeverityCritical},
+			Annotations: map[string]string{
+				"summary":     "memory API of " + p.Name + " has no available replica",
+				"description": "The tatara-memory Deployment for Project " + p.Name + " has reported 0 available replicas for 10m. Every memory read and write for this Project is failing (issue #528).",
 			},
 		},
 		{
@@ -505,6 +563,32 @@ func memoryAlertRules(p *tatarav1alpha1.Project, cluster, namespace string, back
 				"description": fmt.Sprintf("Fewer than the declared %d cnpg instance(s) of cluster %s have had a healthy scrape target for 10m - one or more instances are down, crash-looping, or unreachable (issues #442, #444, #448).", instances, cluster),
 			},
 		},
+	}
+
+	// PARTIAL loss of the API. Generated only above one replica: at one replica
+	// `< 1` is the same predicate as MemoryAPIUnavailable's `== 0`, and a rule
+	// that duplicates its neighbour verbatim is tech debt (hard rule 4), exactly
+	// as the replication-topology rules below are instance-gated.
+	//
+	// The `> 0` filter keeps TOTAL loss out of this rule, so a dead Project pages
+	// critical once rather than critical plus warning on the same condition.
+	if apiReplicas > 1 {
+		rules = append(rules, monitoringv1.Rule{
+			Alert: "MemoryAPIReplicasBelowDeclared",
+			Expr: intstr.FromString(fmt.Sprintf(
+				`(kube_deployment_status_replicas_available{%s} > 0) < %d`,
+				apiSelector, apiReplicas,
+			)),
+			For:    dur("15m"),
+			Labels: map[string]string{"severity": memorySeverityWarning},
+			Annotations: map[string]string{
+				"summary": "memory API of " + p.Name + " is serving below its declared replica count",
+				"description": fmt.Sprintf(
+					"The tatara-memory Deployment for Project %s has had fewer than the declared %d available replicas for 15m, with at least one still serving. The Project stays Ready by design (its phase no longer tracks partial availability), so this is the only signal of degraded API redundancy (issue #528).",
+					p.Name, apiReplicas,
+				),
+			},
+		})
 	}
 
 	if instances > 1 {

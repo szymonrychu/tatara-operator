@@ -148,7 +148,7 @@ func (r *ProjectReconciler) applyMemoryStack(ctx context.Context, p *tataradevv1
 		// client.Apply (the Patch variant) is deprecated in controller-runtime
 		// v0.24.1 with no stated removal version. Migration to the typed
 		// r.Apply(ctx, applyconfig) API requires generated applyconfiguration
-		// types for all 10 stack objects (incl. cnpg Cluster) and is tracked
+		// types for every stack object (incl. cnpg Cluster) and is tracked
 		// for N4. The Patch path is functionally identical in the interim.
 		if err := r.Patch(ctx, obj, client.Apply, //nolint:staticcheck
 			client.FieldOwner(memoryFieldOwner), client.ForceOwnership); err != nil {
@@ -493,12 +493,22 @@ func (r *ProjectReconciler) memoryStackHealth(ctx context.Context, p *tataradevv
 // in UpdatedReplicas fails the second clause.
 //
 // What was dropped is a third clause, AvailableReplicas == Replicas, which
-// conflated "the rollout landed" with "every replica is serving". At one replica
-// the two are the same statement - with the template clause satisfied, a surge
-// is the only way Replicas can exceed 1, and a surge means old-RS pods are still
-// counted, so UpdatedReplicas < Replicas and the clause is unreachable. It
-// therefore never decided anything, which is why it stayed invisible until
-// spec.memory.apiReplicas became settable. Above one replica it inverts the
+// conflated "the rollout landed" with "every replica is serving".
+//
+// At one replica dropping it changes no decision - but NOT because the clause
+// was unreachable. An earlier draft of this comment claimed that, and it was
+// false: at Replicas=1, UpdatedReplicas=1, ObservedGeneration==Generation,
+// AvailableReplicas=0 (a restarting pod, the commonest real state) the first two
+// clauses hold, the third is evaluated, and it returns false. It decided, on
+// every reconcile. The true reason is narrower: AvailableReplicas <= Replicas
+// always holds, so at one replica the clause can only fail when
+// AvailableReplicas == 0, and both predicates then yield memoryAvail = 0 - the
+// old one by failing and leaving memoryAvail at its zero value, the new one by
+// taking the branch and assigning Status.AvailableReplicas, which is 0. Same for
+// lightrag under Recreate. A table case pins exactly that state; do not delete
+// it.
+//
+// Above one replica it inverts the
 // point of HA: one unavailable replica out of three zeroed the serving count and
 // took the whole Project's memory stack to Provisioning (and, past
 // ProvisioningTimeout, Degraded) while two replicas were still answering, which

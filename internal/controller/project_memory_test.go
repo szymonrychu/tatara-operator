@@ -367,8 +367,10 @@ func TestMemoryStackHealth_UnconvergedRolloutNotCountedReady(t *testing.T) {
 	// Issue #355: a Deployment mid-rollout can have an old-generation replica
 	// sitting Available while the new generation is still rolling out. That
 	// must NOT read as ready - AvailableReplicas alone cannot tell the two
-	// apart, so memoryStackHealth must also gate on rollout convergence
-	// (ObservedGeneration==Generation && UpdatedReplicas==Replicas==AvailableReplicas).
+	// apart, so memoryStackHealth must also gate on template convergence
+	// (ObservedGeneration==Generation && UpdatedReplicas==Replicas). The
+	// AvailableReplicas clause is deliberately NOT part of that gate - see
+	// deploymentTemplateConverged.
 	ctx := context.Background()
 	r := newMemoryReconciler()
 	p := mkMemoryProject(t, "health-unconverged")
@@ -524,6 +526,24 @@ func TestDeploymentTemplateConverged(t *testing.T) {
 			name: "never applied, all zero",
 			dep:  appsv1.Deployment{},
 			want: true, // 0==0 for every field; caller only reaches here on a found object with zero replicas requested, a degenerate case that still reads 0 available either way
+		},
+		{
+			name: "single replica restarting - the state the dropped clause was wrongly called unreachable for",
+			dep: appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 2},
+				Status: appsv1.DeploymentStatus{
+					ObservedGeneration: 2, Replicas: 1, UpdatedReplicas: 1, AvailableReplicas: 0,
+				},
+			},
+			// The dropped AvailableReplicas==Replicas clause WAS evaluated here, on
+			// every reconcile, and returned false - so the old predicate said false
+			// and the new one says true. The change is still decision-equivalent at
+			// one replica, for the narrower reason: AvailableReplicas <= Replicas,
+			// so the clause could only fail with AvailableReplicas == 0, and both
+			// predicates then yield memoryAvail = 0 (the old one by falling through
+			// to the zero value, the new one by assigning Status.AvailableReplicas).
+			// Do not delete this case - it is the counterexample to the claim.
+			want: true,
 		},
 		{
 			name: "multi replica with one unavailable is still converged",

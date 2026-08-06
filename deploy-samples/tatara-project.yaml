@@ -44,7 +44,11 @@ spec:
     #   - name: tunnel
     #     image: busybox
     #     command: ['sh', '-c', 'sleep infinity']
-  memory: {pgInstances: 1, pgStorage: 10Gi, neo4jStorage: 10Gi}
+  # apiReplicas sizes the tatara-memory API Deployment. 1 is the default and
+  # leaves the API with no node-reboot tolerance (issue #528); above 1 the
+  # topology spread becomes DoNotSchedule and the PDB starts serialising
+  # disruption. Same knob as tatara-project-values.yaml.
+  memory: {apiReplicas: 1, pgInstances: 1, pgStorage: 10Gi, neo4jStorage: 10Gi}
   # PAT-based activation (no bot account / no Project board). botLogin == the PAT
   # owner. No `board`, so issueScan covers per-repo issues only (the Repository CRs
   # below). mergePolicy/prReactionScope/approvalLabel default.
