@@ -366,9 +366,12 @@ spec:
                 type: array
               lastTurn:
                 description: |-
-                  LastTurn is the CURRENT pod's most recent completed turn (issue #527). It is
-                  the only thing G.7's synthetic handoff note can be built from. Cleared on
-                  every stage transition, alongside PodStartedAt.
+                  LastTurn is the most recent turn of this STAGE OCCUPANCY that produced
+                  anything - not the current pod's, and not merely the last one to complete
+                  (issue #527). It outlives a pod on the respawn path, and a turn that
+                  produced neither finalText nor pushedRepos leaves it alone. It is the only
+                  thing G.7's synthetic handoff note can be built from. Cleared on every
+                  stage transition, alongside PodStartedAt. See the LastTurn type doc.
                 properties:
                   at:
                     description: At is when the turn-complete callback landed.

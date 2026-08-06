@@ -413,8 +413,17 @@ type Note struct {
 	Body string `json:"body"`
 }
 
-// LastTurn is the continuation payload of the most recently COMPLETED turn in
-// the CURRENT STAGE OCCUPANCY: what the agent said, and what it pushed.
+// LastTurn is the continuation payload of the most recent turn in the CURRENT
+// STAGE OCCUPANCY that PRODUCED anything: what the agent said, and what it
+// pushed.
+//
+// Produced anything, not merely completed. A turn that finished with neither
+// finalText nor pushedRepos (state="failed" is a real wrapper state) does not
+// overwrite this, because recording "nothing" would discard the newest turn
+// that did have something and make the next TTL stop report handoff="none" one
+// turn after the operator held a real payload. So this is the newest NON-EMPTY
+// payload, and handoff="none" means what the runbook says it means: no turn in
+// this stage ever produced anything.
 //
 // Stage occupancy, not pod. It normally describes the live pod, but it OUTLIVES
 // one on the respawn path: respawnLostPod writes no handoff note - a pod that
@@ -558,9 +567,12 @@ type TaskStatus struct {
 	//       and under fix V6-6 the wrapper then 410s every turn it is given.
 	// +optional
 	PodStartedAt *metav1.Time `json:"podStartedAt,omitempty"`
-	// LastTurn is the CURRENT pod's most recent completed turn (issue #527). It is
-	// the only thing G.7's synthetic handoff note can be built from. Cleared on
-	// every stage transition, alongside PodStartedAt.
+	// LastTurn is the most recent turn of this STAGE OCCUPANCY that produced
+	// anything - not the current pod's, and not merely the last one to complete
+	// (issue #527). It outlives a pod on the respawn path, and a turn that
+	// produced neither finalText nor pushedRepos leaves it alone. It is the only
+	// thing G.7's synthetic handoff note can be built from. Cleared on every
+	// stage transition, alongside PodStartedAt. See the LastTurn type doc.
 	// +optional
 	LastTurn *LastTurn `json:"lastTurn,omitempty"`
 	// Notes: append-only journal. IT IS the continuation state. Capped at 50 in

@@ -424,9 +424,27 @@ const maxLastTurnPushedRepos = 20
 // completion, and terminal Task: a stale or duplicate callback for a turn the
 // Task has already moved past must not overwrite the live turn's payload, and a
 // Task whose work is over is not written at all.
+//
+// Callable from ANY path that finalises a turn, and it must be called from all
+// of them: handleTurnComplete for the callback, PollOnce for the backstop that
+// recovers turns whose callback never arrived. A path that finalises without
+// this one leaves the Task reporting handoff="none" on a payload the operator
+// was holding.
 func (s *CallbackServer) recordLastTurn(ctx context.Context, task *tatarav1alpha1.Task,
 	finalText string, pushedRepos []string, turnID string) error {
 
+	// A turn that produced NEITHER text nor a push has no continuation state, and
+	// recording that fact would destroy the newest turn that did have some:
+	// state="failed" is a real wrapper state and reaches here empty. The next TTL
+	// stop would then emit the placeholder note ("do not read this note as
+	// continuity") and count handoff="none" one turn after the operator held a
+	// real payload. Keeping the newest NON-EMPTY payload is what makes
+	// handoff="none" mean what the runbook says: nothing was ever produced. Safe
+	// because LastTurn.At dates the payload and the synthetic note renders it, so
+	// a carried-over one cannot read as the stopped pod's own work.
+	if finalText == "" && len(pushedRepos) == 0 {
+		return nil
+	}
 	if len(pushedRepos) > maxLastTurnPushedRepos {
 		pushedRepos = pushedRepos[:maxLastTurnPushedRepos]
 	}
@@ -589,6 +607,19 @@ func (s *CallbackServer) PollOnce(ctx context.Context) {
 			s.refreshLastActivity(ctx, task.Name, task.Namespace, turn, tr.LastActivityAt.UTC().Format(time.RFC3339))
 		}
 		if tr.State == "complete" || tr.State == "failed" {
+			// Persist the continuation payload BEFORE recordResult stamps
+			// annTurnComplete, exactly as the callback path does: the stamp closes
+			// recordLastTurn's already-processed guard. Skipping this is what made
+			// the backstop population - turns whose callback never landed, i.e. the
+			// degraded wrappers most likely to then TTL-stop - report handoff="none"
+			// with the finalText in hand. agent.TurnResult carries no pushedRepos
+			// (callback-wire only), and finalText alone is a real synthetic handoff.
+			// Same message string as the callback path: runbooks.md's diagnosis step
+			// greps for it, and the grep has to cover both writers.
+			if err := s.recordLastTurn(ctx, task, tr.FinalText, nil, turn); err != nil {
+				l.Error(err, "record last-turn continuation payload (non-fatal)",
+					"action", "poll_backstop", "task", task.Name, "turn_id", turn)
+			}
 			_ = s.recordResult(ctx, tr, task, turn)
 		}
 	}
