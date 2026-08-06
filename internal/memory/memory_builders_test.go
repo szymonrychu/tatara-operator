@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/memory"
 	corev1 "k8s.io/api/core/v1"
 )
@@ -107,4 +108,42 @@ func TestMemoryService(t *testing.T) {
 	// Service (neo4j/lightrag share the pin-set labels and a "http" port).
 	require.Equal(t, "memory", svc.Labels["app.kubernetes.io/component"])
 	require.Len(t, svc.OwnerReferences, 1)
+}
+
+func TestMemoryDeployment_Replicas(t *testing.T) {
+	t.Run("default replicas is 1", func(t *testing.T) {
+		p := testProject("acme")
+		d := memory.MemoryDeployment(p, testCfg())
+		require.Equal(t, int32(1), *d.Spec.Replicas)
+	})
+
+	t.Run("spec-set replicas is honored", func(t *testing.T) {
+		p := testProject("acme")
+		// spec.memory.apiReplicas is what makes the topologySpreadConstraints and
+		// podAntiAffinity already on this pod template do anything: at one replica
+		// they are inert, so any reboot of the hosting node is a 100% outage of
+		// that Project's memory API.
+		p.Spec.Memory = &tatarav1alpha1.MemorySpec{APIReplicas: 3}
+		d := memory.MemoryDeployment(p, testCfg())
+		require.Equal(t, int32(3), *d.Spec.Replicas)
+	})
+}
+
+func TestMemoryDeployment_ProbeBudgets(t *testing.T) {
+	p := testProject("acme")
+	c := memory.MemoryDeployment(p, testCfg()).Spec.Template.Spec.Containers[0]
+
+	// /readyz pings Postgres AND does a LightRAG HTTP round-trip, so the k8s
+	// default 1s timeout fails closed on any dependency slower than one second.
+	// That is what added ~95s of NotReady on 2026-08-01 while LightRAG was still
+	// cold-starting: nine consecutive probes cancelled at exactly 1.000s.
+	require.NotNil(t, c.ReadinessProbe, "readinessProbe missing")
+	require.Equal(t, int32(5), c.ReadinessProbe.TimeoutSeconds, "readinessProbe.timeoutSeconds must be explicit; the k8s default 1s cannot cover a Postgres ping plus a LightRAG round-trip")
+	require.Equal(t, int32(3), c.ReadinessProbe.FailureThreshold, "readinessProbe.failureThreshold must be explicit so the tolerance is stated, not inherited")
+
+	// Liveness KILLS the container, so an unset (1s) timeout turns node-level CPU
+	// contention into a restart storm. The 2026-08-01 reboot bumped restartCount
+	// by 6 on mem-mtg and 4 on mem-tatara.
+	require.NotNil(t, c.LivenessProbe, "livenessProbe missing")
+	require.Equal(t, int32(5), c.LivenessProbe.TimeoutSeconds, "livenessProbe.timeoutSeconds must be explicit; a 1s default restarts a merely-slow pod")
 }

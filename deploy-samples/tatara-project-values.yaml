@@ -63,6 +63,12 @@ project:
       pgInstances: 1
       pgStorage: 10Gi
       neo4jStorage: 10Gi
+      # apiReplicas sizes the tatara-memory API Deployment. At 1 the spread and
+      # anti-affinity rules on its pod template are inert, so a reboot of the
+      # hosting node is a 100% outage of this Project's memory API. Raise it on a
+      # multi-node cluster; the operator emits a PodDisruptionBudget that only
+      # starts serialising drains above 1.
+      apiReplicas: 1
     scm:
       provider: github
       owner: szymonrychu

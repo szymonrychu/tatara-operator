@@ -5697,6 +5697,18 @@ spec:
                   visible in the persisted object; the internal/memory builders no longer need
                   to carry fallback constants.
                 properties:
+                  apiReplicas:
+                    default: 1
+                    description: |-
+                      APIReplicas sizes the per-Project tatara-memory API Deployment. It stays 1
+                      by default so existing Projects are unchanged, but is now settable: at one
+                      replica the topologySpreadConstraints and podAntiAffinity already on the pod
+                      template are inert, so any reboot of the hosting node is a 100% outage of
+                      that Project's memory API (issue #528, the 2026-08-01 4-of-5-node reboot).
+                      The PodDisruptionBudget the operator emits alongside the Deployment only
+                      starts protecting anything above 1.
+                    minimum: 1
+                    type: integer
                   neo4jStorage:
                     default: 10Gi
                     type: string
@@ -6249,6 +6261,19 @@ spec:
                   MemoryStatus reports the observed state of the per-Project memory stack.
                   Endpoint is the canonical in-cluster URL every other component reads.
                 properties:
+                  apiAvailableReplicas:
+                    description: |-
+                      APIAvailableReplicas / APIWantReplicas are the observed and declared
+                      tatara-memory API replica counts. Like the CNPG counts they are recorded
+                      even while the stack reads Ready: above one replica a stack serving on 2 of
+                      3 replicas stays Ready on purpose (the API is stateless behind a Service, so
+                      one available replica serves every request), and these are then the only
+                      Project-level record that a replica is missing.
+                    format: int32
+                    type: integer
+                  apiWantReplicas:
+                    format: int32
+                    type: integer
                   endpoint:
                     type: string
                   externalEndpoint:

@@ -55,6 +55,7 @@ events.k8s.io|events
 ""|persistentvolumeclaims
 apps|deployments
 apps|statefulsets
+policy|poddisruptionbudgets
 postgresql.cnpg.io|clusters
 postgresql.cnpg.io|clusters/status
 postgresql.cnpg.io|scheduledbackups

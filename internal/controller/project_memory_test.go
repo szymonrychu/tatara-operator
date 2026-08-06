@@ -405,7 +405,86 @@ func TestMemoryStackHealth_UnconvergedRolloutNotCountedReady(t *testing.T) {
 	}
 }
 
-func TestDeploymentRolloutConverged(t *testing.T) {
+func TestMemoryStackHealth_PartialMultiReplicaStillServing(t *testing.T) {
+	// At apiReplicas: 3 the rollout is converged (ObservedGeneration matches,
+	// UpdatedReplicas==Replicas) but one replica is unavailable, so
+	// AvailableReplicas < Replicas. The memory API is stateless behind a Service,
+	// so the surviving 2 serve every request and the stack must stay Ready.
+	// Requiring full availability here was the trap that made opting into HA take
+	// the whole Project to Provisioning (and, past ProvisioningTimeout, Degraded)
+	// for exactly the capacity loss HA was meant to absorb.
+	ctx := context.Background()
+	r := newMemoryReconciler()
+	p := mkMemoryProject(t, "health-partial-multi")
+
+	// Configure the project for 3 memory API replicas.
+	p.Spec.Memory = &tataradevv1alpha1.MemorySpec{APIReplicas: 3}
+	if err := k8sClient.Update(ctx, p); err != nil {
+		t.Fatalf("set apiReplicas=3: %v", err)
+	}
+
+	if _, err := r.ensureNeo4jPassword(ctx, p); err != nil {
+		t.Fatalf("password: %v", err)
+	}
+	if err := r.applyMemoryStack(ctx, p); err != nil {
+		t.Fatalf("applyMemoryStack: %v", err)
+	}
+
+	// Make the rest of the stack healthy.
+	fakeStackHealthy(t, p.Name)
+
+	// Patch the memory Deployment status: converged rollout (Observed==Gen,
+	// Updated==Replicas) but 2 of 3 available (one pod starting/draining).
+	// Always set Replicas before the others: the envtest apiserver enforces
+	// readyReplicas <= replicas.
+	names := memory.NamesFor(p.Name)
+	var mem appsv1.Deployment
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: names.Memory}, &mem); err != nil {
+		t.Fatalf("get memory deployment: %v", err)
+	}
+	mem.Status.ObservedGeneration = mem.Generation
+	mem.Status.Replicas = 3
+	mem.Status.UpdatedReplicas = 3
+	mem.Status.ReadyReplicas = 2
+	mem.Status.AvailableReplicas = 2
+	if err := k8sClient.Status().Update(ctx, &mem); err != nil {
+		t.Fatalf("fake memory deployment status: %v", err)
+	}
+
+	h, err := r.memoryStackHealth(ctx, p)
+	if err != nil {
+		t.Fatalf("memoryStackHealth: %v", err)
+	}
+
+	// The memory stack is serving: 2 of 3 replicas are available behind the
+	// Service. memoryAvail must reflect that.
+	if h.memoryAvail != 2 {
+		t.Fatalf("memoryAvail = %d, want 2 (available replicas behind service)", h.memoryAvail)
+	}
+
+	// With 2 available, the memory stack is not a not-ready component.
+	notReady := h.notReadyComponents()
+	for _, comp := range notReady {
+		if comp == "memory-api" {
+			t.Fatalf("notReadyComponents contains memory-api, but %d of 3 replicas serve", h.memoryAvail)
+		}
+	}
+
+	// The phase must be Ready since all components pass their gates.
+	phase := memoryPhase(h.pgReady, h.pgWant, h.neo4jReady, h.lightragAvail, h.memoryAvail)
+	if phase != "Ready" {
+		t.Fatalf("memoryPhase = %q, want Ready", phase)
+	}
+
+	// memoryWant is recorded even while the stack reads Ready, for the same
+	// reason as the CNPG counts: 2 of 3 is Ready on purpose, so this is the only
+	// Project-level record that a replica is missing.
+	if h.memoryWant != 3 {
+		t.Fatalf("memoryWant = %d, want 3", h.memoryWant)
+	}
+}
+
+func TestDeploymentTemplateConverged(t *testing.T) {
 	cases := []struct {
 		name string
 		dep  appsv1.Deployment
@@ -446,11 +525,31 @@ func TestDeploymentRolloutConverged(t *testing.T) {
 			dep:  appsv1.Deployment{},
 			want: true, // 0==0 for every field; caller only reaches here on a found object with zero replicas requested, a degenerate case that still reads 0 available either way
 		},
+		{
+			name: "multi replica with one unavailable is still converged",
+			dep: appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 2},
+				Status: appsv1.DeploymentStatus{
+					ObservedGeneration: 2, Replicas: 3, UpdatedReplicas: 3, AvailableReplicas: 2,
+				},
+			},
+			want: true, // The memory API is stateless behind a Service, so 2 of 3 available serves every request; treating it as unconverged takes the whole Project to Provisioning for a capacity loss the HA it just opted into was meant to absorb.
+		},
+		{
+			name: "multi replica mid rollout with a stale pod is not converged",
+			dep: appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 2},
+				Status: appsv1.DeploymentStatus{
+					ObservedGeneration: 2, Replicas: 4, UpdatedReplicas: 3, AvailableReplicas: 3,
+				},
+			},
+			want: false, // This pins the issue-#355 detection (an old-generation pod counted in Replicas but not UpdatedReplicas) at a replica count above 1, where it was never tested.
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := deploymentRolloutConverged(&tc.dep); got != tc.want {
-				t.Fatalf("deploymentRolloutConverged = %v, want %v", got, tc.want)
+			if got := deploymentTemplateConverged(&tc.dep); got != tc.want {
+				t.Fatalf("deploymentTemplateConverged = %v, want %v", got, tc.want)
 			}
 		})
 	}

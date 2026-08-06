@@ -23,6 +23,7 @@ const (
 	defaultPgStorage    = "10Gi"
 	defaultPgWalStorage = "8Gi"
 	defaultNeo4jStorage = "10Gi"
+	defaultAPIReplicas  = 1
 )
 
 // Defaults for the cnpg object-store backup stanza (issue #432). Applied in the
@@ -233,6 +234,16 @@ func PgInstances(p *tatarav1alpha1.Project) int {
 		return p.Spec.Memory.PgInstances
 	}
 	return defaultPgInstances
+}
+
+// APIReplicas resolves the tatara-memory API replica count from spec,
+// defaulting to 1. Exported for the same reason as PgInstances: the builder and
+// any caller reasoning about the stack's HA posture read one source of truth.
+func APIReplicas(p *tatarav1alpha1.Project) int32 {
+	if p.Spec.Memory != nil && p.Spec.Memory.APIReplicas > 0 {
+		return int32(p.Spec.Memory.APIReplicas)
+	}
+	return defaultAPIReplicas
 }
 
 // pgStorage resolves the postgres storage size from spec, defaulting.

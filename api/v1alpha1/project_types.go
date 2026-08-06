@@ -34,6 +34,17 @@ type MemorySpec struct {
 	// +kubebuilder:default="10Gi"
 	// +optional
 	Neo4jStorage string `json:"neo4jStorage,omitempty"`
+	// APIReplicas sizes the per-Project tatara-memory API Deployment. It stays 1
+	// by default so existing Projects are unchanged, but is now settable: at one
+	// replica the topologySpreadConstraints and podAntiAffinity already on the pod
+	// template are inert, so any reboot of the hosting node is a 100% outage of
+	// that Project's memory API (issue #528, the 2026-08-01 4-of-5-node reboot).
+	// The PodDisruptionBudget the operator emits alongside the Deployment only
+	// starts protecting anything above 1.
+	// +kubebuilder:default=1
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	APIReplicas int `json:"apiReplicas,omitempty"`
 }
 
 // MemoryStatus reports the observed state of the per-Project memory stack.
@@ -81,6 +92,16 @@ type MemoryStatus struct {
 	// instance-manager endpoint (see MEMORY.md 2026-07-26).
 	// +optional
 	PgPrimary string `json:"pgPrimary,omitempty"`
+	// APIAvailableReplicas / APIWantReplicas are the observed and declared
+	// tatara-memory API replica counts. Like the CNPG counts they are recorded
+	// even while the stack reads Ready: above one replica a stack serving on 2 of
+	// 3 replicas stays Ready on purpose (the API is stateless behind a Service, so
+	// one available replica serves every request), and these are then the only
+	// Project-level record that a replica is missing.
+	// +optional
+	APIAvailableReplicas int32 `json:"apiAvailableReplicas,omitempty"`
+	// +optional
+	APIWantReplicas int32 `json:"apiWantReplicas,omitempty"`
 }
 
 // MemoryReadyStabilizationWindow is how long the memory stack must hold

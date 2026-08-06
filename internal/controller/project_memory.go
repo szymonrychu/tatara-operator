@@ -112,6 +112,13 @@ func (r *ProjectReconciler) applyMemoryStack(ctx context.Context, p *tataradevv1
 		memory.MemoryConfigMap(p, cfg),
 		memory.MemoryDeployment(p, cfg),
 		memory.MemoryService(p, cfg),
+		// PodDisruptionBudgets for the two Deployments. Applied unconditionally
+		// rather than gated on the replica count: maxUnavailable=1 is a no-op at
+		// one replica, so there is no state in which the object must be DELETED
+		// again (contrast the ScheduledBackup below). See internal/memory/pdb.go
+		// for why maxUnavailable + AlwaysAllow and never minAvailable.
+		memory.MemoryPDB(p, cfg),
+		memory.LightragPDB(p, cfg),
 	}
 	if ing := memory.Ingress(p, cfg); ing != nil {
 		objs = append(objs, ing)
@@ -350,7 +357,11 @@ type memoryHealth struct {
 	pgDanglingPVC []string
 	neo4jReady    int32
 	lightragAvail int32
-	memoryAvail   int32
+	// memoryAvail / memoryWant are the observed and declared tatara-memory API
+	// replica counts. Both are recorded even while the stack reads Ready: above
+	// one replica a stack serving on 2 of 3 stays Ready on purpose.
+	memoryAvail int32
+	memoryWant  int32
 }
 
 // notReadyComponents names the stack components below their readiness gate, in
@@ -419,7 +430,7 @@ func pgUnhealthyInstances(st map[cnpgv1.PodStatus][]string) []string {
 func (r *ProjectReconciler) memoryStackHealth(ctx context.Context, p *tataradevv1alpha1.Project) (memoryHealth, error) {
 	names := memory.NamesFor(p.Name)
 	ns := r.MemoryConfig.Namespace
-	h := memoryHealth{pgWant: memory.PgInstances(p)}
+	h := memoryHealth{pgWant: memory.PgInstances(p), memoryWant: memory.APIReplicas(p)}
 
 	// A NotFound read means the object was SSA-applied moments ago and is not
 	// yet visible in the informer cache (or has not been created yet). That is
@@ -451,7 +462,7 @@ func (r *ProjectReconciler) memoryStackHealth(ctx context.Context, p *tataradevv
 		if !apierrors.IsNotFound(e) {
 			return memoryHealth{}, fmt.Errorf("get lightrag deployment: %w", e)
 		}
-	} else if deploymentRolloutConverged(&lightrag) {
+	} else if deploymentTemplateConverged(&lightrag) {
 		h.lightragAvail = lightrag.Status.AvailableReplicas
 	}
 
@@ -460,26 +471,47 @@ func (r *ProjectReconciler) memoryStackHealth(ctx context.Context, p *tataradevv
 		if !apierrors.IsNotFound(e) {
 			return memoryHealth{}, fmt.Errorf("get memory deployment: %w", e)
 		}
-	} else if deploymentRolloutConverged(&mem) {
+	} else if deploymentTemplateConverged(&mem) {
 		h.memoryAvail = mem.Status.AvailableReplicas
 	}
 
 	return h, nil
 }
 
-// deploymentRolloutConverged reports whether d's rollout has fully landed: the
-// controller has observed the latest spec generation, and every replica is on
-// the current pod template (UpdatedReplicas) and Available. Without this, a
-// Deployment mid-rollout with one stale-generation replica still Available
-// reads identically to a converged one, so memoryStackHealth would count it
-// ready while an old pod runs alongside the new one (issue #355 - the
-// mem-tatara-lightrag rollout never converged during the incident, old+new
-// pods coexisting, and nothing detected it). A never-applied/status-not-yet-
-// populated Deployment (all fields zero) is correctly NOT converged.
-func deploymentRolloutConverged(d *appsv1.Deployment) bool {
+// deploymentTemplateConverged reports whether the Deployment controller has
+// observed d's latest spec generation AND every pod it currently counts is on
+// the current pod template. It says nothing about how many of those pods are
+// Available; the caller reads AvailableReplicas separately as the serving count.
+//
+// Splitting the two is the point. Without the generation/template check a
+// Deployment mid-rollout with a stale-generation replica still Available reads
+// identically to a converged one, so memoryStackHealth would count it ready
+// while an old pod runs alongside the new one (issue #355 - the
+// mem-tatara-lightrag rollout never converged during the incident, old+new pods
+// coexisting, and nothing detected it). That detection lives entirely in the two
+// clauses below and is unchanged: an old pod still counted in Replicas but not
+// in UpdatedReplicas fails the second clause.
+//
+// What was dropped is a third clause, AvailableReplicas == Replicas, which
+// conflated "the rollout landed" with "every replica is serving". At one replica
+// the two are the same statement - with the template clause satisfied, a surge
+// is the only way Replicas can exceed 1, and a surge means old-RS pods are still
+// counted, so UpdatedReplicas < Replicas and the clause is unreachable. It
+// therefore never decided anything, which is why it stayed invisible until
+// spec.memory.apiReplicas became settable. Above one replica it inverts the
+// point of HA: one unavailable replica out of three zeroed the serving count and
+// took the whole Project's memory stack to Provisioning (and, past
+// ProvisioningTimeout, Degraded) while two replicas were still answering, which
+// is the exact over-reaction issues #215 and #355 warn about. Partial
+// availability is surfaced on status.memory instead, the way partial CNPG
+// degradation is (issue #442).
+//
+// A never-applied/status-not-yet-populated Deployment (all fields zero) reads
+// converged, but its AvailableReplicas is 0, so the caller still treats it as
+// not ready.
+func deploymentTemplateConverged(d *appsv1.Deployment) bool {
 	return d.Status.ObservedGeneration == d.Generation &&
-		d.Status.UpdatedReplicas == d.Status.Replicas &&
-		d.Status.AvailableReplicas == d.Status.Replicas
+		d.Status.UpdatedReplicas == d.Status.Replicas
 }
 
 // memoryQuorum is the minimum number of cnpg instances that must be Ready for
@@ -601,6 +633,14 @@ func (r *ProjectReconciler) reconcileMemory(ctx context.Context, p *tataradevv1a
 	p.Status.Memory.PgReadyInstances = h.pgReady
 	p.Status.Memory.PgWantInstances = h.pgWant
 	p.Status.Memory.PgPrimary = h.pgPrimary
+
+	// Recorded even while the stack reads Ready, for the same reason as the CNPG
+	// counts above: at apiReplicas > 1 a stack serving on 2 of 3 API replicas is
+	// deliberately still Ready (the API is stateless behind a Service, so one
+	// available replica serves every request), so without these the partial loss
+	// is invisible from the Project alone.
+	p.Status.Memory.APIAvailableReplicas = h.memoryAvail
+	p.Status.Memory.APIWantReplicas = h.memoryWant
 
 	// Capture the current provisioning episode's start before the block below
 	// clears it on reaching Ready; the provision-duration histogram measures
