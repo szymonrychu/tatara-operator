@@ -535,7 +535,7 @@ func AgentEnv(project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) []core
 		{Name: "TATARA_SKILL_PROFILE", Value: profileForKind(kind)},
 		{Name: "TATARA_REPO", Value: agentRepoEnv(task)},
 		{Name: "TASK_BRANCH", Value: taskBranch},
-		{Name: "AGENT_POD_TTL_SECONDS", Value: strconv.Itoa(PodTTLSeconds(project, task))},
+		{Name: EnvAgentPodTTLSeconds, Value: strconv.Itoa(PodTTLSeconds(project, task))},
 		{Name: "TATARA_CONTRACT_VERSION", Value: strconv.Itoa(ContractVersion)},
 	}
 }

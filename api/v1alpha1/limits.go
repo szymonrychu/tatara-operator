@@ -57,6 +57,12 @@ const (
 	// PendingCommentBodyMaxBytes caps PendingComment.Body.
 	PendingCommentBodyMaxBytes = 16384
 
+	// LastTurnFinalTextMaxBytes caps LastTurn.FinalText. Half of
+	// NoteBodyMaxBytes on purpose: this text is EMBEDDED in the G.7 synthetic
+	// handoff note along with the repo list and the framing, and a note that
+	// exceeds Note.Body's own cap is an empty notes journal.
+	LastTurnFinalTextMaxBytes = 2048
+
 	// IssueBodyMaxBytes and MergeRequestBodyMaxBytes cap the mirrored forge
 	// bodies. See the byte-vs-character note above: the forge's own cap is in
 	// characters, so a body the forge accepted can still be too long here.

@@ -1123,25 +1123,47 @@ func (r *TaskReconciler) ttlStop(ctx context.Context, proj *tatarav1alpha1.Proje
 		AgentKind:   agentKind,
 		Deadline:    deadline,
 		TurnTimeout: time.Duration(proj.Spec.Agent.TurnTimeoutSeconds) * time.Second,
-		// LastFinalText/PushedRepos are not persisted on the Task (only recordResult
-		// stamps turn-complete), so the synthetic note degrades to "(none)". The
-		// non-empty-notes guarantee still holds: agent handoff, else synthetic.
 	}
-	outcome, err := stopper.StopWithHandoff(ctx, task, in)
+	// status.lastTurn is THE material the synthetic handoff note is built from
+	// (issue #527). Omitting it here - which this did, with a comment shrugging
+	// that the invariant "still holds" - is what made every synthetic note the
+	// same content-free string.
+	if lt := task.Status.LastTurn; lt != nil {
+		in.LastFinalText, in.PushedRepos = lt.FinalText, lt.PushedRepos
+	}
+	res, err := stopper.StopWithHandoff(ctx, task, in)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("ttl stop %s: %w", task.Name, err)
 	}
 	if err := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 		fresh.Status.PodStartedAt = nil
 		fresh.Status.StageWorkStartedAt = nil
+		// The pod this described is gone; the next one starts from the note.
+		fresh.Status.LastTurn = nil
 		return true
 	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("ttl stop re-arm %s: %w", task.Name, err)
 	}
-	log.FromContext(ctx).Info("agent pod TTL-stopped; handed off",
-		"action", "agent_pod_ttl_stop", "resource_id", task.Name,
-		"agent_kind", agentKind, "outcome", outcome)
+	logTTLStop(ctx,
+		"agent pod TTL-stopped; handed off",
+		"agent pod TTL-stopped with NO continuation state captured; the previous pod's work is unrecorded",
+		"agent_pod_ttl_stop", res, "resource_id", task.Name, "agent_kind", agentKind)
 	return ctrl.Result{RequeueAfter: agentBootRequeue}, nil
+}
+
+// logTTLStop logs one G.7 stop at a level and with a wording that match what
+// actually happened. The single line this replaces read "agent pod TTL-stopped;
+// handed off" at INFO on EVERY path, including the one where nothing was handed
+// off - so the failure mode had no log signature at all and nobody went looking
+// for ~19 days (issue #527).
+func logTTLStop(ctx context.Context, okMsg, lostMsg, action string, res agent.TTLStopResult, fields ...any) {
+	fields = append([]any{"action", action, "outcome", res.Outcome, "handoff", res.Handoff}, fields...)
+	l := log.FromContext(ctx)
+	if res.Handoff == agent.TTLHandoffNone {
+		l.Error(nil, lostMsg, fields...)
+		return
+	}
+	l.Info(okMsg, fields...)
 }
 
 // turn0Marker identifies the pod turn-0 was submitted to. A respawn re-stamps

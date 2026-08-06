@@ -195,6 +195,21 @@ func (s *CallbackServer) orphanReason(pod *corev1.Pod, tasks map[string]*tatarav
 	// flight. Conversation persistence lets a still-live Task re-spawn a fresh pod
 	// and resume, so reaping is safe.
 	if s.IdlePodReapAfter > 0 && !taskHasInflightTurn(task) {
+		// PAST t0 THE G.7 STOP OWNS THIS POD (issue #527). The stop sequence needs
+		// the wrapper ALIVE: it is the only thing that can offer the agent its one
+		// handoff turn, and Task.status.notes is the only continuation state the
+		// next pod gets. Reaping here wins the race - idlePodReapMinutes (30) is
+		// less than agentPodTTLSeconds (3600), so any pod idle since before
+		// t0-30m is deleted first - and the stop then runs against a corpse,
+		// captures nothing, and reports force_deleted for a pod nobody forced.
+		// The two clocks were unaware of each other; this is the awareness.
+		//
+		// Only from t0, deliberately. Before t0 no stop is pending and the #237
+		// backstop keeps its full reach; a pod reaped then simply respawns through
+		// the ordinary pod-gone path, which has nothing to hand off anyway.
+		if t0, ok := agent.PodTTLDeadlineFromSpec(pod, task); ok && !time.Now().Before(t0) {
+			return "", false
+		}
 		if time.Since(podLastActivity(pod, task)) > s.IdlePodReapAfter {
 			return "idle no live turn", true
 		}

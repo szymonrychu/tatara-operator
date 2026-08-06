@@ -413,6 +413,42 @@ type Note struct {
 	Body string `json:"body"`
 }
 
+// LastTurn is the continuation payload of the most recently COMPLETED turn on
+// the CURRENT pod: what the agent said, and what it pushed.
+//
+// It exists for exactly one consumer, G.7's synthetic handoff note. A TTL stop
+// that the agent cannot answer has to write the handoff FOR it, and it can only
+// write what the operator kept. Before this field the operator kept nothing:
+// turncallback stamped annTurnComplete and threw finalText and pushedRepos away,
+// so ttlStop built agent.TTLStopInput with both fields at their zero values and
+// writeSyntheticNote rendered the constant string "Last turn's final text:
+// (none). Repos pushed: none." on EVERY synthetic path. The non-empty-notes
+// invariant was satisfied VACUOUSLY and the next pod resumed from a bundle whose
+// only note said nothing (issue #527).
+//
+// CLEARED ON EVERY STAGE TRANSITION, alongside PodStartedAt (see there). It
+// describes THIS pod's last turn; carrying it across a transition would let a
+// TTL stop in implementing hand the next pod a clarify pod's final text.
+type LastTurn struct {
+	// At is when the turn-complete callback landed.
+	At metav1.Time `json:"at"`
+	// FinalText is the agent's last message, clamped to LastTurnFinalTextMaxBytes.
+	// The cap is deliberately well under NoteBodyMaxBytes (4096): the synthetic
+	// note wraps this text in framing, and a note the API server rejects on
+	// MaxLength is an EMPTY notes journal - the exact failure G.7 exists to
+	// prevent.
+	// Go-side twin: LastTurnFinalTextMaxBytes (limits.go). Change both together.
+	// +optional
+	// +kubebuilder:validation:MaxLength=2048
+	FinalText string `json:"finalText,omitempty"`
+	// PushedRepos are the repos the agent actually pushed this turn (contract
+	// G.2). RETAINED rather than reduced to a bool: without the names the next
+	// pod cannot tell "no diff" from "forgot to push" on a multi-repo Task.
+	// +optional
+	// +kubebuilder:validation:MaxItems=20
+	PushedRepos []string `json:"pushedRepos,omitempty"`
+}
+
 // TaskStats is the running usage/token accounting for a Task (contract A.4).
 type TaskStats struct {
 	TokensInput         int64 `json:"tokensInput,omitempty"`
@@ -512,6 +548,11 @@ type TaskStatus struct {
 	//       and under fix V6-6 the wrapper then 410s every turn it is given.
 	// +optional
 	PodStartedAt *metav1.Time `json:"podStartedAt,omitempty"`
+	// LastTurn is the CURRENT pod's most recent completed turn (issue #527). It is
+	// the only thing G.7's synthetic handoff note can be built from. Cleared on
+	// every stage transition, alongside PodStartedAt.
+	// +optional
+	LastTurn *LastTurn `json:"lastTurn,omitempty"`
 	// Notes: append-only journal. IT IS the continuation state. Capped at 50 in
 	// Go (drop-oldest, spilled to tatara-memory); MaxItems is a backstop only.
 	// +optional

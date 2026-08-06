@@ -16,6 +16,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -220,6 +221,14 @@ func (s *CallbackServer) handleTurnComplete(w http.ResponseWriter, r *http.Reque
 		tokenDelta, usageRecorded = d, rec
 	}
 
+	// Persist the turn's continuation payload BEFORE recordResult stamps
+	// annTurnComplete: the stamp is what requeues the reconcile, and that
+	// reconcile may TTL-stop this very pod. Best-effort - losing the payload
+	// degrades the synthetic handoff note, failing the turn loses the turn.
+	if err := s.recordLastTurn(r.Context(), task, p.FinalText, p.PushedRepos, p.TurnID); err != nil {
+		l.Error(err, "record last-turn continuation payload (non-fatal)", "turn_id", p.TurnID)
+	}
+
 	if err := s.recordResult(r.Context(), agent.TurnResult{
 		State: p.State, FinalText: p.FinalText, StopReason: p.StopReason, Err: p.Error,
 	}, task, p.TurnID); err != nil {
@@ -397,6 +406,47 @@ func taskTokenLabels(task *tatarav1alpha1.Task) (project, repo, kind, issue, mod
 	}
 	model = task.Status.ResolvedModel
 	return
+}
+
+// maxLastTurnPushedRepos caps status.lastTurn.pushedRepos, the Go twin of its
+// MaxItems marker. A Task spans a handful of repos; the cap exists so a
+// misreporting wrapper cannot push the Task status toward the A.7 byte budget.
+const maxLastTurnPushedRepos = 20
+
+// recordLastTurn persists this turn's finalText and pushedRepos on
+// status.lastTurn (issue #527). They are the ONLY material G.7's synthetic
+// handoff note can be built from, and until this existed the operator kept
+// neither - so every TTL stop the agent could not answer wrote the constant
+// string "Last turn's final text: (none). Repos pushed: none." and the next pod
+// resumed from a bundle with no continuation state at all.
+//
+// Guarded exactly like recordUsage: a stale or duplicate callback for a turn the
+// Task has already moved past must not overwrite the live turn's payload, and a
+// Task whose work is over is not written at all.
+func (s *CallbackServer) recordLastTurn(ctx context.Context, task *tatarav1alpha1.Task,
+	finalText string, pushedRepos []string, turnID string) error {
+
+	if len(pushedRepos) > maxLastTurnPushedRepos {
+		pushedRepos = pushedRepos[:maxLastTurnPushedRepos]
+	}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := s.Client.Get(ctx, types.NamespacedName{Namespace: s.Namespace, Name: task.Name}, fresh); err != nil {
+			return fmt.Errorf("reload task for last turn: %w", err)
+		}
+		if fresh.Annotations[annCurrentTurn] != turnID || tatarav1alpha1.TaskDone(fresh) {
+			return nil
+		}
+		fresh.Status.LastTurn = &tatarav1alpha1.LastTurn{
+			At: metav1.NewTime(time.Now()),
+			// TruncateUTF8, never a naive slice: the CRD cap is in BYTES and a cut
+			// that lands mid-rune produces invalid UTF-8 the API server rejects,
+			// which would 422 the whole status write (issue #495).
+			FinalText:   tatarav1alpha1.TruncateUTF8(finalText, tatarav1alpha1.LastTurnFinalTextMaxBytes),
+			PushedRepos: pushedRepos,
+		}
+		return s.Client.Status().Update(ctx, fresh)
+	})
 }
 
 // recordResult bumps the Task's turn-complete annotation to requeue its
