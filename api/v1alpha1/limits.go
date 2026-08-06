@@ -1,6 +1,10 @@
 package v1alpha1
 
-import "unicode/utf8"
+import (
+	"strings"
+	"unicode"
+	"unicode/utf8"
+)
 
 // The Go-side twins of every +kubebuilder:validation:MaxLength marker on a
 // field that receives EXTERNALLY-SIZED text - a forge comment, an issue or MR
@@ -64,6 +68,29 @@ const (
 	MergeRequestBodyMaxBytes = 65536
 )
 
+// IssueTitleMaxChars caps the title of every issue this platform files on a
+// forge. It is the odd one out among the constants above, twice over, and both
+// differences are load-bearing.
+//
+// It is NOT the twin of a kubebuilder marker. No CRD field caps a title, so
+// TestCRDMaxLengthMatchesConstants has nothing to hold it against; what it
+// mirrors is the FORGE's own validation. GitLab rejects an issue title over 255
+// with a 400 and GitHub imposes no title limit at all, so this is the stricter
+// of the two applied to BOTH: the provider is a per-project setting, no
+// provider-capability model exists to hang a per-forge limit on, and one shared
+// ceiling costs GitHub nothing.
+//
+// It counts CHARACTERS, not bytes - the one place in this file where the
+// byte-vs-character note above bites in the other direction. 255 CJK characters
+// is 765 bytes, so clamping this with TruncateUTF8 would mutilate a title the
+// forge would have accepted. ClampIssueTitle is the cut that gets it right.
+const IssueTitleMaxChars = 255
+
+// titleTruncatedMarker makes a clamped title READ as clamped. Without it a cut
+// title is indistinguishable from one the agent merely wrote badly, and the
+// reader has no way to know the rest of the sentence ever existed.
+const titleTruncatedMarker = "...(truncated)"
+
 // TruncateUTF8 cuts s to at most maxBytes BYTES on a rune boundary. A string
 // that already fits is returned byte-identical - callers compare stored values
 // (drainRenderedEvents matches a pending event by its whole value tuple, body
@@ -77,4 +104,47 @@ func TruncateUTF8(s string, maxBytes int) string {
 		cut = cut[:len(cut)-1]
 	}
 	return cut
+}
+
+// TruncateRunes cuts s to at most maxRunes RUNES, always on a rune boundary. It
+// is the character-counting twin of TruncateUTF8 and the two are NOT
+// interchangeable: TruncateUTF8 enforces the API server's byte limits, this one
+// enforces a forge's character limits. A string that already fits is returned
+// byte-identical, for the same reason TruncateUTF8 does it.
+func TruncateRunes(s string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return ""
+	}
+	n := 0
+	for i := range s {
+		if n == maxRunes {
+			return s[:i]
+		}
+		n++
+	}
+	return s
+}
+
+// ClampIssueTitle cuts title to fit IssueTitleMaxChars, leaving the elision
+// marker visible when it had to cut. Trailing whitespace is trimmed off the cut
+// first, so the marker never trails a half-written word by three spaces.
+//
+// Every agent-supplied title handed to the forge goes through this. It is the
+// clamp the limits contract was missing: the body beside it on the same request
+// has been clamped since #495, the title never was, and a GitLab 400 on an
+// over-long title discards the whole outcome the agent had just submitted.
+func ClampIssueTitle(title string) string {
+	if utf8.RuneCountInString(title) <= IssueTitleMaxChars {
+		return title
+	}
+	// A title only over the cap because of the whitespace around it is not over
+	// it at all: the forge strips before it length-validates. Trimming here also
+	// stops a long enough run of LEADING whitespace from spending the entire cut
+	// and clamping the title down to nothing but the marker.
+	title = strings.TrimSpace(title)
+	if utf8.RuneCountInString(title) <= IssueTitleMaxChars {
+		return title
+	}
+	cut := TruncateRunes(title, IssueTitleMaxChars-utf8.RuneCountInString(titleTruncatedMarker))
+	return strings.TrimRightFunc(cut, unicode.IsSpace) + titleTruncatedMarker
 }
