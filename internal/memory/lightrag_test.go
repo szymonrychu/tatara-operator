@@ -51,6 +51,52 @@ func TestLightragDeployment(t *testing.T) {
 	require.Equal(t, "password", env["NEO4J_PASSWORD"].ValueFrom.SecretKeyRef.Key)
 }
 
+func TestLightragDeployment_ReadinessProbeExercisesDataPlane(t *testing.T) {
+	p := testProject("acme")
+	d := memory.LightragDeployment(p, testCfg())
+	c := d.Spec.Template.Spec.Containers[0]
+
+	// A tcpSocket probe (or an httpGet /health probe) cannot detect a wedged
+	// LightRAG: incident tatara-operator#502 showed /health answering 200 in
+	// ~3ms while /query and /documents/* hung for 121s. The probe must hit an
+	// endpoint that actually touches the storage backends.
+	require.NotNil(t, c.ReadinessProbe)
+	require.NotNil(t, c.ReadinessProbe.HTTPGet, "readiness must be httpGet, not tcpSocket - a TCP connect succeeds against a wedged HTTP server")
+	require.Equal(t, "/documents/status_counts", c.ReadinessProbe.HTTPGet.Path)
+	require.Equal(t, "http", c.ReadinessProbe.HTTPGet.Port.StrVal)
+	require.NotZero(t, c.ReadinessProbe.TimeoutSeconds, "must bound how long a wedged backend can stall the probe itself")
+	require.NotZero(t, c.ReadinessProbe.FailureThreshold)
+}
+
+func TestLightragDeployment_LivenessProbeRestartsWedgedPod(t *testing.T) {
+	p := testProject("acme")
+	d := memory.LightragDeployment(p, testCfg())
+	c := d.Spec.Template.Spec.Containers[0]
+
+	// Root cause of #502: no livenessProbe existed at all, so a wedged pod
+	// (Ready=true, 0 restarts, data plane permanently hung) was never
+	// restarted and never routed around.
+	require.NotNil(t, c.LivenessProbe, "lightrag needs a livenessProbe so a wedged data plane gets restarted")
+	require.NotNil(t, c.LivenessProbe.HTTPGet)
+	require.Equal(t, "/documents/status_counts", c.LivenessProbe.HTTPGet.Path)
+	require.NotZero(t, c.LivenessProbe.TimeoutSeconds)
+	require.NotZero(t, c.LivenessProbe.FailureThreshold)
+	require.GreaterOrEqual(t, c.LivenessProbe.PeriodSeconds*c.LivenessProbe.FailureThreshold, int32(60),
+		"liveness must tolerate a real busy stretch (burst A in #502 ran LightRAG at up to 0.30 cores for real work) before restarting")
+}
+
+func TestLightragDeployment_Resources(t *testing.T) {
+	p := testProject("acme")
+	d := memory.LightragDeployment(p, testCfg())
+	c := d.Spec.Template.Spec.Containers[0]
+
+	// #502 Q6: BestEffort QoS (no resources at all) put lightrag first in line
+	// for eviction and gave it the lowest CPU shares under node contention.
+	require.False(t, c.Resources.Requests.Cpu().IsZero(), "requests.cpu must be set - no BestEffort QoS")
+	require.False(t, c.Resources.Requests.Memory().IsZero(), "requests.memory must be set - no BestEffort QoS")
+	require.False(t, c.Resources.Limits.Memory().IsZero(), "limits.memory must be set")
+}
+
 func TestLightragDeployment_ImagePullSecrets(t *testing.T) {
 	p := testProject("acme")
 

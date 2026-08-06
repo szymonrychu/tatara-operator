@@ -117,6 +117,28 @@ func lightragInitContainers(n Names, cfg Config) []corev1.Container {
 	}}
 }
 
+// lightragDataPlaneProbe builds a probe against a LightRAG endpoint that
+// actually touches the storage backends, rather than the liveness-only
+// /health used by tatara-memory's own /readyz. See #502: /health kept
+// answering in ~3ms while the data plane was wedged for 121s at a time, so a
+// probe on /health (tcpSocket or httpGet) cannot detect this failure mode.
+// timeoutSeconds bounds how long a stalled backend can hold up the probe
+// itself; failureThreshold*periodSeconds sets how long a stall must persist
+// before the probe trips.
+func lightragDataPlaneProbe(failureThreshold, periodSeconds int32) *corev1.Probe {
+	return &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			HTTPGet: &corev1.HTTPGetAction{
+				Path: "/documents/status_counts",
+				Port: intstr.FromString("http"),
+			},
+		},
+		TimeoutSeconds:   5,
+		PeriodSeconds:    periodSeconds,
+		FailureThreshold: failureThreshold,
+	}
+}
+
 // LightragDeployment builds the per-Project lightrag Deployment (port 9621,
 // Recreate strategy because the data PVC is RWO with one replica).
 func LightragDeployment(p *tatarav1alpha1.Project, cfg Config) *appsv1.Deployment {
@@ -147,9 +169,34 @@ func LightragDeployment(p *tatarav1alpha1.Project, cfg Config) *appsv1.Deploymen
 							{Name: "http", ContainerPort: 9621, Protocol: corev1.ProtocolTCP},
 						},
 						Env: lightragEnv(p, cfg),
-						ReadinessProbe: &corev1.Probe{
-							ProbeHandler:  corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromString("http")}},
-							PeriodSeconds: 10,
+						// #502 root cause: a tcpSocket readinessProbe (and an httpGet
+						// /health probe, which was measured returning 200 in ~3ms
+						// mid-incident) cannot see a wedged data plane - LightRAG kept
+						// accepting TCP and answering /health while /query and
+						// /documents/* hung for up to 121s. /documents/status_counts is
+						// a GET that actually touches the storage backends, so a stall
+						// there reflects real data-plane health.
+						ReadinessProbe: lightragDataPlaneProbe(3, 10),
+						// No livenessProbe existed at all, so the wedged pod (Ready=true,
+						// 0 restarts) was never restarted and never routed around.
+						// failureThreshold*periodSeconds=180s tolerates the real busy
+						// stretches observed in the incident (up to 0.30 cores of genuine
+						// work) before concluding the process is actually wedged.
+						LivenessProbe: lightragDataPlaneProbe(6, 30),
+						Resources: corev1.ResourceRequirements{
+							// #502 Q6: no resources at all meant BestEffort QoS - first in
+							// line for eviction, lowest CPU shares under contention.
+							// Requests/limits sized against the incident's own measurements
+							// (idle ~0.010-0.011 cores, 877MB working set, bursts to 0.30
+							// cores) with headroom for real ingest work.
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("250m"),
+								corev1.ResourceMemory: resource.MustParse("512Mi"),
+							},
+							Limits: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("2"),
+								corev1.ResourceMemory: resource.MustParse("2Gi"),
+							},
 						},
 						VolumeMounts: []corev1.VolumeMount{{Name: "data", MountPath: "/app/data"}},
 					}},
