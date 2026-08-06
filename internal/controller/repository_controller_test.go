@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -164,18 +165,18 @@ func TestPublishIngestHealth(t *testing.T) {
 	}
 
 	// Failed phase -> failing 1.
-	r.publishIngestHealth(mkRepoObj("r-failed", "Failed", 0, true, nil))
+	r.publishIngestHealth(mkRepoObj("r-failed", "Failed", 0, true, nil), false)
 	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("proj", "r-failed")); got != 1 {
 		t.Errorf("failed phase: failing = %v, want 1", got)
 	}
 	// Mid-retry (Ingesting but unresolved consecutive failures) -> failing 1.
-	r.publishIngestHealth(mkRepoObj("r-retry", "Ingesting", 2, true, nil))
+	r.publishIngestHealth(mkRepoObj("r-retry", "Ingesting", 2, true, nil), false)
 	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("proj", "r-retry")); got != 1 {
 		t.Errorf("retrying: failing = %v, want 1", got)
 	}
 	// Healthy (Ingested, no failures) -> failing 0 and timestamp published.
 	ts := metav1.Unix(1750000000, 0)
-	r.publishIngestHealth(mkRepoObj("r-ok", "Ingested", 0, true, &ts))
+	r.publishIngestHealth(mkRepoObj("r-ok", "Ingested", 0, true, &ts), false)
 	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("proj", "r-ok")); got != 0 {
 		t.Errorf("healthy: failing = %v, want 0", got)
 	}
@@ -184,18 +185,73 @@ func TestPublishIngestHealth(t *testing.T) {
 	}
 	// Recovery on the SAME repo: the gauge must clear, not stay latched - this is
 	// the whole point of the current-state signal vs the monotonic counter (#138).
-	r.publishIngestHealth(mkRepoObj("r-heal", "Failed", 3, true, nil))
+	r.publishIngestHealth(mkRepoObj("r-heal", "Failed", 3, true, nil), false)
 	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("proj", "r-heal")); got != 1 {
 		t.Fatalf("pre-recovery: failing = %v, want 1", got)
 	}
-	r.publishIngestHealth(mkRepoObj("r-heal", "Ingested", 0, true, &ts))
+	r.publishIngestHealth(mkRepoObj("r-heal", "Ingested", 0, true, &ts), false)
 	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("proj", "r-heal")); got != 0 {
 		t.Errorf("post-recovery: failing = %v, want 0 (must clear)", got)
 	}
 	// A disabled repo never reports failing even if its status looks failed.
-	r.publishIngestHealth(mkRepoObj("r-disabled", "Failed", 5, false, nil))
+	r.publishIngestHealth(mkRepoObj("r-disabled", "Failed", 5, false, nil), false)
 	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("proj", "r-disabled")); got != 0 {
 		t.Errorf("disabled: failing = %v, want 0", got)
+	}
+}
+
+// TestPublishIngestHealth_Gated pins the ingest_failing x ingest_gated
+// interaction from issue #525: the two gauges are published together and
+// "gated" wins. A gated repo launches no ingest Job, and only a successful
+// ingest resets Phase/IngestFailureCount, so reporting it as failing pins the
+// gauge for as long as the project memory stack is down.
+func TestPublishIngestHealth_Gated(t *testing.T) {
+	m := obs.NewOperatorMetrics(prometheus.NewRegistry())
+	r := &RepositoryReconciler{Metrics: m}
+
+	mkRepoObj := func(name string, failCount int, enabled bool) *tataradevv1alpha1.Repository {
+		rp := &tataradevv1alpha1.Repository{}
+		rp.Name = name
+		rp.Spec.ProjectRef = "proj"
+		rp.Spec.IngestEnabled = boolPtrRC(enabled)
+		rp.Status.Phase = "Failed"
+		rp.Status.IngestFailureCount = failCount
+		return rp
+	}
+
+	cases := []struct {
+		name            string
+		repo            *tataradevv1alpha1.Repository
+		gated           bool
+		failing, isGate float64
+	}{
+		{"failing and gated", mkRepoObj("g-failing", 3, true), true, 0, 1},
+		{"failing, not gated", mkRepoObj("g-open", 3, true), false, 1, 0},
+		// A disabled repo is not held by the gate, it is switched off.
+		{"disabled and gated", mkRepoObj("g-disabled", 3, false), true, 0, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r.publishIngestHealth(tc.repo, tc.gated)
+			if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("proj", tc.repo.Name)); got != tc.failing {
+				t.Errorf("ingest_failing = %v, want %v", got, tc.failing)
+			}
+			if got := testutil.ToFloat64(m.RepositoryIngestGatedGauge("proj", tc.repo.Name)); got != tc.isGate {
+				t.Errorf("ingest_gated = %v, want %v", got, tc.isGate)
+			}
+		})
+	}
+
+	// The mask is not latched: the same repo un-masks the moment the gate opens,
+	// without any successful ingest in between.
+	repo := mkRepoObj("g-cycle", 3, true)
+	r.publishIngestHealth(repo, true)
+	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("proj", "g-cycle")); got != 0 {
+		t.Fatalf("gated: ingest_failing = %v, want 0", got)
+	}
+	r.publishIngestHealth(repo, false)
+	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("proj", "g-cycle")); got != 1 {
+		t.Errorf("gate reopened: ingest_failing = %v, want 1", got)
 	}
 }
 
@@ -409,6 +465,22 @@ func setProjectMemoryReady(t *testing.T, name, endpoint string) {
 	}
 }
 
+// setProjectMemoryNotReady drops a project's memory stack out of Ready, the way
+// a crash-looping backend does: the phase moves off Ready and ReadySince is
+// cleared, so MemoryStablyReady needs a fresh stabilization window.
+func setProjectMemoryNotReady(t *testing.T, name string) {
+	t.Helper()
+	p := &tataradevv1alpha1.Project{}
+	if err := k8sClient.Get(context.Background(),
+		types.NamespacedName{Namespace: testNS, Name: name}, p); err != nil {
+		t.Fatalf("get project %s: %v", name, err)
+	}
+	p.Status.Memory = &tataradevv1alpha1.MemoryStatus{Phase: "Degraded"}
+	if err := k8sClient.Status().Update(context.Background(), p); err != nil {
+		t.Fatalf("set project %s memory not ready: %v", name, err)
+	}
+}
+
 func TestRepoReconcile_GatesUntilMemoryReady(t *testing.T) {
 	mkProject(t, "rp-mem", "rp-mem-scm")
 	mkSecret(t, "rp-mem-scm", map[string][]byte{"token": []byte("x"), "webhookSecret": []byte("y")})
@@ -482,6 +554,139 @@ func TestRepoReconcile_IngestGatedGauge(t *testing.T) {
 	reconcile()
 	if got := testutil.ToFloat64(r.Metrics.RepositoryIngestGatedGauge("rp-gauge", "gaugerepo")); got != 0 {
 		t.Fatalf("ingest_gated after memory stably Ready = %v, want 0", got)
+	}
+}
+
+// TestRepoReconcile_GatedRepoDoesNotReportFailing guards issue #525: a repo that
+// was ALREADY failing when the memory-readiness gate closed kept
+// operator_repository_ingest_failing pinned at 1 with no way out. Gated means no
+// ingest Job is launched, and only a successful ingest resets the failure state,
+// so the gauge - and every alert keyed on it - could not clear until the project
+// memory stack recovered. mtg-decks held the alert for 18.6h with zero ingest
+// attempts in 19.6h. While gated the failing gauge reads 0 and
+// operator_repository_ingest_gated carries the truth; the moment the gate opens
+// the repo is retryable again and the failing gauge un-masks.
+func TestRepoReconcile_GatedRepoDoesNotReportFailing(t *testing.T) {
+	mkProject(t, "rp-gatedfail", "rp-gatedfail-scm")
+	mkSecret(t, "rp-gatedfail-scm", map[string][]byte{"token": []byte("x"), "webhookSecret": []byte("y")})
+	repo := mkRepo(t, "gatedfailrepo", "rp-gatedfail")
+
+	// The repo is already in a failing ingest state when the gate closes. The
+	// recent failure timestamp keeps the exponential back-off holding once memory
+	// comes back, which is also the case worth pinning: back-off is NOT the gate,
+	// so the failing gauge must read 1 there.
+	failedAt := metav1.NewTime(time.Now())
+	repo.Status.Phase = "Failed"
+	repo.Status.IngestFailureCount = 3
+	repo.Status.LastIngestedCommit = "deadbee"
+	repo.Status.LastIngestFailureTime = &failedAt
+	if err := k8sClient.Status().Update(context.Background(), repo); err != nil {
+		t.Fatalf("seed failing status: %v", err)
+	}
+
+	// One reconciler across both passes so the gauges survive between them.
+	r := newRepoReconciler()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: testNS, Name: "gatedfailrepo"}}
+	reconcile := func() {
+		t.Helper()
+		if _, err := r.Reconcile(logf.IntoContext(context.Background(), logf.Log), req); err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+	}
+
+	// Project memory is not Ready at all: the gate holds.
+	reconcile()
+	if got := testutil.ToFloat64(r.Metrics.RepositoryIngestGatedGauge("rp-gatedfail", "gatedfailrepo")); got != 1 {
+		t.Fatalf("ingest_gated while memory not ready = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(r.Metrics.RepositoryIngestFailingGauge("rp-gatedfail", "gatedfailrepo")); got != 0 {
+		t.Errorf("ingest_failing while gated = %v, want 0: gated means no ingest Job runs, "+
+			"so nothing can reset the failure state and the alert would never clear", got)
+	}
+	if jobs := listIngestJobs(t, "gatedfailrepo"); len(jobs) != 0 {
+		t.Fatalf("gated repo must not launch a job, got %d", len(jobs))
+	}
+
+	// Gate opens: the repo is retryable again, so its unresolved failures are
+	// reportable again. Masking must not become a permanent amnesty.
+	setProjectMemoryReady(t, "rp-gatedfail", "http://mem-rp-gatedfail.tatara.svc:8080")
+	reconcile()
+	if got := testutil.ToFloat64(r.Metrics.RepositoryIngestGatedGauge("rp-gatedfail", "gatedfailrepo")); got != 0 {
+		t.Fatalf("ingest_gated after memory stably Ready = %v, want 0", got)
+	}
+	if got := testutil.ToFloat64(r.Metrics.RepositoryIngestFailingGauge("rp-gatedfail", "gatedfailrepo")); got != 1 {
+		t.Errorf("ingest_failing once the gate opens = %v, want 1 (failures are still unresolved)", got)
+	}
+	if jobs := listIngestJobs(t, "gatedfailrepo"); len(jobs) != 0 {
+		t.Fatalf("back-off must still hold the retry, got %d job(s)", len(jobs))
+	}
+}
+
+// TestRepoReconcile_ActiveJobIsNotReportedGated pins the other half of the #525
+// masking rule: the gauge means "the memory-readiness gate is what is holding
+// this repo's next ingest", which is false while an ingest Job is in flight. The
+// Job concurrency guard returns long before the gate branch, so a memory blip
+// mid-ingest must not be reported as gated - and must not mask the failing gauge
+// for a repo that is, right now, retrying.
+func TestRepoReconcile_ActiveJobIsNotReportedGated(t *testing.T) {
+	mkProject(t, "rp-inflight", "rp-inflight-scm")
+	mkSecret(t, "rp-inflight-scm", map[string][]byte{"token": []byte("x"), "webhookSecret": []byte("y")})
+	mkRepo(t, "inflightrepo", "rp-inflight")
+	setProjectMemoryReady(t, "rp-inflight", "http://mem-rp-inflight.tatara.svc:8080")
+
+	r := newRepoReconciler()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: testNS, Name: "inflightrepo"}}
+	reconcile := func() {
+		t.Helper()
+		if _, err := r.Reconcile(logf.IntoContext(context.Background(), logf.Log), req); err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+	}
+
+	reconcile()
+	jobName := waitRepoJob(t, "inflightrepo")
+
+	// Earlier attempts left unresolved failures: the in-flight Job IS the retry.
+	repo := getRepo(t, "inflightrepo")
+	repo.Status.IngestFailureCount = 2
+	if err := k8sClient.Status().Update(context.Background(), repo); err != nil {
+		t.Fatalf("seed failure count: %v", err)
+	}
+
+	// The memory stack drops out while that Job is still running.
+	setProjectMemoryNotReady(t, "rp-inflight")
+	reconcile()
+
+	if got := getRepo(t, "inflightrepo").Status.JobName; got != jobName {
+		t.Fatalf("jobName = %q, want the in-flight %q (guard must still hold)", got, jobName)
+	}
+	if got := testutil.ToFloat64(r.Metrics.RepositoryIngestGatedGauge("rp-inflight", "inflightrepo")); got != 0 {
+		t.Errorf("ingest_gated with an ingest Job in flight = %v, want 0: the gate is not what is holding this repo", got)
+	}
+	if got := testutil.ToFloat64(r.Metrics.RepositoryIngestFailingGauge("rp-inflight", "inflightrepo")); got != 1 {
+		t.Errorf("ingest_failing while actively retrying = %v, want 1: the mask applies to gated repos, not to running ones", got)
+	}
+}
+
+// TestRepoReconcile_MissingProjectErrors pins the error deferral #525 introduced:
+// the owning-Project read moved to the top of Reconcile so the gate state is
+// available to the gauges, and its error is now checked 50-odd lines later. Drop
+// that check and the reconcile falls through to ingest.BuildJob with a
+// zero-value Project.
+func TestRepoReconcile_MissingProjectErrors(t *testing.T) {
+	mkRepo(t, "orphanrepo", "rp-nonexistent")
+
+	r := newRepoReconciler()
+	_, err := r.Reconcile(logf.IntoContext(context.Background(), logf.Log),
+		ctrl.Request{NamespacedName: types.NamespacedName{Namespace: testNS, Name: "orphanrepo"}})
+	if err == nil || !strings.Contains(err.Error(), "get owning project") {
+		t.Fatalf("reconcile err = %v, want a 'get owning project' failure", err)
+	}
+	if got := testutil.ToFloat64(r.Metrics.RepositoryIngestGatedGauge("rp-nonexistent", "orphanrepo")); got != 0 {
+		t.Errorf("ingest_gated with an unreadable Project = %v, want 0 (gate state is unknown, not closed)", got)
+	}
+	if jobs := listIngestJobs(t, "orphanrepo"); len(jobs) != 0 {
+		t.Fatalf("unreadable Project must not launch a job, got %d", len(jobs))
 	}
 }
 
