@@ -56,6 +56,31 @@ const (
 	incrementalFallbackThreshold = 3
 )
 
+// memoryStuckAlertFor mirrors the `for:` of tatara-observability's CRITICAL
+// "Memory stack stuck not ready" rule, which reads the same evidence
+// (operator_memory_stacks{phase=~"Provisioning|Failed|Degraded"}) per project.
+const memoryStuckAlertFor = 15 * time.Minute
+
+// ingestGateMaskDelay is how long the project memory stack must have been
+// continuously non-Ready before a gated repo's operator_repository_ingest_failing
+// gauge is masked (issue #525, see publishIngestHealth).
+//
+// It is a QUALIFICATION on entering the mask, deliberately not a dwell on
+// leaving it. A CHATTERING gate - a memory pod that restarts every few minutes,
+// each restart clearing Project.status.memory.readySince and buying a fresh
+// MemoryReadyStabilizationWindow - must NOT mask anything: the repo really is
+// stuck failing and nothing about a 3m blip changes that. Masking on a blip
+// would punch holes in the gauge that keep the 1h "Repository stuck in failing
+// ingest state" rule from ever reaching its `for`, which is strictly worse than
+// the deadlock this masking exists to fix.
+//
+// The delay is derived, not chosen: memoryStuckAlertFor is the window the
+// per-project critical memory alert needs on the same evidence, plus one
+// MemoryReadyStabilizationWindow of margin for scrape and evaluation latency.
+// The invariant it buys is that the mask can never engage on a repo whose
+// project is not already eligible to page in its own right.
+const ingestGateMaskDelay = memoryStuckAlertFor + tataradevv1alpha1.MemoryReadyStabilizationWindow
+
 // ingestBackoff returns the back-off duration for the given consecutive failure
 // count: base * 2^(failures-1), capped at maxIngestBackoff.
 func ingestBackoff(failures int) time.Duration {
@@ -149,7 +174,7 @@ func (r *RepositoryReconciler) doReconcile(ctx context.Context, req ctrl.Request
 	// failing gauge while it is genuinely retrying. This is a REPORTING
 	// predicate only - the gate itself keys on memoryGated alone, so a stale
 	// status.jobName can never let an ingest past it.
-	r.publishIngestHealth(&repo, memoryGated && repo.Status.JobName == "")
+	r.publishIngestHealth(&repo, memoryGated && repo.Status.JobName == "", memoryNotReadyFor(&project, time.Now()))
 
 	// item 7 (FIX-2): keep the printcolumn-backed open issue/incident counts
 	// fresh on every reconcile, independent of ingest state/gating - this MUST
@@ -426,9 +451,9 @@ func (r *RepositoryReconciler) doReconcile(ctx context.Context, req ctrl.Request
 // (issue #138). A disabled repo never reports failing. The last-ingest timestamp
 // lets PromQL compute staleness as time() - the gauge.
 //
-// It is the SINGLE writer of both ingest gauges, and "gated" wins over
-// "failing" (issue #525). The two used to be independent, which deadlocked: a
-// repo that was already failing when the memory-readiness gate closed launches
+// It is the SINGLE writer of both ingest gauges, and a SUSTAINED "gated" wins
+// over "failing" (issue #525). The two used to be independent, which deadlocked:
+// a repo that was already failing when the memory-readiness gate closed launches
 // no new ingest Job, and only a SUCCESSFUL ingest resets Phase/IngestFailureCount,
 // so the failing gauge stayed pinned at 1 for as long as the project memory
 // stack was down. mtg-decks held "Repository stuck in failing ingest state" for
@@ -437,21 +462,54 @@ func (r *RepositoryReconciler) doReconcile(ctx context.Context, req ctrl.Request
 // alone: IngestFailureCount also drives the exponential back-off and the
 // incremental-to-full escalation, so resetting it would restart back-off at 30s
 // and drop the self-heal the instant a just-recovered memory stack came back.
-// While the gate holds, operator_repository_ingest_gated is the accurate signal
-// (TataraIngestGated alerts on it); the mask is not latched, so the failing
-// gauge un-masks on the first reconcile after the gate opens. The caller decides
-// what "gated" means - see Reconcile: only a repo with no Job in flight counts,
-// or the mask would swallow a repo that is actively retrying.
-func (r *RepositoryReconciler) publishIngestHealth(repo *tataradevv1alpha1.Repository, gated bool) {
+// While the gate holds, operator_repository_ingest_gated is the accurate signal.
+//
+// notReadyFor is how long the project memory stack has been continuously
+// non-Ready, and the mask engages only past ingestGateMaskDelay. A gate that has
+// only just closed does NOT mask: see that constant for why a chattering gate
+// must keep reporting the truth. The mask is not latched in either direction -
+// it is recomputed every reconcile, so the failing gauge un-masks on the first
+// pass after the gate opens, with no successful ingest in between.
+//
+// The caller decides what "gated" means - see Reconcile: only a repo with no Job
+// in flight counts, or the mask would swallow a repo that is actively retrying.
+func (r *RepositoryReconciler) publishIngestHealth(repo *tataradevv1alpha1.Repository, gated bool, notReadyFor time.Duration) {
 	enabled := tataradevv1alpha1.BoolVal(repo.Spec.IngestEnabled, true)
 	gated = enabled && gated
 	r.Metrics.SetRepositoryIngestGated(repo.Spec.ProjectRef, repo.Name, gated)
-	failing := enabled && !gated && (repo.Status.Phase == "Failed" || repo.Status.IngestFailureCount > 0)
+	masked := gated && notReadyFor >= ingestGateMaskDelay
+	failing := enabled && !masked && (repo.Status.Phase == "Failed" || repo.Status.IngestFailureCount > 0)
 	r.Metrics.SetRepositoryIngestFailing(repo.Spec.ProjectRef, repo.Name, failing)
 	if repo.Status.LastIngestTime != nil {
 		r.Metrics.SetRepositoryLastIngestTimestamp(repo.Spec.ProjectRef, repo.Name,
 			float64(repo.Status.LastIngestTime.Unix()))
 	}
+}
+
+// memoryNotReadyFor reports how long p's memory stack has been continuously in a
+// non-Ready phase, and 0 when it is Ready or when no clock has been recorded.
+//
+// The clock is Project.status.memory.provisioningSince deliberately, not the
+// Repository's own MemoryNotReady condition: several Repository reconcile paths
+// (ingestEnabled toggled off, an unreadable Project, a failed count patch)
+// return before the condition is cleared, so that condition can stay True across
+// a recovery and hand a LATER gate close an hours-old transition time. This
+// field is maintained unconditionally by the Project reconciler, is cleared the
+// moment the stack reaches Ready, and is the exact quantity the per-project
+// operator_memory_stacks{phase=~"Provisioning|Failed|Degraded"} alert measures -
+// which is what makes ingestGateMaskDelay comparable to that alert's `for`.
+//
+// 0 for a Ready stack is not just a guard: publishIngestHealth only consults
+// this while the gate is closed, and a stack that is Ready-but-inside the
+// stabilization window is a healthy stack, not an outage.
+func memoryNotReadyFor(p *tataradevv1alpha1.Project, now time.Time) time.Duration {
+	if p == nil || p.Status.Memory == nil || p.Status.Memory.Phase == "Ready" {
+		return 0
+	}
+	if p.Status.Memory.ProvisioningSince == nil {
+		return 0
+	}
+	return now.Sub(p.Status.Memory.ProvisioningSince.Time)
 }
 
 // repairStaleFailedPhase enforces the invariant that Status.Phase=="Failed"

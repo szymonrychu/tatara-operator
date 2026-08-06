@@ -227,7 +227,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		// working unchanged.
 		repositoryIngestFailing: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "operator_repository_ingest_failing",
-			Help: "1 when a Repository is currently in a failing ingest state (status Phase=Failed or IngestFailureCount>0) AND is not held by the project memory-readiness gate, else 0. Current-state, recovery-aware signal that clears the moment a re-ingest succeeds, unlike the monotonic operator_ingest_job_total counter (issue #138). Reads 0 while operator_repository_ingest_gated is 1: a gated repo launches no new ingest Job, so nothing could reset its failure state and this gauge would pin forever (issue #525). Exponential back-off between retries does NOT mask it - only the gate does. Labelled by owning project (issue #457).",
+			Help: "1 when a Repository is currently in a failing ingest state (status Phase=Failed or IngestFailureCount>0) AND is not held by the project memory-readiness gate, else 0. Current-state, recovery-aware signal that clears the moment a re-ingest succeeds, unlike the monotonic operator_ingest_job_total counter (issue #138). Reads 0 while the repo is gated AND its project memory stack has been continuously non-Ready for 18m (ingestGateMaskDelay): once qualified, a gated repo launches no new ingest Job, so nothing could reset its failure state and this gauge would pin forever (issue #525). A SHORT gate does NOT mask it - a chattering memory stack would otherwise punch holes in this gauge and stop the 1h alert on it from ever firing. Exponential back-off between retries does NOT mask it - only the qualified gate does. Labelled by owning project (issue #457).",
 		}, []string{"project", "repo"}),
 		// Issue #434: a Repository whose re-ingest is held by the project
 		// memory-readiness gate is neither Failed nor accumulating failures, so
@@ -239,11 +239,13 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		// held only for a repo that was HEALTHY when the gate closed. One that
 		// was already failing kept repositoryIngestFailing at 1 with no way out,
 		// because clearing it needs a successful ingest and the gate forbids one.
-		// The publisher now masks it, which makes the two mutually exclusive by
-		// construction rather than by assumption.
+		// The publisher now masks it after a qualification delay (18m of
+		// continuous non-Ready project memory stack), so the two are mutually
+		// exclusive for a SUSTAINED gate, but deliberately NOT for a chattering
+		// one.
 		repositoryIngestGated: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "operator_repository_ingest_gated",
-			Help: "1 while a Repository's NEXT re-ingest is held by the project memory-readiness gate, else 0; a repo with an ingest Job already in flight reads 0, because the gate is not what is holding it. Mutually exclusive with operator_repository_ingest_failing, which is masked to 0 while this is 1 - a gated repo runs no new ingest Job, so it is waiting, not stuck failing (issues #434, #525). Labelled by owning project (issue #457).",
+			Help: "1 while a Repository's NEXT re-ingest is held by the project memory-readiness gate, else 0; a repo with an ingest Job already in flight reads 0, because the gate is not what is holding it. Mutually exclusive with operator_repository_ingest_failing only once this has been 1 for a sustained outage (18m of a non-Ready project memory stack, ingestGateMaskDelay) - during a shorter gate both can read 1. A gated repo runs no new ingest Job, so once the gate is sustained it is waiting, not stuck failing (issues #434, #525). Labelled by owning project (issue #457).",
 		}, []string{"project", "repo"}),
 		repositoryLastIngestTime: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "operator_repository_last_ingest_timestamp_seconds",
@@ -715,7 +717,8 @@ func (m *OperatorMetrics) ForgetRepository(repo string) {
 // clears as soon as a re-ingest succeeds, so alerting on it does not keep firing
 // for an hour after a self-healed transient burst (issue #138).
 //
-// Callers must pass failing=false while the repo is gated (issue #525); see
+// Callers must pass failing=false while the repo is gated AND that gate has
+// held past ingestGateMaskDelay (18m; issue #525); see
 // (*RepositoryReconciler).publishIngestHealth, the single writer of both gauges.
 func (m *OperatorMetrics) SetRepositoryIngestFailing(project, repo string, failing bool) {
 	m.trackRepoProject(project, repo)
@@ -730,8 +733,9 @@ func (m *OperatorMetrics) SetRepositoryIngestFailing(project, repo string, faili
 // 1 while its re-ingest is held by the project memory-readiness gate, else 0.
 // The gate is a silent hold - nothing fails, nothing retries - so
 // operator_repository_ingest_failing cannot see it (issue #434), and a repo that
-// was already failing when the gate closed has that gauge masked to 0 for the
-// duration, because no new ingest Job can run to clear it (issue #525).
+// was already failing when the gate closed has that gauge masked only after the
+// qualification delay (ingestGateMaskDelay, 18m), because no new ingest Job can
+// run to clear it once qualified (issue #525).
 //
 // Only the repo's NEXT ingest is gated: a repo whose Job is already in flight
 // is not held by the gate and must be reported gated=false, or its failing

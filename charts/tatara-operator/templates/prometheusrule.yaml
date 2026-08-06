@@ -123,29 +123,25 @@ spec:
             description: "operator_agent_unreachable_termination_total increased in 15m: a Task was killed because its wrapper agent stayed unreachable past the boot deadline."
         - alert: TataraIngestJobFailing
           expr: operator_repository_ingest_failing > 0
-          for: 15m
+          # 20m, strictly after the 18m ingestGateMaskDelay: a repo that starts
+          # failing at the same moment its project memory stack goes down must not
+          # fire at 15m and then resolve at 18m when the mask engages - that
+          # pairing is a guaranteed flap. 20m still sits far below the 1h window
+          # the routed tatara-observability sibling uses.
+          for: 20m
           labels:
             severity: {{ .Values.prometheusRule.severityLabel | quote }}
           annotations:
             summary: "memory re-ingest is failing for a repo"
-            description: "Repository {{ "{{" }} $labels.repo {{ "}}" }} (project {{ "{{" }} $labels.project {{ "}}" }}) has been in a failing ingest state (status Phase=Failed or unresolved consecutive ingest failures) for 15m: its recall corpus is going stale. This keys on the live per-repo operator_repository_ingest_failing gauge derived from the Repository status, so it clears the moment a re-ingest succeeds. Unlike the old increase(operator_ingest_job_total[1h]) alert it does NOT keep firing for an hour after a transient incremental burst self-heals via the full-ingest fallback (issue #138). A repo held by the memory-readiness gate is excluded at the source - the gauge is masked to 0 while operator_repository_ingest_gated is 1 - because a gated repo launches no new ingest Job and could therefore never clear this alert; it fires TataraIngestGated instead (issue #525). Back-off between retries does NOT mask the gauge, and neither does an ingest Job already in flight - only the gate does."
+            description: "Repository {{ "{{" }} $labels.repo {{ "}}" }} (project {{ "{{" }} $labels.project {{ "}}" }}) has been in a failing ingest state (status Phase=Failed or unresolved consecutive ingest failures) for 20m: its recall corpus is going stale. This keys on the live per-repo operator_repository_ingest_failing gauge derived from the Repository status, so it clears the moment a re-ingest succeeds. Unlike the old increase(operator_ingest_job_total[1h]) alert it does NOT keep firing for an hour after a transient incremental burst self-heals via the full-ingest fallback (issue #138). A repo held by the memory-readiness gate is masked to 0 only once the project memory stack has been continuously non-Ready for 18m (ingestGateMaskDelay) - a short memory blip does NOT mask it, so this alert can still fire in the first 18m of an outage. Once the mask engages, a gated repo launches no new ingest Job and could therefore never clear this alert on its own; it fires TataraIngestGated instead (issue #525). Back-off between retries does NOT mask the gauge, and neither does an ingest Job already in flight - only the qualified gate does."
         - alert: TataraIngestGated
-          # max_over_time, not the bare gauge, because a CHATTERING gate must page
-          # too (issue #525): every memory-pod restart clears Project.status.memory
-          # .readySince, so one >10s blip gates the whole project for a fresh 3m
-          # stabilization window. A stack restarting every ~10m therefore never
-          # holds gated=1 for a continuous hour, while masking ingest_failing for
-          # 3m out of every 10 - which would keep TataraIngestJobFailing's 15m
-          # window from ever closing either, and drop coverage to TataraIngestStale's
-          # 26h backstop. The 15m smear bridges the gaps; a single normal blip still
-          # only reaches ~18m of truth, well short of the 1h `for`.
-          expr: max_over_time(operator_repository_ingest_gated[15m]) > 0
+          expr: operator_repository_ingest_gated > 0
           for: 1h
           labels:
             severity: {{ .Values.prometheusRule.severityLabel | quote }}
           annotations:
             summary: "memory re-ingest is held by the memory-readiness gate"
-            description: "Repository {{ "{{" }} $labels.repo {{ "}}" }} (project {{ "{{" }} $labels.project {{ "}}" }}) has had its re-ingest held by the project memory-readiness gate for 1h. The gate is a SILENT hold - nothing fails and nothing retries - so operator_repository_ingest_failing reads 0 throughout and TataraIngestJobFailing cannot see it; a 37h fleet-wide freeze was previously caught only by TataraIngestStale's 26h backstop (issue #434). This alert is therefore the ONLY per-repo signal while the gate holds, including for a repo that was already failing when it closed: its failing gauge is masked to 0 for the duration, because gated means no new ingest Job runs and nothing could reset the failure state (issue #525). It fires on a CHATTERING gate as well as a held one (see the max_over_time in the expr), which is the case where neither alert would otherwise reach its window. The gate normally clears within the 3m memory-Ready stabilization window, so an hour of it means the project's memory stack is not converging - check operator_memory_stacks for that project. A repo whose ingest Job is already running is NOT reported gated, so this never fires for a repo that is mid-ingest."
+            description: "Repository {{ "{{" }} $labels.repo {{ "}}" }} (project {{ "{{" }} $labels.project {{ "}}" }}) has had its re-ingest held by the project memory-readiness gate for 1h. The gate is a SILENT hold - nothing fails and nothing retries - so a repo that was HEALTHY when the gate closed reads operator_repository_ingest_failing=0 throughout and TataraIngestJobFailing cannot see it; a 37h fleet-wide freeze was previously caught only by TataraIngestStale's 26h backstop (issue #434). This is the per-repo signal while the gate holds. A repo that was already failing when the gate closed keeps operator_repository_ingest_failing at 1 for the first 18m of the outage and only then has it masked, because gated means no new ingest Job runs and nothing could reset the failure state once the mask engages. The two gauges are therefore mutually exclusive only for a SUSTAINED gate (18m+ of continuous non-Ready memory stack), never for a chattering one. The gate normally clears within the 3m memory-Ready stabilization window, so an hour of it means the project's memory stack is not converging - check operator_memory_stacks for that project. A repo whose ingest Job is already running is NOT reported gated, so this never fires for a repo that is mid-ingest."
         - alert: TataraIngestStale
           expr: (time() - operator_repository_last_ingest_timestamp_seconds) > {{ .Values.prometheusRule.ingestStaleAfterSeconds }}
           for: 30m
