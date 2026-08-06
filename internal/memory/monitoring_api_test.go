@@ -94,12 +94,29 @@ func TestMemoryAPIReplicasBelowDeclared(t *testing.T) {
 //
 // It was also cluster-wide: `jobLabel` pins job="tatara-memory" for all three
 // Projects in one namespace (verified live), so a per-Project PrometheusRule was
-// evaluating a cluster-wide condition. absent() over a service-scoped selector
-// fixes both: it collapses to one series, and it scopes to this Project.
+// evaluating a cluster-wide condition. The `service` label is the only one that
+// distinguishes them.
+//
+// `max by (namespace, service) (...) == 0`, and deliberately NOT
+// `absent(up{...} == 1)`, which was the first attempt at this fix and is wrong
+// for a reason that is invisible until you run it. absent() derives its output
+// labels from its argument only when that argument is a plain vector selector;
+// given a filtered expression like `up{...} == 1` it can derive nothing and
+// emits a LABEL-LESS sample. Verified live:
+//
+//	absent(up{job=~".*tatara-memory.*", namespace="tatara", service="mem-x"} == 1)  ->  {}
+//	max by (namespace, service) (up{job=~".*tatara-memory.*", namespace="tatara"})
+//	  ->  {namespace="tatara", service="mem-mtg"} 1, {..., service="mem-tatara"} 1, ...
+//
+// A label-less sample gives all three Projects one Alertmanager fingerprint, so
+// the first Project to go down would suppress the notification for the other
+// two - the same defect the ..._NotKeyedOnScrapeHealth guard forbids elsewhere.
 func TestMemoryDownIsAggregatedAndPerProject(t *testing.T) {
 	r := apiRules(t, projectWithAPIReplicas("acme", 3))["MemoryDown"]
-	require.Equal(t, `absent(up{job=~".*tatara-memory.*", namespace="tatara", service="mem-acme"} == 1)`, r.Expr.StrVal)
+	require.Equal(t, `max by (namespace, service) (up{job=~".*tatara-memory.*", namespace="tatara", service="mem-acme"}) == 0`, r.Expr.StrVal)
 	require.Equal(t, "critical", r.Labels["severity"])
-	require.False(t, strings.Contains(r.Expr.StrVal, "== 0"),
-		"the unaggregated `up == 0` form yields one series per pod and false-pages when one replica of N is down")
+	require.True(t, strings.HasPrefix(r.Expr.StrVal, "max by (namespace, service)"),
+		"must aggregate: the bare `up == 0` form yields one series per pod and false-pages when one replica of N is down")
+	require.NotContains(t, r.Expr.StrVal, "absent(",
+		"absent() over a filtered expression emits a LABEL-LESS sample, collapsing all three Projects onto one Alertmanager fingerprint")
 }

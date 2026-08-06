@@ -407,17 +407,35 @@ func memoryAlertRules(p *tatarav1alpha1.Project, cluster, namespace string, back
 		{
 			// Class-A deadman: the recall backbone has no scrape target up.
 			//
-			// absent(), not `up == 0`. The bare form is unaggregated, so it yields
-			// one series per scrape target: at apiReplicas > 1 a single replica
-			// whose node is rebooting - the literal 2026-08-01 scenario - would
-			// fire this CRITICAL page, whose description says no instance is
-			// scrapeable, while the remaining replicas serve every request.
-			// absent() collapses that to one signal that means what the
-			// description claims. Scoping it to this Project's `service` also
-			// fixes a pre-existing bug: the selector was cluster-wide inside a
-			// per-Project PrometheusRule.
+			// Aggregated, not the bare `up == 0`. The bare form yields one series
+			// per scrape target, so at apiReplicas > 1 a single replica whose node
+			// is rebooting - the literal 2026-08-01 scenario - fires this CRITICAL
+			// page, whose description says NO instance is scrapeable, while the
+			// remaining replicas serve every request. The `max by` collapses that
+			// to one signal per Project that means what the description claims.
+			//
+			// `max by (namespace, service)` and NOT `absent(up{...} == 1)`, which
+			// is the obvious spelling and is wrong in a way that only shows up at
+			// runtime: absent() derives its output labels from its argument only
+			// when that argument is a plain vector selector. Given a filtered
+			// expression it derives nothing and emits a LABEL-LESS sample, so all
+			// three Projects would share one Alertmanager fingerprint and the first
+			// one down would suppress the notification for the other two. Verified
+			// live against this cluster:
+			//   absent(up{..., service="mem-x"} == 1)                  -> {}
+			//   max by (namespace, service) (up{..., namespace="tatara"})
+			//     -> {namespace="tatara", service="mem-mtg"} 1, {... "mem-tatara"} 1, ...
+			//
+			// Scoping to this Project's `service` also fixes a pre-existing bug:
+			// the selector was cluster-wide inside a per-Project PrometheusRule.
+			//
+			// This fires only when EVERY target for the Project is down. Targets
+			// that vanish from service discovery entirely produce no series and so
+			// no alert here - that case is MemoryAPIUnavailable's, which reads the
+			// Deployment from kube-state-metrics and does not depend on the API
+			// being scrapeable at all.
 			Alert:  "MemoryDown",
-			Expr:   intstr.FromString(fmt.Sprintf(`absent(up{%s} == 1)`, apiScrapeSelector)),
+			Expr:   intstr.FromString(fmt.Sprintf(`max by (namespace, service) (up{%s}) == 0`, apiScrapeSelector)),
 			For:    dur("5m"),
 			Labels: map[string]string{"severity": memorySeverityCritical},
 			Annotations: map[string]string{
