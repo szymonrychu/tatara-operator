@@ -165,18 +165,18 @@ func TestPublishIngestHealth(t *testing.T) {
 	}
 
 	// Failed phase -> failing 1.
-	r.publishIngestHealth(mkRepoObj("r-failed", "Failed", 0, true, nil), false)
+	r.publishIngestHealth(mkRepoObj("r-failed", "Failed", 0, true, nil), false, 0)
 	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("proj", "r-failed")); got != 1 {
 		t.Errorf("failed phase: failing = %v, want 1", got)
 	}
 	// Mid-retry (Ingesting but unresolved consecutive failures) -> failing 1.
-	r.publishIngestHealth(mkRepoObj("r-retry", "Ingesting", 2, true, nil), false)
+	r.publishIngestHealth(mkRepoObj("r-retry", "Ingesting", 2, true, nil), false, 0)
 	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("proj", "r-retry")); got != 1 {
 		t.Errorf("retrying: failing = %v, want 1", got)
 	}
 	// Healthy (Ingested, no failures) -> failing 0 and timestamp published.
 	ts := metav1.Unix(1750000000, 0)
-	r.publishIngestHealth(mkRepoObj("r-ok", "Ingested", 0, true, &ts), false)
+	r.publishIngestHealth(mkRepoObj("r-ok", "Ingested", 0, true, &ts), false, 0)
 	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("proj", "r-ok")); got != 0 {
 		t.Errorf("healthy: failing = %v, want 0", got)
 	}
@@ -185,16 +185,16 @@ func TestPublishIngestHealth(t *testing.T) {
 	}
 	// Recovery on the SAME repo: the gauge must clear, not stay latched - this is
 	// the whole point of the current-state signal vs the monotonic counter (#138).
-	r.publishIngestHealth(mkRepoObj("r-heal", "Failed", 3, true, nil), false)
+	r.publishIngestHealth(mkRepoObj("r-heal", "Failed", 3, true, nil), false, 0)
 	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("proj", "r-heal")); got != 1 {
 		t.Fatalf("pre-recovery: failing = %v, want 1", got)
 	}
-	r.publishIngestHealth(mkRepoObj("r-heal", "Ingested", 0, true, &ts), false)
+	r.publishIngestHealth(mkRepoObj("r-heal", "Ingested", 0, true, &ts), false, 0)
 	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("proj", "r-heal")); got != 0 {
 		t.Errorf("post-recovery: failing = %v, want 0 (must clear)", got)
 	}
 	// A disabled repo never reports failing even if its status looks failed.
-	r.publishIngestHealth(mkRepoObj("r-disabled", "Failed", 5, false, nil), false)
+	r.publishIngestHealth(mkRepoObj("r-disabled", "Failed", 5, false, nil), false, 0)
 	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("proj", "r-disabled")); got != 0 {
 		t.Errorf("disabled: failing = %v, want 0", got)
 	}
@@ -223,16 +223,24 @@ func TestPublishIngestHealth_Gated(t *testing.T) {
 		name            string
 		repo            *tataradevv1alpha1.Repository
 		gated           bool
+		notReadyFor     time.Duration
 		failing, isGate float64
 	}{
-		{"failing and gated", mkRepoObj("g-failing", 3, true), true, 0, 1},
-		{"failing, not gated", mkRepoObj("g-open", 3, true), false, 1, 0},
+		{"failing, gate held past the mask delay", mkRepoObj("g-failing", 3, true), true, ingestGateMaskDelay + time.Minute, 0, 1},
+		// Regression the review caught: under a chattering gate the mask must never
+		// engage, or "Repository stuck in failing ingest state" (1h `for`) can never
+		// fire, because the gate keeps re-closing before the alert's window elapses.
+		{"failing, gate only just closed (chatter)", mkRepoObj("g-chatter1", 3, true), true, 2 * time.Minute, 1, 1},
+		// Same regression, pinned right at the boundary: notReadyFor one second
+		// short of the delay must still report failing, not masked.
+		{"failing, gate closed just under the delay", mkRepoObj("g-chatter2", 3, true), true, ingestGateMaskDelay - time.Second, 1, 1},
+		{"failing, not gated", mkRepoObj("g-open", 3, true), false, ingestGateMaskDelay + time.Minute, 1, 0},
 		// A disabled repo is not held by the gate, it is switched off.
-		{"disabled and gated", mkRepoObj("g-disabled", 3, false), true, 0, 0},
+		{"disabled and gated", mkRepoObj("g-disabled", 3, false), true, ingestGateMaskDelay + time.Minute, 0, 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			r.publishIngestHealth(tc.repo, tc.gated)
+			r.publishIngestHealth(tc.repo, tc.gated, tc.notReadyFor)
 			if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("proj", tc.repo.Name)); got != tc.failing {
 				t.Errorf("ingest_failing = %v, want %v", got, tc.failing)
 			}
@@ -245,13 +253,81 @@ func TestPublishIngestHealth_Gated(t *testing.T) {
 	// The mask is not latched: the same repo un-masks the moment the gate opens,
 	// without any successful ingest in between.
 	repo := mkRepoObj("g-cycle", 3, true)
-	r.publishIngestHealth(repo, true)
+	r.publishIngestHealth(repo, true, ingestGateMaskDelay+time.Minute)
 	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("proj", "g-cycle")); got != 0 {
 		t.Fatalf("gated: ingest_failing = %v, want 0", got)
 	}
-	r.publishIngestHealth(repo, false)
+	r.publishIngestHealth(repo, false, 0)
 	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("proj", "g-cycle")); got != 1 {
 		t.Errorf("gate reopened: ingest_failing = %v, want 1", got)
+	}
+}
+
+// TestMemoryNotReadyFor pins how long a project's memory stack has been
+// continuously non-Ready, the input ingestGateMaskDelay is measured against.
+func TestMemoryNotReadyFor(t *testing.T) {
+	now := time.Now()
+	since := func(d time.Duration) *metav1.Time {
+		ts := metav1.NewTime(now.Add(-d))
+		return &ts
+	}
+
+	cases := []struct {
+		name string
+		p    *tataradevv1alpha1.Project
+		want time.Duration
+	}{
+		{"nil project", nil, 0},
+		{"nil memory status", &tataradevv1alpha1.Project{}, 0},
+		{
+			"ready, no ProvisioningSince",
+			&tataradevv1alpha1.Project{Status: tataradevv1alpha1.ProjectStatus{
+				Memory: &tataradevv1alpha1.MemoryStatus{Phase: "Ready"},
+			}},
+			0,
+		},
+		{
+			"ready, stale ProvisioningSince still wins as ready",
+			&tataradevv1alpha1.Project{Status: tataradevv1alpha1.ProjectStatus{
+				Memory: &tataradevv1alpha1.MemoryStatus{Phase: "Ready", ProvisioningSince: since(40 * time.Minute)},
+			}},
+			0,
+		},
+		{
+			"provisioning, no ProvisioningSince",
+			&tataradevv1alpha1.Project{Status: tataradevv1alpha1.ProjectStatus{
+				Memory: &tataradevv1alpha1.MemoryStatus{Phase: "Provisioning"},
+			}},
+			0,
+		},
+		{
+			"provisioning 40m",
+			&tataradevv1alpha1.Project{Status: tataradevv1alpha1.ProjectStatus{
+				Memory: &tataradevv1alpha1.MemoryStatus{Phase: "Provisioning", ProvisioningSince: since(40 * time.Minute)},
+			}},
+			40 * time.Minute,
+		},
+		{
+			"degraded 20m",
+			&tataradevv1alpha1.Project{Status: tataradevv1alpha1.ProjectStatus{
+				Memory: &tataradevv1alpha1.MemoryStatus{Phase: "Degraded", ProvisioningSince: since(20 * time.Minute)},
+			}},
+			20 * time.Minute,
+		},
+		{
+			"failed 20m",
+			&tataradevv1alpha1.Project{Status: tataradevv1alpha1.ProjectStatus{
+				Memory: &tataradevv1alpha1.MemoryStatus{Phase: "Failed", ProvisioningSince: since(20 * time.Minute)},
+			}},
+			20 * time.Minute,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := memoryNotReadyFor(tc.p, now); got != tc.want {
+				t.Errorf("memoryNotReadyFor() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -584,6 +660,19 @@ func TestRepoReconcile_GatedRepoDoesNotReportFailing(t *testing.T) {
 		t.Fatalf("seed failing status: %v", err)
 	}
 
+	// Seed the project memory as a LONG outage before the first reconcile, so the
+	// mask actually engages: a short/no-history non-ready gate must not mask (see
+	// TestRepoReconcile_ChatteringGateKeepsFailingVisible for that half).
+	project := getProject(t, "rp-gatedfail")
+	notReadySince := metav1.NewTime(time.Now().Add(-(ingestGateMaskDelay + 10*time.Minute)))
+	project.Status.Memory = &tataradevv1alpha1.MemoryStatus{
+		Phase:             "Degraded",
+		ProvisioningSince: &notReadySince,
+	}
+	if err := k8sClient.Status().Update(context.Background(), project); err != nil {
+		t.Fatalf("seed project memory outage: %v", err)
+	}
+
 	// One reconciler across both passes so the gauges survive between them.
 	r := newRepoReconciler()
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: testNS, Name: "gatedfailrepo"}}
@@ -619,6 +708,54 @@ func TestRepoReconcile_GatedRepoDoesNotReportFailing(t *testing.T) {
 	}
 	if jobs := listIngestJobs(t, "gatedfailrepo"); len(jobs) != 0 {
 		t.Fatalf("back-off must still hold the retry, got %d job(s)", len(jobs))
+	}
+}
+
+// TestRepoReconcile_ChatteringGateKeepsFailingVisible is the regression the
+// review caught: a memory stack that has only just gone non-Ready (chatter,
+// not a real outage) must not mask the failing gauge. If it did, a stack
+// that flaps in and out of Ready every couple of minutes would keep
+// operator_repository_ingest_failing masked forever and "Repository stuck in
+// failing ingest state" (1h `for`) could never fire.
+func TestRepoReconcile_ChatteringGateKeepsFailingVisible(t *testing.T) {
+	mkProject(t, "rp-chatter", "rp-chatter-scm")
+	mkSecret(t, "rp-chatter-scm", map[string][]byte{"token": []byte("x"), "webhookSecret": []byte("y")})
+	repo := mkRepo(t, "chatterrepo", "rp-chatter")
+
+	failedAt := metav1.NewTime(time.Now())
+	repo.Status.Phase = "Failed"
+	repo.Status.IngestFailureCount = 3
+	repo.Status.LastIngestedCommit = "deadbee"
+	repo.Status.LastIngestFailureTime = &failedAt
+	if err := k8sClient.Status().Update(context.Background(), repo); err != nil {
+		t.Fatalf("seed failing status: %v", err)
+	}
+
+	project := getProject(t, "rp-chatter")
+	notReadySince := metav1.NewTime(time.Now().Add(-2 * time.Minute))
+	project.Status.Memory = &tataradevv1alpha1.MemoryStatus{
+		Phase:             "Provisioning",
+		ProvisioningSince: &notReadySince,
+	}
+	if err := k8sClient.Status().Update(context.Background(), project); err != nil {
+		t.Fatalf("seed project memory chatter: %v", err)
+	}
+
+	r := newRepoReconciler()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: testNS, Name: "chatterrepo"}}
+	if _, err := r.Reconcile(logf.IntoContext(context.Background(), logf.Log), req); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if got := testutil.ToFloat64(r.Metrics.RepositoryIngestGatedGauge("rp-chatter", "chatterrepo")); got != 1 {
+		t.Fatalf("ingest_gated = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(r.Metrics.RepositoryIngestFailingGauge("rp-chatter", "chatterrepo")); got != 1 {
+		t.Errorf("ingest_failing = %v, want 1: a gate that has only just closed must not mask the "+
+			"failing gauge, else a chattering memory stack keeps the 1h alert from ever firing", got)
+	}
+	if jobs := listIngestJobs(t, "chatterrepo"); len(jobs) != 0 {
+		t.Fatalf("gated repo must not launch a job, got %d", len(jobs))
 	}
 }
 
