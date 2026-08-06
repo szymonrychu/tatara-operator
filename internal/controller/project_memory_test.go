@@ -1505,3 +1505,63 @@ func provisionDurationSum(t *testing.T, reg *prometheus.Registry) float64 {
 	t.Fatalf("operator_memory_provision_duration_seconds not found in registry")
 	return 0
 }
+
+func TestMemoryStackHealth_StatusReportsAvailabilityDuringRollout(t *testing.T) {
+	// status.memory.apiAvailableReplicas is documented as "the only Project-level
+	// record that a replica is missing", so it must not read 0 while three
+	// replicas answer every request.
+	//
+	// It used to, because the observed count was only assigned inside the
+	// deploymentTemplateConverged branch, and a rollout is by definition
+	// unconverged: the surge replica makes Replicas != UpdatedReplicas for its
+	// whole duration. Anyone reading the field mid-image-bump saw a total outage.
+	//
+	// The convergence gate still guards the READINESS input (memoryAvail, which
+	// feeds memoryPhase and notReadyComponents) - that is the issue-#355
+	// detection and it is deliberately unchanged. Only the reported count is
+	// unconditional.
+	ctx := context.Background()
+	r := newMemoryReconciler()
+	p := mkMemoryProject(t, "health-rollout-status")
+
+	p.Spec.Memory = &tataradevv1alpha1.MemorySpec{APIReplicas: 3}
+	if err := k8sClient.Update(ctx, p); err != nil {
+		t.Fatalf("set apiReplicas=3: %v", err)
+	}
+	if _, err := r.ensureNeo4jPassword(ctx, p); err != nil {
+		t.Fatalf("password: %v", err)
+	}
+	if err := r.applyMemoryStack(ctx, p); err != nil {
+		t.Fatalf("applyMemoryStack: %v", err)
+	}
+	fakeStackHealthy(t, p.Name)
+
+	// Mid-rollout: 4 pods counted (3 new + 1 old surge), 3 updated, 3 available.
+	names := memory.NamesFor(p.Name)
+	var mem appsv1.Deployment
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: names.Memory}, &mem); err != nil {
+		t.Fatalf("get memory deployment: %v", err)
+	}
+	mem.Status.ObservedGeneration = mem.Generation
+	mem.Status.Replicas = 4
+	mem.Status.UpdatedReplicas = 3
+	mem.Status.ReadyReplicas = 3
+	mem.Status.AvailableReplicas = 3
+	if err := k8sClient.Status().Update(ctx, &mem); err != nil {
+		t.Fatalf("fake mid-rollout deployment status: %v", err)
+	}
+
+	h, err := r.memoryStackHealth(ctx, p)
+	if err != nil {
+		t.Fatalf("memoryStackHealth: %v", err)
+	}
+
+	if h.memoryAvailObserved != 3 {
+		t.Fatalf("memoryAvailObserved = %d, want 3: three replicas are serving, the status field must say so mid-rollout", h.memoryAvailObserved)
+	}
+	// The readiness input stays gated on convergence: an unconverged template is
+	// the #355 signature and must not count as ready.
+	if h.memoryAvail != 0 {
+		t.Fatalf("memoryAvail = %d, want 0: the readiness gate must still refuse an unconverged rollout (#355)", h.memoryAvail)
+	}
+}

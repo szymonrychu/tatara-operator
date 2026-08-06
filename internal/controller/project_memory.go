@@ -360,8 +360,17 @@ type memoryHealth struct {
 	// memoryAvail / memoryWant are the observed and declared tatara-memory API
 	// replica counts. Both are recorded even while the stack reads Ready: above
 	// one replica a stack serving on 2 of 3 stays Ready on purpose.
-	memoryAvail int32
-	memoryWant  int32
+	//
+	// memoryAvail is the READINESS input and stays gated on template
+	// convergence, because an unconverged template is the issue-#355 signature.
+	// memoryAvailObserved is the same number ungated, and is what
+	// status.memory.apiAvailableReplicas reports: a rollout is unconverged by
+	// definition (the surge replica makes Replicas != UpdatedReplicas for its
+	// whole duration), so reporting the gated value made the status field read 0
+	// through every image bump while every replica answered requests.
+	memoryAvail         int32
+	memoryAvailObserved int32
+	memoryWant          int32
 }
 
 // notReadyComponents names the stack components below their readiness gate, in
@@ -471,8 +480,11 @@ func (r *ProjectReconciler) memoryStackHealth(ctx context.Context, p *tataradevv
 		if !apierrors.IsNotFound(e) {
 			return memoryHealth{}, fmt.Errorf("get memory deployment: %w", e)
 		}
-	} else if deploymentTemplateConverged(&mem) {
-		h.memoryAvail = mem.Status.AvailableReplicas
+	} else {
+		h.memoryAvailObserved = mem.Status.AvailableReplicas
+		if deploymentTemplateConverged(&mem) {
+			h.memoryAvail = mem.Status.AvailableReplicas
+		}
 	}
 
 	return h, nil
@@ -649,7 +661,7 @@ func (r *ProjectReconciler) reconcileMemory(ctx context.Context, p *tataradevv1a
 	// deliberately still Ready (the API is stateless behind a Service, so one
 	// available replica serves every request), so without these the partial loss
 	// is invisible from the Project alone.
-	p.Status.Memory.APIAvailableReplicas = h.memoryAvail
+	p.Status.Memory.APIAvailableReplicas = h.memoryAvailObserved
 	p.Status.Memory.APIWantReplicas = h.memoryWant
 
 	// Capture the current provisioning episode's start before the block below

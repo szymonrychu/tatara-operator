@@ -1,7 +1,6 @@
 package memory_test
 
 import (
-	"strings"
 	"testing"
 
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
@@ -20,12 +19,43 @@ func apiRules(t *testing.T, p *tatarav1alpha1.Project) map[string]monitoringv1.R
 	return out
 }
 
-// TestMemoryAPIUnavailable is the replacement page for total API loss.
+// TestEveryAlertCarriesTheProjectLabel is the structural guard for
+// cross-Project notification dedup, and it covers every rule rather than the
+// new ones only.
 //
-// It exists because deploymentTemplateConverged no longer demands
-// AvailableReplicas == Replicas: a Project serving 0 of 1, or 2 of 3, now stays
-// Ready as far as the Project phase is concerned, so the only remaining signal
-// of API loss is a Prometheus rule.
+// A PrometheusRule is per-Project, but the ALERT is identified by its label set.
+// Most of these expressions aggregate (sum, count, histogram_quantile over
+// `by (le)`), and an aggregation without `by` returns a LABEL-LESS sample - so
+// before this label, `MemoryPostgresInstancesBelowDeclared` firing for Project A
+// and for Project B produced two alerts with the identical label set
+// {alertname, severity}. Alertmanager sees one fingerprint and notifies once:
+// Project B's critical is silently swallowed by Project A's.
+//
+// Keying that on expression shape is exactly the accident that produced the
+// absent() bug. `project` makes it structural and testable instead.
+func TestEveryAlertCarriesTheProjectLabel(t *testing.T) {
+	// Three replicas and multi-instance postgres so the instance-gated rules
+	// (replication topology, MemoryAPIReplicasBelowDeclared) are generated too.
+	p := projectWithAPIReplicas("acme", 3)
+	p.Spec.Memory.PgInstances = 3
+
+	rules := apiRules(t, p)
+	require.Greater(t, len(rules), 10, "sanity: the gated rules should be present")
+	for name, r := range rules {
+		require.Equal(t, "acme", r.Labels["project"],
+			"alert %s has no project label: it would share an Alertmanager fingerprint with the other Projects' copy of the same rule", name)
+	}
+}
+
+// TestMemoryAPIUnavailable is the page for total loss of a Project's API.
+//
+// It is NOT justified by "the Project phase no longer tracks this" - that would
+// be false. memoryPhase still requires memoryAvail >= 1, so a Project serving
+// 0 of 1 still demotes to Provisioning and eventually Degraded exactly as it
+// did before; only PARTIAL loss stopped demoting. This rule earns its place on
+// two other differences: the Degraded path only pages after the whole
+// MemoryProvisioningTimeout (45m by default) has elapsed, and it reports the
+// Project as unhealthy rather than naming the API as the failed component.
 //
 // It keys on kube-state-metrics, NOT on `count(up{...} == 1)`. The API serves
 // /metrics from the same HTTP server as /readyz, and the ServiceMonitor keeps
@@ -36,38 +66,40 @@ func apiRules(t *testing.T, p *tatarav1alpha1.Project) map[string]monitoringv1.R
 //	2026-08-01T19:10:00Z -> 1
 //
 // A count(up == 1) rule would have scored the exact 2026-08-01 failure as healthy.
+//
+// The kube_deployment_created join is a warm-up guard, not decoration: a
+// brand-new Project takes cnpg bootstrap plus a LightRAG round-trip before
+// /readyz first succeeds, and routinely exceeds 10m. Without it, creating a
+// Project is a guaranteed false CRITICAL. The old `up == 0` could not fire for a
+// target that did not exist yet, so this is new noise that has to be bounded.
 func TestMemoryAPIUnavailable(t *testing.T) {
 	r, ok := apiRules(t, testProject("acme"))["MemoryAPIUnavailable"]
 	require.True(t, ok, "MemoryAPIUnavailable must be generated at every replica count")
 
-	require.Equal(t, `kube_deployment_status_replicas_available{namespace="tatara", deployment="mem-acme"} == 0`, r.Expr.StrVal)
+	require.Equal(t,
+		`(kube_deployment_status_replicas_available{namespace="tatara", deployment="mem-acme"} == 0)`+
+			` and on(namespace, deployment) (time() - kube_deployment_created{namespace="tatara", deployment="mem-acme"} > 2700)`,
+		r.Expr.StrVal)
 	require.Equal(t, "critical", r.Labels["severity"])
 	require.Equal(t, "10m", string(*r.For))
 }
 
-// TestMemoryAPIUnavailable_NotKeyedOnScrapeHealth is a regression guard, not a
-// duplicate of the above: it forbids reintroducing the count(up{...} == 1)
-// shape MemoryPostgresInstancesBelowDeclared correctly uses for cnpg. That
-// shape is right there and wrong here, for the reason quoted above.
-func TestMemoryAPIUnavailable_NotKeyedOnScrapeHealth(t *testing.T) {
-	rules := apiRules(t, projectWithAPIReplicas("acme", 3))
-	for _, name := range []string{"MemoryAPIUnavailable", "MemoryAPIReplicasBelowDeclared"} {
-		expr := rules[name].Expr.StrVal
-		require.NotContains(t, expr, "count(", "%s must not aggregate: count() returns a LABEL-LESS sample, so all three Projects would collapse onto one Alertmanager fingerprint and dedupe into a single notification", name)
-		require.NotContains(t, expr, "up{", "%s must not key on scrape health: up==1 is true for a NotReady replica on this stack", name)
-		require.Contains(t, expr, `namespace="tatara"`, "%s must carry KSM's namespace label", name)
-		require.Contains(t, expr, `deployment="mem-acme"`, "%s must carry KSM's deployment label so each Project gets its own fingerprint", name)
-	}
-}
-
-// TestMemoryAPIReplicasBelowDeclared is the PARTIAL-loss signal, and only that.
+// TestMemoryAPIReplicasBelowDeclared is the partial-loss signal.
 //
-// It is generated only above one replica: at one replica `< 1` is identical to
-// MemoryAPIUnavailable's `== 0`, and a rule that is inert-by-construction or a
-// verbatim duplicate of its neighbour is tech debt (hard rule 4).
+// `< N` with NO `> 0` filter, deliberately. An earlier draft filtered total loss
+// out so a dead Project would page critical once rather than critical plus
+// warning. That created a blind spot with no signal anywhere: this rule and
+// MemoryAPIUnavailable were then mutually exclusive, so an availability count
+// oscillating between N-1 and 0 reset one For clock every time it satisfied the
+// other and neither ever elapsed - which is the literal #528 mode, /readyz
+// intermittently timing out against a cold LightRAG. A monotonic 3 -> 2 -> 0
+// slide had the same gap. Overlapping windows and an occasional double page are
+// the cheaper mistake.
 //
-// The `> 0` filter keeps total loss out of it, so a dead Project pages critical
-// once instead of critical plus warning.
+// Still generated only above one replica: at one replica `< 1` IS
+// MemoryAPIUnavailable's `== 0`, and a rule that duplicates its neighbour
+// verbatim is tech debt (hard rule 4), the same reason the replication-topology
+// rules are instance-gated.
 func TestMemoryAPIReplicasBelowDeclared(t *testing.T) {
 	t.Run("absent at one replica", func(t *testing.T) {
 		_, ok := apiRules(t, testProject("acme"))["MemoryAPIReplicasBelowDeclared"]
@@ -77,10 +109,28 @@ func TestMemoryAPIReplicasBelowDeclared(t *testing.T) {
 	t.Run("present above one replica", func(t *testing.T) {
 		r, ok := apiRules(t, projectWithAPIReplicas("acme", 3))["MemoryAPIReplicasBelowDeclared"]
 		require.True(t, ok)
-		require.Equal(t, `(kube_deployment_status_replicas_available{namespace="tatara", deployment="mem-acme"} > 0) < 3`, r.Expr.StrVal)
+		require.Equal(t, `kube_deployment_status_replicas_available{namespace="tatara", deployment="mem-acme"} < 3`, r.Expr.StrVal)
 		require.Equal(t, "warning", r.Labels["severity"])
 		require.Equal(t, "15m", string(*r.For))
 	})
+}
+
+// TestMemoryAPIRulesNotKeyedOnScrapeHealth forbids reintroducing the
+// count(up{...} == 1) shape MemoryPostgresInstancesBelowDeclared correctly uses
+// for cnpg. That shape is right there and wrong here, for the reason quoted on
+// TestMemoryAPIUnavailable: on this stack up == 1 for a NotReady replica.
+//
+// It asserts a property the byte-for-byte expression tests above do not, so it
+// is not a dead restatement of them: it holds for whatever those expressions
+// become, which is the point of a guard.
+func TestMemoryAPIRulesNotKeyedOnScrapeHealth(t *testing.T) {
+	p := projectWithAPIReplicas("acme", 3)
+	for _, name := range []string{"MemoryAPIUnavailable", "MemoryAPIReplicasBelowDeclared"} {
+		r, ok := apiRules(t, p)[name]
+		require.True(t, ok)
+		require.NotContains(t, r.Expr.StrVal, "up{",
+			"%s must not key on scrape health: up==1 is true for a NotReady replica on this stack", name)
+	}
 }
 
 // TestMemoryDownIsAggregatedAndPerProject covers the finding that opting into
@@ -102,21 +152,15 @@ func TestMemoryAPIReplicasBelowDeclared(t *testing.T) {
 // for a reason that is invisible until you run it. absent() derives its output
 // labels from its argument only when that argument is a plain vector selector;
 // given a filtered expression like `up{...} == 1` it can derive nothing and
-// emits a LABEL-LESS sample. Verified live:
+// emits a LABEL-LESS sample. Verified live, and confirmed in the Prometheus
+// source (createLabelsForAbsentFunction switches on VectorSelector /
+// MatrixSelector only, and `up{...} == 1` is a BinaryExpr):
 //
 //	absent(up{job=~".*tatara-memory.*", namespace="tatara", service="mem-x"} == 1)  ->  {}
 //	max by (namespace, service) (up{job=~".*tatara-memory.*", namespace="tatara"})
 //	  ->  {namespace="tatara", service="mem-mtg"} 1, {..., service="mem-tatara"} 1, ...
-//
-// A label-less sample gives all three Projects one Alertmanager fingerprint, so
-// the first Project to go down would suppress the notification for the other
-// two - the same defect the ..._NotKeyedOnScrapeHealth guard forbids elsewhere.
 func TestMemoryDownIsAggregatedAndPerProject(t *testing.T) {
 	r := apiRules(t, projectWithAPIReplicas("acme", 3))["MemoryDown"]
 	require.Equal(t, `max by (namespace, service) (up{job=~".*tatara-memory.*", namespace="tatara", service="mem-acme"}) == 0`, r.Expr.StrVal)
 	require.Equal(t, "critical", r.Labels["severity"])
-	require.True(t, strings.HasPrefix(r.Expr.StrVal, "max by (namespace, service)"),
-		"must aggregate: the bare `up == 0` form yields one series per pod and false-pages when one replica of N is down")
-	require.NotContains(t, r.Expr.StrVal, "absent(",
-		"absent() over a filtered expression emits a LABEL-LESS sample, collapsing all three Projects onto one Alertmanager fingerprint")
 }

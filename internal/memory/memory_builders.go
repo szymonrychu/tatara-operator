@@ -88,13 +88,15 @@ func MemoryDeployment(p *tatarav1alpha1.Project, cfg Config) *appsv1.Deployment 
 						// On 2026-08-01 that cost ~95s of extra NotReady (nine /readyz calls
 						// cancelled at exactly 1.000s while LightRAG cold-started) on top of
 						// a restart storm that bumped restartCount by 6 on one Project and 4
-						// on another. failureThreshold is stated rather than inherited so the
-						// readiness tolerance (3 x 10s) is visible in the manifest.
+						// on another. failureThreshold is stated rather than inherited on all three, so
+						// each probe's tolerance is visible in the manifest: 20 x 5s for
+						// startup, 3 x 10s for liveness and readiness alike.
 						LivenessProbe: &corev1.Probe{
 							ProbeHandler:        corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromString("http")}},
 							InitialDelaySeconds: 5,
 							PeriodSeconds:       10,
 							TimeoutSeconds:      5,
+							FailureThreshold:    3,
 						},
 						ReadinessProbe: &corev1.Probe{
 							ProbeHandler:        corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/readyz", Port: intstr.FromString("http")}},

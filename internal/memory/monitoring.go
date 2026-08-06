@@ -6,6 +6,7 @@ import (
 
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/config"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -405,7 +406,9 @@ func memoryAlertRules(p *tatarav1alpha1.Project, cluster, namespace string, back
 
 	rules := []monitoringv1.Rule{
 		{
-			// Class-A deadman: the recall backbone has no scrape target up.
+			// Class-A: the recall backbone has no scrape target up. NOT a deadman - it
+			// needs the series to exist, so a Project whose targets never appeared at
+			// all is MemoryAPIUnavailable's business, not this rule's.
 			//
 			// Aggregated, not the bare `up == 0`. The bare form yields one series
 			// per scrape target, so at apiReplicas > 1 a single replica whose node
@@ -451,12 +454,28 @@ func memoryAlertRules(p *tatarav1alpha1.Project, cluster, namespace string, back
 			// terms: the pod was Running and scrapeable the whole time, just never
 			// Ready, so no scrape-health rule saw it.
 			//
-			// It also backfills what deploymentTemplateConverged deliberately gave
-			// up. That predicate no longer demands AvailableReplicas == Replicas, so
-			// a Project serving 0 of 1 (or 2 of 3) no longer demotes its own phase;
-			// the alerting layer owns that signal now.
-			Alert:  "MemoryAPIUnavailable",
-			Expr:   intstr.FromString(fmt.Sprintf(`kube_deployment_status_replicas_available{%s} == 0`, apiSelector)),
+			// It is NOT justified by "the Project phase no longer tracks this".
+			// That would be false: memoryPhase still requires memoryAvail >= 1, so
+			// total loss still demotes the Project to Provisioning and eventually
+			// Degraded exactly as before - only PARTIAL loss stopped demoting. What
+			// this adds over the phase is speed and attribution: the Degraded page
+			// only lands after the whole MemoryProvisioningTimeout has elapsed, and
+			// reports the Project unhealthy rather than naming the API.
+			//
+			// The kube_deployment_created join is a warm-up guard, not decoration.
+			// A brand-new Project needs cnpg bootstrap plus a LightRAG round-trip
+			// before /readyz first succeeds and routinely exceeds this rule's 10m
+			// For, so without it every Project creation is a guaranteed false
+			// CRITICAL. The old `up == 0` could not fire for a target that did not
+			// exist yet; this metric has no such protection, so the grace is
+			// explicit and matched to the provisioning budget the controller
+			// already allows.
+			Alert: "MemoryAPIUnavailable",
+			Expr: intstr.FromString(fmt.Sprintf(
+				`(kube_deployment_status_replicas_available{%s} == 0)`+
+					` and on(namespace, deployment) (time() - kube_deployment_created{%s} > %d)`,
+				apiSelector, apiSelector, int(config.DefaultMemoryProvisioningTimeout.Seconds()),
+			)),
 			For:    dur("10m"),
 			Labels: map[string]string{"severity": memorySeverityCritical},
 			Annotations: map[string]string{
@@ -588,13 +607,21 @@ func memoryAlertRules(p *tatarav1alpha1.Project, cluster, namespace string, back
 	// that duplicates its neighbour verbatim is tech debt (hard rule 4), exactly
 	// as the replication-topology rules below are instance-gated.
 	//
-	// The `> 0` filter keeps TOTAL loss out of this rule, so a dead Project pages
-	// critical once rather than critical plus warning on the same condition.
+	// Plain `< N`, with no `> 0` filter. Filtering total loss out - so a dead
+	// Project pages critical once instead of critical plus warning - was tried
+	// and reverted: it made this rule and MemoryAPIUnavailable mutually
+	// exclusive, so an availability count oscillating between N-1 and 0 reset one
+	// For clock every time it satisfied the other and NEITHER ever elapsed. That
+	// is the literal #528 mode (/readyz intermittently timing out against a cold
+	// LightRAG), and it would have had no signal anywhere - MemoryDown cannot see
+	// it (up == 1 for a NotReady replica) and MemoryHigh5xx cannot either (a
+	// NotReady pod is out of the endpoints and serves nothing). A monotonic
+	// 3 -> 2 -> 0 slide had the same gap. An occasional double page is cheaper.
 	if apiReplicas > 1 {
 		rules = append(rules, monitoringv1.Rule{
 			Alert: "MemoryAPIReplicasBelowDeclared",
 			Expr: intstr.FromString(fmt.Sprintf(
-				`(kube_deployment_status_replicas_available{%s} > 0) < %d`,
+				`kube_deployment_status_replicas_available{%s} < %d`,
 				apiSelector, apiReplicas,
 			)),
 			For:    dur("15m"),
@@ -796,6 +823,25 @@ func memoryAlertRules(p *tatarav1alpha1.Project, cluster, namespace string, back
 				},
 			},
 		)
+	}
+
+	// Stamp the Project onto EVERY rule, in one place, so a rule added later
+	// cannot forget it.
+	//
+	// A PrometheusRule is per-Project, but an alert is identified by its LABEL
+	// SET, and most of these expressions aggregate - sum(), count(),
+	// histogram_quantile over `by (le)` - which returns a label-less sample. So
+	// without this, MemoryPostgresInstancesBelowDeclared firing for two Projects
+	// produced two alerts labelled identically {alertname, severity}:
+	// Alertmanager sees ONE fingerprint and notifies once, silently swallowing
+	// the second Project's critical. (Three PrometheusRules also produced
+	// colliding ALERTS_FOR_STATE series in the same Prometheus.)
+	//
+	// Doing it here rather than per-expression is the point: leaving per-Project
+	// identity to depend on which labels an expression happens to preserve is
+	// exactly the accident that made absent() look correct.
+	for i := range rules {
+		rules[i].Labels["project"] = p.Name
 	}
 
 	return rules
