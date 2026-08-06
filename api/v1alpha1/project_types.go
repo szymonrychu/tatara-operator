@@ -41,10 +41,22 @@ type MemorySpec struct {
 	// that Project's memory API (issue #528, the 2026-08-01 4-of-5-node reboot).
 	// The PodDisruptionBudget the operator emits alongside the Deployment only
 	// starts protecting anything above 1.
+	//
+	// It is int32, not int, and carries an explicit Maximum. The value is
+	// narrowed to int32 on the way to the Deployment, and with a Go `int` field
+	// controller-gen omits `format: int32`, so the apiserver admits any int64
+	// and apiReplicas: 4294967296 wraps to replicas 0 - the memory API scaled to
+	// zero, with no error anywhere. Maximum bounds it below int32's own ceiling.
+	//
+	// Above 1 this does NOT buy tolerance of every node reboot: /readyz
+	// round-trips LightRAG, which is single-replica by storage (RWO PVC +
+	// Recreate), so rebooting its node fails readiness on all N API replicas
+	// together. Fixing that needs RWX or per-replica volumes.
 	// +kubebuilder:default=1
 	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=10
 	// +optional
-	APIReplicas int `json:"apiReplicas,omitempty"`
+	APIReplicas int32 `json:"apiReplicas,omitempty"`
 }
 
 // MemoryStatus reports the observed state of the per-Project memory stack.

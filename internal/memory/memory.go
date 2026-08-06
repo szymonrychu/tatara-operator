@@ -241,7 +241,7 @@ func PgInstances(p *tatarav1alpha1.Project) int {
 // any caller reasoning about the stack's HA posture read one source of truth.
 func APIReplicas(p *tatarav1alpha1.Project) int32 {
 	if p.Spec.Memory != nil && p.Spec.Memory.APIReplicas > 0 {
-		return int32(p.Spec.Memory.APIReplicas)
+		return p.Spec.Memory.APIReplicas
 	}
 	return defaultAPIReplicas
 }

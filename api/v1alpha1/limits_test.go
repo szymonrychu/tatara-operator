@@ -45,9 +45,21 @@ func TestCRDMaxLengthMatchesConstants(t *testing.T) {
 	}
 }
 
-// crdMaxLength walks the generated CRD's v1alpha1 openAPIV3Schema down path
-// (descending through items for array fields) and returns the leaf's maxLength.
+// crdMaxLength returns the leaf's maxLength facet at path in the generated CRD.
 func crdMaxLength(t *testing.T, crdFile string, path ...string) int {
+	t.Helper()
+	node := crdSchemaAt(t, crdFile, path...)
+	maxLen, ok := node["maxLength"].(float64)
+	if !ok {
+		t.Fatalf("CRD %s: %v carries no maxLength - the marker is missing", crdFile, path)
+	}
+	return int(maxLen)
+}
+
+// crdSchemaAt walks the generated CRD's v1alpha1 openAPIV3Schema down path
+// (descending through items for array fields) and returns the leaf schema node,
+// so a test can assert on any facet controller-gen emitted, not just maxLength.
+func crdSchemaAt(t *testing.T, crdFile string, path ...string) map[string]any {
 	t.Helper()
 	raw, err := os.ReadFile(filepath.Join("..", "..", "charts", "tatara-operator", "crd-bases", crdFile))
 	if err != nil {
@@ -89,9 +101,5 @@ func crdMaxLength(t *testing.T, crdFile string, path ...string) int {
 		}
 		node = next
 	}
-	maxLen, ok := node["maxLength"].(float64)
-	if !ok {
-		t.Fatalf("CRD %s: %v carries no maxLength - the marker is missing", crdFile, path)
-	}
-	return int(maxLen)
+	return node
 }
