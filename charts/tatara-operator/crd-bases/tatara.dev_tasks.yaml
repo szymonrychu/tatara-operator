@@ -364,6 +364,41 @@ spec:
                   type: string
                 maxItems: 50
                 type: array
+              lastTurn:
+                description: |-
+                  LastTurn is the most recent turn of this STAGE OCCUPANCY that produced
+                  anything - not the current pod's, and not merely the last one to complete
+                  (issue #527). It outlives a pod on the respawn path, and a turn that
+                  produced neither finalText nor pushedRepos leaves it alone. It is the only
+                  thing G.7's synthetic handoff note can be built from. Cleared on every
+                  stage transition, alongside PodStartedAt. See the LastTurn type doc.
+                properties:
+                  at:
+                    description: At is when the turn-complete callback landed.
+                    format: date-time
+                    type: string
+                  finalText:
+                    description: |-
+                      FinalText is the agent's last message, clamped to LastTurnFinalTextMaxBytes.
+                      The cap is deliberately well under NoteBodyMaxBytes (4096): the synthetic
+                      note wraps this text in framing, and a note the API server rejects on
+                      MaxLength is an EMPTY notes journal - the exact failure G.7 exists to
+                      prevent.
+                      Go-side twin: LastTurnFinalTextMaxBytes (limits.go). Change both together.
+                    maxLength: 2048
+                    type: string
+                  pushedRepos:
+                    description: |-
+                      PushedRepos are the repos the agent actually pushed this turn (contract
+                      G.2). RETAINED rather than reduced to a bool: without the names the next
+                      pod cannot tell "no diff" from "forgot to push" on a multi-repo Task.
+                    items:
+                      type: string
+                    maxItems: 20
+                    type: array
+                required:
+                - at
+                type: object
               mergeCursor:
                 description: |-
                   MergeCursor is the index into Spec.MergeOrder the sequential merge reached.

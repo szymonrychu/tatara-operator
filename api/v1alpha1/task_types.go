@@ -413,6 +413,61 @@ type Note struct {
 	Body string `json:"body"`
 }
 
+// LastTurn is the continuation payload of the most recent turn in the CURRENT
+// STAGE OCCUPANCY that PRODUCED anything: what the agent said, and what it
+// pushed.
+//
+// Produced anything, not merely completed. A turn that finished with neither
+// finalText nor pushedRepos (state="failed" is a real wrapper state) does not
+// overwrite this, because recording "nothing" would discard the newest turn
+// that did have something and make the next TTL stop report handoff="none" one
+// turn after the operator held a real payload. So this is the newest NON-EMPTY
+// payload, and handoff="none" means what the runbook says it means: no turn in
+// this stage ever produced anything.
+//
+// Stage occupancy, not pod. It normally describes the live pod, but it OUTLIVES
+// one on the respawn path: respawnLostPod writes no handoff note - a pod that
+// vanished mid-turn produced nothing to write - so this is the only surviving
+// trace of that pod's work, and clearing it there would turn a recoverable crash
+// into guaranteed loss. ttlStop DOES clear it, because that path has just spent
+// the payload on a synthetic note. Both sites carry the argument.
+//
+// So At is load-bearing, not incidental: the synthetic note renders it, because
+// a payload that may predate the pod being stopped must not read as that pod's.
+//
+// It exists for exactly one consumer, G.7's synthetic handoff note. A TTL stop
+// that the agent cannot answer has to write the handoff FOR it, and it can only
+// write what the operator kept. Before this field the operator kept nothing:
+// turncallback stamped annTurnComplete and threw finalText and pushedRepos away,
+// so ttlStop built agent.TTLStopInput with both fields at their zero values and
+// writeSyntheticNote rendered the constant string "Last turn's final text:
+// (none). Repos pushed: none." on EVERY synthetic path. The non-empty-notes
+// invariant was satisfied VACUOUSLY and the next pod resumed from a bundle whose
+// only note said nothing (issue #527).
+//
+// CLEARED ON EVERY STAGE TRANSITION, alongside PodStartedAt (see there). That
+// boundary is hard: carrying it across a transition would let a TTL stop in
+// implementing hand the next pod a clarify pod's final text.
+type LastTurn struct {
+	// At is when the turn-complete callback landed.
+	At metav1.Time `json:"at"`
+	// FinalText is the agent's last message, clamped to LastTurnFinalTextMaxBytes.
+	// The cap is deliberately well under NoteBodyMaxBytes (4096): the synthetic
+	// note wraps this text in framing, and a note the API server rejects on
+	// MaxLength is an EMPTY notes journal - the exact failure G.7 exists to
+	// prevent.
+	// Go-side twin: LastTurnFinalTextMaxBytes (limits.go). Change both together.
+	// +optional
+	// +kubebuilder:validation:MaxLength=2048
+	FinalText string `json:"finalText,omitempty"`
+	// PushedRepos are the repos the agent actually pushed this turn (contract
+	// G.2). RETAINED rather than reduced to a bool: without the names the next
+	// pod cannot tell "no diff" from "forgot to push" on a multi-repo Task.
+	// +optional
+	// +kubebuilder:validation:MaxItems=20
+	PushedRepos []string `json:"pushedRepos,omitempty"`
+}
+
 // TaskStats is the running usage/token accounting for a Task (contract A.4).
 type TaskStats struct {
 	TokensInput         int64 `json:"tokensInput,omitempty"`
@@ -512,6 +567,14 @@ type TaskStatus struct {
 	//       and under fix V6-6 the wrapper then 410s every turn it is given.
 	// +optional
 	PodStartedAt *metav1.Time `json:"podStartedAt,omitempty"`
+	// LastTurn is the most recent turn of this STAGE OCCUPANCY that produced
+	// anything - not the current pod's, and not merely the last one to complete
+	// (issue #527). It outlives a pod on the respawn path, and a turn that
+	// produced neither finalText nor pushedRepos leaves it alone. It is the only
+	// thing G.7's synthetic handoff note can be built from. Cleared on every
+	// stage transition, alongside PodStartedAt. See the LastTurn type doc.
+	// +optional
+	LastTurn *LastTurn `json:"lastTurn,omitempty"`
 	// Notes: append-only journal. IT IS the continuation state. Capped at 50 in
 	// Go (drop-oldest, spilled to tatara-memory); MaxItems is a backstop only.
 	// +optional

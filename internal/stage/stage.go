@@ -691,6 +691,10 @@ func Enter(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, to, reason string, now
 	t.Status.StageEnteredAt = &stamp
 	t.Status.PodStartedAt = nil
 	t.Status.StageWorkStartedAt = nil
+	// lastTurn belongs to the pod the clocks above measured (issue #527). Left
+	// standing, the new stage's G.7 TTL stop would build its synthetic handoff
+	// note from the OLD stage's final text.
+	t.Status.LastTurn = nil
 	t.Status.Stats.PodRecreations = 0
 	if !preserveElapsedCarry {
 		t.Status.StageElapsedCarrySeconds = 0

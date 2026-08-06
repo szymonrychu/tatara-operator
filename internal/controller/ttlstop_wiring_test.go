@@ -1,0 +1,150 @@
+// The wiring half of issue #527. internal/agent proves the stop sequence USES
+// LastFinalText/PushedRepos; this proves ttlStop actually SUPPLIES them. The
+// original defect lived entirely in the gap between those two facts: the
+// mechanism was correct and its only caller passed it nothing.
+package controller
+
+import (
+	"context"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+
+	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/agent"
+)
+
+// ttlStopTask is a Task whose pod is an hour past t0 with a recorded last turn.
+func ttlStopTask(name string, lastTurn *tatarav1alpha1.LastTurn) *tatarav1alpha1.Task {
+	started := metav1.NewTime(time.Now().Add(-2 * time.Hour))
+	return &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: mdNS, UID: types.UID("uid-" + name)},
+		Spec:       tatarav1alpha1.TaskSpec{Kind: "implement", ProjectRef: "proj", Goal: "g"},
+		Status: tatarav1alpha1.TaskStatus{
+			Stage:        tatarav1alpha1.StageImplementing,
+			PodStartedAt: &started,
+			LastTurn:     lastTurn,
+		},
+	}
+}
+
+func ttlStopProject() *tatarav1alpha1.Project {
+	p := tsProject(3)
+	p.Spec.AgentPodTTLSeconds = 3600
+	p.Spec.Agent.TurnTimeoutSeconds = 1
+	return p
+}
+
+// TestTTLStop_SyntheticNoteCarriesLastTurn is the root-cause regression at the
+// call site. The pod is gone (the wrapper is unreachable), so the synthetic path
+// runs - exactly the production shape - and the note it writes must contain the
+// last turn's work, not a placeholder.
+func TestTTLStop_SyntheticNoteCarriesLastTurn(t *testing.T) {
+	task := ttlStopTask("t-ttlwire", &tatarav1alpha1.LastTurn{
+		At:          metav1.Now(),
+		FinalText:   "rebased onto main; the merge gate is still red on lint",
+		PushedRepos: []string{"tatara-operator", "tatara-observability"},
+	})
+	c := newMirrorClient(t, task)
+	r := tsReconciler(c)
+
+	_, err := r.ttlStop(context.Background(), ttlStopProject(), task, "implement", time.Now())
+	require.NoError(t, err)
+
+	fresh := mdGetTask(t, c, "t-ttlwire")
+	require.Len(t, fresh.Status.Notes, 1, "the TTL stop must leave exactly its handoff note")
+	body := fresh.Status.Notes[0].Body
+	require.Contains(t, body, "rebased onto main; the merge gate is still red on lint",
+		"ttlStop did not pass status.lastTurn.finalText into TTLStopInput (#527)")
+	require.Contains(t, body, "tatara-operator, tatara-observability",
+		"ttlStop did not pass status.lastTurn.pushedRepos into TTLStopInput (#527)")
+	require.NotContains(t, body, agent.SyntheticNoteLostMarker)
+
+	require.Nil(t, fresh.Status.LastTurn, "lastTurn describes a pod that no longer exists")
+	require.Nil(t, fresh.Status.PodStartedAt, "the TTL stop re-arms the Task for a fresh pod")
+}
+
+// TestTTLStop_NoLastTurnWritesTheLossPlaceholder: with nothing recorded there is
+// genuinely nothing to hand off. The note must SAY that rather than render an
+// empty-fields handoff, which is what the next pod (and the alert) read.
+func TestTTLStop_NoLastTurnWritesTheLossPlaceholder(t *testing.T) {
+	task := ttlStopTask("t-ttlwire-empty", nil)
+	c := newMirrorClient(t, task)
+	r := tsReconciler(c)
+
+	_, err := r.ttlStop(context.Background(), ttlStopProject(), task, "implement", time.Now())
+	require.NoError(t, err)
+
+	fresh := mdGetTask(t, c, "t-ttlwire-empty")
+	require.Len(t, fresh.Status.Notes, 1)
+	require.Contains(t, fresh.Status.Notes[0].Body, agent.SyntheticNoteLostMarker)
+}
+
+// TestTTLStop_LongFinalTextStillFitsTheNote: LastTurn.FinalText is capped at
+// 2048 bytes and Note.Body at 4096 precisely so the note the stop writes is
+// always writable. A note the API server rejects is an EMPTY journal.
+func TestTTLStop_LongFinalTextStillFitsTheNote(t *testing.T) {
+	task := ttlStopTask("t-ttlwire-long", &tatarav1alpha1.LastTurn{
+		At:        metav1.Now(),
+		FinalText: strings.Repeat("x", tatarav1alpha1.LastTurnFinalTextMaxBytes),
+	})
+	c := newMirrorClient(t, task)
+	r := tsReconciler(c)
+
+	_, err := r.ttlStop(context.Background(), ttlStopProject(), task, "implement", time.Now())
+	require.NoError(t, err)
+
+	fresh := mdGetTask(t, c, "t-ttlwire-long")
+	require.Len(t, fresh.Status.Notes, 1)
+	require.LessOrEqual(t, len(fresh.Status.Notes[0].Body), tatarav1alpha1.NoteBodyMaxBytes)
+}
+
+// TestRespawnLostPod_KeepsLastTurn locks a DELIBERATE divergence, not a
+// convenience. ttlStop nils status.lastTurn because it has just spent the
+// payload on a synthetic note; respawnLostPod writes no note at all, so the same
+// nil here would turn a recoverable crash into guaranteed loss. The field
+// therefore outlives its pod on this path only, and the two sites say so.
+func TestRespawnLostPod_KeepsLastTurn(t *testing.T) {
+	task := ttlStopTask("t-respawn-lt", &tatarav1alpha1.LastTurn{
+		At:          metav1.Now(),
+		FinalText:   "the vanished pod's only surviving trace",
+		PushedRepos: []string{"tatara-operator"},
+	})
+	c := newMirrorClient(t, task)
+	r := tsReconciler(c)
+
+	_, err := r.respawnLostPod(context.Background(), ttlStopProject(), task, time.Now())
+	require.NoError(t, err)
+
+	fresh := mdGetTask(t, c, "t-respawn-lt")
+	require.Nil(t, fresh.Status.PodStartedAt, "the respawn re-arms the pod clock")
+	require.NotNil(t, fresh.Status.LastTurn,
+		"respawnLostPod writes no handoff note, so clearing lastTurn discards the dead pod's only trace")
+	require.Equal(t, "the vanished pod's only surviving trace", fresh.Status.LastTurn.FinalText)
+	require.Empty(t, fresh.Status.Notes, "the respawn path writes no note; that is why lastTurn must survive it")
+}
+
+// TestTTLStop_SyntheticNoteDatesItsPayload: because lastTurn can outlive its pod
+// (see above), the note must date the turn it was built from rather than imply
+// it is the stopped pod's own work.
+func TestTTLStop_SyntheticNoteDatesItsPayload(t *testing.T) {
+	at := metav1.NewTime(time.Now().Add(-90 * time.Minute).Truncate(time.Second))
+	task := ttlStopTask("t-ttlwire-dated", &tatarav1alpha1.LastTurn{
+		At:        at,
+		FinalText: "work from a pod that already crashed",
+	})
+	c := newMirrorClient(t, task)
+	r := tsReconciler(c)
+
+	_, err := r.ttlStop(context.Background(), ttlStopProject(), task, "implement", time.Now())
+	require.NoError(t, err)
+
+	fresh := mdGetTask(t, c, "t-ttlwire-dated")
+	require.Len(t, fresh.Status.Notes, 1)
+	require.Contains(t, fresh.Status.Notes[0].Body, at.UTC().Format(time.RFC3339),
+		"ttlStop did not pass status.lastTurn.at into TTLStopInput")
+}

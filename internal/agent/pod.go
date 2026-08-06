@@ -535,7 +535,7 @@ func AgentEnv(project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) []core
 		{Name: "TATARA_SKILL_PROFILE", Value: profileForKind(kind)},
 		{Name: "TATARA_REPO", Value: agentRepoEnv(task)},
 		{Name: "TASK_BRANCH", Value: taskBranch},
-		{Name: "AGENT_POD_TTL_SECONDS", Value: strconv.Itoa(PodTTLSeconds(project, task))},
+		{Name: EnvAgentPodTTLSeconds, Value: strconv.Itoa(PodTTLSeconds(project, task))},
 		{Name: "TATARA_CONTRACT_VERSION", Value: strconv.Itoa(ContractVersion)},
 	}
 }
@@ -560,7 +560,7 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		{Name: "MODEL", Value: modelForKindOnRepo(project, task.Spec.Kind, task.Labels[tatarav1alpha1.LabelActivity], targetRepo)},
 		{Name: "EFFORT", Value: effortForKind(project, task.Spec.Kind, task.Labels[tatarav1alpha1.LabelActivity])},
 		{Name: "PERMISSION_MODE", Value: project.Spec.Agent.PermissionMode},
-		{Name: "TURN_TIMEOUT_SECONDS", Value: strconv.Itoa(project.Spec.Agent.TurnTimeoutSeconds)},
+		{Name: EnvTurnTimeoutSeconds, Value: strconv.Itoa(project.Spec.Agent.TurnTimeoutSeconds)},
 		{Name: "DEFAULT_CALLBACK_URL", Value: strings.TrimSuffix(cfg.CallbackURL, "/") + "/internal/turn-complete"},
 		// Push-metrics: the wrapper Pod is too short-lived to be reliably
 		// scraped, so it pushes its /metrics to the operator's push-receiver

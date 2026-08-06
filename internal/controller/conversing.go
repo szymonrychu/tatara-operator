@@ -65,13 +65,19 @@ func (r *TaskReconciler) conversingHandoffAndPark(ctx context.Context, proj *tat
 			Deadline:    now,
 			TurnTimeout: time.Duration(proj.Spec.Agent.TurnTimeoutSeconds) * time.Second,
 		}
-		outcome, err := stopper.StopWithHandoff(ctx, task, in)
+		// Same material as the TTL path: without it the synthetic note is a
+		// placeholder (issue #527).
+		if lt := task.Status.LastTurn; lt != nil {
+			in.LastFinalText, in.PushedRepos, in.LastTurnAt = lt.FinalText, lt.PushedRepos, lt.At.Time
+		}
+		res, err := stopper.StopWithHandoff(ctx, task, in)
 		if err != nil {
 			return fmt.Errorf("conversing: handoff stop on %s: %w", task.Name, err)
 		}
-		log.FromContext(ctx).Info("conversation handed off",
-			"action", "conversing_handoff", "resource_id", task.Name,
-			"cause", cause, "outcome", outcome)
+		logTTLStop(ctx,
+			"conversation handed off",
+			"conversation ended with NO continuation state captured; this pod's work is unrecorded",
+			"conversing_handoff", res, "resource_id", task.Name, "cause", cause)
 	}
 
 	if err := EnterStage(ctx, r.Client, sp, r.Metrics, task, mrs,

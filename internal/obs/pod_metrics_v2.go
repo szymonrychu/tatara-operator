@@ -22,18 +22,34 @@ var agentContractMismatchTotal = prometheus.NewCounterVec(prometheus.CounterOpts
 }, []string{"expected", "got", "image"})
 
 // agentPodTTLExpiredTotal counts agent pods stopped by the G.7 TTL stop
-// sequence, by how the handoff was captured:
+// sequence, on TWO INDEPENDENT dimensions.
 //
-//	agent_handoff     - the agent answered the handoff turn and wrote its note
-//	synthetic_handoff - the handoff turn was refused/failed; the operator wrote
-//	                    a synthetic note from finalText + pushedRepos
-//	force_deleted     - as synthetic_handoff, and the pod had to be force-deleted
+// outcome - how the POD was stopped:
 //
-// Task.status.notes is NEVER empty after a TTL stop, in any of the three.
+//	graceful      - the wrapper session closed and the pod came down
+//	force_deleted - the graceful stop failed against a live pod, so it was
+//	                deleted with a zero grace period
+//
+// handoff - how the CONTINUATION STATE was captured, which is the dimension that
+// decides whether work was lost:
+//
+//	agent     - the agent answered the handoff turn and wrote its own note
+//	synthetic - the operator wrote the note from lastTurn's finalText/pushedRepos
+//	none      - the operator held NOTHING to write; the note that landed is a
+//	            placeholder. THIS is the silent-work-loss bucket to alert on.
+//
+// They were ONE label until issue #527, and every consumer read it wrong as a
+// result: the stop dimension overwrote the capture dimension on any teardown
+// error, so synthetic_handoff was unreachable and never once recorded, while
+// alerts/tatara-operator.yaml fired on force_deleted claiming "neither an agent
+// handoff nor a synthetic one" - a state the code could not produce.
+//
+// Task.status.notes is NEVER empty after a TTL stop, on any pairing. handoff=none
+// is precisely the case where non-empty is not the same as useful.
 var agentPodTTLExpiredTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Name: "operator_agent_pod_ttl_expired_total",
-	Help: "Agent pods stopped by the pod TTL stop sequence (contract G.7), by agent kind and handoff outcome.",
-}, []string{"agent_kind", "outcome"})
+	Help: "Agent pods stopped by the pod TTL stop sequence (contract G.7), by agent kind, how the pod was stopped (outcome), and how continuation state was captured (handoff).",
+}, []string{"agent_kind", "outcome", "handoff"})
 
 func init() {
 	ctrlmetrics.Registry.MustRegister(agentContractMismatchTotal, agentPodTTLExpiredTotal)
@@ -51,12 +67,13 @@ func AgentContractMismatchCounter(expected, got, image string) prometheus.Counte
 }
 
 // AgentPodTTLExpired increments operator_agent_pod_ttl_expired_total for one
-// TTL-stopped pod. outcome is agent_handoff|synthetic_handoff|force_deleted.
-func AgentPodTTLExpired(agentKind, outcome string) {
-	agentPodTTLExpiredTotal.WithLabelValues(agentKind, outcome).Inc()
+// TTL-stopped pod. outcome is graceful|force_deleted; handoff is
+// agent|synthetic|none.
+func AgentPodTTLExpired(agentKind, outcome, handoff string) {
+	agentPodTTLExpiredTotal.WithLabelValues(agentKind, outcome, handoff).Inc()
 }
 
 // AgentPodTTLExpiredCounter returns the counter for test assertions.
-func AgentPodTTLExpiredCounter(agentKind, outcome string) prometheus.Counter {
-	return agentPodTTLExpiredTotal.WithLabelValues(agentKind, outcome)
+func AgentPodTTLExpiredCounter(agentKind, outcome, handoff string) prometheus.Counter {
+	return agentPodTTLExpiredTotal.WithLabelValues(agentKind, outcome, handoff)
 }
