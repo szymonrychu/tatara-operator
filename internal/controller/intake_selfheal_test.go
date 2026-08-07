@@ -19,7 +19,7 @@ import (
 // Task create and its MergeRequest/Issue bind (a restart, e.g. during a rollout)
 // leaves the Task alive but the artifact an UNBOUND stub - no controller owner,
 // empty status - and the Task with no ref. Every later mint pass hit the
-// created=false backstop and returned WITHOUT re-binding, so the artifact stayed
+// non-created backstop and returned WITHOUT re-binding, so the artifact stayed
 // orphaned forever: ownedMRs found nothing and the review agent's submit_outcome
 // 400'd ("this task owns no open MR") on every retry. The backstop now repairs
 // the binding against the existing live twin.
@@ -103,9 +103,9 @@ func TestMintReviewTask_RepairsUnboundMRStub(t *testing.T) {
 	stub := unboundMRStub(num)
 	m, c := minterFor(t, proj, repo, twin, stub)
 
-	_, created, err := m.MintForItem(context.Background(), proj, repo, reviewPRItem(num), false, nil)
+	_, outcome, err := m.MintForItem(context.Background(), proj, repo, reviewPRItem(num), false, nil)
 	require.NoError(t, err)
-	require.False(t, created, "the live twin already holds the natural key; the create no-ops")
+	require.Equal(t, MintExistingLive, outcome, "the live twin already holds the natural key; the create no-ops")
 
 	var mr tatarav1alpha1.MergeRequest
 	require.NoError(t, c.Get(context.Background(), nn(tatarav1alpha1.MergeRequestName("tatara-operator", num)), &mr))
@@ -129,9 +129,9 @@ func TestMintReviewTask_RepairsMissingMR(t *testing.T) {
 	twin := reviewTwin(num)
 	m, c := minterFor(t, proj, repo, twin) // no MR CR at all
 
-	_, created, err := m.MintForItem(context.Background(), proj, repo, reviewPRItem(num), false, nil)
+	_, outcome, err := m.MintForItem(context.Background(), proj, repo, reviewPRItem(num), false, nil)
 	require.NoError(t, err)
-	require.False(t, created)
+	require.Equal(t, MintExistingLive, outcome)
 
 	var mr tatarav1alpha1.MergeRequest
 	require.NoError(t, c.Get(context.Background(), nn(tatarav1alpha1.MergeRequestName("tatara-operator", num)), &mr),
@@ -152,9 +152,17 @@ func TestMintReviewTask_RepairIdempotent(t *testing.T) {
 	m, c := minterFor(t, proj, repo, twin, stub)
 
 	for i := 0; i < 3; i++ {
-		_, created, err := m.MintForItem(context.Background(), proj, repo, reviewPRItem(num), false, nil)
+		_, outcome, err := m.MintForItem(context.Background(), proj, repo, reviewPRItem(num), false, nil)
 		require.NoError(t, err)
-		require.False(t, created)
+		if i == 0 {
+			// The stub is still unbound, so ClassifyPR routes to PRReview and the
+			// live twin holds the natural key: the repair runs on THIS pass.
+			require.Equal(t, MintExistingLive, outcome)
+			continue
+		}
+		// The repair bound the stub, so the MR is now owned and classification
+		// says nothing is owed - never MintCreated on any pass.
+		require.Equal(t, MintNotOwed, outcome)
 	}
 
 	var tk tatarav1alpha1.Task
@@ -186,10 +194,10 @@ func TestMintReviewTask_RepairNeverStealsForeignOwner(t *testing.T) {
 
 	m, c := minterFor(t, proj, repo, twin, stub)
 	pr := reviewPRItem(num).PR
-	_, created, err := m.MintReviewTask(context.Background(), proj, repo, pr, stub,
+	_, outcome, err := m.MintReviewTask(context.Background(), proj, repo, pr, stub,
 		tatarav1alpha1.StageTriaging, "", nil)
 	require.NoError(t, err, "refusing to steal is a clean no-op, never a heartbeat-suppressing error")
-	require.False(t, created)
+	require.Equal(t, MintExistingLive, outcome)
 
 	var mr tatarav1alpha1.MergeRequest
 	require.NoError(t, c.Get(context.Background(), nn(stub.Name), &mr))
@@ -258,10 +266,10 @@ func TestMintIssueTask_RepairsUnboundIssueStub(t *testing.T) {
 
 	ext := scm.Issue{Number: num, State: "open", Author: "alice", Title: "boom",
 		URL: "https://github.com/szymonrychu/tatara-operator/issues/" + strconv.Itoa(num)}
-	_, created, err := m.MintIssueTask(context.Background(), proj, repo, ext,
+	_, outcome, err := m.MintIssueTask(context.Background(), proj, repo, ext,
 		tatarav1alpha1.StageTriaging, "", nil)
 	require.NoError(t, err)
-	require.False(t, created, "the live twin already holds the natural key; the create no-ops")
+	require.Equal(t, MintExistingLive, outcome, "the live twin already holds the natural key; the create no-ops")
 
 	var iss tatarav1alpha1.Issue
 	require.NoError(t, c.Get(context.Background(), nn(tatarav1alpha1.IssueName("tatara-operator", num)), &iss))

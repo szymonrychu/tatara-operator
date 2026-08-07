@@ -106,10 +106,10 @@ func TestSweepAfterWebhook_NoDoubleMint(t *testing.T) {
 
 	// Drive the shared funnel again as the sweep would, same natural key.
 	m := &controller.Minter{Client: c, APIReader: c, Scheme: c.Scheme()}
-	_, created, err := m.MintForItem(context.Background(), proj, repo,
+	_, outcome, err := m.MintForItem(context.Background(), proj, repo,
 		controller.ForgeItem{Issue: scm.Issue{Number: 353, State: "open", Author: "alice"}}, false, nil)
 	require.NoError(t, err)
-	require.False(t, created, "the Issue CR is owned; the sweep backstop no-ops")
+	require.Equal(t, controller.MintNotOwed, outcome, "the Issue CR is owned; the sweep backstop no-ops")
 	require.Len(t, allTasks(t, c, "mp4"), 1)
 }
 

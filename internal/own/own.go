@@ -136,6 +136,35 @@ func OldestSurvivingOwner(obj client.Object, live map[string]bool) (string, bool
 	return "", false
 }
 
+// DropOwner removes EVERY Task-kind owner ref naming task from obj, IN MEMORY,
+// and reports whether anything changed so the caller can skip its Update.
+//
+// It exists for the ONE case RepairZeroController does not cover, and the
+// distinction is issue #521: RepairZeroController handles "no ref carries
+// controller=true"; this handles "a ref names a Task that DOES NOT EXIST". A
+// dangling controller ref is not ownership, it is a string, and it must be
+// REMOVED rather than read past - the same ref also misroutes ownerTaskRequests
+// (stage_controller.go), the reaper cascade and ourMR, so a caller that merely
+// ignored it would leave three other consumers still wrong.
+//
+// LIVENESS IS NOT DECIDED HERE. This package is memory-only by its own package
+// doc; the caller Gets the Task and decides. See Minter.resolveLiveOwner.
+func DropOwner(obj client.Object, task string) bool {
+	refs := obj.GetOwnerReferences()
+	kept := make([]metav1.OwnerReference, 0, len(refs))
+	for _, r := range refs {
+		if isTaskRef(r) && r.Name == task {
+			continue
+		}
+		kept = append(kept, r)
+	}
+	if len(kept) == len(refs) {
+		return false
+	}
+	obj.SetOwnerReferences(kept)
+	return true
+}
+
 // RepairZeroController is B.2 rule 5's guard. An Issue/MergeRequest must NEVER
 // have zero controller owners: with plain owners and no controller owner it is
 // worked by nobody and re-minted by nobody, because the sweep's orphan

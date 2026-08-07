@@ -2,6 +2,7 @@ package obs
 
 import (
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
@@ -90,8 +91,11 @@ var SweepErrorsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Help: "Sweep errors, by project, activity and reason (contract K.1).",
 }, []string{"project", "activity", "reason"})
 
-// SweepSkippedTotal counts per-item work the sweep DELIBERATELY did not do, by
-// project, activity and reason. It is the counterpart to SweepErrorsTotal and
+// SweepSkippedTotal counts per-item work the INTAKE FUNNEL deliberately did not
+// do, by project, activity and reason. The sweep is one producer
+// (activity="sweep"); the webhook is the other (activity="webhook",
+// Minter.MintForItem naming the IsOrphanIssue clause that refused a live
+// delivery). It is the counterpart to SweepErrorsTotal and
 // exists so a benign, self-clearing steady state stays VISIBLE without being
 // reported as a fault (issue #477: a PR whose MergeRequest another live Task
 // already controller-owns used to raise a hard sweep error on every 4h pass,
@@ -100,12 +104,172 @@ var SweepErrorsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 // operator_sweep_errors_total and not on ERROR line counts.
 var SweepSkippedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Name: "operator_sweep_skipped_total",
-	Help: "Sweep items deliberately skipped, by project, activity and reason (contract B.4).",
+	Help: "Intake items deliberately skipped, by project, activity (sweep|webhook) and reason (contract B.4).",
 }, []string{"project", "activity", "reason"})
 
+// SweepStaleOwnerRepairedTotal counts Issue AND MergeRequest mirrors whose
+// controller ownerRef named a Task the API server no longer has, and which the
+// intake funnel therefore REPAIRED by dropping the ref (issue #521). BOTH
+// mirror kinds: the reaper releases ownership of them symmetrically
+// (releaseOwnership), so the dangling-ref defect existed identically on both.
+// It is deliberately NOT a SweepSkippedTotal reason: a repair is work done, and
+// it is followed by a mint in the SAME pass, so sharing a series with "I did
+// nothing" would hide the difference between the bug being fixed and the bug
+// still running.
+//
+// Expected shape after the #521 rollout: a single burst (one per stranded
+// artifact, five issues in the tatara project) and then flat forever. A
+// SUSTAINED rate on activity="sweep" is a reap that is not handing over
+// ownership - go read B.5, not this counter. activity="webhook" is the same
+// repair reached from a live forge delivery instead of a pass; a reap is still
+// what produced the stale ref, so the same instruction applies.
+var SweepStaleOwnerRepairedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "operator_sweep_stale_owner_repaired_total",
+	Help: "Issue/MergeRequest mirrors whose controller ownerRef named a non-existent Task and was dropped, by project and activity (contract B.2/B.4, issue #521).",
+}, []string{"project", "activity"})
+
+// SweepOrphanStrandedSeconds is the sweep's DEADMAN, and it exists because the
+// only sweep alert before it was a LIVENESS heartbeat
+// (SweepLastSuccessTimestamp), which reported green for 19 hours while five
+// open issues in tatara/tatara-operator had no Task at all (issue #521). A
+// heartbeat structurally cannot catch that class: the sweep WAS running,
+// correctly, doing nothing. This measures the WORK instead - one series per
+// open, allowed-author issue that FINISHED a sweep pass with no live owning
+// Task, valued at that issue's age in seconds.
+//
+// Steady state is ZERO SERIES. Alert on max by (project) over a threshold well
+// past one sweep period; the {repo, number} labels NAME the offender, which a
+// pre-aggregated max cannot.
+//
+// It is set for every orphan the pass did not serve - budget-bound, tombstone-
+// deleted, AND every per-item ERROR exit. That last group is the one an earlier
+// draft missed, and it under-reported exactly when the sweep was failing: an
+// issue whose list_comments or mint failed ended the pass with no live owning
+// Task, which is the literal definition above.
+//
+// CARDINALITY (contract K.1). Per-issue labels mean the series MUST be deleted
+// when the issue is served, exactly like MergeCursorStalledSeconds: a gauge
+// that is never deleted is scraped forever and /metrics grows without bound.
+// ClearSweepOrphanStranded is called at the top of every per-repo sweep, and it
+// is scoped to (project, repo) rather than project because SweepProject is
+// called with dueRepos - clearing by project would wipe series for repos this
+// pass never looked at.
+var SweepOrphanStrandedSeconds = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "operator_sweep_orphan_stranded_seconds",
+	Help: "Age in seconds of an open, allowed-author issue that finished a sweep pass with no live owning Task, by project, repo and number (contract B.4/K.1, issue #521).",
+}, []string{"project", "repo", "number"})
+
+// ClearSweepOrphanStranded deletes every stranded series for one (project,
+// repo). Called at the top of each per-repo sweep, so an issue served by this
+// pass loses its series on this pass.
+func ClearSweepOrphanStranded(project, repo string) {
+	SweepOrphanStrandedSeconds.DeletePartialMatch(prometheus.Labels{"project": project, "repo": repo})
+}
+
+// RetainSweepOrphanStranded deletes every stranded series for `project` whose
+// repo is NOT in keep. It is the LEAK half of ClearSweepOrphanStranded, and it
+// exists because that function only ever runs from inside a sweep pass: a
+// project whose sweep is switched off, whose issueScan cron is emptied or made
+// unparseable, whose Repository is unenrolled, or which is DELETED outright
+// never sweeps that repo again, so its last value is scraped forever. The
+// intended alert is `max by (project) (...) > threshold`, so a frozen 19h
+// series pages permanently until the pod rolls - a deadman that cannot be
+// switched off is not a deadman, it is an alarm nobody will believe.
+//
+// keep == nil (or empty) retracts the whole project: that IS the disabled /
+// no-cron / deleted case.
+//
+// It enumerates rather than taking the repo set on faith because
+// DeletePartialMatch can only express "delete these labels", never "keep only
+// these" - and the repos that leak are by definition the ones the caller no
+// longer has a name for.
+func RetainSweepOrphanStranded(project string, keep []string) {
+	kept := make(map[string]bool, len(keep))
+	for _, r := range keep {
+		kept[r] = true
+	}
+	ch := make(chan prometheus.Metric, 64)
+	go func() {
+		SweepOrphanStrandedSeconds.Collect(ch)
+		close(ch)
+	}()
+	var drop []string
+	for m := range ch {
+		var d dto.Metric
+		if err := m.Write(&d); err != nil {
+			continue
+		}
+		var gotProject, gotRepo string
+		for _, lp := range d.Label {
+			switch lp.GetName() {
+			case "project":
+				gotProject = lp.GetValue()
+			case "repo":
+				gotRepo = lp.GetValue()
+			}
+		}
+		if gotProject == project && !kept[gotRepo] {
+			drop = append(drop, gotRepo)
+		}
+	}
+	for _, repo := range drop {
+		SweepOrphanStrandedSeconds.DeletePartialMatch(prometheus.Labels{"project": project, "repo": repo})
+	}
+}
+
+// MintOutcomeError is the {outcome} label value for a mint that FAILED. It is
+// deliberately not a controller.MintOutcome member - that vocabulary describes
+// what a caller must DO NEXT, and an error is already a returned error - but
+// without it the series counts only the good news, which is the same
+// "green and silent" shape issue #521 spent 19 hours inside.
+const MintOutcomeError = "error"
+
+// MintOutcomeTotal counts every intake mint attempt by its typed outcome
+// (controller.MintOutcome). It is the metric half of replacing a bare
+// `created bool`, which collapsed FOUR states into one bit and let
+// resume.go log a re-mint that never happened: "nothing was owed" and "I
+// deleted a Task holding this name and the mint is still owed" were the same
+// value. A non-zero rate on outcome="tombstone_deleted" is a re-mint-after-reap
+// churn signal; a non-zero rate on outcome="existing_live" is the normal
+// webhook-beats-sweep backstop.
+var MintOutcomeTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "operator_intake_mint_outcome_total",
+	Help: "Intake mint attempts by task kind and typed outcome (contract B.4).",
+}, []string{"kind", "outcome"})
+
 // sweepSkipReasons is the closed skip-reason set. Keep in sync with sweep.go's
-// SweepSkip* constants.
-var sweepSkipReasons = []string{"mr_claimed_by_other_task"}
+// SweepSkip* constants - enforced by TestSweepSkipReasonsMatchSweepConstants,
+// which scans them out of the source, because the identical prose instruction
+// on sweepSeedReasons had already drifted from four call sites (issue #495).
+var sweepSkipReasons = []string{
+	"mr_claimed_by_other_task",
+	"issue_not_open",
+	"issue_owned",
+	"issue_reporter_not_allowed",
+	"mint_budget_bound",
+	"already_minted",
+	"tombstone_deleted",
+	"mint_not_owed",
+}
+
+// mintOutcomeKinds x mintOutcomes is MintOutcomeTotal's closed label set, seeded
+// for the same reason every other counter here is: a CounterVec with no
+// WithLabelValues call has NO series at all, so increase(...[1h]) is blind to
+// the first mint after every pod roll. Kept literal (no reverse import of
+// internal/controller) exactly like sweepSeedReasons.
+var mintOutcomeKinds = []string{"clarify", "review"}
+var mintOutcomes = []string{"not_owed", "created", "existing_live", "tombstone_deleted", MintOutcomeError}
+
+// sweepActivities is the closed {activity} set for the two intake-funnel
+// counters BOTH the sweep and the webhook produce. The webhook half was
+// implicitly labelled "sweep" until issue #521's review; a mint driven by a
+// live forge delivery is not a sweep pass and must not read as one.
+var sweepActivities = []string{"sweep", WebhookActivity}
+
+// WebhookActivity mirrors controller.WebhookActivity. Literal here for the same
+// no-reverse-import reason as sweepSeedReasons; the two are pinned together by
+// TestWebhookActivityMatchesTheControllerConstant.
+const WebhookActivity = "webhook"
 
 // sweepSeedReasons is the closed fail(reason, ...) set for sweep.go's B.4 pass
 // (SweepActivity), plus list_tasks. Literal here (not imported from
@@ -125,7 +289,7 @@ var sweepSeedReasons = []string{
 	"list_comments", "get_issue", "mint_issue_task", "clear_webhook_marker",
 	"get_owning_task", "get_mr_cr", "adopt_pr", "mint_review_task",
 	"reopen_retained_proposal", "get_mr_cr_post_classify", "list_pr_comments",
-	"reconcile_ownership",
+	"reconcile_ownership", "resolve_live_owner",
 }
 
 // cronReasons/refineReasons are the closed reason sets for projectscan.go's
@@ -167,7 +331,15 @@ func SeedSweepErrorsForProject(project string) {
 	seedLabels(seed, []string{project}, []string{"documentation", "issueScan"}, cronReasons)
 	seedLabels(seed, []string{project}, []string{"refine"}, refineReasons)
 	skip := func(l ...string) { SweepSkippedTotal.WithLabelValues(l...) }
-	seedLabels(skip, []string{project}, []string{"sweep"}, sweepSkipReasons)
+	seedLabels(skip, []string{project}, sweepActivities, sweepSkipReasons)
+	for _, activity := range sweepActivities {
+		SweepStaleOwnerRepairedTotal.WithLabelValues(project, activity)
+	}
+	// MintOutcomeTotal carries NO project label, so this is process-global and
+	// idempotent - seeded here rather than in init() only because this is where
+	// its neighbours are, and its absence was the gap the #521 review found.
+	mint := func(l ...string) { MintOutcomeTotal.WithLabelValues(l...) }
+	seedLabels(mint, mintOutcomeKinds, mintOutcomes)
 }
 
 func init() {
@@ -178,5 +350,8 @@ func init() {
 		SweepNextExpectedTimestamp,
 		SweepErrorsTotal,
 		SweepSkippedTotal,
+		SweepStaleOwnerRepairedTotal,
+		MintOutcomeTotal,
+		SweepOrphanStrandedSeconds,
 	)
 }

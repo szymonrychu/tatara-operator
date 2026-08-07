@@ -200,11 +200,20 @@ func (s *Server) maybeTriggerLabelMint(ctx context.Context, provider string, pro
 	item := controller.ForgeItem{Issue: scm.Issue{
 		Number: ev.Number, State: "open", Author: ev.ActorLogin,
 		Title: ev.Title, Body: ev.Body, Labels: ev.Labels, URL: ev.URL}}
-	if _, created, merr := s.minter().MintForItem(ctx, proj, repo, item, true, s.cfg.SpillerFor(proj)); merr != nil {
+	_, outcome, merr := s.minter().MintForItem(ctx, proj, repo, item, true, s.cfg.SpillerFor(proj))
+	if merr != nil {
 		s.log.ErrorContext(ctx, "issues: trigger-label mint failed", "error", merr,
 			"project", proj.Name, "issue_ref", ev.IssueRef)
 		return
-	} else if created {
+	}
+	if outcome == controller.MintTombstoneDeleted {
+		// Best-effort backstop: there is no response to fail, and the sweep's
+		// 30s tombstone requeue re-drives the mint that is still owed.
+		s.log.InfoContext(ctx, "issues: trigger-label mint deleted a stale terminal task; the sweep re-drives it",
+			"project", proj.Name, "issue_ref", ev.IssueRef)
+		return
+	}
+	if outcome == controller.MintCreated {
 		if cerr := controller.ClearWebhookOriginated(ctx, s.cfg.Client, s.reader(), s.cfg.Namespace, tatarav1.IssueName(repo.Name, ev.Number)); cerr != nil {
 			s.log.ErrorContext(ctx, "issues: clear webhook-originated marker failed", "error", cerr, "issue_ref", ev.IssueRef)
 		}

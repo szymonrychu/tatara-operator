@@ -579,6 +579,11 @@ func (s *Server) minter() *controller.Minter {
 		Scheme:     s.cfg.Client.Scheme(),
 		Metrics:    nil,
 		SpillerFor: s.cfg.SpillerFor, // EnsureTaskForMRComment resolves its own spiller (OP6)
+		// A webhook mint is NOT a sweep pass. Attributing its skips and its
+		// stale-owner repairs to activity="sweep" made
+		// SweepStaleOwnerRepairedTotal's own triage instruction wrong for this
+		// half of the producers.
+		Activity: controller.WebhookActivity,
 	}
 }
 
@@ -666,12 +671,23 @@ func (s *Server) handleIssueOpened(ctx context.Context, w http.ResponseWriter, p
 		Number: ev.Number, State: "open", Author: ev.ActorLogin,
 		Title: ev.Title, Body: ev.Body, Labels: ev.Labels, URL: ev.URL,
 	}}
-	if _, created, merr := s.minter().MintForItem(ctx, &proj, repo, item, true, s.cfg.SpillerFor(&proj)); merr != nil {
+	_, outcome, merr := s.minter().MintForItem(ctx, &proj, repo, item, true, s.cfg.SpillerFor(&proj))
+	if merr != nil {
 		s.log.ErrorContext(ctx, "issues: primary mint failed", "error", merr,
 			"project", proj.Name, "issue_ref", ev.IssueRef)
 		s.reject(w, http.StatusInternalServerError, "mint issue", provider, ev.Kind, ev.Action, "error")
 		return
-	} else if created {
+	}
+	if outcome == controller.MintTombstoneDeleted {
+		// A dead twin held the natural key and was just deleted; the mint is
+		// still OWED. 500 so the forge redelivers within seconds, which is this
+		// file's existing policy for a mint that did not land.
+		s.log.ErrorContext(ctx, "issues: mint deleted a stale terminal task; the mint is still owed",
+			"project", proj.Name, "issue_ref", ev.IssueRef)
+		s.reject(w, http.StatusInternalServerError, "mint issue", provider, ev.Kind, ev.Action, "error")
+		return
+	}
+	if outcome == controller.MintCreated {
 		// Consumed-exactly-once (F7-1): this mint READ the liveness marker (it
 		// minted ACTIVE), so clear it - only the sweep did before, so a webhook
 		// mint left the marker to re-activate the issue on a later reap cycle.
@@ -714,12 +730,22 @@ func (s *Server) handleMROpened(ctx context.Context, w http.ResponseWriter, prov
 		Number: ev.Number, Author: ev.ActorLogin, HeadSHA: ev.HeadSHA,
 		HeadBranch: ev.HeadBranch, Repo: repoSlug(repo), Body: ev.Body, Labels: ev.Labels,
 	}}
-	if _, created, merr := s.minter().MintForItem(ctx, &proj, repo, item, false, s.cfg.SpillerFor(&proj)); merr != nil {
+	_, outcome, merr := s.minter().MintForItem(ctx, &proj, repo, item, false, s.cfg.SpillerFor(&proj))
+	if merr != nil {
 		s.log.ErrorContext(ctx, "mr: primary mint failed", "error", merr,
 			"project", proj.Name, "issue_ref", ev.IssueRef)
 		s.reject(w, http.StatusInternalServerError, "mint mr", provider, ev.Kind, ev.Action, "error")
 		return
-	} else if created {
+	}
+	if outcome == controller.MintTombstoneDeleted {
+		// See handleIssueOpened: the mint is still OWED, so 500 and let the
+		// forge redeliver rather than reporting an accepted no-op.
+		s.log.ErrorContext(ctx, "mr: mint deleted a stale terminal task; the mint is still owed",
+			"project", proj.Name, "issue_ref", ev.IssueRef)
+		s.reject(w, http.StatusInternalServerError, "mint mr", provider, ev.Kind, ev.Action, "error")
+		return
+	}
+	if outcome == controller.MintCreated {
 		s.log.InfoContext(ctx, "mr: webhook minted review task",
 			"action", "mr_webhook_mint", "project", proj.Name, "repository", repo.Name, "number", ev.Number)
 	}
@@ -807,14 +833,23 @@ func (s *Server) handleIssueComment(ctx context.Context, w http.ResponseWriter, 
 			// comment gets dropped with no sweep recovery (the issue is now owned, so
 			// IsOrphanIssue skips it). MintStage still checks TataraParkedLabel FIRST, so
 			// a deliberately backlog-parked issue stays parked regardless.
-			if _, created, merr := s.minter().MintForItem(ctx, &proj, commentRepo, item, true, s.cfg.SpillerFor(&proj)); merr != nil {
+			_, outcome, merr := s.minter().MintForItem(ctx, &proj, commentRepo, item, true, s.cfg.SpillerFor(&proj))
+			if merr != nil {
 				// Parity with handleIssueOpened/handleMROpened (fix F-misc): a mint error
 				// is a 5xx so GitHub redelivers, rather than a silent 202 that waits for
 				// the next sweep.
 				s.log.ErrorContext(ctx, "issue_comment: orphan mint failed", "error", merr, "issue_ref", ev.IssueRef)
 				s.reject(w, http.StatusInternalServerError, "mint orphan issue comment", provider, ev.Kind, ev.Action, "error")
 				return
-			} else if created {
+			}
+			if outcome == controller.MintTombstoneDeleted {
+				// The mint is still OWED; same 5xx-and-redeliver policy as above.
+				s.log.ErrorContext(ctx, "issue_comment: orphan mint deleted a stale terminal task; the mint is still owed",
+					"issue_ref", ev.IssueRef)
+				s.reject(w, http.StatusInternalServerError, "mint orphan issue comment", provider, ev.Kind, ev.Action, "error")
+				return
+			}
+			if outcome == controller.MintCreated {
 				if cerr := controller.ClearWebhookOriginated(ctx, s.cfg.Client, s.reader(), s.cfg.Namespace, tatarav1.IssueName(commentRepo.Name, ev.Number)); cerr != nil {
 					s.log.ErrorContext(ctx, "issue_comment: clear webhook-originated marker failed", "error", cerr, "issue_ref", ev.IssueRef)
 				}

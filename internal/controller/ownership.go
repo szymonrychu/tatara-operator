@@ -333,8 +333,15 @@ func (d *StageDriver) reMintReviewOwner(ctx context.Context, proj *tatarav1alpha
 	prevOwner, _ := own.ControllerOwner(mr) // "" when mr carries no controller yet
 	pr := prRefFromMR(repo, mr)
 	stg, reason := MintReviewStage(mr)
-	if _, _, err := d.minter().MintReviewTask(ctx, proj, repo, pr, mr, stg, reason, d.spiller(proj), prevOwner); err != nil {
+	_, outcome, err := d.minter().MintReviewTask(ctx, proj, repo, pr, mr, stg, reason, d.spiller(proj), prevOwner)
+	if err != nil {
 		return fmt.Errorf("flip: re-mint review task: %w", err)
+	}
+	if outcome == MintTombstoneDeleted {
+		// The mint is still OWED: this MR has no review owner yet. Return an
+		// error so the MergeRequest reconciler requeues rather than reporting a
+		// hand-back that did not happen.
+		return fmt.Errorf("flip: re-mint review task for %s deleted a stale terminal task; the mint is still owed", mr.Name)
 	}
 	return nil
 }
