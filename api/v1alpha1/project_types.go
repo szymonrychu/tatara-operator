@@ -34,6 +34,29 @@ type MemorySpec struct {
 	// +kubebuilder:default="10Gi"
 	// +optional
 	Neo4jStorage string `json:"neo4jStorage,omitempty"`
+	// APIReplicas sizes the per-Project tatara-memory API Deployment. It stays 1
+	// by default so existing Projects are unchanged, but is now settable: at one
+	// replica the topologySpreadConstraints and podAntiAffinity already on the pod
+	// template are inert, so any reboot of the hosting node is a 100% outage of
+	// that Project's memory API (issue #528, the 2026-08-01 4-of-5-node reboot).
+	// The PodDisruptionBudget the operator emits alongside the Deployment only
+	// starts protecting anything above 1.
+	//
+	// It is int32, not int, and carries an explicit Maximum. The value is
+	// narrowed to int32 on the way to the Deployment, and with a Go `int` field
+	// controller-gen omits `format: int32`, so the apiserver admits any int64
+	// and apiReplicas: 4294967296 wraps to replicas 0 - the memory API scaled to
+	// zero, with no error anywhere. Maximum bounds it below int32's own ceiling.
+	//
+	// Above 1 this does NOT buy tolerance of every node reboot: /readyz
+	// round-trips LightRAG, which is single-replica by storage (RWO PVC +
+	// Recreate), so rebooting its node fails readiness on all N API replicas
+	// together. Fixing that needs RWX or per-replica volumes.
+	// +kubebuilder:default=1
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=10
+	// +optional
+	APIReplicas int32 `json:"apiReplicas,omitempty"`
 }
 
 // MemoryStatus reports the observed state of the per-Project memory stack.
@@ -81,6 +104,16 @@ type MemoryStatus struct {
 	// instance-manager endpoint (see MEMORY.md 2026-07-26).
 	// +optional
 	PgPrimary string `json:"pgPrimary,omitempty"`
+	// APIAvailableReplicas / APIWantReplicas are the observed and declared
+	// tatara-memory API replica counts. Like the CNPG counts they are recorded
+	// even while the stack reads Ready: above one replica a stack serving on 2 of
+	// 3 replicas stays Ready on purpose (the API is stateless behind a Service, so
+	// one available replica serves every request), and these are then the only
+	// Project-level record that a replica is missing.
+	// +optional
+	APIAvailableReplicas int32 `json:"apiAvailableReplicas,omitempty"`
+	// +optional
+	APIWantReplicas int32 `json:"apiWantReplicas,omitempty"`
 }
 
 // MemoryReadyStabilizationWindow is how long the memory stack must hold

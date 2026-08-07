@@ -32,7 +32,7 @@ func MemoryConfigMap(p *tatarav1alpha1.Project, cfg Config) *corev1.ConfigMap {
 // their respective Secrets.
 func MemoryDeployment(p *tatarav1alpha1.Project, cfg Config) *appsv1.Deployment {
 	n := NamesFor(p.Name)
-	replicas := int32(1)
+	replicas := APIReplicas(p)
 	sel := selectorLabels(p.Name, "memory")
 	podLabels := labels(p.Name)
 	podLabels["app.kubernetes.io/component"] = "memory"
@@ -48,7 +48,7 @@ func MemoryDeployment(p *tatarav1alpha1.Project, cfg Config) *appsv1.Deployment 
 				Spec: corev1.PodSpec{
 					ImagePullSecrets:          imagePullSecrets(cfg),
 					Affinity:                  componentAffinity(p.Name, "memory", cfg),
-					TopologySpreadConstraints: topologySpreadConstraints(p.Name, "memory", cfg),
+					TopologySpreadConstraints: topologySpreadConstraints(p.Name, "memory", cfg, replicas),
 					Containers: []corev1.Container{{
 						Name:  "tatara-memory",
 						Image: cfg.MemoryImage,
@@ -77,16 +77,33 @@ func MemoryDeployment(p *tatarav1alpha1.Project, cfg Config) *appsv1.Deployment 
 							ProbeHandler:     corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromString("http")}},
 							PeriodSeconds:    5,
 							FailureThreshold: 20,
+							TimeoutSeconds:   5,
 						},
+						// All THREE probe timeouts are set EXPLICITLY (startup above,
+						// liveness and readiness below). Kubernetes defaults an unset probe
+						// timeoutSeconds to 1, which is wrong for every probe here:
+						// /readyz pings Postgres AND does a LightRAG HTTP round-trip, and
+						// liveness KILLS the container, so a 1s budget turns any dependency
+						// or node-level slowdown into flapping readiness and restart storms.
+						// On 2026-08-01 that cost ~95s of extra NotReady (nine /readyz calls
+						// cancelled at exactly 1.000s while LightRAG cold-started) on top of
+						// a restart storm that bumped restartCount by 6 on one Project and 4
+						// on another. failureThreshold is stated rather than inherited on all three, so
+						// each probe's tolerance is visible in the manifest: 20 x 5s for
+						// startup, 3 x 10s for liveness and readiness alike.
 						LivenessProbe: &corev1.Probe{
 							ProbeHandler:        corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromString("http")}},
 							InitialDelaySeconds: 5,
 							PeriodSeconds:       10,
+							TimeoutSeconds:      5,
+							FailureThreshold:    3,
 						},
 						ReadinessProbe: &corev1.Probe{
 							ProbeHandler:        corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/readyz", Port: intstr.FromString("http")}},
 							InitialDelaySeconds: 5,
 							PeriodSeconds:       10,
+							TimeoutSeconds:      5,
+							FailureThreshold:    3,
 						},
 					}},
 				},

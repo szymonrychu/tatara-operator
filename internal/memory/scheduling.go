@@ -89,15 +89,39 @@ func crossProjectAntiAffinity(project string, cfg Config) *corev1.PodAntiAffinit
 	}
 }
 
-// topologySpreadConstraints builds the soft spread rule that fans a project's
-// own replicas of one component across nodes (the topologyKey domain). MaxSkew 1
-// with WhenUnsatisfiable=ScheduleAnyway: on a cluster that cannot satisfy the
-// spread (dev/single-node) the pod still schedules rather than staying Pending.
-func topologySpreadConstraints(project, component string, cfg Config) []corev1.TopologySpreadConstraint {
-	return []corev1.TopologySpreadConstraint{{
+// topologySpreadConstraints builds the spread rule that fans a project's own
+// replicas of one component across nodes (the topologyKey domain), with a
+// hardness that depends on the replica count.
+//
+// At one replica: MaxSkew 1 + ScheduleAnyway. There is nothing to spread, and a
+// cluster that cannot satisfy the spread (dev/single-node) must still schedule
+// rather than leave the pod Pending.
+//
+// Above one replica: DoNotSchedule. ScheduleAnyway is only a scheduler SCORE -
+// the resource-balance and image-locality plugins and the weight-50
+// cross-project anti-affinity term can all outvote it, so all N replicas can
+// legally land on one node and a reboot of that node is still a 100% outage.
+// That is precisely the failure #528 filed, so a replicas knob without this
+// would be a knob that fixes nothing.
+//
+// nodeTaintsPolicy=Honor rides along with the hard form only. The default,
+// Ignore, counts a cordoned node as an eligible domain: mid-drain the drained
+// node is then the only domain with room under MaxSkew 1, so the replacement
+// replica strands Pending until the drain finishes. Attaching it only to the
+// hard form keeps every existing single-replica pod template byte-identical -
+// which matters most for lightrag, whose Recreate strategy makes a template
+// rewrite real downtime for no gain.
+func topologySpreadConstraints(project, component string, cfg Config, replicas int32) []corev1.TopologySpreadConstraint {
+	tsc := corev1.TopologySpreadConstraint{
 		MaxSkew:           1,
 		TopologyKey:       topologyKey(cfg),
 		WhenUnsatisfiable: corev1.ScheduleAnyway,
 		LabelSelector:     &metav1.LabelSelector{MatchLabels: selectorLabels(project, component)},
-	}}
+	}
+	if replicas > 1 {
+		honor := corev1.NodeInclusionPolicyHonor
+		tsc.WhenUnsatisfiable = corev1.DoNotSchedule
+		tsc.NodeTaintsPolicy = &honor
+	}
+	return []corev1.TopologySpreadConstraint{tsc}
 }

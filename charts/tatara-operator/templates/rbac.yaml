@@ -54,6 +54,13 @@ rules:
   - apiGroups: ["apps"]
     resources: ["statefulsets"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Per-Project memory PodDisruptionBudgets (issue #528): the operator applies a
+  # PodDisruptionBudget alongside each memory-stack Deployment so a node drain takes at most one
+  # replica at a time once spec.memory.apiReplicas is above 1. Same verb set as
+  # the Deployments it guards, since it is applied on the same reconcile path.
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
