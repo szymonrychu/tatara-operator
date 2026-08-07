@@ -72,6 +72,18 @@ func (m *Minter) MintOrUnparkTakeoverTask(ctx context.Context, proj *tatarav1alp
 	repo *tatarav1alpha1.Repository, mr *tatarav1alpha1.MergeRequest, requestingUser, commentBody string,
 	sp objbudget.Spiller, expectFrom ...string) (*tatarav1alpha1.Task, error) {
 
+	return m.mintOrUnparkTakeoverTask(ctx, proj, repo, mr, requestingUser, commentBody, sp, false, expectFrom...)
+}
+
+// mintOrUnparkTakeoverTask carries the retried flag MintOrUnparkTakeoverTask's
+// exported signature does not: the tombstone path below retries against the
+// freed name, and that retry must be BOUNDED (issue #521 boy-scout - it used to
+// recurse with no bound, so two mints racing the same dead name could recurse
+// indefinitely).
+func (m *Minter) mintOrUnparkTakeoverTask(ctx context.Context, proj *tatarav1alpha1.Project,
+	repo *tatarav1alpha1.Repository, mr *tatarav1alpha1.MergeRequest, requestingUser, commentBody string,
+	sp objbudget.Spiller, retried bool, expectFrom ...string) (*tatarav1alpha1.Task, error) {
+
 	name := takeoverTaskName(proj, repo, mr.Spec.Number)
 
 	var existing tatarav1alpha1.Task
@@ -128,19 +140,24 @@ func (m *Minter) MintOrUnparkTakeoverTask(ctx context.Context, proj *tatarav1alp
 	if err := controllerutil.SetControllerReference(proj, task, m.Scheme); err != nil {
 		return nil, fmt.Errorf("takeover: set task ownerref: %w", err)
 	}
-	created, twin, err := m.createTaskRaceSafe(ctx, task)
+	outcome, twin, err := m.createTaskRaceSafe(ctx, task)
 	if err != nil {
 		return nil, err
 	}
-	if !created {
-		if twin != nil {
-			return twin, nil
-		}
+	switch outcome {
+	case MintExistingLive:
+		return twin, nil
+	case MintTombstoneDeleted:
 		// createTaskRaceSafe collided with a DEAD twin and just deleted the
-		// tombstone (its "re-mint on the next tick" case). There is no "next
-		// tick" on this endpoint-driven path: retry once against the now-freed
-		// name rather than surfacing a false negative to the caller.
-		return m.MintOrUnparkTakeoverTask(ctx, proj, repo, mr, requestingUser, commentBody, sp, expectFrom...)
+		// tombstone. There is no "next tick" on this endpoint-driven path:
+		// retry ONCE against the now-freed name rather than surfacing a false
+		// negative to the caller. BOUNDED (issue #521 boy-scout): the recursion
+		// used to be unbounded, so two mints racing the same dead name could
+		// recurse indefinitely.
+		if retried {
+			return nil, fmt.Errorf("takeover: task %s name still held by a dead twin after one retry", name)
+		}
+		return m.mintOrUnparkTakeoverTask(ctx, proj, repo, mr, requestingUser, commentBody, sp, true, expectFrom...)
 	}
 
 	ext := mrExtFromMR(mr)

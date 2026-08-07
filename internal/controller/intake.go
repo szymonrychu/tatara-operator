@@ -43,6 +43,26 @@ type Minter struct {
 	// its own spiller here instead. Nil-safe (see spillerFor) for callers built
 	// before this field existed, or in unit tests.
 	SpillerFor func(proj *tatarav1alpha1.Project) objbudget.Spiller
+	// Activity is the {activity} metric label this Minter's skips and stale-owner
+	// repairs are attributed to: SweepActivity for the sweep's own funnel,
+	// WebhookActivity for the webhook's. Empty means SweepActivity, which is what
+	// every construction did IMPLICITLY before - and it made
+	// SweepStaleOwnerRepairedTotal's documented triage instruction ("a SUSTAINED
+	// rate is a reap that is not handing over ownership - go read B.5") wrong for
+	// the webhook half, which reaps nothing.
+	Activity string
+}
+
+// WebhookActivity is the {activity} label for mints driven by a live forge
+// delivery rather than by a sweep pass. See Minter.Activity.
+const WebhookActivity = "webhook"
+
+// activity resolves Minter.Activity, defaulting to the sweep.
+func (m *Minter) activity() string {
+	if m.Activity == "" {
+		return SweepActivity
+	}
+	return m.Activity
 }
 
 // minter builds the ONE shared intake funnel from the reconciler's own fields.
@@ -99,6 +119,38 @@ func (m *Minter) reader() client.Reader {
 	return m.Client
 }
 
+// MintOutcome is the CLOSED result vocabulary of the intake funnel. It replaces
+// a bare `created bool`, which squeezed four materially different states into
+// one bit:
+//
+//	MintNotOwed           classification says no Task is owed (bot PR, ignored,
+//	                      already owned by a live Task). Nothing happened.
+//	MintCreated           a new Task exists. This is the ONLY outcome a caller
+//	                      may describe as "minted".
+//	MintExistingLive      the deterministic natural key is held by a LIVE twin.
+//	                      No new Task; the twin's binding was repaired.
+//	MintTombstoneDeleted  the key was held by a DEAD twin, which this call just
+//	                      DELETED. The mint is still OWED and has not happened.
+//	                      A caller must re-drive, not report success.
+//
+// The last two are why the bool was a defect: resume.go logged "re-minted the
+// issue fresh" for every non-error return, including the one where a Task had
+// just been destroyed and nothing replaced it. Every caller must now switch.
+type MintOutcome string
+
+const (
+	// MintNotOwed: classification decided no Task is owed. Also the value
+	// returned alongside a non-nil error, which callers must check FIRST.
+	MintNotOwed MintOutcome = "not_owed"
+	// MintCreated: a new Task exists.
+	MintCreated MintOutcome = "created"
+	// MintExistingLive: a live twin holds the natural key.
+	MintExistingLive MintOutcome = "existing_live"
+	// MintTombstoneDeleted: a dead twin held the key and was deleted. The mint
+	// is OWED and has NOT happened; re-drive.
+	MintTombstoneDeleted MintOutcome = "tombstone_deleted"
+)
+
 // ForgeItem is one forge work item the intake funnel classifies + mints for.
 type ForgeItem struct {
 	IsPR  bool
@@ -107,41 +159,77 @@ type ForgeItem struct {
 }
 
 // MintForItem classifies item with the SAME predicates the sweep uses and mints
-// the Task if one is owed, race-safe on the natural key. created=false means
-// "nothing to mint" (bot/ignored/already-owned) OR "the backstop found it
-// already minted". It applies NO creation budget: the webhook mints a live human
+// the Task if one is owed, race-safe on the natural key. It returns a typed
+// MintOutcome; see MintOutcome for what each member obliges the caller to do.
+// It applies NO creation budget: the webhook mints a live human
 // signal immediately, and downstream admission (ensureTicket -> dispatcher)
 // bounds concurrency. The sweep keeps its own budget check BEFORE calling the
 // per-stage mint helpers (see sweepIssues/sweepPRs).
 func (m *Minter) MintForItem(ctx context.Context, proj *tatarav1alpha1.Project,
 	repo *tatarav1alpha1.Repository, item ForgeItem, webhookOriginated bool,
-	sp objbudget.Spiller) (*tatarav1alpha1.Task, bool, error) {
+	sp objbudget.Spiller) (*tatarav1alpha1.Task, MintOutcome, error) {
 
+	activity := m.activity()
 	if item.IsPR {
 		cr, err := m.mergeRequestCR(ctx, proj, repo, item.PR.Number)
 		if err != nil {
-			return nil, false, err
+			return mintErr(SweepReviewKind, err)
 		}
-		// A human PR never carries a task/<name> head branch, so it has no owning
-		// Task by branch: ClassifyPR's orphan check keys on the MR CR owner only.
-		switch ClassifyPR(proj, repo, item.PR, nil, cr) {
+		// LIVENESS, not presence, on this arm too (issue #521). ClassifyPR's
+		// orphan check is the exact MR analogue of IsOrphanIssue clause (b) and
+		// carried the identical defect: a dangling controller ref made an open
+		// human PR classify PRIgnore forever, on the webhook path as well as the
+		// sweep's. A human PR never carries a task/<name> head branch, so it has
+		// no owning Task by branch and the MR CR owner is the only input.
+		liveOwner, lerr := m.resolveLiveMROwner(ctx, proj, cr, activity)
+		if lerr != nil {
+			return mintErr(SweepReviewKind, lerr)
+		}
+		switch ClassifyPR(proj, repo, item.PR, nil, liveOwner) {
 		case PRReview:
 			stg, reason := MintReviewStage(cr)
 			return m.MintReviewTask(ctx, proj, repo, item.PR, cr, stg, reason, sp)
 		default: // PRAdopt / PRClaimed (both sweep-only) / PRIgnore
-			return nil, false, nil
+			obs.MintOutcomeTotal.WithLabelValues(SweepReviewKind, string(MintNotOwed)).Inc()
+			return nil, MintNotOwed, nil
 		}
 	}
 
 	cr, err := m.issueCR(ctx, proj, repo, item.Issue.Number)
 	if err != nil {
-		return nil, false, err
+		return mintErr(SweepIssueKind, err)
 	}
-	if !IsOrphanIssue(proj, repo, item.Issue, cr) {
-		return nil, false, nil
+	// Clause (b) resolves LIVENESS, not just presence, and repairs a tombstone
+	// ref in place (issue #521). The webhook path needs this exactly as much as
+	// the sweep does: a dangling controller ref made the primary mint a silent
+	// no-op too, so a human opening an issue got nothing either.
+	liveOwner, lerr := m.resolveLiveIssueOwner(ctx, proj, cr, activity)
+	if lerr != nil {
+		return mintErr(SweepIssueKind, lerr)
+	}
+	// The REASON is read, not discarded. IsOrphanIssue's own doc says a caller
+	// cannot structurally skip an issue without naming the clause that refused
+	// it, and this - the first non-sweep caller - did exactly that: a human
+	// opened an issue, the reporter allowlist refused it, and there was no
+	// counter and no log. Same green-and-silent state as #521, on the path a
+	// human notices first.
+	if orphan, skipReason := IsOrphanIssue(proj, repo, item.Issue, liveOwner); !orphan {
+		skipIssue(ctx, proj, repo, item.Issue.Number, activity, skipReason)
+		obs.MintOutcomeTotal.WithLabelValues(SweepIssueKind, string(MintNotOwed)).Inc()
+		return nil, MintNotOwed, nil
 	}
 	stg, reason := MintStage(proj, repo, item.Issue, webhookOriginated)
 	return m.MintIssueTask(ctx, proj, repo, item.Issue, stg, reason, sp)
+}
+
+// mintErr is the ONE error return of the intake funnel, so an error is a
+// COUNTED outcome instead of an invisible one. MintOutcomeTotal was incremented
+// only on the two success paths inside MintIssueTask/MintReviewTask, which left
+// every classify decline and every failure off the series entirely - a counter
+// that only ever counts the good news.
+func mintErr(kind string, err error) (*tatarav1alpha1.Task, MintOutcome, error) {
+	obs.MintOutcomeTotal.WithLabelValues(kind, obs.MintOutcomeError).Inc()
+	return nil, MintNotOwed, err
 }
 
 // MintIssueTask is mintTaskForIssue's race-safe body (fix M3-10's ADOPT-OR-CREATE
@@ -150,7 +238,7 @@ func (m *Minter) MintForItem(ctx context.Context, proj *tatarav1alpha1.Project,
 // kind, repo, number) collide on AlreadyExists rather than minting twice, and
 // the create itself goes through createTaskRaceSafe.
 func (m *Minter) MintIssueTask(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository,
-	ext scm.Issue, stg, reason string, sp objbudget.Spiller) (*tatarav1alpha1.Task, bool, error) {
+	ext scm.Issue, stg, reason string, sp objbudget.Spiller) (*tatarav1alpha1.Task, MintOutcome, error) {
 
 	task := &tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{
@@ -179,28 +267,30 @@ func (m *Minter) MintIssueTask(ctx context.Context, proj *tatarav1alpha1.Project
 	// still applies.
 	agent.StampPodName(task, proj.Name, repo.Name)
 	if err := controllerutil.SetControllerReference(proj, task, m.Scheme); err != nil {
-		return nil, false, fmt.Errorf("intake: set task ownerref: %w", err)
+		return mintErr(SweepIssueKind, fmt.Errorf("intake: set task ownerref: %w", err))
 	}
-	created, existing, err := m.createTaskRaceSafe(ctx, task)
+	// createTaskRaceSafe counts the outcome it decides (including its own
+	// errors), so nothing below re-counts a created/existing/tombstone verdict.
+	outcome, existing, err := m.createTaskRaceSafe(ctx, task)
 	if err != nil {
-		return nil, false, err
+		return nil, MintNotOwed, err
 	}
-	if !created {
+	if outcome != MintCreated {
 		// Backstop: repair an interrupted mint that left the twin's Issue CR an
 		// unbound stub (the MergeRequest analogue in MintReviewTask documents why).
 		if existing != nil {
 			if rerr := m.repairIssueBinding(ctx, proj, repo, ext, existing, sp); rerr != nil {
-				return nil, false, rerr
+				return mintErr(SweepIssueKind, rerr)
 			}
 		}
-		return task, false, nil
+		return task, outcome, nil
 	}
 	if err := SyncIssue(ctx, m.Client, sp, proj, repo, ext); err != nil {
-		return nil, false, fmt.Errorf("intake: sync issue: %w", err)
+		return mintErr(SweepIssueKind, fmt.Errorf("intake: sync issue: %w", err))
 	}
 	issName := tatarav1alpha1.IssueName(repo.Name, ext.Number)
 	if err := ownIssueForTask(ctx, m.Client, proj.Namespace, issName, task); err != nil {
-		return nil, false, err
+		return mintErr(SweepIssueKind, err)
 	}
 	// The STAGE comes from Spec.InitialStage via the TaskReconciler create-edge
 	// (fix C5): NO racing post-create stage write. Only issueRefs is stamped here,
@@ -211,12 +301,12 @@ func (m *Minter) MintIssueTask(ctx context.Context, proj *tatarav1alpha1.Project
 			fresh.Status.IssueRefs = append(fresh.Status.IssueRefs, issName)
 		}
 	}); err != nil {
-		return nil, false, err
+		return mintErr(SweepIssueKind, err)
 	}
 	if m.Metrics != nil {
 		m.Metrics.OrphanAdopted(SweepIssueKind)
 	}
-	return task, true, nil
+	return task, MintCreated, nil
 }
 
 // MintReviewTask is mintReviewTaskForPR's race-safe body (unchanged ADOPT-OR-
@@ -229,7 +319,7 @@ func (m *Minter) MintIssueTask(ctx context.Context, proj *tatarav1alpha1.Project
 // for the ordinary fresh-mint case, where no prior controller is expected -
 // every call site except reMintReviewOwner.
 func (m *Minter) MintReviewTask(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository,
-	pr scm.PRRef, cr *tatarav1alpha1.MergeRequest, stg, reason string, sp objbudget.Spiller, expectFrom ...string) (*tatarav1alpha1.Task, bool, error) {
+	pr scm.PRRef, cr *tatarav1alpha1.MergeRequest, stg, reason string, sp objbudget.Spiller, expectFrom ...string) (*tatarav1alpha1.Task, MintOutcome, error) {
 
 	ext := mrSnapshot(proj, repo, pr)
 	task := &tatarav1alpha1.Task{
@@ -257,13 +347,13 @@ func (m *Minter) MintReviewTask(ctx context.Context, proj *tatarav1alpha1.Projec
 	// the queue path all name the same repo the same way.
 	agent.StampPodName(task, proj.Name, repo.Name)
 	if err := controllerutil.SetControllerReference(proj, task, m.Scheme); err != nil {
-		return nil, false, fmt.Errorf("intake: set task ownerref: %w", err)
+		return mintErr(SweepReviewKind, fmt.Errorf("intake: set task ownerref: %w", err))
 	}
-	created, existing, err := m.createTaskRaceSafe(ctx, task)
+	outcome, existing, err := m.createTaskRaceSafe(ctx, task)
 	if err != nil {
-		return nil, false, err
+		return nil, MintNotOwed, err
 	}
-	if !created {
+	if outcome != MintCreated {
 		// Backstop: the natural-key twin already exists. An interrupted mint (a
 		// restart between the Task create and the bind below) can leave that twin's
 		// MergeRequest CR an UNBOUND stub - no owner, empty status - and nothing
@@ -273,13 +363,13 @@ func (m *Minter) MintReviewTask(ctx context.Context, proj *tatarav1alpha1.Projec
 		// twin (a no-op once it is already bound).
 		if existing != nil {
 			if rerr := m.repairMRBinding(ctx, proj, repo, ext, existing, sp); rerr != nil {
-				return nil, false, rerr
+				return mintErr(SweepReviewKind, rerr)
 			}
 		}
-		return task, false, nil
+		return task, outcome, nil
 	}
 	if err := m.bindMRToTask(ctx, proj, repo, ext, task, sp, expectFrom...); err != nil {
-		return nil, false, err
+		return mintErr(SweepReviewKind, err)
 	}
 	// Stage from Spec.InitialStage via the create-edge (fix C5); mrRefs +
 	// humanReviewRounds stamped under RetryOnConflict so they survive the reconciler
@@ -292,62 +382,76 @@ func (m *Minter) MintReviewTask(ctx context.Context, proj *tatarav1alpha1.Projec
 		}
 		fresh.Status.HumanReviewRounds = rounds
 	}); err != nil {
-		return nil, false, err
+		return mintErr(SweepReviewKind, err)
 	}
 	if m.Metrics != nil {
 		m.Metrics.OrphanAdopted(SweepReviewKind)
 	}
-	return task, true, nil
+	return task, MintCreated, nil
 }
 
 // createTaskRaceSafe creates task idempotently on its DETERMINISTIC name. On a
 // natural-key collision (a concurrent webhook + sweep, or the backstop pass over
-// an already-minted item) it returns created=false rather than a second Task.
+// an already-minted item) it returns MintExistingLive or MintTombstoneDeleted
+// rather than a second Task.
 // A collision with a DEAD (terminal/deleting) twin of the same name is the
 // re-mint-after-reap case: delete the tombstone and retry, so a legitimately new
 // event is never blocked by a dead name.
 //
-// When created=false because a LIVE twin already holds the name, that twin is
-// returned so the caller can REPAIR an interrupted mint (the twin's Issue/MR
-// mirror may still be an unbound stub - see MintReviewTask/MintIssueTask). It is
-// nil on every other created=false path (a terminal twin just got deleted for a
-// clean re-mint; there is nothing to repair).
-func (m *Minter) createTaskRaceSafe(ctx context.Context, task *tatarav1alpha1.Task) (bool, *tatarav1alpha1.Task, error) {
+// On MintExistingLive, that live twin is returned so the caller can REPAIR an
+// interrupted mint (the twin's Issue/MR mirror may still be an unbound stub -
+// see MintReviewTask/MintIssueTask). It is nil on every other non-created path
+// (a terminal twin just got deleted for a clean re-mint; there is nothing to
+// repair).
+func (m *Minter) createTaskRaceSafe(ctx context.Context, task *tatarav1alpha1.Task) (MintOutcome, *tatarav1alpha1.Task, error) {
 	key := types.NamespacedName{Namespace: task.Namespace, Name: task.Name}
+	// THE natural-key arbiter, so THE place the outcome is metered: counting in
+	// MintIssueTask/MintReviewTask instead left the third caller
+	// (MintOrUnparkTakeoverTask, which calls this directly) off the series
+	// entirely, and with it every tombstone delete on the takeover path.
+	count := func(o MintOutcome) MintOutcome {
+		obs.MintOutcomeTotal.WithLabelValues(task.Spec.Kind, string(o)).Inc()
+		return o
+	}
+	countErr := func() { obs.MintOutcomeTotal.WithLabelValues(task.Spec.Kind, obs.MintOutcomeError).Inc() }
 	// Live (uncached) pre-check shrinks the window before the deterministic-name
 	// collision even applies; the collision below is the actual arbiter.
 	existing := &tatarav1alpha1.Task{}
 	if err := m.reader().Get(ctx, key, existing); err == nil {
 		if existing.DeletionTimestamp == nil && !tatarav1alpha1.TaskDone(existing) {
-			return false, existing, nil // live twin: the backstop no-ops the create but repairs the bind
+			return count(MintExistingLive), existing, nil // live twin: the backstop no-ops the create but repairs the bind
 		}
 	} else if !apierrors.IsNotFound(err) {
-		return false, nil, fmt.Errorf("intake: pre-check task %s: %w", key.Name, err)
+		countErr()
+		return MintNotOwed, nil, fmt.Errorf("intake: pre-check task %s: %w", key.Name, err)
 	}
 
 	err := m.Client.Create(ctx, task)
 	if err == nil {
-		return true, nil, nil
+		return count(MintCreated), nil, nil
 	}
 	if !apierrors.IsAlreadyExists(err) {
-		return false, nil, fmt.Errorf("intake: create task %s: %w", key.Name, err)
+		countErr()
+		return MintNotOwed, nil, fmt.Errorf("intake: create task %s: %w", key.Name, err)
 	}
 	// Resolve the winning twin through the UNCACHED reader (F3-1): a stale cache
 	// that showed a still-LIVE twin as terminal would cascade a Delete of its
 	// owned Issue/MR mirror. The Delete below stays on m.Client (writes go
 	// through the writer), but the terminal/deleting decision must be live.
 	if getErr := m.reader().Get(ctx, key, existing); getErr != nil {
-		return false, nil, fmt.Errorf("intake: resolve existing task %s: %w", key.Name, getErr)
+		countErr()
+		return MintNotOwed, nil, fmt.Errorf("intake: resolve existing task %s: %w", key.Name, getErr)
 	}
 	if existing.DeletionTimestamp != nil || tatarav1alpha1.TaskDone(existing) {
 		if delErr := m.Client.Delete(ctx, existing); delErr != nil && !apierrors.IsNotFound(delErr) {
-			return false, nil, fmt.Errorf("intake: delete stale terminal task %s: %w", key.Name, delErr)
+			countErr()
+			return MintNotOwed, nil, fmt.Errorf("intake: delete stale terminal task %s: %w", key.Name, delErr)
 		}
-		log.FromContext(ctx).Info("intake: deleted stale terminal task on name collision; re-minting next pass",
+		log.FromContext(ctx).Info("intake: deleted stale terminal task on name collision; the mint is still OWED",
 			"action", "intake_stale_delete", "resource_id", key.Name)
-		return false, nil, nil // re-mint on the next tick against the freed name
+		return count(MintTombstoneDeleted), nil, nil // the caller re-drives; see MintOutcome
 	}
-	return false, existing, nil // live twin
+	return count(MintExistingLive), existing, nil // live twin
 }
 
 // issueCR returns the Issue CR for (repo, number), or nil when none exists.

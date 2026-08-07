@@ -56,11 +56,12 @@ func assertLabelNames(t *testing.T, got, want []string) {
 // the Project reconcile path (issue #441). It must be idempotent: Reconcile
 // calls it on every pass.
 func TestSeedSweepErrorsForProject(t *testing.T) {
-	// sweep x 17 (nightlySweep dropped: dead, no live producer; +4 for the
-	// fail() sites the list had drifted from, issue #495), brainstorm x 1
-	// (demand-driven now, only stamp_failed can fire), documentation/issueScan
-	// x 2 each (invalid_cron, stamp_failed), refine x 3 (its own cron, Task 3).
-	const wantPerProject = 17 + 1 + 2*2 + 3
+	// sweep x 18 (nightlySweep dropped: dead, no live producer; +4 for the
+	// fail() sites the list had drifted from, issue #495; +resolve_live_owner,
+	// issue #521), brainstorm x 1 (demand-driven now, only stamp_failed can
+	// fire), documentation/issueScan x 2 each (invalid_cron, stamp_failed),
+	// refine x 3 (its own cron, Task 3).
+	const wantPerProject = 18 + 1 + 2*2 + 3
 
 	before := testutil.CollectAndCount(SweepErrorsTotal)
 	SeedSweepErrorsForProject("seed-test-proj")
@@ -92,7 +93,10 @@ func TestSweepSkippedTotalLabels(t *testing.T) {
 // BENIGN steady state, so the series that proves it is NOT happening has to
 // exist before the first skip does.
 func TestSeedSweepSkippedForProject(t *testing.T) {
-	const wantPerProject = 1 // sweep x mr_claimed_by_other_task
+	// (sweep, webhook) x the closed SweepSkip* vocabulary. The webhook is a
+	// PRODUCER of this counter since issue #521's review: MintForItem names the
+	// clause that refused an issue, and a webhook mint is not a sweep pass.
+	const wantPerProject = 2 * 8
 
 	before := testutil.CollectAndCount(SweepSkippedTotal)
 	SeedSweepErrorsForProject("skip-seed-proj")
@@ -145,5 +149,132 @@ func TestSweepSeedReasonsCoverEveryFailSite(t *testing.T) {
 			t.Errorf("sweepSeedReasons seeds %q but no fail(%q, ...) call site remains in sweep.go: "+
 				"a permanently dead zero series", reason, reason)
 		}
+	}
+}
+
+// TestSweepSkipReasonsMatchSweepConstants is the skip-side twin of
+// TestSweepSeedReasonsCoverEveryFailSite, and it exists for the same reason:
+// sweepSkipReasons carries a "keep in sync with sweep.go's SweepSkip*
+// constants" comment, and a comment cannot enforce that. An unseeded skip
+// reason has NO series until its first skip, and a counter born AT its first
+// skip has no earlier sample to increase from - so
+// increase(operator_sweep_skipped_total{reason=...}[1h]) is blind to exactly
+// the first skip after every pod roll, which is the observability hole issue
+// #521 spent 19 hours inside. Fails BOTH ways: an unseeded constant, and a
+// seeded reason with no constant left.
+func TestSweepSkipReasonsMatchSweepConstants(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join("..", "controller", "sweep.go"))
+	if err != nil {
+		t.Fatalf("read sweep.go: %v", err)
+	}
+	seeded := map[string]bool{}
+	for _, r := range sweepSkipReasons {
+		seeded[r] = true
+	}
+	declared := map[string]bool{}
+	for _, m := range regexp.MustCompile(`SweepSkip[A-Za-z]+\s*=\s*"([a-z_]+)"`).FindAllStringSubmatch(string(src), -1) {
+		declared[m[1]] = true
+	}
+	if len(declared) == 0 {
+		t.Fatal("found no SweepSkip* constants in sweep.go - the scan is broken, not the seed list")
+	}
+	for reason := range declared {
+		if !seeded[reason] {
+			t.Errorf("sweep.go declares skip reason %q but sweepSkipReasons does not seed it: "+
+				"increase() cannot see its first increment", reason)
+		}
+	}
+	for reason := range seeded {
+		if !declared[reason] {
+			t.Errorf("sweepSkipReasons seeds %q but no SweepSkip* constant declares it: "+
+				"a permanently dead zero series", reason)
+		}
+	}
+}
+
+func TestSweepStaleOwnerRepairedTotalLabels(t *testing.T) {
+	SweepStaleOwnerRepairedTotal.WithLabelValues("label-test-proj", "sweep").Inc()
+	assertLabelNames(t, gatheredLabelNames(t, SweepStaleOwnerRepairedTotal,
+		"operator_sweep_stale_owner_repaired_total"),
+		[]string{"activity", "project"})
+}
+
+func TestMintOutcomeTotalLabels(t *testing.T) {
+	MintOutcomeTotal.WithLabelValues("clarify", "created").Inc()
+	assertLabelNames(t, gatheredLabelNames(t, MintOutcomeTotal,
+		"operator_intake_mint_outcome_total"),
+		[]string{"kind", "outcome"})
+}
+
+func TestSweepOrphanStrandedSecondsLabels(t *testing.T) {
+	SweepOrphanStrandedSeconds.WithLabelValues("label-test-proj", "tatara-operator", "510").Set(1)
+	assertLabelNames(t, gatheredLabelNames(t, SweepOrphanStrandedSeconds,
+		"operator_sweep_orphan_stranded_seconds"),
+		[]string{"number", "project", "repo"})
+}
+
+// The gauge carries a per-issue label, so a healed issue's series MUST leave
+// the registry or /metrics grows without bound (contract K.1 CARDINALITY, the
+// same rule ClearMergeCursorStalled exists for). Clearing is scoped to
+// (project, repo) because SweepProject is called with dueRepos, not every repo.
+func TestClearSweepOrphanStranded(t *testing.T) {
+	SweepOrphanStrandedSeconds.WithLabelValues("clear-proj", "repo-a", "1").Set(1)
+	SweepOrphanStrandedSeconds.WithLabelValues("clear-proj", "repo-b", "2").Set(1)
+	ClearSweepOrphanStranded("clear-proj", "repo-a")
+	if n := testutil.CollectAndCount(SweepOrphanStrandedSeconds); n < 1 {
+		t.Fatal("clearing one repo removed every series")
+	}
+	ClearSweepOrphanStranded("clear-proj", "repo-a")
+	SweepOrphanStrandedSeconds.WithLabelValues("clear-proj", "repo-a", "1").Set(1)
+	ClearSweepOrphanStranded("clear-proj", "repo-a")
+	ClearSweepOrphanStranded("clear-proj", "repo-b")
+}
+
+// TestRetainSweepOrphanStranded is the deadman's cardinality half.
+// ClearSweepOrphanStranded only ever runs from INSIDE a sweep pass, so every
+// transition that stops the sweep looking at a (project, repo) - the sweep
+// disabled, the issueScan cron emptied, a Repository unenrolled, the Project
+// deleted - freezes that series at its last value and it is scraped forever.
+// The alert is max by (project) over a threshold, so a frozen 19h series pages
+// permanently until the pod rolls.
+func TestRetainSweepOrphanStranded(t *testing.T) {
+	SweepOrphanStrandedSeconds.Reset()
+	SweepOrphanStrandedSeconds.WithLabelValues("retain-proj", "kept-repo", "1").Set(1)
+	SweepOrphanStrandedSeconds.WithLabelValues("retain-proj", "gone-repo", "2").Set(1)
+	SweepOrphanStrandedSeconds.WithLabelValues("other-proj", "gone-repo", "3").Set(1)
+
+	RetainSweepOrphanStranded("retain-proj", []string{"kept-repo"})
+	if n := testutil.CollectAndCount(SweepOrphanStrandedSeconds); n != 2 {
+		t.Fatalf("series after retain = %d, want 2 (kept-repo and the OTHER project's, untouched)", n)
+	}
+
+	// nil keep retracts the whole project: that IS the disabled / no-cron /
+	// deleted case.
+	RetainSweepOrphanStranded("retain-proj", nil)
+	if n := testutil.CollectAndCount(SweepOrphanStrandedSeconds); n != 1 {
+		t.Fatalf("series after full retract = %d, want 1 (only the other project's)", n)
+	}
+	RetainSweepOrphanStranded("other-proj", nil)
+	if n := testutil.CollectAndCount(SweepOrphanStrandedSeconds); n != 0 {
+		t.Fatalf("series after retracting every project = %d, want 0", n)
+	}
+}
+
+// TestWebhookActivityMatchesTheControllerConstant pins obs.WebhookActivity to
+// controller.WebhookActivity. The literal is duplicated here to avoid a reverse
+// import (the sweepSeedReasons precedent), and a duplicated literal that
+// nothing checks is how a seeded activity silently stops matching its producer.
+func TestWebhookActivityMatchesTheControllerConstant(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join("..", "controller", "intake.go"))
+	if err != nil {
+		t.Fatalf("read intake.go: %v", err)
+	}
+	m := regexp.MustCompile(`WebhookActivity\s*=\s*"([a-z_]+)"`).FindStringSubmatch(string(src))
+	if m == nil {
+		t.Fatal("found no WebhookActivity constant in intake.go - the scan is broken, not the constant")
+	}
+	if m[1] != WebhookActivity {
+		t.Fatalf("controller.WebhookActivity = %q but obs.WebhookActivity = %q: the seeded series "+
+			"and the producer's label have drifted apart", m[1], WebhookActivity)
 	}
 }

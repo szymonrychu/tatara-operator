@@ -65,9 +65,9 @@ func TestMintForItem_IssueWebhookOriginated_MintsTriagingClarify(t *testing.T) {
 
 	item := ForgeItem{Issue: scm.Issue{Number: 353, State: "open", Author: "alice",
 		Title: "login 500s", URL: "https://github.com/o/r/issues/353"}}
-	task, created, err := m.MintForItem(context.Background(), proj, repo, item, true, nil)
+	task, outcome, err := m.MintForItem(context.Background(), proj, repo, item, true, nil)
 	require.NoError(t, err)
-	require.True(t, created)
+	require.Equal(t, MintCreated, outcome)
 	require.Equal(t, SweepIssueKind, task.Spec.Kind)
 	require.Equal(t, tatarav1alpha1.StageTriaging, task.Spec.InitialStage)
 	require.Equal(t, tatarav1alpha1.IntakeTaskName("p", "clarify", "tatara-operator", 353), task.Name)
@@ -87,9 +87,9 @@ func TestMintForItem_ColdIssue_MintsParked(t *testing.T) {
 	repo := sweepRepo("p")
 	m, _ := minterFor(t, proj, repo)
 	item := ForgeItem{Issue: scm.Issue{Number: 7, State: "open", Author: "alice"}}
-	task, created, err := m.MintForItem(context.Background(), proj, repo, item, false, nil)
+	task, outcome, err := m.MintForItem(context.Background(), proj, repo, item, false, nil)
 	require.NoError(t, err)
-	require.True(t, created)
+	require.Equal(t, MintCreated, outcome)
 	require.Equal(t, tatarav1alpha1.StageParked, task.Spec.InitialStage)
 	require.Equal(t, stage.ReasonBacklogSweep, task.Spec.InitialStageReason)
 }
@@ -100,12 +100,12 @@ func TestMintForItem_OwnedIssue_NoOp(t *testing.T) {
 	repo := sweepRepo("p")
 	m, _ := minterFor(t, proj, repo)
 	item := ForgeItem{Issue: scm.Issue{Number: 9, State: "open", Author: "alice"}}
-	_, created, err := m.MintForItem(context.Background(), proj, repo, item, true, nil)
+	_, outcome, err := m.MintForItem(context.Background(), proj, repo, item, true, nil)
 	require.NoError(t, err)
-	require.True(t, created)
-	_, created2, err := m.MintForItem(context.Background(), proj, repo, item, true, nil)
+	require.Equal(t, MintCreated, outcome)
+	_, outcome2, err := m.MintForItem(context.Background(), proj, repo, item, true, nil)
 	require.NoError(t, err)
-	require.False(t, created2, "an owned issue is not an orphan; the backstop no-ops")
+	require.Equal(t, MintNotOwed, outcome2, "an owned issue is not an orphan; the backstop no-ops")
 }
 
 // A human PR in reaction scope mints a review Task (triaging, no prior verdict).
@@ -115,9 +115,9 @@ func TestMintForItem_HumanPR_MintsReview(t *testing.T) {
 	m, _ := minterFor(t, proj, repo)
 	item := ForgeItem{IsPR: true, PR: scm.PRRef{Number: 42, Author: "alice",
 		HeadSHA: "abc", HeadBranch: "fix", Repo: "o/r"}}
-	task, created, err := m.MintForItem(context.Background(), proj, repo, item, false, nil)
+	task, outcome, err := m.MintForItem(context.Background(), proj, repo, item, false, nil)
 	require.NoError(t, err)
-	require.True(t, created)
+	require.Equal(t, MintCreated, outcome)
 	require.Equal(t, SweepReviewKind, task.Spec.Kind)
 	require.Equal(t, tatarav1alpha1.StageTriaging, task.Spec.InitialStage)
 }
@@ -129,9 +129,9 @@ func TestMintForItem_BotPR_NoMint(t *testing.T) {
 	m, _ := minterFor(t, proj, repo)
 	item := ForgeItem{IsPR: true, PR: scm.PRRef{Number: 43, Author: "tatara-bot",
 		HeadSHA: "abc", HeadBranch: "chore", Repo: "o/r"}}
-	task, created, err := m.MintForItem(context.Background(), proj, repo, item, false, nil)
+	task, outcome, err := m.MintForItem(context.Background(), proj, repo, item, false, nil)
 	require.NoError(t, err)
-	require.False(t, created)
+	require.Equal(t, MintNotOwed, outcome)
 	require.Nil(t, task)
 }
 
@@ -144,21 +144,21 @@ func TestMintForItem_ConcurrentSameKey_OneTask(t *testing.T) {
 
 	const n = 6
 	var wg sync.WaitGroup
-	wins := make([]bool, n)
+	wins := make([]MintOutcome, n)
 	errs := make([]error, n)
 	wg.Add(n)
 	for i := 0; i < n; i++ {
 		go func(i int) {
 			defer wg.Done()
-			_, ok, err := m.MintForItem(context.Background(), proj, repo, item, true, nil)
-			wins[i], errs[i] = ok, err
+			_, outcome, err := m.MintForItem(context.Background(), proj, repo, item, true, nil)
+			wins[i], errs[i] = outcome, err
 		}(i)
 	}
 	wg.Wait()
 	got := 0
 	for i := 0; i < n; i++ {
 		require.NoError(t, errs[i])
-		if wins[i] {
+		if wins[i] == MintCreated {
 			got++
 		}
 	}
@@ -250,9 +250,9 @@ func TestMintIssueTask_StampsPodName(t *testing.T) {
 	m, c := minterFor(t, proj, repo)
 
 	item := ForgeItem{Issue: scm.Issue{Number: 353, State: "open", Author: "alice"}}
-	task, created, err := m.MintForItem(context.Background(), proj, repo, item, true, nil)
+	task, outcome, err := m.MintForItem(context.Background(), proj, repo, item, true, nil)
 	require.NoError(t, err)
-	require.True(t, created)
+	require.Equal(t, MintCreated, outcome)
 	require.Equal(t, "clr-p-tatara-operator-i353", task.Annotations[agent.PodNameAnnotation])
 
 	var stored tatarav1alpha1.Task
@@ -268,9 +268,9 @@ func TestMintReviewTask_StampsPodName(t *testing.T) {
 
 	item := ForgeItem{IsPR: true, PR: scm.PRRef{Number: 59, Author: "alice",
 		HeadSHA: "abc", HeadBranch: "fix", Repo: "o/r"}}
-	task, created, err := m.MintForItem(context.Background(), proj, repo, item, false, nil)
+	task, outcome, err := m.MintForItem(context.Background(), proj, repo, item, false, nil)
 	require.NoError(t, err)
-	require.True(t, created)
+	require.Equal(t, MintCreated, outcome)
 	require.Equal(t, "rev-p-tatara-operator-p59", task.Annotations[agent.PodNameAnnotation])
 
 	var stored tatarav1alpha1.Task
@@ -288,9 +288,9 @@ func TestMintReviewTask_StampedPodNameFitsDNS1123(t *testing.T) {
 	m, _ := minterFor(t, proj, repo)
 
 	item := ForgeItem{IsPR: true, PR: scm.PRRef{Number: 34, Author: "alice", HeadSHA: "abc", Repo: "o/r"}}
-	task, created, err := m.MintForItem(context.Background(), proj, repo, item, false, nil)
+	task, outcome, err := m.MintForItem(context.Background(), proj, repo, item, false, nil)
 	require.NoError(t, err)
-	require.True(t, created)
+	require.Equal(t, MintCreated, outcome)
 	name := task.Annotations[agent.PodNameAnnotation]
 	require.Equal(t, "rev-tatara-tatara-memory-repo-ingester-p34", name)
 	require.LessOrEqual(t, len(name), 63)
@@ -313,9 +313,9 @@ func TestMintIssueTask_AdoptedLegacyTwin_KeepsFallbackPodName(t *testing.T) {
 	m, c := minterFor(t, proj, repo, legacy)
 
 	item := ForgeItem{Issue: scm.Issue{Number: 353, State: "open", Author: "alice"}}
-	_, created, err := m.MintForItem(context.Background(), proj, repo, item, true, nil)
+	_, outcome, err := m.MintForItem(context.Background(), proj, repo, item, true, nil)
 	require.NoError(t, err)
-	require.False(t, created, "a live natural-key twin is adopted, not re-minted")
+	require.Equal(t, MintExistingLive, outcome, "a live natural-key twin is adopted, not re-minted")
 
 	var stored tatarav1alpha1.Task
 	require.NoError(t, c.Get(context.Background(), client.ObjectKeyFromObject(legacy), &stored))
@@ -333,9 +333,9 @@ func TestMintIssueTask_StampedPodNameStableAcrossStageChange(t *testing.T) {
 	m, c := minterFor(t, proj, repo)
 
 	item := ForgeItem{Issue: scm.Issue{Number: 12, State: "open", Author: "alice"}}
-	task, created, err := m.MintForItem(context.Background(), proj, repo, item, true, nil)
+	task, outcome, err := m.MintForItem(context.Background(), proj, repo, item, true, nil)
 	require.NoError(t, err)
-	require.True(t, created)
+	require.Equal(t, MintCreated, outcome)
 	want := agent.PodName(task)
 
 	var fresh tatarav1alpha1.Task

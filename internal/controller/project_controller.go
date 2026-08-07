@@ -246,6 +246,13 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			// SweepLastSuccessTimestamp and SweepErrorsTotal have the identical
 			// leak but tearing them down too is out of scope here (see MEMORY.md).
 			obs.SweepNextExpectedTimestamp.DeletePartialMatch(prometheus.Labels{"project": req.Name})
+			// obs.SweepOrphanStrandedSeconds is retracted for the SAME reason and
+			// is NOT out of scope: it carries a per-ISSUE label, so a deleted
+			// Project leaks one permanently-frozen series per stranded issue, and
+			// its alert (max by (project) over a threshold) then pages forever for
+			// a project that no longer exists. runScans covers the three
+			// in-life transitions; this covers deletion.
+			obs.RetainSweepOrphanStranded(req.Name, nil)
 			return ctrl.Result{}, nil
 		}
 		r.Metrics.ReconcileResult("Project", "error")

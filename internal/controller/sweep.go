@@ -92,10 +92,57 @@ const (
 	// error counters.
 	SweepActivity = "sweep"
 
-	// SweepSkipMRClaimed is the {reason} on SweepSkippedTotal for clause 1b: an
-	// adoptable-by-shape PR whose MergeRequest CR another Task already
-	// controller-owns. Kept in sync with obs.sweepSkipReasons.
+	// THE CLOSED SweepSkip VOCABULARY: every reason the sweep DELIBERATELY does
+	// not do a piece of work. It is the {reason} label on
+	// obs.SweepSkippedTotal and the `reason` field on the sweep_skip_issue /
+	// sweep_skip_pr log lines, and it is kept in sync with obs.sweepSkipReasons
+	// by TestSweepSkipReasonsMatchSweepConstants, which scans these constants
+	// out of this file (the prose version of that instruction had already
+	// drifted once for the fail() reasons - see issue #495).
+	//
+	// Values are snake_case with NO "skip" prefix, matching SweepSkipMRClaimed,
+	// which predates the rest: one label carrying two naming conventions is the
+	// drift this vocabulary exists to prevent, and the Go identifier already
+	// says "skip".
+	//
+	// There is deliberately NO "owner gone" member. Before issue #521 a dead
+	// owner WAS a silent skip - that is the whole bug. It is now a REPAIR
+	// (obs.SweepStaleOwnerRepairedTotal) followed by a mint in the same pass,
+	// and "I repaired something" must not share a series with "I did nothing".
+
+	// SweepSkipNone is the empty reason: nothing was skipped.
+	SweepSkipNone = ""
+	// SweepSkipMRClaimed is clause 1b: an adoptable-by-shape PR whose
+	// MergeRequest CR another Task already controller-owns.
 	SweepSkipMRClaimed = "mr_claimed_by_other_task"
+	// SweepSkipIssueNotOpen is IsOrphanIssue clause (a): the forge says the
+	// issue is not open.
+	SweepSkipIssueNotOpen = "issue_not_open"
+	// SweepSkipIssueOwned is IsOrphanIssue clause (b): a LIVE Task
+	// controller-owns the Issue CR. Since #521 "live" is load-bearing - the
+	// clause used to accept a ref naming a Task that no longer existed.
+	SweepSkipIssueOwned = "issue_owned"
+	// SweepSkipReporterNotAllowed is IsOrphanIssue clause (c): the reporter
+	// intake gate (issue #102) refused the author.
+	SweepSkipReporterNotAllowed = "issue_reporter_not_allowed"
+	// SweepSkipMintBudget: one of the two creation budgets bound, so this
+	// orphan is deferred to the next pass. Paired with
+	// obs.SweepMintCapHitTotal, which says WHICH cap bound, once per pass;
+	// this says WHICH ISSUES paid for it.
+	SweepSkipMintBudget = "mint_budget_bound"
+	// SweepSkipAlreadyMinted: MintExistingLive. A webhook (or a concurrent
+	// pass) already minted this natural key and its Task is alive.
+	SweepSkipAlreadyMinted = "already_minted"
+	// SweepSkipTombstoneDeleted: MintTombstoneDeleted. The deterministic name
+	// was held by a dead twin, which has just been deleted; the mint is owed
+	// and has NOT happened yet. The pass requeues (sweepRemintDelay) rather
+	// than waiting a full sweep period.
+	SweepSkipTombstoneDeleted = "tombstone_deleted"
+	// SweepSkipMintNotOwed: MintNotOwed. Classification says no Task is owed at
+	// all. It has its OWN member rather than folding into already_minted,
+	// which asserts a Task exists - the two are opposite facts and a shared
+	// series cannot be alerted on.
+	SweepSkipMintNotOwed = "mint_not_owed"
 
 	// SweepIssueKind is the Task kind a sweep-minted ISSUE Task carries. F.3 has
 	// NO triaging -> implementing edge: an issue Task enters clarifying, where the
@@ -114,6 +161,24 @@ const (
 	sweepGoalLimit = 16384
 )
 
+// sweepRemintDelay is how long the pass asks to be requeued after it DELETED a
+// stale terminal Task holding a natural key (MintTombstoneDeleted). The mint is
+// still OWED, and waiting a full sweep period for it is the silent-next-pass
+// shape issue #521 exists to kill.
+//
+// It is 30s and not 0 because the deleted tombstone's owned Issue/MergeRequest
+// mirrors cascade in the BACKGROUND (DeletePropagationBackground): re-minting
+// instantly could bind a fresh Task to a mirror the GC is still collecting.
+// 30s is comfortably past that, and 120x better than the hourly pass. It is
+// also why the owed mint is NOT simply re-driven inline in this same pass.
+//
+// THE DELAY IS ONLY HALF THE MECHANISM. Waking in 30s does nothing on its own:
+// reposDueForScan anchors every repo's slot on Status.LastIssueScan, so a pass
+// that stamped would leave the owed repo not-due for a full cron period and the
+// wake would find zero due repos. runScans skips the stamp while this requeue
+// is pending - see the comment there, which is where the two halves meet.
+const sweepRemintDelay = 30 * time.Second
+
 // SweepEnabled reports whether the B.4 sweep runs for proj. ON by default: it is
 // the ONLY intake path since the cutover, so it is disabled only by an explicit
 // SweepDisabledValue break-glass annotation.
@@ -124,28 +189,195 @@ func SweepEnabled(proj *tatarav1alpha1.Project) bool {
 // IsOrphanIssue is THE orphan predicate. THREE clauses, all required:
 //
 //	a. issue.state == "open"                           (SCM truth)
-//	b. no Issue CR for (repo, number) has a controller=true owner
+//	b. no LIVE Task controller-owns the Issue CR
 //	c. IsAllowedReporter(proj, repo, issue.author)     (fix C6)
 //
-// cr is the Issue CR for (repo, iss.Number), or nil when none exists. A zero-
-// owner CR IS an orphan: fix H13 has a failed Task RELEASE its controller
-// ownership and drop the ownerRef, and per B.1 an object with zero owners is
-// never garbage collected - it is still there, and the mint ADOPTS it.
+// It returns the orphan verdict AND, when the verdict is false, the SweepSkip
+// reason that produced it - the same refactor shape as stage.Unpark ->
+// stage.UnparkDetailed, and for the same reason its doc gives: a guard that
+// declines without recording a reason is how a high-stakes rule stalls work for
+// a day with zero errors and zero logs. A caller cannot structurally skip an
+// issue without naming the clause that refused it.
+//
+// liveOwner is the name of the Task that controller-owns the Issue CR AND STILL
+// EXISTS, or "" when there is none. It is NOT read off the CR here, and issue
+// #521 is why. The old form called own.ControllerOwner(cr), which returns
+// owned=true for any ref carrying controller=true and NEVER checks the named
+// Task exists - so an Issue CR whose owning Task was reaped kept a dangling
+// controller ownerRef forever, the sweep read it as owned, and five open issues
+// went 19 hours with no Task and no log line. Taking the resolved owner as a
+// PARAMETER makes "resolve liveness first" structural rather than a convention
+// the next caller can forget. Minter.resolveLiveOwner is the resolver, and it
+// DROPS a tombstone ref rather than ignoring it.
+//
+// A zero-owner CR IS an orphan: fix H13 has a failed Task RELEASE its
+// controller ownership and drop the ownerRef, and per B.1 an object with zero
+// owners is never garbage collected - it is still there, and the mint ADOPTS
+// it.
 //
 // Clause (c) is the reporter intake gate (issue #102, api/v1alpha1/logins.go).
 // It is closed-by-default when configured (an empty allowlist preserves the open
 // default; an empty LOGIN fails closed under an active gate) and its entire
 // purpose is that an INJECTED issue never becomes a Task.
-func IsOrphanIssue(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, iss scm.Issue, cr *tatarav1alpha1.Issue) bool {
+func IsOrphanIssue(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, iss scm.Issue, liveOwner string) (bool, string) {
 	if iss.State != "open" {
-		return false
+		return false, SweepSkipIssueNotOpen
 	}
-	if cr != nil {
-		if _, owned := own.ControllerOwner(cr); owned {
-			return false
+	if liveOwner != "" {
+		return false, SweepSkipIssueOwned
+	}
+	if !tatarav1alpha1.IsAllowedReporter(proj, repo, iss.Author) {
+		return false, SweepSkipReporterNotAllowed
+	}
+	return true, SweepSkipNone
+}
+
+// resolveLiveIssueOwner and resolveLiveMROwner are resolveLiveOwner's TYPED
+// front doors, and they exist for one reason: a typed nil pointer boxed in a
+// client.Object interface is NOT == nil, so "there is no mirror yet" has to be
+// answered before the value is boxed or the first method call panics. Both
+// arms hand a possibly-nil CR straight out of issueCR/mergeRequestCR.
+func (m *Minter) resolveLiveIssueOwner(ctx context.Context, proj *tatarav1alpha1.Project,
+	cr *tatarav1alpha1.Issue, activity string) (string, error) {
+
+	if cr == nil {
+		return "", nil
+	}
+	return m.resolveLiveOwner(ctx, proj, cr, activity)
+}
+
+func (m *Minter) resolveLiveMROwner(ctx context.Context, proj *tatarav1alpha1.Project,
+	cr *tatarav1alpha1.MergeRequest, activity string) (string, error) {
+
+	if cr == nil {
+		return "", nil
+	}
+	return m.resolveLiveOwner(ctx, proj, cr, activity)
+}
+
+// resolveLiveOwner answers IsOrphanIssue clause (b): who controller-owns cr AND
+// still exists. It returns "" when nobody does.
+//
+// It takes a client.Object, not an *Issue, because the defect is IDENTICAL on
+// the MergeRequest arm - the reaper releases ownership of Issue and
+// MergeRequest through one symmetric releaseOwnership, so an MR mirror whose
+// controller-owning Task was reaped keeps a dangling ref exactly the same way,
+// and ClassifyPR read it exactly the same way (an open human PR classified
+// PRIgnore forever: no mint, no counter, no log). Two arms of one defect get
+// one resolver; a parallel copy is how they drift.
+//
+// THE TOMBSTONE BRANCH IS THE #521 FIX. A ref naming a Task the API server does
+// not have is not ownership, it is a dangling string, and it is DROPPED - a
+// write, not an in-memory ignore. Merely ignoring it would fix the sweep and
+// leave three other consumers reading the same lie: ownerTaskRequests
+// (stage_controller.go) would enqueue reconciles for a Task that does not
+// exist, the reaper cascade would reason about it, and ourMR would key on it.
+// Dropping it also lets THIS SAME PASS mint, because the very next call is
+// IsOrphanIssue with liveOwner="".
+//
+// It lives HERE and not in internal/own because that package is memory-only by
+// its own package doc: every function except RepairZeroController mutates an
+// object in memory and returns, and the caller owns the Update. The API Get
+// that decides liveness does not belong there. own.DropOwner is the pure
+// mutation half.
+//
+// THE GET IS UNCACHED (m.reader()). A stale informer cache that has not yet
+// observed a freshly created Task would report NotFound and this function would
+// drop a LIVE owner's ref, stealing an issue out from under a running Task -
+// strictly worse than the bug it fixes. createTaskRaceSafe already made exactly
+// this call for exactly this reason (fix F3-1).
+func (m *Minter) resolveLiveOwner(ctx context.Context, proj *tatarav1alpha1.Project,
+	cr client.Object, activity string) (string, error) {
+
+	if cr == nil {
+		return "", nil
+	}
+	// TWO iterations, never more. The second exists ONLY for the race
+	// dropStaleOwner's fresh read exposes: the caller's copy came from the
+	// CACHED client and can name a Task that was reaped, while a concurrent
+	// webhook binds a DIFFERENT, LIVE Task as controller in the same window.
+	// The fresh Get sees that Task, DropOwner finds nothing to drop, and
+	// reporting "no owner" from there mints a DUPLICATE - createTaskRaceSafe
+	// only absorbs that when the live Task holds the SAME deterministic
+	// natural-key name, which a takeover or incident Task does not. A third
+	// hand-over inside the same window is the next pass's business: a loop
+	// here could spin against the API server, and the bound is what makes that
+	// impossible rather than unlikely.
+	for i := 0; i < 2; i++ {
+		name, owned := own.ControllerOwner(cr)
+		if !owned {
+			return "", nil
+		}
+		var task tatarav1alpha1.Task
+		err := m.reader().Get(ctx, types.NamespacedName{Namespace: cr.GetNamespace(), Name: name}, &task)
+		if err == nil {
+			return name, nil
+		}
+		if !apierrors.IsNotFound(err) {
+			return "", fmt.Errorf("sweep: resolve owner task %q of %s: %w", name, cr.GetName(), err)
+		}
+		dropped, derr := m.dropStaleOwner(ctx, cr, name)
+		if derr != nil {
+			return "", derr
+		}
+		if dropped {
+			obs.SweepStaleOwnerRepairedTotal.WithLabelValues(proj.Name, activity).Inc()
+			log.FromContext(ctx).Info("sweep: dropped a controller ownerRef naming a Task that no longer exists; the artifact is mintable again",
+				"action", "sweep_stale_owner_repaired", "resource_id", cr.GetName(),
+				"activity", activity, "project", proj.Name, "stale_owner", name)
+		}
+		// dropStaleOwner mirrored the FRESH refs onto cr. A controller that is
+		// still the one we just resolved as gone means the write did not take;
+		// stop rather than re-drop it forever.
+		if cur, still := own.ControllerOwner(cr); !still || cur == name {
+			return "", nil
 		}
 	}
-	return tatarav1alpha1.IsAllowedReporter(proj, repo, iss.Author)
+	return "", nil
+}
+
+// dropStaleOwner removes owner's ownerRef from the Issue/MergeRequest mirror in
+// etcd, under RetryOnConflict against a FRESH copy, and mirrors the result onto
+// cr so the caller's copy is not left carrying a ref that no longer exists. It
+// reports whether it actually wrote, so the repair counter counts repairs and
+// not passes. A concurrently reaped CR (NotFound) is not an error: there is
+// nothing left to repair.
+//
+// THE RE-READ IS UNCACHED (m.reader()), matching the liveness Get in
+// resolveLiveOwner. Through the cached Client a Conflict retry re-Gets the SAME
+// stale resourceVersion and loses again, so all five attempts burn and the
+// caller's fail("resolve_live_owner") skips the issue AND fails the whole pass.
+// Status is a subresource, so the full Update below cannot clobber it.
+func (m *Minter) dropStaleOwner(ctx context.Context, cr client.Object, owner string) (bool, error) {
+	key := client.ObjectKeyFromObject(cr)
+	wrote := false
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		wrote = false
+		fresh, ok := cr.DeepCopyObject().(client.Object)
+		if !ok {
+			return fmt.Errorf("sweep: %T is not a client.Object", cr)
+		}
+		if err := m.reader().Get(ctx, key, fresh); err != nil {
+			return err
+		}
+		if !own.DropOwner(fresh, owner) {
+			cr.SetOwnerReferences(fresh.GetOwnerReferences())
+			return nil
+		}
+		if err := m.Client.Update(ctx, fresh); err != nil {
+			return err
+		}
+		cr.SetOwnerReferences(fresh.GetOwnerReferences())
+		wrote = true
+		return nil
+	})
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("sweep: drop stale owner %q from %s: %w", owner, key.Name, err)
+	}
+	return wrote, nil
 }
 
 // MintStage returns the stage (and stage reason) a newly minted Task for iss
@@ -483,9 +715,21 @@ const (
 //     ->  review Task iff prInReactionScope
 //  4. everything else                 ->  IGNORE
 //
-// cr is the MergeRequest CR for (repo, pr.Number), or nil when none exists. The
-// ORPHAN half of clause 3 is the exact MR analogue of IsOrphanIssue's clause (b),
-// and it is load-bearing in BOTH directions:
+// liveOwner is the name of the Task that controller-owns the MergeRequest CR
+// for (repo, pr.Number) AND STILL EXISTS, or "" when there is none - the exact
+// MR analogue of IsOrphanIssue's liveOwner parameter, and taken as a PARAMETER
+// for the same reason (issue #521). This function used to call
+// own.ControllerOwner(cr) twice, in BOTH clauses below, and that call returns
+// owned=true for any ref carrying controller=true without ever checking the
+// named Task exists. So an MR mirror whose controller-owning Task was reaped
+// kept a dangling ref forever, an open HUMAN PR classified PRIgnore on every
+// pass - no mint, no counter, no log - and an adoptable bot PR was held
+// PRClaimed by a claimant that no longer existed.
+// Minter.resolveLiveMROwner is the resolver, and it DROPS the tombstone ref
+// rather than ignoring it.
+//
+// The ORPHAN half of clause 3 is the exact MR analogue of IsOrphanIssue's
+// clause (b), and it is load-bearing in BOTH directions:
 //
 //	an OWNED MR CR is NOT an orphan. A human's PR never has a task/<name> head
 //	branch, so taskForBranch always returns nil for it - meaning nothing else in
@@ -523,7 +767,7 @@ const (
 //
 // Consequence: every review-kind Task is non-bot-authored BY CONSTRUCTION.
 func ClassifyPR(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, pr scm.PRRef,
-	owner *tatarav1alpha1.Task, cr *tatarav1alpha1.MergeRequest) PRDisposition {
+	owner *tatarav1alpha1.Task, liveOwner string) PRDisposition {
 
 	if AdoptPR(proj, owner, pr) {
 		// CLAUSE 1b (issue #477). An MR already controller-owned by someone
@@ -533,11 +777,11 @@ func ClassifyPR(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, p
 		// taskForBranch already prefers the claiming Task when it shares this
 		// branch, so reaching here means the claimant is on a DIFFERENT branch
 		// (a takeover hand-over mid-flight, a review mint's expectFrom source).
-		// Skip; the claimant is driving the MR.
-		if cr != nil {
-			if cur, owned := own.ControllerOwner(cr); owned && cur != owner.Name {
-				return PRClaimed
-			}
+		// Skip; the claimant is driving the MR. A claimant that no longer
+		// EXISTS is not driving anything, so liveOwner is empty for it and the
+		// adoption proceeds.
+		if liveOwner != "" && liveOwner != owner.Name {
+			return PRClaimed
 		}
 		return PRAdopt
 	}
@@ -548,10 +792,8 @@ func ClassifyPR(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, p
 	if pr.Author == "" {
 		return PRIgnore
 	}
-	if cr != nil {
-		if _, owned := own.ControllerOwner(cr); owned {
-			return PRIgnore // not an orphan: a live Task is already working it
-		}
+	if liveOwner != "" {
+		return PRIgnore // not an orphan: a live Task is already working it
 	}
 	if prInReactionScope(proj, repo, prCandidate(pr), bot) {
 		return PRReview
@@ -704,8 +946,12 @@ func (b *sweepBudget) capHit(ctx context.Context, cap string) {
 //
 // sp is the A.7 spiller for the mirror writes; nil is legal (a sweep-minted
 // Issue/MergeRequest is far under the byte budget on its first write).
+//
+// It returns a non-zero requeue-after when the pass deleted a stale terminal
+// Task holding a natural key: that mint is still OWED and must not wait a full
+// sweep period (issue #521).
 func (r *ProjectReconciler) SweepProject(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader,
-	repos []tatarav1alpha1.Repository, sp objbudget.Spiller, activity string) error {
+	repos []tatarav1alpha1.Repository, sp objbudget.Spiller, activity string) (time.Duration, error) {
 	l := log.FromContext(ctx)
 	now := time.Now()
 
@@ -719,8 +965,9 @@ func (r *ProjectReconciler) SweepProject(ctx context.Context, proj *tatarav1alph
 		// which double-counted every sweep fault into the ERROR-rate alert).
 		l.Error(err, "sweep: list_tasks", "action", "sweep_error",
 			"resource_id", proj.Name, "activity", activity, "reason", "list_tasks")
-		return fmt.Errorf("sweep: count active tasks: %w", err)
+		return 0, fmt.Errorf("sweep: count active tasks: %w", err)
 	}
+	requeue := time.Duration(0)
 	budget := newSweepBudget(proj, active)
 	minted := map[string]int{tatarav1alpha1.StageTriaging: 0, tatarav1alpha1.StageParked: 0}
 	var firstErr error
@@ -760,14 +1007,16 @@ func (r *ProjectReconciler) SweepProject(ctx context.Context, proj *tatarav1alph
 		if ierr != nil {
 			fail("list_issues", ierr, "repo", repo.Name)
 		} else {
-			r.sweepIssues(ctx, proj, repo, reader, owner, name, issues, budget, minted, sp, activity, fail)
+			requeue = soonerRequeue(requeue,
+				r.sweepIssues(ctx, proj, repo, reader, owner, name, issues, budget, minted, sp, activity, now, fail))
 		}
 		prs, perr := reader.ListOpenPRs(ctx, owner, name)
 		if perr != nil {
 			fail("list_prs", perr, "repo", repo.Name)
 			continue
 		}
-		r.sweepPRs(ctx, proj, repo, reader, writer, token, owner, name, prs, budget, minted, sp, activity, fail)
+		requeue = soonerRequeue(requeue,
+			r.sweepPRs(ctx, proj, repo, reader, writer, token, owner, name, prs, budget, minted, sp, activity, fail))
 	}
 
 	// EVERY pass, including the zero: a sweep that mints nothing is the signal
@@ -785,21 +1034,127 @@ func (r *ProjectReconciler) SweepProject(ctx context.Context, proj *tatarav1alph
 	// so a sweep that genuinely cannot run still leaves the heartbeat unset.
 	obs.SweepLastSuccessTimestamp.WithLabelValues(proj.Name, activity).Set(float64(now.Unix()))
 	if firstErr != nil {
-		return firstErr
+		return requeue, firstErr
 	}
 	l.Info("sweep: pass complete",
 		"action", "sweep_pass", "resource_id", proj.Name, "activity", activity,
+		"repos", repoNames(repos),
 		"minted_triaging", minted[tatarav1alpha1.StageTriaging],
 		"minted_parked", minted[tatarav1alpha1.StageParked],
 		"active_tasks", budget.active, "duration_ms", time.Since(now).Milliseconds())
-	return nil
+	return requeue, nil
+}
+
+// repoNames is the `repos` field on the sweep_pass log line. SweepProject is
+// handed dueRepos, NOT every repo in the project, so without this a pass-complete
+// line cannot be read as "these repos were scanned" - which is a diagnostic
+// gap, not a cosmetic one (issue #521 took 19 hours partly because the repo set
+// of each pass had to be reconstructed from per-repo cadence config and
+// timestamps). Sweep order is preserved: it is the order failures will appear in.
+func repoNames(repos []tatarav1alpha1.Repository) []string {
+	out := make([]string, 0, len(repos))
+	for i := range repos {
+		out = append(out, repos[i].Name)
+	}
+	return out
+}
+
+// strandOrphan marks ONE orphan issue as having finished a sweep pass with no
+// live owning Task. See obs.SweepOrphanStrandedSeconds for why a heartbeat
+// cannot replace it.
+func (r *ProjectReconciler) strandOrphan(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository,
+	ref scm.IssueRef, now time.Time) {
+
+	obs.SweepOrphanStrandedSeconds.
+		WithLabelValues(proj.Name, repo.Name, strconv.Itoa(ref.Number)).
+		Set(now.Sub(ref.CreatedAt).Seconds())
+}
+
+// strandOnFailure is strandOrphan for the ERROR exits of the per-issue loop.
+// The deadman used to be set only on the budget-bound and tombstone paths, so
+// it UNDER-REPORTED exactly when the sweep was failing: an orphan whose
+// list_comments / get_issue / mint_issue_task / resolve_live_owner failed hit
+// fail() and continue with no series at all, and the gauge read ZERO for an
+// issue that had just ended a pass with no live owning Task - the literal
+// negation of its own Help text.
+//
+// The gate is IsOrphanIssue with liveOwner="" - "as far as this pass got, this
+// looks like an orphan". On the failures that happen BEFORE ownership is
+// resolved that deliberately over-reports (an owned issue whose mirror read
+// failed gets a series until the next pass clears it), and that is the right
+// direction: a deadman that under-reports while the thing it watches is broken
+// is not a deadman.
+func (r *ProjectReconciler) strandOnFailure(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository,
+	ext scm.Issue, ref scm.IssueRef, now time.Time) {
+
+	if orphan, _ := IsOrphanIssue(proj, repo, ext, ""); orphan {
+		r.strandOrphan(proj, repo, ref, now)
+	}
+}
+
+// skipIssue records ONE deliberately-skipped issue: the counter for the alert,
+// and the log line for the human. BOTH, and the reason is the one the codebase
+// already gives for SweepSkippedTotal - a counter cannot say WHICH issue went
+// unanswered, which is exactly the gap that let five open issues sit for 19
+// hours with a green sweep heartbeat (issue #521).
+//
+// resource_id is the Issue MIRROR's name (iss-<repo>-<number>), not the
+// project: the five live victims are named in kubectl output and in the CR's
+// own metadata by that string, so it is what an operator greps for.
+//
+// A package-level function, not a *ProjectReconciler method: the first non-sweep
+// caller (Minter.MintForItem, on the WEBHOOK path) has no reconciler, and its
+// having none is exactly why it discarded the skip reason with `orphan, _` and
+// left a human's refused issue with no counter and no log.
+func skipIssue(ctx context.Context, proj *tatarav1alpha1.Project,
+	repo *tatarav1alpha1.Repository, number int, activity, reason string) {
+
+	obs.SweepSkippedTotal.WithLabelValues(proj.Name, activity, reason).Inc()
+	log.FromContext(ctx).Info("sweep: issue skipped",
+		"action", "sweep_skip_issue", "resource_id", tatarav1alpha1.IssueName(repo.Name, number),
+		"activity", activity, "reason", reason, "project", proj.Name,
+		"repo", repo.Name, "number", number)
+}
+
+// skipPR is skipIssue's PR arm. It exists because sweepPRs counted its skips
+// with NO companion log line - and a counter cannot say WHICH PR went
+// unanswered any more on this arm than on the issue arm - while its
+// budget-bound path counted nothing at all.
+func skipPR(ctx context.Context, proj *tatarav1alpha1.Project,
+	repo *tatarav1alpha1.Repository, number int, activity, reason string, kv ...any) {
+
+	obs.SweepSkippedTotal.WithLabelValues(proj.Name, activity, reason).Inc()
+	log.FromContext(ctx).Info("sweep: PR skipped",
+		append([]any{"action", "sweep_skip_pr",
+			"resource_id", tatarav1alpha1.MergeRequestName(repo.Name, number),
+			"activity", activity, "reason", reason, "project", proj.Name,
+			"repo", repo.Name, "number", number}, kv...)...)
+}
+
+// soonerRequeue folds one candidate requeue into the running minimum. The sweep
+// used to take the LAST non-zero delay any repo asked for, which is only
+// harmless while sweepRemintDelay is the single delay constant in the file - the
+// moment a second one exists, last-wins silently discards the urgent one.
+func soonerRequeue(cur, d time.Duration) time.Duration {
+	if d <= 0 {
+		return cur
+	}
+	if cur == 0 || d < cur {
+		return d
+	}
+	return cur
 }
 
 // sweepIssues mints a Task for every orphan issue in one repo, within budget.
 func (r *ProjectReconciler) sweepIssues(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository,
 	reader scm.SCMReader, owner, name string, issues []scm.IssueRef, budget *sweepBudget, minted map[string]int,
-	sp objbudget.Spiller, activity string, fail func(string, error, ...any)) {
+	sp objbudget.Spiller, activity string, now time.Time, fail func(string, error, ...any)) time.Duration {
 
+	// Clear FIRST, set per stranded issue below: an issue this pass serves must
+	// lose its series on this pass, or the deadman is a permanent false alarm.
+	obs.ClearSweepOrphanStranded(proj.Name, repo.Name)
+
+	requeue := time.Duration(0)
 	for _, ref := range issues {
 		if ref.IsPR {
 			continue
@@ -808,6 +1163,7 @@ func (r *ProjectReconciler) sweepIssues(ctx context.Context, proj *tatarav1alpha
 		cr, gerr := r.issueCR(ctx, proj, repo, ref.Number)
 		if gerr != nil {
 			fail("get_issue_cr", gerr, "repo", repo.Name, "number", ref.Number)
+			r.strandOnFailure(proj, repo, ext, ref, now)
 			continue
 		}
 		// O9 BACKSTOP, and it runs BEFORE the orphan check on purpose. ref is an
@@ -821,6 +1177,7 @@ func (r *ProjectReconciler) sweepIssues(ctx context.Context, proj *tatarav1alpha
 		if cr != nil && cr.Status.Status == "rejected" && ext.State == "open" {
 			if rerr := reopenRetainedProposal(ctx, r.Client, cr, botLoginOf(proj)); rerr != nil {
 				fail("reopen_retained_proposal", rerr, "repo", repo.Name, "number", ref.Number)
+				r.strandOnFailure(proj, repo, ext, ref, now)
 				continue
 			}
 			// Re-read: the undo dropped the ownerRef in etcd, and IsOrphanIssue below
@@ -828,10 +1185,19 @@ func (r *ProjectReconciler) sweepIssues(ctx context.Context, proj *tatarav1alpha
 			// period for a reopen the operator has already acted on.
 			if cr, gerr = r.issueCR(ctx, proj, repo, ref.Number); gerr != nil {
 				fail("get_issue_cr", gerr, "repo", repo.Name, "number", ref.Number)
+				r.strandOnFailure(proj, repo, ext, ref, now)
 				continue
 			}
 		}
-		if !IsOrphanIssue(proj, repo, ext, cr) {
+		liveOwner, lerr := r.minter().resolveLiveIssueOwner(ctx, proj, cr, activity)
+		if lerr != nil {
+			fail("resolve_live_owner", lerr, "repo", repo.Name, "number", ref.Number)
+			r.strandOnFailure(proj, repo, ext, ref, now)
+			continue
+		}
+		orphan, skipReason := IsOrphanIssue(proj, repo, ext, liveOwner)
+		if !orphan {
+			skipIssue(ctx, proj, repo, ref.Number, activity, skipReason)
 			continue
 		}
 		// The thread is read ONLY for an orphan: an owned issue is re-read by the
@@ -841,12 +1207,14 @@ func (r *ProjectReconciler) sweepIssues(ctx context.Context, proj *tatarav1alpha
 		comments, cerr := reader.ListIssueComments(ctx, owner, name, ref.Number)
 		if cerr != nil {
 			fail("list_comments", cerr, "repo", repo.Name, "number", ref.Number)
+			r.strandOnFailure(proj, repo, ext, ref, now)
 			continue
 		}
 		ext.Comments = comments
 		content, ferr := reader.GetIssue(ctx, owner, name, ref.Number)
 		if ferr != nil {
 			fail("get_issue", ferr, "repo", repo.Name, "number", ref.Number)
+			r.strandOnFailure(proj, repo, ext, ref, now)
 			continue
 		}
 		if content.Title != "" {
@@ -860,30 +1228,50 @@ func (r *ProjectReconciler) sweepIssues(ctx context.Context, proj *tatarav1alpha
 		live := WebhookOriginated(cr)
 		stg, reason := MintStage(proj, repo, ext, live)
 		if !budget.allow(ctx, stg) {
+			skipIssue(ctx, proj, repo, ref.Number, activity, SweepSkipMintBudget)
+			r.strandOrphan(proj, repo, ref, now)
 			continue
 		}
-		task, created, merr := r.minter().MintIssueTask(ctx, proj, repo, ext, stg, reason, sp)
+		task, outcome, merr := r.minter().MintIssueTask(ctx, proj, repo, ext, stg, reason, sp)
 		if merr != nil {
 			fail("mint_issue_task", merr, "repo", repo.Name, "number", ref.Number)
+			r.strandOnFailure(proj, repo, ext, ref, now)
 			continue
 		}
-		if !created {
-			// A webhook already minted this natural key; the sweep's backstop no-ops.
-			continue
-		}
-		// Spent, on the mint that read it - whichever stage that mint chose.
-		if live {
-			if cerr := r.clearWebhookOriginated(ctx, proj, repo, ref.Number); cerr != nil {
-				fail("clear_webhook_marker", cerr, "repo", repo.Name, "number", ref.Number)
+		switch outcome {
+		case MintCreated:
+			// Spent, on the mint that read it - whichever stage that mint chose.
+			if live {
+				if cerr := r.clearWebhookOriginated(ctx, proj, repo, ref.Number); cerr != nil {
+					fail("clear_webhook_marker", cerr, "repo", repo.Name, "number", ref.Number)
+				}
 			}
+			budget.record(stg)
+			minted[stg]++
+			log.FromContext(ctx).Info("sweep: minted task for orphan issue",
+				"action", "sweep_mint", "resource_id", task.Name, "activity", activity,
+				"repo", repo.Name, "number", ref.Number, "stage", stg, "stage_reason", reason,
+				"webhook_originated", live)
+		case MintExistingLive:
+			// A webhook already minted this natural key; the sweep's backstop no-ops.
+			skipIssue(ctx, proj, repo, ref.Number, activity, SweepSkipAlreadyMinted)
+		case MintTombstoneDeleted:
+			// The mint is OWED and has NOT happened. Ask for a fast requeue
+			// instead of waiting a full sweep period.
+			skipIssue(ctx, proj, repo, ref.Number, activity, SweepSkipTombstoneDeleted)
+			r.strandOrphan(proj, repo, ref, now)
+			requeue = soonerRequeue(requeue, sweepRemintDelay)
+		case MintNotOwed:
+			// Unreachable: MintIssueTask is called only past IsOrphanIssue, and
+			// it never classifies. Named anyway so a future member of the
+			// vocabulary cannot be added without meeting this switch - and under
+			// its OWN reason, because "nothing was owed" and "a Task already
+			// exists" are opposite facts.
+			skipIssue(ctx, proj, repo, ref.Number, activity, SweepSkipMintNotOwed)
+			r.strandOrphan(proj, repo, ref, now)
 		}
-		budget.record(stg)
-		minted[stg]++
-		log.FromContext(ctx).Info("sweep: minted task for orphan issue",
-			"action", "sweep_mint", "resource_id", task.Name, "activity", activity,
-			"repo", repo.Name, "number", ref.Number, "stage", stg, "stage_reason", reason,
-			"webhook_originated", live)
 	}
+	return requeue
 }
 
 // sweepPRs applies the four-clause disposition to every open PR in one repo,
@@ -897,9 +1285,10 @@ func (r *ProjectReconciler) sweepIssues(ctx context.Context, proj *tatarav1alpha
 func (r *ProjectReconciler) sweepPRs(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository,
 	reader scm.SCMReader, writer scm.SCMWriter, token, owner, name string,
 	prs []scm.PRRef, budget *sweepBudget, minted map[string]int, sp objbudget.Spiller, activity string,
-	fail func(string, error, ...any)) {
+	fail func(string, error, ...any)) time.Duration {
 
 	l := log.FromContext(ctx)
+	requeue := time.Duration(0)
 	for _, pr := range prs {
 		// The mirror is read BEFORE the branch lookup, not after: its controller
 		// owner is what disambiguates a head branch that several Tasks share
@@ -909,16 +1298,21 @@ func (r *ProjectReconciler) sweepPRs(ctx context.Context, proj *tatarav1alpha1.P
 			fail("get_mr_cr", gerr, "repo", repo.Name, "number", pr.Number)
 			continue
 		}
-		claimedBy := ""
-		if cr != nil {
-			claimedBy, _ = own.ControllerOwner(cr)
+		// LIVENESS, not presence (issue #521). A ref naming a reaped Task is a
+		// dangling string: it disambiguated taskForBranch onto a Task that does
+		// not exist AND made ClassifyPR ignore an open human PR forever. The
+		// resolver DROPS it, so this same pass reclassifies and mints.
+		claimedBy, lerr := r.minter().resolveLiveMROwner(ctx, proj, cr, activity)
+		if lerr != nil {
+			fail("resolve_live_owner", lerr, "repo", repo.Name, "number", pr.Number)
+			continue
 		}
 		ownerTask, terr := r.taskForBranch(ctx, proj, pr.HeadBranch, claimedBy)
 		if terr != nil {
 			fail("get_owning_task", terr, "repo", repo.Name, "number", pr.Number)
 			continue
 		}
-		switch ClassifyPR(proj, repo, pr, ownerTask, cr) {
+		switch ClassifyPR(proj, repo, pr, ownerTask, claimedBy) {
 		case PRAdopt:
 			if aerr := r.adoptPRIntoTask(ctx, proj, repo, pr, ownerTask, sp); aerr != nil {
 				fail("adopt_pr", aerr, "repo", repo.Name, "number", pr.Number)
@@ -930,34 +1324,45 @@ func (r *ProjectReconciler) sweepPRs(ctx context.Context, proj *tatarav1alpha1.P
 		case PRReview:
 			stg, reason := MintReviewStage(cr)
 			if !budget.allow(ctx, stg) {
+				// Counted AND logged. This arm used to count nothing at all, so
+				// an orphan PR deferred by the budget was the one skip in the
+				// pass with no series and no line anywhere.
+				skipPR(ctx, proj, repo, pr.Number, activity, SweepSkipMintBudget, "stage", stg)
 				continue
 			}
-			task, created, merr := r.minter().MintReviewTask(ctx, proj, repo, pr, cr, stg, reason, sp)
+			task, outcome, merr := r.minter().MintReviewTask(ctx, proj, repo, pr, cr, stg, reason, sp)
 			if merr != nil {
 				fail("mint_review_task", merr, "repo", repo.Name, "number", pr.Number)
 				continue
 			}
-			if !created {
+			switch outcome {
+			case MintCreated:
+				budget.record(stg)
+				minted[stg]++
+				l.Info("sweep: minted review task for human PR",
+					"action", "sweep_mint", "resource_id", task.Name, "activity", activity,
+					"repo", repo.Name, "number", pr.Number, "stage", stg, "stage_reason", reason,
+					"kind", SweepReviewKind, "adopted_mirror", cr != nil,
+					"human_review_rounds", task.Status.HumanReviewRounds)
+			case MintExistingLive:
 				// A webhook already minted this natural key; the sweep's backstop no-ops.
-				continue
+				skipPR(ctx, proj, repo, pr.Number, activity, SweepSkipAlreadyMinted)
+			case MintNotOwed:
+				// Its OWN reason, not folded into already_minted: "nothing was
+				// owed" and "a Task already exists" are opposite facts.
+				skipPR(ctx, proj, repo, pr.Number, activity, SweepSkipMintNotOwed)
+			case MintTombstoneDeleted:
+				// The mint is OWED and has NOT happened; ask for a fast requeue.
+				skipPR(ctx, proj, repo, pr.Number, activity, SweepSkipTombstoneDeleted)
+				requeue = soonerRequeue(requeue, sweepRemintDelay)
 			}
-			budget.record(stg)
-			minted[stg]++
-			l.Info("sweep: minted review task for human PR",
-				"action", "sweep_mint", "resource_id", task.Name, "activity", activity,
-				"repo", repo.Name, "number", pr.Number, "stage", stg, "stage_reason", reason,
-				"kind", SweepReviewKind, "adopted_mirror", cr != nil,
-				"human_review_rounds", task.Status.HumanReviewRounds)
 		case PRClaimed:
 			// Clause 1b (issue #477). NOT an error and NOT metered as one: the
 			// claiming Task owns this MR legitimately and the sweep has nothing
 			// to do until that Task is reaped. Counted, though - a claim that
 			// never clears is a stuck Task, and operator_sweep_skipped_total is
 			// where that shows up without burning the ERROR-rate alert.
-			obs.SweepSkippedTotal.WithLabelValues(proj.Name, activity, SweepSkipMRClaimed).Inc()
-			l.Info("sweep: PR already claimed by another task; adoption skipped",
-				"action", "sweep_skip_pr", "resource_id", proj.Name, "activity", activity,
-				"reason", SweepSkipMRClaimed, "repo", repo.Name, "number", pr.Number,
+			skipPR(ctx, proj, repo, pr.Number, activity, SweepSkipMRClaimed,
 				"head_branch", pr.HeadBranch, "branch_task", ownerTask.Name, "claimed_by", claimedBy)
 		case PRIgnore:
 			// Clause 2/4. No Task, no pod, no tokens, and the PR is NOT touched: a
@@ -1013,6 +1418,7 @@ func (r *ProjectReconciler) sweepPRs(ctx context.Context, proj *tatarav1alpha1.P
 			fail("reconcile_ownership", oerr, "repo", repo.Name, "number", pr.Number)
 		}
 	}
+	return requeue
 }
 
 // listPRCommentsAfter lists mr number's comments and cuts the oldest-first

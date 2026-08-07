@@ -1415,8 +1415,19 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 	// SweepProject itself.
 	if SweepEnabled(proj) {
 		if dueRepos, soonestSweep, ok := r.reposDueForScan(proj, "issueScan", repos, now); ok {
+			// DEADMAN RETENTION (contract K.1 cardinality).
+			// obs.ClearSweepOrphanStranded only ever runs from INSIDE a sweep
+			// pass, so a Repository that leaves the project is never looked at
+			// again and its stranded series freezes at its last value and is
+			// scraped forever. The alert is max by (project) over a threshold,
+			// so a frozen 19h series pages permanently until the pod rolls.
+			// Every ENROLLED repo is kept: its own slot clears it when it fires,
+			// and retracting a repo this pass did not sweep would blind the
+			// deadman for up to a full period.
+			obs.RetainSweepOrphanStranded(proj.Name, repoNames(repos))
 			if len(dueRepos) > 0 {
-				if serr := r.SweepProject(ctx, proj, reader, dueRepos, nil, SweepActivity); serr != nil {
+				sweepRequeue, serr := r.SweepProject(ctx, proj, reader, dueRepos, nil, SweepActivity)
+				if serr != nil {
 					// RE-REPORT ONLY, hence V(1) (issue #477). SweepProject has
 					// ALREADY logged this error at ERROR and metered it on
 					// operator_sweep_errors_total - every per-item failure through
@@ -1429,7 +1440,28 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 						"action", "scan_sweep_error", "resource_id", proj.Name,
 						"activity", SweepActivity, "error", serr.Error())
 				}
-				if serr := r.stampScan(ctx, proj, "issueScan"); serr != nil {
+				if sweepRequeue > 0 {
+					// The pass DELETED a stale terminal Task holding a natural key;
+					// that mint is still OWED and has NOT happened (issue #521).
+					//
+					// THE SKIPPED STAMP IS HALF THE FIX, and without it the other
+					// half is a no-op. stampScan writes Status.LastIssueScan, which
+					// IS reposDueForScan's dueBase, and repoNextFire anchors every
+					// repo's slot on that base - so a pass that stamps leaves the
+					// owed repo not-due for a FULL cron period. The 30s wake would
+					// then find len(dueRepos) == 0, never call SweepProject, and the
+					// owed mint would wait the remaining ~59.5 minutes: the exact
+					// silent-next-pass shape this change exists to eliminate.
+					// Leaving the base alone keeps precisely the repos that were due
+					// still due, so the wake re-sweeps THEM and nothing else.
+					//
+					// BOUNDED. createTaskRaceSafe deletes each tombstone exactly
+					// once and a Task carries no finalizer, so the name is free
+					// immediately and the next pass MINTS - which stamps, and the
+					// sweep is back on its cron cadence. A pass can only defer the
+					// stamp while it is making that progress.
+					consider(now.Add(sweepRequeue))
+				} else if serr := r.stampScan(ctx, proj, "issueScan"); serr != nil {
 					l.Error(serr, "scan: persist sweep stamp failed",
 						"action", "scan_stamp_error", "resource_id", proj.Name, "activity", SweepActivity)
 					obs.SweepErrorsTotal.WithLabelValues(proj.Name, "issueScan", "stamp_failed").Inc()
@@ -1440,11 +1472,20 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 			} else {
 				consider(soonestSweep)
 			}
-		} else if cronSpec.IssueScan.Schedule != "" {
-			l.Error(fmt.Errorf("invalid cron %q", cronSpec.IssueScan.Schedule), "scan: invalid issueScan cron, disabling",
-				"action", "scan_cron_invalid", "resource_id", proj.Name, "activity", "issueScan")
-			// invalid_cron is metered once per tick by publishNextExpected (deferred above).
+		} else {
+			// No usable issueScan cron (emptied, or unparseable): no pass will
+			// ever run to clear a stranded series again, so retract them all.
+			obs.RetainSweepOrphanStranded(proj.Name, nil)
+			if cronSpec.IssueScan.Schedule != "" {
+				l.Error(fmt.Errorf("invalid cron %q", cronSpec.IssueScan.Schedule), "scan: invalid issueScan cron, disabling",
+					"action", "scan_cron_invalid", "resource_id", proj.Name, "activity", "issueScan")
+				// invalid_cron is metered once per tick by publishNextExpected (deferred above).
+			}
 		}
+	} else {
+		// The break-glass annotation switched the sweep off for this project;
+		// same retraction, same reason as the no-cron branch above.
+		obs.RetainSweepOrphanStranded(proj.Name, nil)
 	}
 
 	// refine (opt-in cron): periodic backlog grooming - closing duplicates and

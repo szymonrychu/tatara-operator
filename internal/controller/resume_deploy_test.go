@@ -94,9 +94,9 @@ func TestResumeNoReentryPark_ClosesPRSeversAndReadoptsActive(t *testing.T) {
 
 	// Simulate the next sweep pass re-minting the orphan issue: it must land ACTIVE
 	// (triaging) via humanHasLastWord, NOT parked, and carry no tatara-parked.
-	task2, created, err := r.minter().MintForItem(ctx, proj, repo, forgeItemFromMirror(got), false, nil)
+	task2, outcome, err := r.minter().MintForItem(ctx, proj, repo, forgeItemFromMirror(got), false, nil)
 	require.NoError(t, err)
-	require.True(t, created, "one reply -> one fresh clarify task")
+	require.Equal(t, MintCreated, outcome, "one reply -> one fresh clarify task")
 	require.Equal(t, tatarav1alpha1.StageTriaging, task2.Spec.InitialStage, "humanHasLastWord -> active, not parked")
 }
 

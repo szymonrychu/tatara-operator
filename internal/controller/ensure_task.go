@@ -2,9 +2,9 @@ package controller
 
 import (
 	"context"
+	"fmt"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
-	"github.com/szymonrychu/tatara-operator/internal/own"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
 
@@ -14,8 +14,13 @@ import (
 // branch, called inline from handleIssueComment; MEMORY W3's driveCommentUnpark
 // is what refreshes/unparks an EXISTING owner once delivery lands).
 //
-// An existing controller owner is returned unchanged - deliverPendingEvent's
-// driveCommentUnpark refreshes/unparks it, this function does not need to. An
+// An existing LIVE controller owner is returned unchanged - deliverPendingEvent's
+// driveCommentUnpark refreshes/unparks it, this function does not need to.
+// LIVE is load-bearing (issue #521): own.ControllerOwner alone returns true for
+// a ref naming a Task the API server no longer has, so a reaped review Task's
+// name was handed straight back to the webhook, which then delivered the
+// human's comment as a TaskEvent to nothing. resolveLiveMROwner DROPS that ref,
+// so the mint below runs on this same call. An
 // orphan OPEN MR with a NON-BOT author in PR reaction scope mints its review
 // Task inline via the SAME PRReview rule ClassifyPR/the sweep use
 // (MintReviewStage + MintReviewTask), race-safe with the sweep through
@@ -25,7 +30,11 @@ import (
 func (m *Minter) EnsureTaskForMRComment(ctx context.Context, proj *tatarav1alpha1.Project,
 	repo *tatarav1alpha1.Repository, mr *tatarav1alpha1.MergeRequest, author string) (string, bool, error) {
 
-	if ownerName, ok := own.ControllerOwner(mr); ok {
+	ownerName, err := m.resolveLiveMROwner(ctx, proj, mr, m.activity())
+	if err != nil {
+		return "", false, err
+	}
+	if ownerName != "" {
 		return ownerName, false, nil
 	}
 	if mr.Status.State != "open" {
@@ -40,11 +49,18 @@ func (m *Minter) EnsureTaskForMRComment(ctx context.Context, proj *tatarav1alpha
 		return "", false, nil
 	}
 	stg, reason := MintReviewStage(mr)
-	task, _, err := m.MintReviewTask(ctx, proj, repo, pr, mr, stg, reason, m.spillerFor(proj))
+	task, outcome, err := m.MintReviewTask(ctx, proj, repo, pr, mr, stg, reason, m.spillerFor(proj))
 	if err != nil {
 		return "", false, err
 	}
-	return task.Name, true, nil
+	if outcome == MintTombstoneDeleted {
+		// The natural key was held by a DEAD twin, which the mint just deleted.
+		// No Task exists, so naming one here would be a fabrication - which is
+		// exactly the class of defect MintOutcome exists to make impossible.
+		// Erroring makes the webhook 5xx and the forge redeliver.
+		return "", false, fmt.Errorf("intake: mint for MR %s deleted a stale terminal task; the mint is still owed", mr.Name)
+	}
+	return task.Name, outcome == MintCreated, nil
 }
 
 // prRefFromMR adapts a MergeRequest mirror CR onto the scm.PRRef the intake

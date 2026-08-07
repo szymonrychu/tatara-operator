@@ -279,3 +279,38 @@ func tail(s string, n int) string {
 	}
 	return s[len(s)-n:]
 }
+
+// TestRedeliverMRComments_MintsWhenTheOwnerWasReaped is issue #521 on OP12's
+// convergence path. own.ControllerOwner accepts a ref naming a Task the API
+// server no longer has, so this function skipped the belt-and-suspenders mint
+// AND then tried to deliver every replayed comment to a Task that does not
+// exist - each one a silent NotFound, on the path that exists precisely to
+// recover a MISSED webhook delivery.
+func TestRedeliverMRComments_MintsWhenTheOwnerWasReaped(t *testing.T) {
+	ctx := context.Background()
+	d, proj, repo := newOwnershipDriver(t, ctx)
+	mr := seedExternalMRWithReviewOwner(t, ctx, proj, repo, 34, "op12-reaped-task-34")
+
+	// THE REAP. envtest runs no GC controller, which is exactly the production
+	// shape here: the mirror survives its owner and keeps the dangling ref.
+	reaped := getTask(t, "op12-reaped-task-34")
+	if err := k8sClient.Delete(ctx, reaped); err != nil {
+		t.Fatalf("reap owner task: %v", err)
+	}
+
+	incoming := []scm.IssueComment{
+		{ExternalID: "500", Author: "alice", Body: "any update?", CreatedAt: fixedTime(1)},
+	}
+	if err := d.redeliverMRComments(ctx, proj, repo, mr, incoming); err != nil {
+		t.Fatal(err)
+	}
+	got := getMR(t, ctx, proj, repo, 34)
+	ownerName, ok := ownerControllerName(got)
+	if !ok || ownerName == "" || ownerName == "op12-reaped-task-34" {
+		t.Fatalf("MR controller owner = %q (owned=%v), want a freshly minted review Task", ownerName, ok)
+	}
+	tk := getTask(t, ownerName)
+	if len(tk.Status.PendingEvents) != 1 {
+		t.Fatalf("mr_comment event not delivered to the re-minted owner: %d pending", len(tk.Status.PendingEvents))
+	}
+}

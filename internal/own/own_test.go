@@ -273,3 +273,76 @@ func TestTaskOwnersIgnoresForeignRefs(t *testing.T) {
 		t.Fatalf("OldestSurvivingOwner = (%q, %v), want (t-a, true)", got, ok)
 	}
 }
+
+// TestDropOwner pins the tombstone-ref half of B.2. An ownerRef naming a Task
+// the API server no longer has is not ownership, it is a dangling string, and
+// #521 is what happens when it is merely IGNORED instead of removed: the same
+// ref misroutes ownerTaskRequests (stage_controller.go), the reaper cascade and
+// ourMR, so the sweep must DROP it, not read past it.
+func TestDropOwner(t *testing.T) {
+	ref := func(name string, controller bool) metav1.OwnerReference {
+		r := metav1.OwnerReference{
+			APIVersion: tataradevv1alpha1.GroupVersion.String(),
+			Kind:       "Task",
+			Name:       name,
+			UID:        types.UID("u-" + name),
+		}
+		if controller {
+			c := true
+			r.Controller = &c
+		}
+		return r
+	}
+	projRef := metav1.OwnerReference{
+		APIVersion: tataradevv1alpha1.GroupVersion.String(),
+		Kind:       "Project",
+		Name:       "proj",
+		UID:        types.UID("u-proj"),
+	}
+
+	tests := map[string]struct {
+		refs    []metav1.OwnerReference
+		drop    string
+		want    bool
+		wantLen int
+	}{
+		"drops the named controller ref": {
+			refs: []metav1.OwnerReference{ref("gone", true)}, drop: "gone", want: true, wantLen: 0,
+		},
+		"drops the named plain ref": {
+			refs: []metav1.OwnerReference{ref("gone", false)}, drop: "gone", want: true, wantLen: 0,
+		},
+		"keeps every other Task ref": {
+			refs: []metav1.OwnerReference{ref("gone", true), ref("alive", false)},
+			drop: "gone", want: true, wantLen: 1,
+		},
+		"keeps non-Task refs": {
+			refs: []metav1.OwnerReference{ref("gone", true), projRef},
+			drop: "gone", want: true, wantLen: 1,
+		},
+		"absent name changes nothing": {
+			refs: []metav1.OwnerReference{ref("alive", true)}, drop: "gone", want: false, wantLen: 1,
+		},
+		"no refs at all changes nothing": {
+			refs: nil, drop: "gone", want: false, wantLen: 0,
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			obj := &tataradevv1alpha1.Issue{
+				ObjectMeta: metav1.ObjectMeta{Name: "iss-x-1", Namespace: "tatara", OwnerReferences: tc.refs},
+			}
+			if got := DropOwner(obj, tc.drop); got != tc.want {
+				t.Fatalf("DropOwner = %v, want %v", got, tc.want)
+			}
+			if n := len(obj.GetOwnerReferences()); n != tc.wantLen {
+				t.Fatalf("remaining owner refs = %d, want %d", n, tc.wantLen)
+			}
+			for _, r := range obj.GetOwnerReferences() {
+				if r.Kind == "Task" && r.Name == tc.drop {
+					t.Fatalf("DropOwner left the dropped ref %q behind", tc.drop)
+				}
+			}
+		})
+	}
+}

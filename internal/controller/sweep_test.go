@@ -116,7 +116,7 @@ func humanComment(id, author, body string, at time.Time) scm.IssueComment {
 func runSweep(t *testing.T, c client.Client, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, rd scm.SCMReader) {
 	t.Helper()
 	r := &ProjectReconciler{Client: c, Scheme: c.Scheme(), Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry())}
-	if err := r.SweepProject(context.Background(), proj, rd, []tatarav1alpha1.Repository{*repo}, nil, SweepActivity); err != nil {
+	if _, err := r.SweepProject(context.Background(), proj, rd, []tatarav1alpha1.Repository{*repo}, nil, SweepActivity); err != nil {
 		t.Fatalf("SweepProject: %v", err)
 	}
 }
@@ -136,74 +136,80 @@ func sweepTasks(t *testing.T, c client.Client, proj string) []tatarav1alpha1.Tas
 	return out
 }
 
-// TestOrphanIssuePredicate pins the THREE clauses of B.4's ONE orphan predicate.
-// Clause (c) is the reporter intake gate (issue #102): v3 deleted it by
-// omission, and its entire purpose is that an INJECTED issue never becomes a
-// Task.
+// TestOrphanIssuePredicate pins the THREE clauses of B.4's ONE orphan
+// predicate, and the REASON each returns. Clause (c) is the reporter intake
+// gate (issue #102): v3 deleted it by omission, and its entire purpose is that
+// an INJECTED issue never becomes a Task.
+//
+// Clause (b) now takes a RESOLVED LIVE owner rather than reading owner refs
+// itself (issue #521). The old form called own.ControllerOwner, which returns
+// owned=true for any ref carrying controller=true and never checks the named
+// Task exists - so an Issue CR whose owning Task was reaped kept a dangling
+// ref forever and was skipped silently on every pass. Taking the live owner as
+// a PARAMETER makes "resolve liveness first" structural instead of a
+// convention a caller can forget. Minter.resolveLiveOwner is what fills it in;
+// TestResolveLiveOwner* pins that half.
 func TestOrphanIssuePredicate(t *testing.T) {
 	proj := sweepProject("orphan-proj")
 	repo := sweepRepo("orphan-proj")
-
-	owned := &tatarav1alpha1.Issue{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: tatarav1alpha1.IssueName(repo.Name, 1), Namespace: testNS,
-			OwnerReferences: []metav1.OwnerReference{{
-				APIVersion: tatarav1alpha1.GroupVersion.String(), Kind: "Task",
-				Name: "owner-task", UID: types.UID("u1"), Controller: boolp(true),
-			}},
-		},
-	}
-	ownerless := &tatarav1alpha1.Issue{
-		ObjectMeta: metav1.ObjectMeta{Name: tatarav1alpha1.IssueName(repo.Name, 1), Namespace: testNS},
-	}
-	plainOnly := &tatarav1alpha1.Issue{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: tatarav1alpha1.IssueName(repo.Name, 1), Namespace: testNS,
-			OwnerReferences: []metav1.OwnerReference{{
-				APIVersion: tatarav1alpha1.GroupVersion.String(), Kind: "Task",
-				Name: "plain-task", UID: types.UID("u2"),
-			}},
-		},
-	}
 
 	gated := sweepProject("orphan-proj")
 	gated.Spec.Scm.ReporterLogins = []string{"alice"}
 
 	tests := map[string]struct {
-		proj *tatarav1alpha1.Project
-		iss  scm.Issue
-		cr   *tatarav1alpha1.Issue
-		want bool
+		proj       *tatarav1alpha1.Project
+		iss        scm.Issue
+		liveOwner  string
+		want       bool
+		wantReason string
 	}{
-		"open, no CR, open allowlist": {
-			proj: proj, iss: scm.Issue{Number: 1, State: "open", Author: "carol"}, want: true,
+		"open, no owner, open allowlist": {
+			proj: proj, iss: scm.Issue{Number: 1, State: "open", Author: "carol"},
+			want: true, wantReason: SweepSkipNone,
 		},
 		"clause a: closed on the forge": {
-			proj: proj, iss: scm.Issue{Number: 1, State: "closed", Author: "carol"}, want: false,
+			proj: proj, iss: scm.Issue{Number: 1, State: "closed", Author: "carol"},
+			want: false, wantReason: SweepSkipIssueNotOpen,
 		},
-		"clause b: an Issue CR with a controller owner": {
-			proj: proj, iss: scm.Issue{Number: 1, State: "open", Author: "carol"}, cr: owned, want: false,
+		"clause b: a LIVE controller owner": {
+			proj: proj, iss: scm.Issue{Number: 1, State: "open", Author: "carol"},
+			liveOwner: "owner-task", want: false, wantReason: SweepSkipIssueOwned,
 		},
-		"clause b: the ownerless survivor of a failed Task IS an orphan": {
-			proj: proj, iss: scm.Issue{Number: 1, State: "open", Author: "carol"}, cr: ownerless, want: true,
+		"clause b: no live owner IS an orphan (the #521 case: the ref named a reaped Task)": {
+			proj: proj, iss: scm.Issue{Number: 1, State: "open", Author: "carol"},
+			liveOwner: "", want: true, wantReason: SweepSkipNone,
 		},
-		"clause b: plain owners only is still an orphan": {
-			proj: proj, iss: scm.Issue{Number: 1, State: "open", Author: "carol"}, cr: plainOnly, want: true,
+		"clause a beats clause b: a closed issue with a live owner still reports not-open": {
+			proj: proj, iss: scm.Issue{Number: 1, State: "closed", Author: "carol"},
+			liveOwner: "owner-task", want: false, wantReason: SweepSkipIssueNotOpen,
 		},
 		"clause c: a non-allowlisted author mints NOTHING": {
-			proj: gated, iss: scm.Issue{Number: 1, State: "open", Author: "mallory"}, want: false,
+			proj: gated, iss: scm.Issue{Number: 1, State: "open", Author: "mallory"},
+			want: false, wantReason: SweepSkipReporterNotAllowed,
 		},
 		"clause c: an allowlisted author passes": {
-			proj: gated, iss: scm.Issue{Number: 1, State: "open", Author: "alice"}, want: true,
+			proj: gated, iss: scm.Issue{Number: 1, State: "open", Author: "alice"},
+			want: true, wantReason: SweepSkipNone,
 		},
 		"clause c: an empty author fails CLOSED under an active gate": {
-			proj: gated, iss: scm.Issue{Number: 1, State: "open", Author: ""}, want: false,
+			proj: gated, iss: scm.Issue{Number: 1, State: "open", Author: ""},
+			want: false, wantReason: SweepSkipReporterNotAllowed,
 		},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			if got := IsOrphanIssue(tc.proj, repo, tc.iss, tc.cr); got != tc.want {
-				t.Fatalf("IsOrphanIssue = %v, want %v", got, tc.want)
+			got, reason := IsOrphanIssue(tc.proj, repo, tc.iss, tc.liveOwner)
+			if got != tc.want {
+				t.Fatalf("IsOrphanIssue orphan = %v, want %v", got, tc.want)
+			}
+			if reason != tc.wantReason {
+				t.Fatalf("IsOrphanIssue reason = %q, want %q", reason, tc.wantReason)
+			}
+			if got && reason != SweepSkipNone {
+				t.Fatalf("an orphan must carry no skip reason, got %q", reason)
+			}
+			if !got && reason == SweepSkipNone {
+				t.Fatal("a non-orphan must NAME the clause that refused it")
 			}
 		})
 	}
@@ -458,7 +464,7 @@ func TestSweepMintsFireOrphanAdopted(t *testing.T) {
 		}
 		reg := prometheus.NewRegistry()
 		r := &ProjectReconciler{Client: c, Scheme: c.Scheme(), Metrics: obs.NewOperatorMetrics(reg)}
-		if err := r.SweepProject(context.Background(), proj, rd, []tatarav1alpha1.Repository{*repo}, nil, SweepActivity); err != nil {
+		if _, err := r.SweepProject(context.Background(), proj, rd, []tatarav1alpha1.Repository{*repo}, nil, SweepActivity); err != nil {
 			t.Fatalf("SweepProject: %v", err)
 		}
 		if got := testutil.ToFloat64(r.Metrics.OrphanAdoptedCounter(SweepIssueKind)); got != 1 {
@@ -479,7 +485,7 @@ func TestSweepMintsFireOrphanAdopted(t *testing.T) {
 		}}}
 		reg := prometheus.NewRegistry()
 		r := &ProjectReconciler{Client: c, Scheme: c.Scheme(), Metrics: obs.NewOperatorMetrics(reg)}
-		if err := r.SweepProject(context.Background(), proj, rd, []tatarav1alpha1.Repository{*repo}, nil, SweepActivity); err != nil {
+		if _, err := r.SweepProject(context.Background(), proj, rd, []tatarav1alpha1.Repository{*repo}, nil, SweepActivity); err != nil {
 			t.Fatalf("SweepProject: %v", err)
 		}
 		if got := testutil.ToFloat64(r.Metrics.OrphanAdoptedCounter(SweepReviewKind)); got != 1 {
@@ -1083,7 +1089,7 @@ func TestSweepNeverReReviewsAHumanPR(t *testing.T) {
 	rd := &sweepReader{prs: []scm.PRRef{humanPR(50)}}
 
 	for cycle := 1; cycle <= 3; cycle++ {
-		if err := r.SweepProject(ctx, proj, rd, []tatarav1alpha1.Repository{*repo}, nil, SweepActivity); err != nil {
+		if _, err := r.SweepProject(ctx, proj, rd, []tatarav1alpha1.Repository{*repo}, nil, SweepActivity); err != nil {
 			t.Fatalf("cycle %d: SweepProject: %v", cycle, err)
 		}
 		tasks := sweepTasks(t, c, proj.Name)
@@ -1110,7 +1116,7 @@ func TestSweepNeverReReviewsAHumanPR(t *testing.T) {
 
 		// A second sweep pass inside the same cycle must be a total no-op: the PR is
 		// now OWNED, so it is not an orphan and it mints NOTHING.
-		if err := r.SweepProject(ctx, proj, rd, []tatarav1alpha1.Repository{*repo}, nil, SweepActivity); err != nil {
+		if _, err := r.SweepProject(ctx, proj, rd, []tatarav1alpha1.Repository{*repo}, nil, SweepActivity); err != nil {
 			t.Fatalf("cycle %d: SweepProject (second pass): %v", cycle, err)
 		}
 		if n := len(sweepTasks(t, c, proj.Name)); n != 1 {
@@ -1322,7 +1328,7 @@ func TestSweepHeartbeatStampsDespitePerItemError(t *testing.T) {
 
 	obs.SweepLastSuccessTimestamp.WithLabelValues("hb-err-proj", activity).Set(0)
 	r := &ProjectReconciler{Client: c, Scheme: c.Scheme(), Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry())}
-	err := r.SweepProject(context.Background(), proj, rd, []tatarav1alpha1.Repository{*repo}, nil, activity)
+	_, err := r.SweepProject(context.Background(), proj, rd, []tatarav1alpha1.Repository{*repo}, nil, activity)
 	if err == nil {
 		t.Fatal("SweepProject returned nil, want the per-item error propagated for the reconciler requeue")
 	}
@@ -1357,7 +1363,7 @@ func TestSweepHeartbeatSuppressedOnHardFailure(t *testing.T) {
 	before := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues("hb-hard-proj", activity, "list_tasks"))
 	obs.SweepLastSuccessTimestamp.WithLabelValues("hb-hard-proj", activity).Set(0)
 	r := &ProjectReconciler{Client: c, Scheme: c.Scheme(), Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry())}
-	err := r.SweepProject(context.Background(), proj, &sweepReader{}, []tatarav1alpha1.Repository{*repo}, nil, activity)
+	_, err := r.SweepProject(context.Background(), proj, &sweepReader{}, []tatarav1alpha1.Repository{*repo}, nil, activity)
 	if err == nil {
 		t.Fatal("SweepProject returned nil, want the activeTaskCount failure")
 	}
@@ -1905,7 +1911,7 @@ func TestSweepHeartbeatIsPerProject(t *testing.T) {
 	obs.SweepLastSuccessTimestamp.WithLabelValues(projA.Name, activity).Set(stale)
 
 	r := &ProjectReconciler{Client: c, Scheme: c.Scheme(), Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry())}
-	if err := r.SweepProject(context.Background(), projB, &sweepReader{},
+	if _, err := r.SweepProject(context.Background(), projB, &sweepReader{},
 		[]tatarav1alpha1.Repository{*repoB}, nil, activity); err != nil {
 		t.Fatalf("SweepProject(hb-multi-b): %v", err)
 	}
@@ -2116,6 +2122,15 @@ func claimedMR(t *testing.T, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.
 	return mr
 }
 
+// liveOwnerOf reads a mirror's controller owner for a ClassifyPR call whose
+// subject is the PREDICATE, not the liveness resolution - the tests that pin
+// liveness resolve it through Minter.resolveLiveOwner instead.
+func liveOwnerOf(t *testing.T, mr *tatarav1alpha1.MergeRequest) string {
+	t.Helper()
+	name, _ := own.ControllerOwner(mr)
+	return name
+}
+
 // TestSweepBranchCollisionAdoptsIntoTheClaimingTask is issue #477's ACTUAL
 // mechanism, reproduced.
 //
@@ -2262,13 +2277,16 @@ func TestClassifyPRClaimedByAnotherTask(t *testing.T) {
 		Number: 7, Author: "tatara-bot", HeadBranch: agent.TaskBranch(owner),
 	}
 
-	if got := ClassifyPR(proj, repo, pr, owner, nil); got != PRAdopt {
+	// liveOwner is what the mirror's controller ref RESOLVES TO, not what it
+	// says: since #521 a ref naming a Task the API server does not have is a
+	// dangling string, and resolveLiveOwner has already dropped it by here.
+	if got := ClassifyPR(proj, repo, pr, owner, ""); got != PRAdopt {
 		t.Fatalf("no mirror yet: ClassifyPR = %q, want %q", got, PRAdopt)
 	}
-	if got := ClassifyPR(proj, repo, pr, owner, claimedMR(t, proj, repo, 7, owner)); got != PRAdopt {
+	if got := ClassifyPR(proj, repo, pr, owner, liveOwnerOf(t, claimedMR(t, proj, repo, 7, owner))); got != PRAdopt {
 		t.Fatalf("owner already owns it: ClassifyPR = %q, want %q (adoption stays idempotent)", got, PRAdopt)
 	}
-	if got := ClassifyPR(proj, repo, pr, owner, claimedMR(t, proj, repo, 7, other)); got != PRClaimed {
+	if got := ClassifyPR(proj, repo, pr, owner, liveOwnerOf(t, claimedMR(t, proj, repo, 7, other))); got != PRClaimed {
 		t.Fatalf("claimed by %s: ClassifyPR = %q, want %q", other.Name, got, PRClaimed)
 	}
 }

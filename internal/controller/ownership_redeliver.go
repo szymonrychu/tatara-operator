@@ -11,7 +11,6 @@ import (
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
-	"github.com/szymonrychu/tatara-operator/internal/own"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
@@ -43,7 +42,16 @@ import (
 func (d *StageDriver) redeliverMRComments(ctx context.Context, proj *tatarav1alpha1.Project,
 	repo *tatarav1alpha1.Repository, mr *tatarav1alpha1.MergeRequest, incoming []scm.IssueComment) error {
 
-	ownerName, hasOwner := own.ControllerOwner(mr)
+	// LIVENESS, not presence (issue #521). own.ControllerOwner alone accepts a
+	// ref naming a reaped Task, so this path skipped the mint below AND then
+	// tried to deliver every replayed comment to a Task that does not exist -
+	// each one a silent NotFound. The resolver drops the ref, so hasOwner goes
+	// false and EnsureTaskForMRComment mints the owner this batch needs.
+	ownerName, lerr := d.minter().resolveLiveMROwner(ctx, proj, mr, SweepActivity)
+	if lerr != nil {
+		return lerr
+	}
+	hasOwner := ownerName != ""
 	if !hasOwner && len(incoming) > 0 {
 		// incoming[0].Author is the mint's author-of-record for this belt-and-
 		// suspenders path; it relies on the sweep's prior PRReview

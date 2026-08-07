@@ -158,11 +158,19 @@ func (r *ProjectReconciler) resumeOne(ctx context.Context, proj *tatarav1alpha1.
 	}
 
 	for _, j := range jobs {
-		if _, _, err := r.minter().MintForItem(ctx, proj, j.repo, j.item, false, nil); err != nil {
+		_, outcome, err := r.minter().MintForItem(ctx, proj, j.repo, j.item, false, nil)
+		if err != nil {
 			return err
 		}
-		log.FromContext(ctx).Info("resumed a no-re-entry park from a human reply: re-minted the issue fresh",
-			"action", "resume_remint", "resource_id", j.name, "old_task", t.Name, "reason", t.Status.StageReason)
+		// The outcome is READ, not discarded. This log line used to fire
+		// unconditionally and claimed a re-mint for every non-error return,
+		// including MintTombstoneDeleted - where a Task had just been DESTROYED
+		// and nothing replaced it. That is the exact defect the typed outcome
+		// closes (issue #521). The issue is severed and ownerless by this point,
+		// so it is an orphan the next sweep pass mints.
+		log.FromContext(ctx).Info("resumed a no-re-entry park from a human reply",
+			"action", "resume_remint", "resource_id", j.name, "old_task", t.Name,
+			"reason", t.Status.StageReason, "outcome", string(outcome))
 	}
 	return nil
 }
