@@ -1089,7 +1089,8 @@ func (s *Server) issueCreate(w http.ResponseWriter, r *http.Request, proj *tatar
 	if !ok {
 		return
 	}
-	created, err := writer.CreateIssue(ctx, repo.Spec.URL, token, scm.IssueReq{Title: req.Title, Body: req.Body})
+	title := tatarav1alpha1.ClampIssueTitle(req.Title)
+	created, err := writer.CreateIssue(ctx, repo.Spec.URL, token, scm.IssueReq{Title: title, Body: req.Body})
 	controller.RecordSCM(s.metrics, providerOf(proj), "create_issue", err)
 	if err != nil {
 		s.log.ErrorContext(ctx, "restapi: creating issue failed",
@@ -1103,7 +1104,7 @@ func (s *Server) issueCreate(w http.ResponseWriter, r *http.Request, proj *tatar
 		return
 	}
 	// No proposal kind: an agent-supplied body never claims tatara provenance.
-	if err := s.mintIssueCR(ctx, proj, repo, task, number, created.URL, req.Title, req.Body, "", nil); err != nil {
+	if err := s.mintIssueCR(ctx, proj, repo, task, number, created.URL, title, req.Body, "", nil); err != nil {
 		writeClientErr(w, err)
 		return
 	}
@@ -1262,7 +1263,12 @@ func (s *Server) issueDeferred(w http.ResponseWriter, r *http.Request, proj *tat
 	requestID := newRequestID(task.Name, action, name, body)
 	pc := tatarav1alpha1.PendingComment{RequestID: requestID, Action: pendingAction(action), Body: body}
 	if action == "edit" {
-		pc.Body = editIntentBody(req.Title, req.Body)
+		// Clamped HERE and not where reviewpost replays it, so the intent the CR
+		// persists is the one the forge will accept. An over-long title makes
+		// EditIssue 400 on every replay: the drain returns on that error before
+		// dropping the intent, so it requeues forever and blocks the intents
+		// queued behind it.
+		pc.Body = editIntentBody(tatarav1alpha1.ClampIssueTitle(req.Title), req.Body)
 	}
 	pc.Body = truncateValidUTF8(pc.Body, tatarav1alpha1.PendingCommentBodyMaxBytes)
 	key := types.NamespacedName{Namespace: s.ns, Name: name}
