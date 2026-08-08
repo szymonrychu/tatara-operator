@@ -687,7 +687,7 @@ func (r *TaskReconciler) commentMRBindingBackstopParked(ctx context.Context, pro
 // already committed the instant it arrives at awaiting-review. A bare claim (Reason
 // "Outcome") never matches either: it has no handoff outstanding.
 //
-// #541: OutcomeCommittedFor ALONE stopped being sufficient. It used to be, because
+// #547: OutcomeCommittedFor ALONE stopped being sufficient. It used to be, because
 // every state had its own agent kind, so a commit naming the state's agent could
 // only have been made IN that state. Folding clarify into implement (#521) made
 // AgentKindFor return the same agent for refined AND under-implementation, so the
@@ -720,7 +720,7 @@ func handoffCondition(task *tatarav1alpha1.Task) *metav1.Condition {
 	//
 	// AT the entry stamp is not after it. A commit written in the SAME etcd write
 	// as the entry it caused shares its metav1.Time, which is SECOND-granular, so
-	// the two stamps are equal and a strict Before() let it through (#541). An
+	// the two stamps are equal and a strict Before() let it through (#547). An
 	// outcome can only be this occupancy's handoff if it was committed strictly
 	// LATER than the entry - which a genuine review commit always is, since the
 	// review pod has to be scheduled, booted and run first.

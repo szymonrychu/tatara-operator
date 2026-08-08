@@ -1191,7 +1191,7 @@ func tsReviewTaskWithOutcome(reason string, recreations int, at time.Time) *tata
 	// a review pod has to be scheduled, booted and run in between. Modelling the
 	// entry and the commit at the same instant made the fixture describe the one
 	// shape that means the opposite thing - an outcome written in the same etcd
-	// write as the entry it CAUSED, which is not a handoff at all (#541).
+	// write as the entry it CAUSED, which is not a handoff at all (#547).
 	task := tsTask("rev", "review", tatarav1alpha1.StateAwaitingReview, at.Add(-time.Minute))
 	task.Status.PodStartedAt = &stamp
 	task.Status.StateWorkStartedAt = &stamp
@@ -1380,7 +1380,7 @@ func TestReviewTask_CommittedOutcomePlusLostPodReachesAwaitingHuman(t *testing.T
 	now := time.Unix(1000, 0)
 	stamp := metav1.NewTime(now.Add(-time.Minute))
 	// Entered awaiting-review BEFORE the review agent committed: a commit sharing
-	// the entry's instant is the transition's OWN outcome, not a handoff (#541).
+	// the entry's instant is the transition's OWN outcome, not a handoff (#547).
 	entered := metav1.NewTime(now.Add(-2 * time.Minute))
 
 	proj := tsProject(3)
@@ -1934,7 +1934,7 @@ func TestReconcile_CommittedOutcomeWithNoDrainParksHandoffStalled(t *testing.T) 
 	})
 }
 
-// #541: the outcome that CAUSED the transition is not the new state's handoff.
+// #547: the outcome that CAUSED the transition is not the new state's handoff.
 //
 // AgentKindFor returns the SAME agent for refined and under-implementation once
 // clarify folded into implement (#521), so the OutcomeAccepted{Reason=Implement}
