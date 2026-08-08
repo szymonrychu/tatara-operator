@@ -340,6 +340,11 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 	if err := agent.ValidatePodResourceQuantities(podConfigFromConfig(cfg)); err != nil {
 		return nil, fmt.Errorf("invalid wrapper pod resource config: %w", err)
 	}
+	// Publish the contract version this process speaks (#544). It is a
+	// compile-time constant that nothing exported, so "which side of a release
+	// train is behind" was only knowable from a mismatch EVENT - i.e. only after
+	// a Task had already been destroyed by it.
+	obs.SetAgentContractExpected(agent.ContractVersion)
 
 	// Durable per-project seq source: webhook and cron producers all share this
 	// stateless allocator. Each project's counter lives in its own ConfigMap

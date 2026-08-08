@@ -108,6 +108,60 @@ func IsContractMismatch(err error) bool {
 	return errors.As(err, &cme)
 }
 
+// ContractSkewWindow is how far the wrapper's reported contract version may sit
+// from the operator's while still being read as a RELEASE TRAIN IN FLIGHT rather
+// than a broken pin.
+//
+// One, in either direction, and that is not a round number picked for taste: the
+// operator and the wrapper move exactly one contract version per release, so at
+// any instant during a train the only reachable skew is +-1. A gap of 2 or more
+// means somebody's pin is genuinely wrong and no amount of waiting fixes it.
+const ContractSkewWindow = 1
+
+// ContractSkewError is the TRANSIENT sibling of ContractMismatchError: the
+// wrapper speaks an ADJACENT contract version, which is the guaranteed state in
+// the middle of a non-atomic release train.
+//
+// The operator image and the agent image are pinned in DIFFERENT helm releases
+// (helmfile.yaml.gotmpl vs values/project-*/common.yaml) and helm rolls them
+// independently, so every single train has a non-empty window where the two
+// disagree. On 2026-08-08 that window was 56 minutes wide and the strict-equality
+// gate destroyed 5 Tasks inside it (#544). It is deliberately NOT a
+// *ContractMismatchError and does NOT unwrap to one: IsContractMismatch is the
+// predicate that routes to the terminal park, and a rollout window must never
+// reach it.
+type ContractSkewError struct {
+	Expected int
+	Got      int
+}
+
+func (e *ContractSkewError) Error() string {
+	return fmt.Sprintf("agent contract skew: operator speaks v%d, wrapper reported v%d (release train in flight)",
+		e.Expected, e.Got)
+}
+
+// IsContractSkew reports whether err is a *ContractSkewError: a version skew the
+// caller should WAIT OUT rather than act on.
+func IsContractSkew(err error) bool {
+	var cse *ContractSkewError
+	return errors.As(err, &cse)
+}
+
+// contractSkewed reports whether got is within ContractSkewWindow of the
+// operator's own version. Zero is excluded: it is the sentinel for "the wrapper
+// reported no contractVersion field at all", which is an OLD wrapper, not a
+// neighbouring release.
+func contractSkewed(got int) bool {
+	if got <= 0 {
+		return false
+	}
+	d := got - ContractVersion
+	if d < 0 {
+		d = -d
+	}
+	return d <= ContractSkewWindow
+}
+
 // AssertContractVersion is the G.10 handshake. At pod-ready, BEFORE a single
 // turn is submitted, the operator reads GET /v1/session and compares the
 // wrapper's contractVersion against its own. A mismatch - or a response with no
@@ -127,10 +181,17 @@ func AssertContractVersion(ctx context.Context, s Session, baseURL string) error
 	if info.ContractVersion == nil {
 		return &ContractMismatchError{Expected: ContractVersion, Got: 0}
 	}
-	if *info.ContractVersion != ContractVersion {
-		return &ContractMismatchError{Expected: ContractVersion, Got: *info.ContractVersion}
+	got := *info.ContractVersion
+	if got == ContractVersion {
+		return nil
 	}
-	return nil
+	// A NEIGHBOURING version is a release train mid-flight, not a broken wrapper.
+	// It is reported separately so the caller can wait it out; strict equality
+	// here is what destroyed 5 Tasks on 2026-08-08 (#544).
+	if contractSkewed(got) {
+		return &ContractSkewError{Expected: ContractVersion, Got: got}
+	}
+	return &ContractMismatchError{Expected: ContractVersion, Got: got}
 }
 
 // IsTTLGone reports whether err is the wrapper's 410 Gone: this pod is past its
