@@ -1277,19 +1277,39 @@ func (r *ProjectReconciler) closeOwnMRs(ctx context.Context, proj *tatarav1alpha
 // FIRST, THEN delete. Skipping the handover leaves artifacts with ZERO controller
 // owners - worked by nobody, re-minted by nobody, because the orphan predicate
 // sees an OWNED Issue.
+//
+// AnnTerminalReleased GATES THE RELEASE HERE FOR THE SAME REASON IT GATES
+// releaseTerminal (issue #545). reapTerminal calls both in one reconcile, ~22 ms
+// apart, and ownedIssues/ownedMRs key off status.issueRefs/status.mrRefs rather
+// than off ownership - so the second pass ALWAYS re-derives the exact artifact
+// set the first pass just released, off a cache that has usually but not always
+// observed that write. When it has not, the release takes its drop branch a
+// second time and Updates against the reaper's OWN commit: 4 of 25 releases over
+// 48 h, each costing a spurious `Operator GC blocked` firing window and one
+// wasted requeue. MutateArtifactOwnerRefs only MASKS that (its fresh Get sees the
+// flag already gone and no-ops); the redundant full re-Get and re-Update per reap
+// is removed here, at the source.
+//
+// The call is NOT dead code, which is why this is a guard and not a deletion:
+// resume.go's collection, reapDelivered and the backlog-sweep park branch all
+// reach deleteReapedTask with no prior releaseTerminal, and for those this is the
+// only release there will ever be. annotateTask writes the annotation back into t
+// in memory, so the flag is visible within the same reconcile that stamped it.
 func (r *ProjectReconciler) deleteReapedTask(ctx context.Context, proj *tatarav1alpha1.Project,
 	t *tatarav1alpha1.Task, live map[string]bool) error {
 
-	issues, err := r.ownedIssues(ctx, t)
-	if err != nil {
-		return err
-	}
-	mrs, err := r.ownedMRs(ctx, t)
-	if err != nil {
-		return err
-	}
-	if _, err := r.releaseOwnership(ctx, proj, t, issues, mrs, live); err != nil {
-		return err
+	if t.Annotations[AnnTerminalReleased] != "true" {
+		issues, err := r.ownedIssues(ctx, t)
+		if err != nil {
+			return err
+		}
+		mrs, err := r.ownedMRs(ctx, t)
+		if err != nil {
+			return err
+		}
+		if _, err := r.releaseOwnership(ctx, proj, t, issues, mrs, live); err != nil {
+			return err
+		}
 	}
 	policy := metav1.DeletePropagationBackground
 	if err := r.Delete(ctx, t.DeepCopy(), &client.DeleteOptions{PropagationPolicy: &policy}); err != nil &&
