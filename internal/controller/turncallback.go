@@ -14,7 +14,6 @@ import (
 	"strings"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
@@ -500,14 +499,28 @@ func (s *CallbackServer) PollOnce(ctx context.Context) {
 			continue
 		}
 
-		// Check for turn timeout before hitting the wrapper.
+		// A STALLED TURN IS NOT TORN DOWN HERE ANY MORE. This loop used to call
+		// expireTimedOutTurn, which deleted the session, Pod and Service outright -
+		// no handoff turn, no handoff note, and everything the agent had written but
+		// not pushed died with the workspace. The stop now runs from
+		// TaskReconciler.stalledTurnStop, which puts a stalled turn through the same
+		// G.7 graceful sequence as a TTL rotation.
+		//
+		// It moved rather than being wrapped in place for a second reason: the
+		// graceful sequence BLOCKS on real timers, and this loop is a single pass
+		// over every Task in the namespace on one 30s ticker. Blocking it per
+		// stalled Task would delay the result-recording below for every OTHER live
+		// turn in the cluster. The Task reconciler is per-Task and already owns the
+		// identical TTL stop.
+		//
+		// Detection stays here only as the observability edge - the reconciler
+		// re-evaluates the same turnTimedOut predicate itself.
 		if s.isTurnTimedOut(ctx, task) {
 			if s.Metrics != nil {
 				s.Metrics.TurnTimeout("poll_backstop")
 			}
-			l.Info("turn timed out in poll backstop", "action", "turn_timeout",
-				"task", task.Name, "turn_id", turn)
-			_ = s.expireTimedOutTurn(ctx, task, turn)
+			l.Info("turn stalled; the stage reconciler will stop it gracefully",
+				"action", "turn_timeout", "task", task.Name, "turn_id", turn)
 			continue
 		}
 
@@ -613,55 +626,6 @@ func (s *CallbackServer) isTurnTimedOut(ctx context.Context, task *tatarav1alpha
 		return false
 	}
 	return turnTimedOut(task.Annotations[annTurnStartedAt], task.Annotations[annTurnLastActivity], project.Spec.Agent.TurnTimeoutSeconds)
-}
-
-// expireTimedOutTurn performs the cleanup for a stalled turn: it deletes the
-// session + Pod/Service and clears the current-turn annotations so a late
-// callback cannot resolve this Task.
-//
-// It DOES NOT terminate the Task. A stalled turn is a POD problem, not a Task
-// outcome: tearing the pod down hands the Task back to the stage machine, which
-// re-ensures a pod for the current stage (the F.4 WORK clock bounds the retry
-// loop and parks at stage-deadline if the agent keeps hanging). The old machine
-// failed the Task outright here, which killed a long healthy stage on one hung
-// turn and had no re-entry.
-func (s *CallbackServer) expireTimedOutTurn(ctx context.Context, task *tatarav1alpha1.Task, turn string) error {
-	if s.Session != nil {
-		_ = s.Session.DeleteSession(ctx, agent.BaseURL(task, s.Namespace))
-	}
-	// Delete Pod and Service best-effort (owner-references ensure GC too).
-	p := &corev1.Pod{}
-	p.Name = agent.PodName(task)
-	p.Namespace = task.Namespace
-	_ = s.Client.Delete(ctx, p)
-	svc := &corev1.Service{}
-	svc.Name = agent.PodName(task)
-	svc.Namespace = task.Namespace
-	_ = s.Client.Delete(ctx, svc)
-
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh := &tatarav1alpha1.Task{}
-		if err := s.Client.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
-			return err
-		}
-		if tatarav1alpha1.TaskDone(fresh) {
-			return nil
-		}
-		// Clear turn annotations so late/duplicate callbacks cannot resolve this
-		// task and stamp annTurnComplete on the next stage's fresh turn.
-		if fresh.Annotations != nil {
-			delete(fresh.Annotations, annCurrentTurn)
-			delete(fresh.Annotations, annTurnStartedAt)
-			delete(fresh.Annotations, annTurnLastActivity)
-			delete(fresh.Annotations, annTurnComplete)
-		}
-		return s.Client.Update(ctx, fresh)
-	}); err != nil {
-		return err
-	}
-	log.FromContext(ctx).Info("stalled turn expired; pod torn down for respawn",
-		"action", "turn_timeout_expired", "resource_id", task.Name, "turn_id", turn)
-	return nil
 }
 
 // Start runs the callback HTTP server (callback + push-metrics + health) until
