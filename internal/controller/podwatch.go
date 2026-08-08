@@ -187,6 +187,11 @@ func (r *PodWatchReconciler) doReconcile(ctx context.Context, req ctrl.Request) 
 	// G.10: assert the wrapper's contract version BEFORE a single turn is
 	// submitted. Zero tokens are burned on a skewed image.
 	if err := r.assertContract(ctx, pod, task); err != nil {
+		// A NEIGHBOURING contract version is a release train mid-flight, not a
+		// broken wrapper. Wait it out (#544) - see waitOutContractSkew.
+		if agent.IsContractSkew(err) {
+			return r.waitOutContractSkew(ctx, pod, task, err)
+		}
 		if agent.IsContractMismatch(err) {
 			return ctrl.Result{}, r.failContractMismatch(ctx, pod, task, err)
 		}
@@ -194,6 +199,10 @@ func (r *PodWatchReconciler) doReconcile(ctx context.Context, req ctrl.Request) 
 		// CLOCK 2 is still armed and bounds this.
 		return ctrl.Result{RequeueAfter: agentBootRequeue}, nil
 	}
+	// The handshake passed: retract any skew this image was carrying. The train
+	// can finish by rolling EITHER side, and rolling the operator forward is what
+	// actually ended #544 - the event counter could not see that at all.
+	obs.AgentContractSkewResolved(podImage(pod))
 
 	// CLOCK 3, armed.
 	if err := StampStageWorkStartedAt(ctx, r.Client, pod.Namespace, taskName, readyAt); err != nil {
@@ -269,6 +278,76 @@ func (r *PodWatchReconciler) assertContract(ctx context.Context, pod *corev1.Pod
 		return nil
 	}
 	return agent.AssertContractVersion(ctx, r.Session, agent.BaseURL(task, pod.Namespace))
+}
+
+// agentContractSkewDeadline bounds how long a Task waits out a contract skew.
+//
+// Sized off the thing it is waiting for: the 2026-08-08 train had the wrapper
+// pin land 56 minutes before the operator pin, and the operator Deployment then
+// took ~16 more minutes to roll across 3 replicas - ~72 minutes end to end. Two
+// hours leaves headroom for a slower train without ever approaching a stage
+// budget, and a skew still present after two hours is not a train, it is a pin
+// nobody is going to fix by itself.
+const agentContractSkewDeadline = 2 * time.Hour
+
+// agentContractSkewRequeue paces the re-check while a skew is being waited out.
+const agentContractSkewRequeue = 30 * time.Second
+
+// podImage names the wrapper image a pod is running, for the skew metric.
+func podImage(pod *corev1.Pod) string {
+	if len(pod.Spec.Containers) == 0 {
+		return ""
+	}
+	return pod.Spec.Containers[0].Image
+}
+
+// waitOutContractSkew is the #544 fix: a wrapper on an ADJACENT contract version
+// is a release train in flight, and the Task waits for it instead of being
+// destroyed by it.
+//
+// THE WAIT IS NOT WISHFUL. The operator and the agent image are pinned in
+// different helm releases, so the skew resolves by either side rolling - and
+// when it resolves by the OPERATOR rolling forward (which is what actually ended
+// #544), THIS EXACT POD passes the handshake on the very next reconcile with no
+// respawn and no lost turns. Nothing has been submitted yet, so nothing is at
+// risk while we wait: the work clock is unarmed and zero tokens are burned.
+//
+// The wait is bounded by agentContractSkewDeadline measured from the pod's own
+// start. Past it the skew is no longer a rollout and the pre-existing terminal
+// park is the correct answer, so this degrades exactly into the old behaviour
+// rather than replacing it.
+func (r *PodWatchReconciler) waitOutContractSkew(ctx context.Context, pod *corev1.Pod,
+	task *tatarav1alpha1.Task, cause error) (ctrl.Result, error) {
+
+	var se *agent.ContractSkewError
+	if !errors.As(cause, &se) {
+		return ctrl.Result{}, cause
+	}
+	image := podImage(pod)
+	expected, got := strconv.Itoa(se.Expected), strconv.Itoa(se.Got)
+	// The gauge is the alertable signal and it stays up for the WHOLE window,
+	// unlike the mismatch counter it replaces (see obs.agentContractSkew).
+	obs.AgentContractSkewObserved(expected, got, image)
+
+	waited := time.Duration(0)
+	if start := podStart(pod); !start.IsZero() {
+		waited = time.Since(start)
+	}
+	l := log.FromContext(ctx)
+	if waited < agentContractSkewDeadline {
+		l.Info("agent wrapper contract is skewed by one release; waiting for the train to settle",
+			"action", "agent_contract_skew_wait", "resource_id", task.Name,
+			"expected", se.Expected, "got", se.Got, "image", image,
+			"waited_seconds", int(waited.Seconds()),
+			"deadline_seconds", int(agentContractSkewDeadline.Seconds()))
+		return ctrl.Result{RequeueAfter: agentContractSkewRequeue}, nil
+	}
+	l.Info("agent wrapper contract skew outlived the release-train window; failing the task",
+		"action", "agent_contract_skew_expired", "resource_id", task.Name,
+		"expected", se.Expected, "got", se.Got, "image", image,
+		"waited_seconds", int(waited.Seconds()))
+	return ctrl.Result{}, r.failContractMismatch(ctx, pod, task,
+		&agent.ContractMismatchError{Expected: se.Expected, Got: se.Got})
 }
 
 // failContractMismatch is the G.10 terminal: the Task fails INSTANTLY, before a
