@@ -1131,11 +1131,14 @@ func (s *Server) issueCreate(w http.ResponseWriter, r *http.Request, proj *tatar
 	if !ok {
 		return
 	}
-	created, err := writer.CreateIssue(ctx, repo.Spec.URL, token, scm.IssueReq{Title: req.Title, Body: req.Body})
+	title := s.clampTitleForForge(ctx, r, obs.TitleSiteIssueCreate, task.Name, req.Title)
+	created, err := writer.CreateIssue(ctx, repo.Spec.URL, token, scm.IssueReq{Title: title, Body: req.Body})
 	controller.RecordSCM(s.metrics, providerOf(proj), "create_issue", err)
 	if err != nil {
+		fields := append(reqLogFields(r), "task", task.Name, "repo", repo.Name)
+		fields = append(fields, titleLogFields(req.Title, title)...)
 		s.log.ErrorContext(ctx, "restapi: creating issue failed",
-			append(reqLogFields(r), "repo", repo.Name, "error", err)...)
+			append(fields, "error", err)...)
 		writeError(w, http.StatusBadGateway, "scm write failed")
 		return
 	}
@@ -1145,7 +1148,7 @@ func (s *Server) issueCreate(w http.ResponseWriter, r *http.Request, proj *tatar
 		return
 	}
 	// No proposal kind: an agent-supplied body never claims tatara provenance.
-	if err := s.mintIssueCR(ctx, proj, repo, task, number, created.URL, req.Title, req.Body, "", nil); err != nil {
+	if err := s.mintIssueCR(ctx, proj, repo, task, number, created.URL, title, req.Body, "", nil); err != nil {
 		writeClientErr(w, err)
 		return
 	}
@@ -1301,10 +1304,38 @@ func (s *Server) issueDeferred(w http.ResponseWriter, r *http.Request, proj *tat
 		}
 	}
 
-	requestID := newRequestID(task.Name, action, name, body)
+	// Clamped HERE and not where reviewpost replays it, so the intent the CR
+	// persists is the one the forge will accept. An over-long title makes
+	// EditIssue 400 on every replay: the drain returns on that error before
+	// dropping the intent, so it requeues forever and blocks the intents queued
+	// behind it.
+	editTitle := ""
+	if action == "edit" {
+		editTitle = s.clampTitleForForge(ctx, r, obs.TitleSiteIssueEdit, task.Name, req.Title)
+	}
+	// The title is part of the idempotency key for action=edit ONLY.
+	//
+	// It has to be in it: for an edit the key's body component is req.Body, so two
+	// edits differing only in title hashed identically, the dedup loop below
+	// dropped the second, and the handler still answered 200 {"deferred":true} -
+	// the write was lost and the agent was told it had landed. A title-only
+	// retitle is the worst shape of it, since req.Body is then "" for every one of
+	// them and they ALL collide on a single key until the drain clears it.
+	//
+	// It must not be in the others: comment and close derive their keys from the
+	// same three parts they always did, byte for byte, so an in-flight retry that
+	// spans this upgrade still dedups. That matters asymmetrically. A duplicate
+	// EditIssue is a PATCH to a value it already holds, i.e. free; a duplicate
+	// comment is a second comment on a human's thread. Appending the title, rather
+	// than splicing it in, is what keeps the other two keys identical.
+	idParts := []string{task.Name, action, name, body}
+	if action == "edit" {
+		idParts = append(idParts, editTitle)
+	}
+	requestID := newRequestID(idParts...)
 	pc := tatarav1alpha1.PendingComment{RequestID: requestID, Action: pendingAction(action), Body: body}
 	if action == "edit" {
-		pc.Body = editIntentBody(req.Title, req.Body)
+		pc.Body = editIntentBody(editTitle, req.Body)
 	}
 	pc.Body = truncateValidUTF8(pc.Body, tatarav1alpha1.PendingCommentBodyMaxBytes)
 	key := types.NamespacedName{Namespace: s.ns, Name: name}
@@ -1343,12 +1374,18 @@ func pendingAction(action string) string {
 }
 
 // editIntentBody encodes an edit intent's title/body pair.
+//
+// The "title: " line is ALWAYS emitted, even when the title is empty. Omitting
+// it put the agent-supplied body on line 1, and parseEditIntent reads line 1 as
+// the title whenever it starts with "title: " - so a body beginning with that
+// literal was decoded back as a title that had never been through
+// ClampIssueTitle, reaching EditIssue blank or over the forge's 255-char cap.
+// An unconditional line costs 8 bytes and makes the encoding unambiguous:
+// whatever the body contains, it can only ever be line 2 onwards.
 func editIntentBody(title, body string) string {
 	var b strings.Builder
 	b.WriteString("<!-- tatara-edit -->\n")
-	if title != "" {
-		b.WriteString("title: " + title + "\n")
-	}
+	b.WriteString("title: " + title + "\n")
 	if body != "" {
 		b.WriteString(body)
 	}

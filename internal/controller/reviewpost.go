@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -609,7 +610,16 @@ func (d *StageDriver) DrainPendingComments(ctx context.Context, obj client.Objec
 			editErr := writer.EditIssue(ctx, token, slug, number, req)
 			RecordSCM(d.Metrics, provider, "edit_issue", editErr)
 			if editErr != nil {
-				return fmt.Errorf("review: edit issue %s#%d: %w", slug, number, editErr)
+				// requestId FIRST, because this is the UNRECOVERABLE forge write:
+				// returning here skips removePendingComments, so the intent requeues
+				// forever and blocks every intent behind it on this Issue. It is also
+				// the key removePendingComments matches on, so it is what an operator
+				// needs to excise the wedged intent by hand. The title fields alone
+				// were no discriminator: action=edit accepts a body with no title, and
+				// that common shape logged the contentless `(title 0 chars, "")`.
+				return fmt.Errorf("review: edit issue %s#%d (request_id_key %s, title %d chars, %q): %w",
+					slug, number, pc.RequestID, utf8.RuneCountInString(title),
+					tatarav1alpha1.TruncateRunes(title, 60), editErr)
 			}
 			l.Info("review: issue edited", "action", "scm_issue_edited", "resource_id", obj.GetName(),
 				"repo", repo.Name, "number", number, "request_id_key", pc.RequestID)
@@ -707,14 +717,23 @@ func threadCarriesMarker(thread []scm.IssueComment, marker string) bool {
 	return false
 }
 
-// parseEditIntent reads Task 12's edit encoding back out: an optional
-// "title: <t>" first line, then the body.
+// parseEditIntent reads Task 12's edit encoding back out: a "title: <t>" first
+// line, then the body.
+//
+// The title is clamped HERE as well as at the restapi boundary that wrote the
+// intent, and the redundancy is deliberate. Intents are persisted on the Issue
+// CR, so intents queued before the clamp existed are still sitting in etcd
+// carrying raw agent titles, and this replay is the only gate they will ever
+// pass through again. An over-long or blank title reaching EditIssue is the
+// unrecoverable case: drainRenderedEvents returns on that error BEFORE
+// removePendingComments, so the intent requeues forever and blocks every intent
+// queued behind it on the same Issue.
 func parseEditIntent(body string) (title, newBody string) {
 	rest := strings.TrimPrefix(body, editIntentMarker)
 	rest = strings.TrimPrefix(rest, "\n")
 	if strings.HasPrefix(rest, "title: ") {
 		line, tail, _ := strings.Cut(rest, "\n")
-		return strings.TrimPrefix(line, "title: "), tail
+		return tatarav1alpha1.ClampIssueTitle(strings.TrimPrefix(line, "title: ")), tail
 	}
 	return "", rest
 }

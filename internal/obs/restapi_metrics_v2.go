@@ -63,6 +63,33 @@ var (
 		Name: "operator_restapi_notes_rehydrate_failed_total",
 		Help: "Spilled note batches task_context(notes=all) could not rehydrate from tatara-memory, by project.",
 	}, []string{"project"})
+
+	// RestTitleClampedTotal counts agent-supplied ISSUE titles the restapi
+	// boundary REWROTE before handing them to the forge (#529), by call site.
+	// The clamp is the fix for a GitLab 400 that used to discard a whole
+	// submitted outcome, so it is expected to engage routinely - which is exactly
+	// why it needs a counter. Without one the platform silently edits what an
+	// agent wrote, and the only trace is a log line on the failure path that, by
+	// construction, no longer fires.
+	//
+	// It counts every rewrite, not only the over-cap cut: a title that changed at
+	// all is a title the forge did not receive verbatim. site is the boundary the
+	// title came through, so a rollout can be read per path rather than as one
+	// fleet-wide number.
+	RestTitleClampedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "operator_rest_title_clamped_total",
+		Help: "Agent-supplied issue titles rewritten by the forge-title clamp, by call site (#529).",
+	}, []string{"site"})
+)
+
+// The call sites of RestTitleClampedTotal, pre-seeded below so a healthy
+// operator exposes a zero baseline from startup rather than a rate alert with no
+// series to evaluate on the first clamp.
+const (
+	TitleSiteIncidentFileIssue = "incident_file_issue"
+	TitleSiteBrainstormPropose = "brainstorm_propose"
+	TitleSiteIssueCreate       = "issue_create"
+	TitleSiteIssueEdit         = "issue_edit"
 )
 
 func init() {
@@ -73,6 +100,7 @@ func init() {
 		RestCIReadTotal,
 		RestTakeoverErrorTotal,
 		RestNotesRehydrateFailedTotal,
+		RestTitleClampedTotal,
 	)
 	// Pre-seed the three real takeover-error stage label sets so a healthy
 	// operator exposes a zero baseline from startup (metric-wiring audit
@@ -81,4 +109,8 @@ func init() {
 	RestTakeoverErrorTotal.WithLabelValues("mint")
 	RestTakeoverErrorTotal.WithLabelValues("ownerref")
 	RestTakeoverErrorTotal.WithLabelValues("stamp")
+	RestTitleClampedTotal.WithLabelValues(TitleSiteIncidentFileIssue)
+	RestTitleClampedTotal.WithLabelValues(TitleSiteBrainstormPropose)
+	RestTitleClampedTotal.WithLabelValues(TitleSiteIssueCreate)
+	RestTitleClampedTotal.WithLabelValues(TitleSiteIssueEdit)
 }
