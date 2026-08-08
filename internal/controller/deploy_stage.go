@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -16,6 +17,7 @@ import (
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
+	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
@@ -58,6 +60,33 @@ import (
 // deployStageRequeue paces the deploying poll.
 const deployStageRequeue = 60 * time.Second
 
+// deployPinFanoutDeadline BOUNDS the wait for the tag -> pin fan-out (#512).
+//
+// deploying is pod-less and poll-driven, and until this bound existed it had no
+// way to conclude that the thing it was waiting for was never coming. On
+// 2026-07-29 the CD fan-out out of tatara-operator into tatara-helmfile stopped
+// emitting bump PRs at 12:24:53Z - tags v1.39.5 and v1.39.6 were cut and no
+// `cd: bump` commit or PR ever appeared for either. Task
+// mt-c-tatara-operator-506 merged PR #509 at 18:57:19Z, entered deploying two
+// seconds later, and polled for 2h06m59s emitting ZERO log lines, because every
+// poll returned a bare "not yet" that is indistinguishable from a normal lap.
+// It then spent all three MaxDeployReentries in 95 seconds (the work clock was
+// frozen, so each re-entry re-tripped the deadline instantly) and discarded the
+// merged work at deploy-blocked.
+//
+// 45 minutes is sized off the observed healthy cadence: bump PRs landed every
+// ~25 minutes all that morning, and a single tag -> bump PR -> merge lap is
+// minutes. Anything past this is not a slow lap, it is a fan-out that is not
+// running.
+const deployPinFanoutDeadline = 45 * time.Minute
+
+// errDeployPinFanoutStalled is the NAMED failure the bound produces. It is a
+// sentinel rather than a bare string because ReconcileDeploying has to tell it
+// apart from a genuine read error: a stalled fan-out is not retried into the
+// budget, it PARKS - at deploy-timeout, which is retryable, so a fan-out
+// somebody repairs still delivers the merge.
+var errDeployPinFanoutStalled = errors.New("deploy: the CD pin fan-out never landed this tag in tatara-helmfile")
+
 // ReconcileDeploying drives ONE Task through the deploying stage: it stamps
 // deployedAt on every owned MR whose merge the apply sweep has observed applied,
 // and hands off to the C.4 delivery postcondition once they all carry it.
@@ -88,6 +117,12 @@ func (d *StageDriver) ReconcileDeploying(ctx context.Context, proj *tatarav1alph
 		}
 		deployed, why, err := d.resolveDeployed(ctx, proj, task, mr)
 		if err != nil {
+			// THE BOUND (#512). The pin this MR is waiting for has provably never
+			// reached tatara-helmfile's main; polling it for the rest of the budget
+			// cannot change that.
+			if errors.Is(err, errDeployPinFanoutStalled) {
+				return ctrl.Result{}, d.parkOnStalledFanout(ctx, proj, task, mrs, mr, err)
+			}
 			return ctrl.Result{}, err
 		}
 		if !deployed {
@@ -232,15 +267,21 @@ func (d *StageDriver) resolveDeployed(ctx context.Context, proj *tatarav1alpha1.
 		return false, "the component release tag is not cut yet", nil
 	}
 
+	// From here every remaining outcome is a WAIT, and waiting is only rational
+	// while the thing we wait for can still arrive. waiting() upgrades a "not yet"
+	// into errDeployPinFanoutStalled once our tag has provably never reached the
+	// helmfile's main past deployPinFanoutDeadline (#512).
+	waiting := d.fanoutBoundedWait(ctx, task, mr, name, tag, mainPin, hfOwner, hfRepo)
+
 	run, ok, err := d.applyRun(ctx, dw, task, hfOwner, hfRepo)
 	if err != nil {
 		return false, "", err
 	}
 	if !ok {
-		return false, "no completed successful " + helmfileRepoName + " apply run on main yet", nil
+		return waiting("no completed successful " + helmfileRepoName + " apply run on main yet")
 	}
 	if !applyPostdatesMerge(run, mr) {
-		return false, "the latest green apply predates this merge", nil
+		return waiting("the latest green apply predates this merge")
 	}
 	appliedPin, err := helmfilePinState(ctx, dw, hfOwner, hfRepo, run.HeadSHA)
 	if err != nil {
@@ -249,12 +290,80 @@ func (d *StageDriver) resolveDeployed(ctx context.Context, proj *tatarav1alpha1.
 		return false, "reading the applied helmfile pin state failed", nil
 	}
 	if !pinAtOrPastArtifactVersion(appliedPin, name, tag) {
-		return false, "the applied helmfile pin is behind " + tag, nil
+		return waiting("the applied helmfile pin is behind " + tag)
 	}
 	l.Info("deploy: the apply carried this change",
 		"action", "deploy_applied", "resource_id", task.Name, "repo", name,
 		"pr", mr.Spec.Number, "version", tag, "apply_sha", run.HeadSHA, "run_url", run.HTMLURL)
 	return true, "", d.stampDeployed(ctx, proj, task, mr, tag)
+}
+
+// fanoutBoundedWait returns the "still waiting" reporter for one merged MR.
+//
+// It is a closure rather than three inline checks because all three remaining
+// waits - no green apply, a green apply that predates the merge, an applied pin
+// behind our tag - become the SAME failure once the bump commit does not exist:
+// they are three views of "the fan-out did not run", and #512's investigation
+// had to correlate all three by hand from the forge because the operator
+// reported none of them.
+//
+// The discriminator is the pin at the helmfile's MAIN, not at an apply run: main
+// is where the fan-out writes, so main still behind our tag means the bump PR was
+// never merged (or never opened at all - the 2026-07-29 case, where no bump PR
+// existed for v1.39.5 or v1.39.6). The apply is blameless there; it had no commit
+// to apply.
+//
+// The anchor is the merge instant. An MR with no MergedAt has no anchor and can
+// never be judged overdue, so it keeps polling - the fail-open rule this file
+// runs on (a wedge is worse than an early delivery) applies to the bound too.
+func (d *StageDriver) fanoutBoundedWait(ctx context.Context, task *tatarav1alpha1.Task,
+	mr *tatarav1alpha1.MergeRequest, artifact, tag, mainPin, hfOwner, hfRepo string,
+) func(why string) (bool, string, error) {
+
+	return func(why string) (bool, string, error) {
+		if pinAtOrPastArtifactVersion(mainPin, artifact, tag) {
+			// The fan-out DID land; we are waiting on the apply, which is a real
+			// wait with a real actor.
+			return false, why, nil
+		}
+		if mr.Status.MergedAt == nil {
+			return false, why, nil
+		}
+		waited := d.now().Sub(mr.Status.MergedAt.Time)
+		if waited < deployPinFanoutDeadline {
+			return false, why + "; the " + helmfileRepoName + " main pin has not moved to " + tag +
+				" yet (CD fan-out pending " + waited.Truncate(time.Second).String() + ")", nil
+		}
+		obs.DeployPinFanoutStalledTotal.WithLabelValues(artifact).Inc()
+		log.FromContext(ctx).Error(errDeployPinFanoutStalled,
+			"deploy: the CD pin fan-out never landed this tag; the deploy cannot resolve",
+			"action", "deploy_pin_fanout_stalled", "resource_id", task.Name, "repo", artifact,
+			"pr", mr.Spec.Number, "tag", tag, "helmfile", hfOwner+"/"+hfRepo,
+			"waited_seconds", int(waited.Seconds()), "reason", why)
+		return false, "", fmt.Errorf("%w: %s %s absent from %s/%s main %s after the merge (%s)",
+			errDeployPinFanoutStalled, artifact, tag, hfOwner, hfRepo, waited.Truncate(time.Second), why)
+	}
+}
+
+// parkOnStalledFanout is the CLEAR FAILURE the bound produces. It parks at
+// deploy-timeout - deliberately the RETRYABLE park (UnparkTimer, bounded by
+// MaxDeployReentries), not a terminal - and posts the same operator notice the
+// budget-elapse path posts, so the merge still delivers if the fan-out is
+// repaired, and a human hears about it in minutes rather than after two hours of
+// silent polling.
+func (d *StageDriver) parkOnStalledFanout(ctx context.Context, proj *tatarav1alpha1.Project,
+	task *tatarav1alpha1.Task, mrs []tatarav1alpha1.MergeRequest,
+	mr *tatarav1alpha1.MergeRequest, cause error) error {
+
+	now := d.now()
+	sp := d.spiller(proj)
+	if err := ParkTask(ctx, d.Client, sp, d.Metrics, task, stage.ReasonDeployTimeout, now, nil); err != nil {
+		return err
+	}
+	log.FromContext(ctx).Info("deploy: parked on a stalled CD pin fan-out",
+		"action", "deploy_fanout_parked", "resource_id", task.Name,
+		"repo", mr.Spec.RepositoryRef, "pr", mr.Spec.Number, "cause", cause.Error())
+	return enqueueDeployTimeoutComment(ctx, d.Client, sp, task, mrs, now)
 }
 
 // applyRun returns the latest COMPLETED, SUCCESSFUL tatara-helmfile apply run on
