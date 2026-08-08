@@ -313,7 +313,7 @@ func (r *TaskReconciler) reconcileClocks(ctx context.Context, proj *tatarav1alph
 			"action", "stage_deadline", "resource_id", task.Name, "state", task.Status.State,
 			"clock", clock, "budget", budget.String(), "elapsed", elapsed.String(),
 			"to", edge.To, "park_reason", edge.Reason)
-		return ctrl.Result{}, true, r.liveHandoffAndPark(ctx, proj, task, mrs, "idle", now)
+		return ctrl.Result{}, true, r.liveHandoffAndPark(ctx, proj, task, mrs, causeIdle, now)
 	}
 
 	mrs, mrErr := ownedMergeRequests(ctx, r.Client, task)
@@ -1210,8 +1210,9 @@ func (r *TaskReconciler) stalledTurnStop(ctx context.Context, proj *tatarav1alph
 			Spiller:   sp,
 			Namespace: task.Namespace,
 		},
-		Namespace: task.Namespace,
-		Record:    obs.AgentPodTTLExpired,
+		Namespace:            task.Namespace,
+		Record:               obs.AgentPodTTLExpired,
+		RecordEmptySynthetic: obs.AgentSyntheticHandoffEmpty,
 	}
 	outcome, err := stopper.StopWithHandoff(ctx, task, agent.TTLStopInput{
 		BaseURL:     agent.BaseURL(task, task.Namespace),
@@ -1222,6 +1223,11 @@ func (r *TaskReconciler) stalledTurnStop(ctx context.Context, proj *tatarav1alph
 		Deadline:    now,
 		TurnTimeout: time.Duration(proj.Spec.Agent.TurnTimeoutSeconds) * time.Second,
 		MaxWait:     StalledTurnHandoffWait,
+		// #527: the same persisted continuation state ttlStop uses. A stalled turn
+		// is the case that needs it MOST - a genuinely hung wrapper never goes
+		// idle, so this caller almost always lands on the synthetic note.
+		LastFinalText: task.Status.LastTurnFinalText,
+		PushedRepos:   task.Status.LastTurnPushedRepos,
 	})
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("stalled turn stop %s: %w", task.Name, err)
@@ -1280,8 +1286,9 @@ func (r *TaskReconciler) ttlStop(ctx context.Context, proj *tatarav1alpha1.Proje
 			Spiller:   sp,
 			Namespace: task.Namespace,
 		},
-		Namespace: task.Namespace,
-		Record:    obs.AgentPodTTLExpired,
+		Namespace:            task.Namespace,
+		Record:               obs.AgentPodTTLExpired,
+		RecordEmptySynthetic: obs.AgentSyntheticHandoffEmpty,
 	}
 	in := agent.TTLStopInput{
 		BaseURL:     agent.BaseURL(task, task.Namespace),
@@ -1289,9 +1296,12 @@ func (r *TaskReconciler) ttlStop(ctx context.Context, proj *tatarav1alpha1.Proje
 		AgentKind:   agentKind,
 		Deadline:    deadline,
 		TurnTimeout: time.Duration(proj.Spec.Agent.TurnTimeoutSeconds) * time.Second,
-		// LastFinalText/PushedRepos are not persisted on the Task (only recordResult
-		// stamps turn-complete), so the synthetic note degrades to "(none)". The
-		// non-empty-notes guarantee still holds: agent handoff, else synthetic.
+		// The last turn-complete callback's finalText + pushedRepos, persisted onto
+		// the Task by CallbackServer.stampLastTurn. Without them the synthetic note
+		// degraded to "(none)"/"none" on EVERY synthetic path, which is what made
+		// the non-empty-notes guarantee vacuous (#527).
+		LastFinalText: task.Status.LastTurnFinalText,
+		PushedRepos:   task.Status.LastTurnPushedRepos,
 	}
 	outcome, err := stopper.StopWithHandoff(ctx, task, in)
 	if err != nil {

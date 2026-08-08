@@ -63,9 +63,36 @@ var agentContractExpected = prometheus.NewGauge(prometheus.GaugeOpts{
 	Help: "The agent wire-contract version this operator process speaks (contract G.10).",
 })
 
+// syntheticHandoffEmptyTotal counts G.7 synthetic handoff notes written with NO
+// continuation state to carry - the note renders "(none)"/"none" and the next
+// pod resumes from nothing.
+//
+// #527: for ~19 days this was the ONLY synthetic note the operator could write,
+// because ttlStop never populated LastFinalText/PushedRepos, and nothing counted
+// it. The non-empty-notes invariant was satisfied vacuously and the Task looked
+// healthy while a turn's work was discarded. A non-zero rate here now means the
+// last-turn state is not reaching the stop - not that a Task legitimately had no
+// completed turn to report.
+var syntheticHandoffEmptyTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "operator_agent_synthetic_handoff_empty_total",
+	Help: "G.7 synthetic handoff notes written with no last-turn continuation state to carry (contract G.7). The next pod resumes from nothing.",
+}, []string{"agent_kind"})
+
 func init() {
 	ctrlmetrics.Registry.MustRegister(agentContractMismatchTotal, agentPodTTLExpiredTotal,
-		agentContractSkew, agentContractExpected)
+		agentContractSkew, agentContractExpected, syntheticHandoffEmptyTotal)
+}
+
+// AgentSyntheticHandoffEmpty increments
+// operator_agent_synthetic_handoff_empty_total for one content-free synthetic
+// handoff note.
+func AgentSyntheticHandoffEmpty(agentKind string) {
+	syntheticHandoffEmptyTotal.WithLabelValues(agentKind).Inc()
+}
+
+// AgentSyntheticHandoffEmptyCounter returns the counter for test assertions.
+func AgentSyntheticHandoffEmptyCounter(agentKind string) prometheus.Counter {
+	return syntheticHandoffEmptyTotal.WithLabelValues(agentKind)
 }
 
 // SetAgentContractExpected publishes the operator's compiled contract version.

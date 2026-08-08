@@ -873,6 +873,46 @@ func StateElapsedSeconds(t *v1alpha1.Task, now time.Time) float64 {
 // pod RESPAWNS, burning one podRecreations. It does NOT terminate the Task. The
 // terminal, once the budget is spent, is park(pod-recreation-exhausted) -
 // pod-not-ready does not exist.
+// ReArmAfterPodLoss puts a LIVE Task back in the admission queue for a fresh
+// pod, in place, charging one podRecreations. It is the answer to a pod that
+// ENDED WITHOUT THE AGENT SAYING ANYTHING - no handoff note, nothing asked and
+// nothing reported - which is not a human gate and must not be parked as one.
+//
+// Parking such a Task awaiting-human is a dead end by construction:
+// awaiting-human is UnparkHuman, so it resumes only on a non-bot comment, and
+// nobody replies to a question that was never posed. Measured live in the tatara
+// namespace: 45 Tasks parked awaiting-human, only 20 of them carrying a real
+// agent handoff; the other 25 were wreckage from pods dying in one 71-minute
+// window, each waiting on an answer to nothing.
+//
+// THREE STAMPS, and every one of them is load-bearing:
+//
+//   - podStartedAt/stateWorkStartedAt to nil re-arms CLOCK 1 so the next
+//     reconcile admits a replacement pod.
+//   - stateEnteredAt to now, because CLOCK 1 measures FROM IT against
+//     AdmissionStarvedBudget. Leaving a stale value re-elapses clock 1 on the
+//     very next pass and parks admission-starved, which is UnparkNever - strictly
+//     worse than the awaiting-human this replaces. That is #513's "a retry that
+//     provides no retry" shape and it must not be recreated here.
+//   - podRecreations is NOT reset (unlike the un-park reArm), and RecordRespawn
+//     bumps it first. It is the ONLY thing bounding this loop: a Task whose pods
+//     keep dying spends the budget and terminates at pod-recreation-exhausted.
+//
+// ConversationLastEventAt is deliberately untouched: it is the HUMAN half of the
+// idle base, and the idle clock is not armed while podStartedAt is nil anyway -
+// it re-bases off the replacement pod's stateWorkStartedAt at pod-ready.
+func ReArmAfterPodLoss(t *v1alpha1.Task, maxPodRecreations int, now time.Time) (Edge, bool) {
+	edge, terminal := RecordRespawn(t, maxPodRecreations)
+	if terminal {
+		return edge, true
+	}
+	stamp := metav1.NewTime(now)
+	t.Status.StateEnteredAt = &stamp
+	t.Status.PodStartedAt = nil
+	t.Status.StateWorkStartedAt = nil
+	return edge, false
+}
+
 func RecordRespawn(t *v1alpha1.Task, maxPodRecreations int) (edge Edge, terminal bool) {
 	t.Status.Stats.PodRecreations++
 	if t.Status.Stats.PodRecreations > maxPodRecreations {
