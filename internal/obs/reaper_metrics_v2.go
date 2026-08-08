@@ -13,6 +13,17 @@ const (
 	// the reap was abandoned rather than leave an artifact with zero controller
 	// owners (worked by nobody, re-minted by nobody: the orphan predicate sees
 	// an OWNED Issue).
+	//
+	// A CONFLICT IS NOT A BLOCK (issue #530). releaseOwnership writes owner refs
+	// under a fresh-Get + RetryOnConflict loop, and a 409 that outlives even that
+	// is still resolved by the reconcile's requeue - measured at 0.83 s and
+	// 0.91 s on the two traced production cases, both of which ended in a
+	// completed reap. Counting them made one sub-second blip hold `Operator GC
+	// blocked` firing for ~1 h behind the annotation "Tasks and their
+	// Issue/MergeRequest CRs are accumulating in etcd", which was false: nothing
+	// accumulated, and operator_orphan_no_controller_total stayed at 0 across the
+	// whole window. Only a failure the requeue will NOT resolve - a refused
+	// handover, a 403, an admission rejection - is counted under this reason.
 	GCBlockedNoControllerOwner = "no_controller_owner"
 	// GCBlockedFoldInFlight: the Task is named in the status.foldInFlight of an
 	// umbrella whose adoption CAN STILL COMPLETE (v1alpha1.FoldInFlightActive).
@@ -60,9 +71,15 @@ const (
 // GCBlockedTotal counts reaps the reaper REFUSED, by reason. It is the
 // observability half of the B.6 SKIP list: without it a Task that is blocked
 // forever looks identical to a Task that is simply young.
+//
+// REFUSED, NOT RETRIED (issue #530). An increment must mean the reap could not
+// be completed, never "one write failed once and the requeue fixed it" - the
+// alert on this counter reads it as durable state ("could not garbage-collect N
+// object(s)"), and it has no decrement to walk that back with. Every increment
+// site owes that distinction; see GCBlockedNoControllerOwner.
 var GCBlockedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Name: "operator_gc_blocked_total",
-	Help: "Terminal-stage reaps refused, by reason (contract B.6/K.1).",
+	Help: "Terminal-stage reaps refused for a reason a requeue does not resolve, by reason (contract B.6/K.1).",
 }, []string{"reason"})
 
 // DocBatchMintTotal counts nightly documentation-batch mint attempts by outcome

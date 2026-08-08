@@ -1002,6 +1002,19 @@ func ourMR(proj *tatarav1alpha1.Project, t *tatarav1alpha1.Task, mr *tatarav1alp
 //
 // It returns the set of artifacts that HAVE a surviving owner - clause (d) of
 // step 4.
+//
+// EVERY WRITE HERE GOES THROUGH MutateArtifactOwnerRefs (issue #524). This used
+// to be the ONE owner-ref write in the tree that did not: it mutated the copy
+// ownedIssues/ownedMRs pulled from the controller-runtime CACHE and issued a
+// bare Update with no re-Get and no RetryOnConflict, while ownership.go's own
+// doc comment called the fresh-Get+retry loop "the exact same conflict-safe
+// discipline every other owner-ref write in this package uses". A cached copy
+// taken milliseconds after somebody else's write (the mirror sync thread, the
+// takeover endpoint, or - per #545 - THIS SAME REAP's earlier pass) carries a
+// stale ownerReferences array and a stale resourceVersion, which either 409s or
+// clobbers the concurrent change. THE DECISION IS TAKEN INSIDE THE MUTATION,
+// on the fresh copy, not outside it: re-Getting and then applying a verdict
+// reached against stale state would fix the resourceVersion and keep the bug.
 func (r *ProjectReconciler) releaseOwnership(ctx context.Context, proj *tatarav1alpha1.Project, t *tatarav1alpha1.Task,
 	issues []tatarav1alpha1.Issue, mrs []tatarav1alpha1.MergeRequest, live map[string]bool) (map[string]bool, error) {
 
@@ -1015,38 +1028,62 @@ func (r *ProjectReconciler) releaseOwnership(ctx context.Context, proj *tatarav1
 	survivors := map[string]bool{}
 	l := log.FromContext(ctx)
 
-	release := func(obj client.Object, dropWhenOrphaned bool) error {
-		owner, ok := own.ControllerOwner(obj)
-		if !ok || owner != t.Name {
+	// release runs the B.5 verdict against the artifact's CURRENT server state.
+	// write is the type-bound MutateArtifactOwnerRefs closure the caller builds
+	// (Go has no generic methods, and the two loops below carry different
+	// element types), so the fresh Get, the decision, the mutation and the
+	// Update are one conflict-safe unit.
+	release := func(obj client.Object, dropWhenOrphaned bool, write ownerRefWriter) error {
+		var (
+			attempt string // "handover" | "drop", the branch taken on the LAST try
+			heir    string
+		)
+		err := write(func(fresh client.Object) error {
+			attempt, heir = "", ""
+			owner, ok := own.ControllerOwner(fresh)
+			if !ok || owner != t.Name {
+				return ErrOwnerRefsUnchanged
+			}
+			survivor, hasHeir := own.OldestSurvivingOwner(fresh, others)
+			if hasHeir {
+				attempt, heir = "handover", survivor
+				return own.HandOverController(fresh, t, &tatarav1alpha1.Task{
+					ObjectMeta: metav1.ObjectMeta{Name: survivor, Namespace: fresh.GetNamespace()},
+				})
+			}
+			if !dropWhenOrphaned {
+				return ErrOwnerRefsUnchanged // it cascades with the Task
+			}
+			attempt = "drop"
+			dropOwnerRef(fresh, t.Name)
 			return nil
-		}
-		heir, hasHeir := own.OldestSurvivingOwner(obj, others)
-		if hasHeir {
-			survivors[obj.GetName()] = true
-			if err := own.HandOverController(obj, t, &tatarav1alpha1.Task{
-				ObjectMeta: metav1.ObjectMeta{Name: heir, Namespace: obj.GetNamespace()},
-			}); err != nil {
+		})
+		if err != nil {
+			// GC IS NOT BLOCKED BY A CONFLICT (issue #530). A 409 here means a
+			// concurrent writer won this round; the reconcile returns the error,
+			// controller-runtime requeues, and the next pass re-Gets and lands -
+			// 0.9 s in the two traced productions cases. Counting it pinned
+			// `Operator GC blocked` firing for ~1 h with an "accumulating in
+			// etcd" annotation that was false. operator_gc_blocked_total must
+			// mean "the release could not be completed", not "one write failed
+			// once", so only a failure the requeue will NOT resolve is counted.
+			if !apierrors.IsConflict(err) {
 				obs.GCBlockedTotal.WithLabelValues(obs.GCBlockedNoControllerOwner).Inc()
+			}
+			if attempt == "handover" {
 				return fmt.Errorf("reap: hand the controller flag to %q on %s: %w", heir, obj.GetName(), err)
 			}
-			if err := r.Update(ctx, obj); err != nil {
-				obs.GCBlockedTotal.WithLabelValues(obs.GCBlockedNoControllerOwner).Inc()
-				return fmt.Errorf("reap: update %s after handover to %q: %w", obj.GetName(), heir, err)
-			}
-			l.Info("handed the controller flag to the oldest surviving owner",
-				"action", "reap_handover", "resource_id", obj.GetName(), "from", t.Name, "to", heir)
-			return nil
-		}
-		if !dropWhenOrphaned {
-			return nil // it cascades with the Task
-		}
-		dropOwnerRef(obj, t.Name)
-		if err := r.Update(ctx, obj); err != nil {
-			obs.GCBlockedTotal.WithLabelValues(obs.GCBlockedNoControllerOwner).Inc()
 			return fmt.Errorf("reap: drop the owner ref of %q from %s: %w", t.Name, obj.GetName(), err)
 		}
-		l.Info("dropped the owner ref of a terminal task; the next sweep re-mints and adopts the artifact",
-			"action", "reap_drop_owner", "resource_id", obj.GetName(), "task", t.Name)
+		switch attempt {
+		case "handover":
+			survivors[obj.GetName()] = true
+			l.Info("handed the controller flag to the oldest surviving owner",
+				"action", "reap_handover", "resource_id", obj.GetName(), "from", t.Name, "to", heir)
+		case "drop":
+			l.Info("dropped the owner ref of a terminal task; the next sweep re-mints and adopts the artifact",
+				"action", "reap_drop_owner", "resource_id", obj.GetName(), "task", t.Name)
+		}
 		return nil
 	}
 
@@ -1065,13 +1102,24 @@ func (r *ProjectReconciler) releaseOwnership(ctx context.Context, proj *tatarav1
 	}
 
 	for i := range issues {
+		iss := &issues[i]
+		write := func(mutate func(fresh client.Object) error) error {
+			return MutateArtifactOwnerRefs(ctx, r.Client, iss, func(fresh *tatarav1alpha1.Issue) error {
+				return mutate(fresh)
+			})
+		}
 		// An OPEN issue must be re-mintable RIGHT NOW (fix H13).
-		if err := release(&issues[i], issues[i].Status.State != "closed"); err != nil {
+		if err := release(iss, iss.Status.State != "closed", write); err != nil {
 			return nil, err
 		}
 	}
 	for i := range mrs {
 		mr := &mrs[i]
+		write := func(mutate func(fresh client.Object) error) error {
+			return MutateArtifactOwnerRefs(ctx, r.Client, mr, func(fresh *tatarav1alpha1.MergeRequest) error {
+				return mutate(fresh)
+			})
+		}
 		// An OPEN MR THAT IS NOT OURS TO CLOSE must be re-mintable RIGHT NOW, for
 		// the same reason and by the same rule. See the doc comment above.
 		drop := !ourMR(proj, t, mr) && mr.Status.State == "open"
@@ -1080,12 +1128,19 @@ func (r *ProjectReconciler) releaseOwnership(ctx context.Context, proj *tatarav1
 				return nil, err
 			}
 		}
-		if err := release(mr, drop); err != nil {
+		if err := release(mr, drop, write); err != nil {
 			return nil, err
 		}
 	}
 	return survivors, nil
 }
+
+// ownerRefWriter is one artifact's conflict-safe owner-ref write: it re-Gets
+// that artifact fresh, hands the fresh copy to mutate, and Updates it under
+// RetryOnConflict (MutateArtifactOwnerRefs). releaseOwnership's release closure
+// is type-agnostic - it runs over Issues and MergeRequests alike - so the typed
+// half is bound per artifact at the call site and passed in as this.
+type ownerRefWriter func(mutate func(fresh client.Object) error) error
 
 // carryHumanReviewRounds persists a dying review Task's V7-9 counter onto the
 // mirror that is about to outlive it. It runs BEFORE the ownerRef is dropped, so
@@ -1222,19 +1277,39 @@ func (r *ProjectReconciler) closeOwnMRs(ctx context.Context, proj *tatarav1alpha
 // FIRST, THEN delete. Skipping the handover leaves artifacts with ZERO controller
 // owners - worked by nobody, re-minted by nobody, because the orphan predicate
 // sees an OWNED Issue.
+//
+// AnnTerminalReleased GATES THE RELEASE HERE FOR THE SAME REASON IT GATES
+// releaseTerminal (issue #545). reapTerminal calls both in one reconcile, ~22 ms
+// apart, and ownedIssues/ownedMRs key off status.issueRefs/status.mrRefs rather
+// than off ownership - so the second pass ALWAYS re-derives the exact artifact
+// set the first pass just released, off a cache that has usually but not always
+// observed that write. When it has not, the release takes its drop branch a
+// second time and Updates against the reaper's OWN commit: 4 of 25 releases over
+// 48 h, each costing a spurious `Operator GC blocked` firing window and one
+// wasted requeue. MutateArtifactOwnerRefs only MASKS that (its fresh Get sees the
+// flag already gone and no-ops); the redundant full re-Get and re-Update per reap
+// is removed here, at the source.
+//
+// The call is NOT dead code, which is why this is a guard and not a deletion:
+// resume.go's collection, reapDelivered and the backlog-sweep park branch all
+// reach deleteReapedTask with no prior releaseTerminal, and for those this is the
+// only release there will ever be. annotateTask writes the annotation back into t
+// in memory, so the flag is visible within the same reconcile that stamped it.
 func (r *ProjectReconciler) deleteReapedTask(ctx context.Context, proj *tatarav1alpha1.Project,
 	t *tatarav1alpha1.Task, live map[string]bool) error {
 
-	issues, err := r.ownedIssues(ctx, t)
-	if err != nil {
-		return err
-	}
-	mrs, err := r.ownedMRs(ctx, t)
-	if err != nil {
-		return err
-	}
-	if _, err := r.releaseOwnership(ctx, proj, t, issues, mrs, live); err != nil {
-		return err
+	if t.Annotations[AnnTerminalReleased] != "true" {
+		issues, err := r.ownedIssues(ctx, t)
+		if err != nil {
+			return err
+		}
+		mrs, err := r.ownedMRs(ctx, t)
+		if err != nil {
+			return err
+		}
+		if _, err := r.releaseOwnership(ctx, proj, t, issues, mrs, live); err != nil {
+			return err
+		}
 	}
 	policy := metav1.DeletePropagationBackground
 	if err := r.Delete(ctx, t.DeepCopy(), &client.DeleteOptions{PropagationPolicy: &policy}); err != nil &&
