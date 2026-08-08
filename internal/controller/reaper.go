@@ -1059,7 +1059,17 @@ func (r *ProjectReconciler) releaseOwnership(ctx context.Context, proj *tatarav1
 			return nil
 		})
 		if err != nil {
-			obs.GCBlockedTotal.WithLabelValues(obs.GCBlockedNoControllerOwner).Inc()
+			// GC IS NOT BLOCKED BY A CONFLICT (issue #530). A 409 here means a
+			// concurrent writer won this round; the reconcile returns the error,
+			// controller-runtime requeues, and the next pass re-Gets and lands -
+			// 0.9 s in the two traced productions cases. Counting it pinned
+			// `Operator GC blocked` firing for ~1 h with an "accumulating in
+			// etcd" annotation that was false. operator_gc_blocked_total must
+			// mean "the release could not be completed", not "one write failed
+			// once", so only a failure the requeue will NOT resolve is counted.
+			if !apierrors.IsConflict(err) {
+				obs.GCBlockedTotal.WithLabelValues(obs.GCBlockedNoControllerOwner).Inc()
+			}
 			if attempt == "handover" {
 				return fmt.Errorf("reap: hand the controller flag to %q on %s: %w", heir, obj.GetName(), err)
 			}
