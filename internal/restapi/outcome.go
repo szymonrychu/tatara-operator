@@ -2039,7 +2039,7 @@ func (o *outcomeCtx) brainstorm(p brainstormPayload) {
 		// marker factor, and putting it on the SCM issue (not just the CR) keeps it
 		// alive across a mirror refresh. Harmless when the flag is off.
 		body := tatarav1alpha1.StampProposalMarker(pr.Body, tatarav1alpha1.ProposalKindBrainstorm)
-		title := tatarav1alpha1.ClampIssueTitle(pr.Title)
+		title := s.clampTitleForForge(ctx, o.r, obs.TitleSiteBrainstormPropose, o.task.Name, pr.Title)
 		created, err := writer.CreateIssue(ctx, repo.Spec.URL, token, scm.IssueReq{
 			Title: title, Body: body, Labels: []string{brainstormingLabel},
 		})
@@ -2236,7 +2236,7 @@ func (o *outcomeCtx) incident(p incidentPayload) {
 	// Provenance marker for the autoApproveTataraProposals carve-out (marker factor);
 	// stamped on both the forge issue and the CR so it survives a mirror refresh.
 	body := tatarav1alpha1.StampProposalMarker(p.Issue.Body, tatarav1alpha1.ProposalKindIncident)
-	title := tatarav1alpha1.ClampIssueTitle(p.Issue.Title)
+	title := s.clampTitleForForge(ctx, o.r, obs.TitleSiteIncidentFileIssue, o.task.Name, p.Issue.Title)
 	issueReq := scm.IssueReq{Title: title, Body: body}
 	if ruleKey != "" {
 		issueReq.Labels = append(issueReq.Labels, forgeAlertRulePrefix+ruleKey)

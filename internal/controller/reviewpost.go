@@ -610,12 +610,15 @@ func (d *StageDriver) DrainPendingComments(ctx context.Context, obj client.Objec
 			editErr := writer.EditIssue(ctx, token, slug, number, req)
 			RecordSCM(d.Metrics, provider, "edit_issue", editErr)
 			if editErr != nil {
-				// Named on the error because this is the UNRECOVERABLE forge write:
+				// requestId FIRST, because this is the UNRECOVERABLE forge write:
 				// returning here skips removePendingComments, so the intent requeues
-				// forever. Whoever reads the resulting log storm needs to know which
-				// intent is wedged, and the title is the only thing that identifies it.
-				return fmt.Errorf("review: edit issue %s#%d (title %d chars, %q): %w",
-					slug, number, utf8.RuneCountInString(title),
+				// forever and blocks every intent behind it on this Issue. It is also
+				// the key removePendingComments matches on, so it is what an operator
+				// needs to excise the wedged intent by hand. The title fields alone
+				// were no discriminator: action=edit accepts a body with no title, and
+				// that common shape logged the contentless `(title 0 chars, "")`.
+				return fmt.Errorf("review: edit issue %s#%d (request_id_key %s, title %d chars, %q): %w",
+					slug, number, pc.RequestID, utf8.RuneCountInString(title),
 					tatarav1alpha1.TruncateRunes(title, 60), editErr)
 			}
 			l.Info("review: issue edited", "action", "scm_issue_edited", "resource_id", obj.GetName(),

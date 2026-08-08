@@ -1,6 +1,7 @@
 package restapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/auth"
+	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
 
@@ -236,6 +238,37 @@ func titleLogFields(raw, sent string) []any {
 		"sent_title_chars", utf8.RuneCountInString(sent),
 		"title_prefix", tatarav1alpha1.TruncateRunes(sent, titleLogPrefixChars),
 	}
+}
+
+// clampTitleForForge clamps an agent-supplied ISSUE title on its way to a forge
+// write, and when the clamp actually changed something it says so - counter plus
+// one INFO line - instead of rewriting what the agent wrote in silence.
+//
+// It is how all four issue-title writes in this package clamp: the three
+// CreateIssue sites and the deferred edit intent. MR titles do not go through it
+// and are a documented gap - see ClampIssueTitle.
+//
+// The clamp exists to make an over-long title a NON-event, so it is expected to
+// engage on ordinary traffic. That is the argument for the signal, not against
+// it: titleLogFields only ever fires on the forge-error path, and the whole
+// point of the clamp is that that path stops firing. Without this the platform
+// edits an agent's title with no trace anywhere.
+//
+// One dedicated line rather than a field spliced into each site's success log:
+// the four sites' success lines are four different messages (one of them emitted
+// by shared outcome-commit code that has no title in scope), and a reader who
+// wants to know whether the clamp is engaging should not have to know which four.
+func (s *Server) clampTitleForForge(ctx context.Context, r *http.Request, site, task, raw string) string {
+	sent := tatarav1alpha1.ClampIssueTitle(raw)
+	if sent == raw {
+		return sent
+	}
+	obs.RestTitleClampedTotal.WithLabelValues(site).Inc()
+	fields := append(reqLogFields(r), "action", "issue_title_clamped",
+		"site", site, "task", task)
+	s.log.InfoContext(ctx, "restapi: issue title clamped",
+		append(fields, titleLogFields(raw, sent)...)...)
+	return sent
 }
 
 // validChangeSignificance is the closed set of semver levels an agent may

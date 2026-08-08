@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -564,6 +565,44 @@ func TestDrainPendingCommentsEditAndClose(t *testing.T) {
 	}
 }
 
+// erroringEditWriter wraps fakeForge and makes EditIssue fail, without adding
+// an error-injection field to fakeForge itself (merge_test.go, out of scope
+// here). Every other call is delegated straight through.
+type erroringEditWriter struct {
+	*fakeForge
+	editIssueErr error
+}
+
+func (w *erroringEditWriter) EditIssue(_ context.Context, _, _ string, _ int, _ scm.EditIssueReq) error {
+	return w.editIssueErr
+}
+
+// When EditIssue fails during the pending-intent drain, the drain returns
+// BEFORE removePendingComments (reviewpost.go ~line 610-620), so the intent
+// requeues forever and an operator has to find it by RequestID. The wrapped
+// error must therefore name pc.RequestID - not just the title, which for a
+// body-only edit intent (the common shape: title empty, body carries the
+// content) is empty and gives the operator no discriminator at all.
+func TestDrainPendingCommentsEditError_NamesRequestID(t *testing.T) {
+	task := mdTask("t1", "clarify", tatarav1alpha1.StateRefined)
+	iss := mdIssue(task, "tatara-operator", 41)
+	iss.Status.PendingComments = []tatarav1alpha1.PendingComment{
+		{RequestID: "req-body-only-edit", Action: "comment", Body: "<!-- tatara-edit -->\ntitle: \nthe new body"},
+	}
+	c := newMirrorClient(t, mdProject(), mdSecret(), mdRepo("tatara-operator"), task, iss)
+
+	f := newFakeForge(t)
+	w := &erroringEditWriter{fakeForge: f, editIssueErr: errors.New("forge rejected the edit")}
+	d := mdNewDriverWithReader(t, f, c, mdNewReader(f))
+	d.SCMFor = func(string) (scm.SCMWriter, error) { return w, nil }
+
+	err := d.DrainPendingComments(context.Background(), mdGetIssue(t, c, iss.Name))
+	require.Error(t, err, "EditIssue failing must fail the drain")
+	require.Contains(t, err.Error(), "req-body-only-edit",
+		"the drain error must name pc.RequestID - it is the unrecoverable write and the "+
+			"only handle an operator has to excise the wedged intent by hand")
+}
+
 // #420: closing an issue posted the SAME close comment twice on a re-drain
 // (a crash/requeue between CloseIssue and removePendingComments leaves the
 // close intent in PendingComments, and the drain re-ran CloseIssue with no
@@ -835,7 +874,7 @@ func TestParseEditIntent_TitleNeverExceedsTheForgeCap(t *testing.T) {
 			// clamp existed. The replay is the only gate it will still pass.
 			name:      "legacy over-long title is clamped at replay",
 			wire:      editIntentMarker + "\ntitle: " + long + "\nbody",
-			wantTitle: tatarav1alpha1.ClampIssueTitle(long),
+			wantTitle: strings.Repeat("q", 241) + "...(truncated)",
 			wantBody:  "body",
 		},
 		{

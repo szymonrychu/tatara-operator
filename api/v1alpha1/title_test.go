@@ -181,3 +181,64 @@ func TestClampIssueTitle_TrimsWhitespaceOffTheCutBeforeMarking(t *testing.T) {
 
 	require.Equal(t, strings.Repeat("a", cut-3)+titleTruncatedMarker, got)
 }
+
+// ClampIssueTitle feeds a line-oriented wire format ("title: <t>\n<body>").
+// An interior line break in a title decodes back as the issue BODY and
+// overwrites the real one on the forge, so every interior line break must be
+// flattened to a single space BEFORE the trim and before the length check.
+// A title is a single line everywhere it is used, and an interior line break in
+// one is not merely untidy: the deferred edit intent carries the title in a
+// LINE-ORIENTED encoding whose decoder cuts at the first "\n", so an unflattened
+// break let the tail of a title come back as the issue BODY and overwrite the
+// real one on the forge. The trim never reached it - it only touches the ends.
+//
+// The last two cases are pins, not new behaviour: flattening must not defeat the
+// trim it runs in front of.
+func TestClampIssueTitle_FlattensLineBreaks(t *testing.T) {
+	cases := []struct {
+		name  string
+		title string
+		want  string
+	}{
+		{"LF", "Fix crash\nSTATUS: done", "Fix crash STATUS: done"},
+		{"CRLF collapses to one space", "Fix crash\r\nSTATUS: done", "Fix crash STATUS: done"},
+		{"CR", "a\rb", "a b"},
+		{"VT and FF", "a\vb\fc", "a b c"},
+		{"unicode line separators", "a\u2028b\u2029c\u0085d", "a b c d"},
+		{"leading and trailing LF is a no-op post-trim", "\nreal title\n", "real title"},
+		{"whitespace-only still collapses", "  \n  ", ""},
+	}
+	lineBreakRunes := []rune{'\n', '\r', '\v', '\f', 0x2028, 0x2029, 0x0085}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ClampIssueTitle(tc.title)
+			require.Equal(t, tc.want, got)
+			for _, r := range lineBreakRunes {
+				require.NotContains(t, got, string(r))
+			}
+		})
+	}
+}
+
+// Flattening runs BEFORE the length check and the cut, so a break cannot survive
+// by sitting on either side of the cut point.
+func TestClampIssueTitle_FlattensBeforeCutting(t *testing.T) {
+	t.Run("newline past the cut point", func(t *testing.T) {
+		title := strings.Repeat("a", 300) + "\n" + strings.Repeat("b", 300)
+
+		got := ClampIssueTitle(title)
+
+		require.Equal(t, IssueTitleMaxChars, utf8.RuneCountInString(got))
+		require.True(t, strings.HasSuffix(got, titleTruncatedMarker))
+		require.NotContains(t, got, "\n")
+	})
+
+	t.Run("newline before the cut point", func(t *testing.T) {
+		title := "a\nb" + strings.Repeat("c", 300)
+
+		got := ClampIssueTitle(title)
+
+		require.NotContains(t, got, "\n")
+		require.Equal(t, IssueTitleMaxChars, utf8.RuneCountInString(got))
+	})
+}
