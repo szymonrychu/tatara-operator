@@ -679,36 +679,58 @@ func (r *TaskReconciler) commentMRBindingBackstopParked(ctx context.Context, pro
 // otherwise. Its LastTransitionTime is when the commit stamped it, which is when
 // the handoff started - not stageEnteredAt.
 //
-// It resolves to exactly one case, kind-agnostically: the reviewing stage after a
+// It resolves to exactly one case, kind-agnostically: awaiting-review after a
 // review outcome commits. Every other kind's commit calls stage.Enter in the SAME
-// write, so its condition Reason can never name the NEW stage's agent kind, and
-// no other stage can be committed-but-not-advanced. That is why the scoped
+// write, so no other state can be committed-but-not-advanced. The scoped
 // OutcomeCommittedFor is load-bearing and a bare OutcomeCommitted would be a bug:
-// the condition is per-TASK and survives across stages, so an implement Task is
-// already committed the instant it arrives at reviewing. A bare claim (Reason
+// the condition is per-TASK and survives across states, so an implement Task is
+// already committed the instant it arrives at awaiting-review. A bare claim (Reason
 // "Outcome") never matches either: it has no handoff outstanding.
+//
+// #547: OutcomeCommittedFor ALONE stopped being sufficient. It used to be, because
+// every state had its own agent kind, so a commit naming the state's agent could
+// only have been made IN that state. Folding clarify into implement (#521) made
+// AgentKindFor return the same agent for refined AND under-implementation, so the
+// approval commit that MOVES a Task refined -> under-implementation names the agent
+// of the state it lands in. Hence the state gate below, which is the invariant this
+// comment always claimed, now asserted instead of inferred.
 //
 // This is the ONE predicate for "this stage's agent is done and the handoff is
 // outstanding". All three production sites route through it - reconcileClocks'
 // deadline and the two B2 suppression guards - so the scoping holds identically
 // at each.
 func handoffCondition(task *tatarav1alpha1.Task) *metav1.Condition {
+	// GATE 1, structural: awaiting-review is the ONE state whose outcome commit
+	// defers its advance to a second reconciler (MergeRequestReconciler ->
+	// DrainPendingReview -> advanceAfterReview). Every other state advances in
+	// the commit's own write, so it has no handoff to be outstanding and no
+	// deadline to bound. This holds whatever AgentKindFor happens to return.
+	if task.Status.State != tatarav1alpha1.StateAwaitingReview {
+		return nil
+	}
 	if !tatarav1alpha1.OutcomeCommittedFor(task, stage.AgentKindFor(task.Status.State, task.Spec.Kind)) {
 		return nil
 	}
 	cond := tatarav1alpha1.OutcomeCondition(task)
-	// stage.Enter never clears the condition, so a commit from a PREVIOUS
-	// occupancy of this same stage is not this occupancy's handoff:
-	// merging -> reviewing (HeadMoved, cycle 4) and the kind=review
-	// awaiting-human unpark both re-enter reviewing carrying Reason=Review
+	// GATE 2, occupancy: stage.Enter never clears the condition, so a commit from
+	// a PREVIOUS occupancy of this same state is not this occupancy's handoff:
+	// merged -> awaiting-review (HeadMoved, cycle 4) and the kind=review
+	// awaiting-human unpark both re-enter awaiting-review carrying Reason=Review
 	// from the last round. This occupancy's agent has not run yet.
 	//
-	// No stage stamp is no occupancy to compare against, so no handoff to bound
+	// AT the entry stamp is not after it. A commit written in the SAME etcd write
+	// as the entry it caused shares its metav1.Time, which is SECOND-granular, so
+	// the two stamps are equal and a strict Before() let it through (#547). An
+	// outcome can only be this occupancy's handoff if it was committed strictly
+	// LATER than the entry - which a genuine review commit always is, since the
+	// review pod has to be scheduled, booted and run first.
+	//
+	// No state stamp is no occupancy to compare against, so no handoff to bound
 	// either - ArmedClock disarms on the same condition (stage.go:572). Every
-	// path into a stage runs stage.Enter, which always stamps it, so a nil stamp
+	// path into a state runs stage.Enter, which always stamps it, so a nil stamp
 	// is unreachable; failing closed just keeps it that way.
 	if task.Status.StateEnteredAt == nil ||
-		cond.LastTransitionTime.Time.Before(task.Status.StateEnteredAt.Time) {
+		!cond.LastTransitionTime.After(task.Status.StateEnteredAt.Time) {
 		return nil
 	}
 	return cond
