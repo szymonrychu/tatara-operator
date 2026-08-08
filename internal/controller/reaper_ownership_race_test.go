@@ -8,7 +8,9 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
@@ -130,4 +132,116 @@ func TestReleaseOwnershipDecidesOnFreshStateNotTheCachedCopy(t *testing.T) {
 	require.Len(t, got.OwnerReferences, 2,
 		"the concurrent owner append was clobbered by a write computed from a stale array")
 	require.Equal(t, before, gcBlocked(), "a completed handover is not a GC block")
+}
+
+func issueConflict(name string) error {
+	return apierrors.NewConflict(
+		schema.GroupResource{Group: tatarav1alpha1.GroupVersion.Group, Resource: "issues"},
+		name, apierrors.NewBadRequest("the object has been modified"))
+}
+
+// TestReleaseOwnershipRetriesATransientConflictWithoutCountingIt is issue #530,
+// first half: one 409 that the very next attempt resolves must neither fail the
+// reap nor move operator_gc_blocked_total. Counting it pinned `Operator GC
+// blocked` firing for ~1 h behind a false "accumulating in etcd" annotation,
+// twice on 2026-08-05, for two conflicts that self-healed in under a second.
+func TestReleaseOwnershipRetriesATransientConflictWithoutCountingIt(t *testing.T) {
+	ctx := context.Background()
+	proj := reapProject("gcflap")
+	repo := reapRepo("gcflap", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
+
+	dying := reapTask("gcflap", "rej-task", "clarify",
+		tatarav1alpha1.StateRejected, stage.ReasonDeclined, time.Now().Add(-time.Minute))
+	dying.Status.IssueRefs = []string{tatarav1alpha1.IssueName(repo.Name, 9)}
+	iss := raceIssue(repo.Name, 9, "gcflap", "rej-task")
+
+	var (
+		mu      sync.Mutex
+		updates int
+	)
+	c := newMirrorClientIntercepted(t, interceptor.Funcs{
+		Update: func(ctx context.Context, cl client.WithWatch, obj client.Object,
+			opts ...client.UpdateOption) error {
+			if _, ok := obj.(*tatarav1alpha1.Issue); ok {
+				mu.Lock()
+				updates++
+				first := updates == 1
+				mu.Unlock()
+				if first {
+					return issueConflict(obj.GetName())
+				}
+			}
+			return cl.Update(ctx, obj, opts...)
+		},
+	}, proj, repo, reapSecret(), dying, iss)
+
+	before := gcBlocked()
+	require.NoError(t, r0(c).ReapTerminal(ctx, proj),
+		"a self-healing 409 on the owner-ref drop must be retried, not surfaced")
+	require.Equal(t, before, gcBlocked(),
+		"a 409 the retry resolved was counted as a permanent GC block")
+	require.Empty(t, mustGetIssue(t, c, iss.Name).OwnerReferences,
+		"the owner ref was never dropped: the release gave up on the first conflict")
+}
+
+// TestReleaseOwnershipDoesNotCountAnExhaustedConflictAsGCBlocked is issue #530,
+// second half. Even when every retry conflicts, the release is not BLOCKED - the
+// reconcile returns the error and controller-runtime requeues it, which is the
+// resolution path the counter's alert claims does not exist. Only a failure the
+// requeue will not resolve belongs in operator_gc_blocked_total.
+func TestReleaseOwnershipDoesNotCountAnExhaustedConflictAsGCBlocked(t *testing.T) {
+	ctx := context.Background()
+	proj := reapProject("gcexh")
+	repo := reapRepo("gcexh", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
+
+	dying := reapTask("gcexh", "rej-task", "clarify",
+		tatarav1alpha1.StateRejected, stage.ReasonDeclined, time.Now().Add(-time.Minute))
+	dying.Status.IssueRefs = []string{tatarav1alpha1.IssueName(repo.Name, 9)}
+	iss := raceIssue(repo.Name, 9, "gcexh", "rej-task")
+
+	c := newMirrorClientIntercepted(t, interceptor.Funcs{
+		Update: func(ctx context.Context, cl client.WithWatch, obj client.Object,
+			opts ...client.UpdateOption) error {
+			if _, ok := obj.(*tatarav1alpha1.Issue); ok {
+				return issueConflict(obj.GetName())
+			}
+			return cl.Update(ctx, obj, opts...)
+		},
+	}, proj, repo, reapSecret(), dying, iss)
+
+	before := gcBlocked()
+	require.Error(t, r0(c).ReapTerminal(ctx, proj), "an unresolved conflict must still fail the reap")
+	require.Equal(t, before, gcBlocked(),
+		"a conflict the requeue will resolve was counted as a permanent GC block")
+}
+
+// TestReleaseOwnershipCountsAPermanentUpdateFailureAsGCBlocked is the other side
+// of #530's boundary: the counter must keep firing for a failure a requeue does
+// NOT fix. Narrowing "blocked" must not silence it.
+func TestReleaseOwnershipCountsAPermanentUpdateFailureAsGCBlocked(t *testing.T) {
+	ctx := context.Background()
+	proj := reapProject("gcperm")
+	repo := reapRepo("gcperm", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
+
+	dying := reapTask("gcperm", "rej-task", "clarify",
+		tatarav1alpha1.StateRejected, stage.ReasonDeclined, time.Now().Add(-time.Minute))
+	dying.Status.IssueRefs = []string{tatarav1alpha1.IssueName(repo.Name, 9)}
+	iss := raceIssue(repo.Name, 9, "gcperm", "rej-task")
+
+	c := newMirrorClientIntercepted(t, interceptor.Funcs{
+		Update: func(ctx context.Context, cl client.WithWatch, obj client.Object,
+			opts ...client.UpdateOption) error {
+			if _, ok := obj.(*tatarav1alpha1.Issue); ok {
+				return apierrors.NewForbidden(
+					schema.GroupResource{Group: tatarav1alpha1.GroupVersion.Group, Resource: "issues"},
+					obj.GetName(), apierrors.NewBadRequest("denied by admission webhook"))
+			}
+			return cl.Update(ctx, obj, opts...)
+		},
+	}, proj, repo, reapSecret(), dying, iss)
+
+	before := gcBlocked()
+	require.Error(t, r0(c).ReapTerminal(ctx, proj))
+	require.Greater(t, gcBlocked(), before,
+		"a rejection no requeue can resolve IS a GC block and must still be counted")
 }
