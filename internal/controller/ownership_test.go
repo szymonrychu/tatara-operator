@@ -540,3 +540,59 @@ func ownerTaskOf(t *testing.T, ctx context.Context, mr *tatarav1alpha1.MergeRequ
 	}
 	return &task
 }
+
+// CLASSIFYING A BOT MR BEFORE ITS HEAD IS KNOWN MUST NOT ARM A FALSE FLIP.
+//
+// The backfill seeds LastBotHeadSHA = liveHead precisely so the drift check
+// below it does not fire on the classification's own backfill - "which is not a
+// drift, it is day one", as the code says. But that seed was conditional on
+// liveHead being non-empty, and the mirror is routinely classified on a
+// reconcile that has not learned the head yet (a freshly opened PR whose mirror
+// syncs the head a beat later). LastBotHeadSHA then stayed empty, and the FIRST
+// reconcile that did know the head saw liveHead != "" and liveHead != "" -> flip.
+//
+// The consequence is not cosmetic: flipToExternal parks the owning Task
+// ownership-lost, hands the MR to the review Task, and the issue restarts from
+// scratch. Live, on tatara's own work: mr-mtg-decks-19 and mr-mtg-decks-15 both
+// ended ownership=external, reason=external-push:<tatara's own commit>, with
+// lastBotHeadSHA EMPTY - and mtg-decks#19 (a finished 4199-line deck PR) was
+// closed and rebuilt from nothing. mr-mtg-decks-17, seeded normally, was fine.
+func TestReconcileOwnership_ClassifyWithoutLiveHeadDoesNotArmAFalseFlip(t *testing.T) {
+	ctx := context.Background()
+	d, proj, repo := newOwnershipDriver(t, ctx)
+	mr := seedOpenMR(t, ctx, proj, repo, 42, "tatara/feat-42", proj.Spec.Scm.BotLogin, "")
+
+	// Pass 1: the mirror has not synced a head yet. This is the classification
+	// that used to leave LastBotHeadSHA empty.
+	if _, err := d.ReconcileOwnership(ctx, proj, repo, mr, "", nil); err != nil {
+		t.Fatalf("classify pass: %v", err)
+	}
+	got := getMR(t, ctx, proj, repo, 42)
+	if got.Status.Ownership != tatarav1alpha1.OwnershipTatara {
+		t.Fatalf("ownership = %q, want tatara: the MR is bot-authored", got.Status.Ownership)
+	}
+
+	// Pass 2: the head arrives. It is TATARA'S OWN commit - the agent pushed it -
+	// so this must not be read as an external push.
+	flipped, err := d.ReconcileOwnership(ctx, proj, repo, got, "agent-head", nil)
+	if err != nil {
+		t.Fatalf("head pass: %v", err)
+	}
+	if flipped {
+		t.Fatal("flipped to external on the agent's own first head: this closes the PR and restarts the issue from nothing")
+	}
+	got = getMR(t, ctx, proj, repo, 42)
+	if got.Status.Ownership != tatarav1alpha1.OwnershipTatara {
+		t.Fatalf("ownership = %q (%s), want tatara", got.Status.Ownership, got.Status.OwnershipReason)
+	}
+
+	// A GENUINE external push must still flip, or the fix has just disabled the
+	// whole mechanism.
+	flipped, err = d.ReconcileOwnership(ctx, proj, repo, got, "human-head", nil)
+	if err != nil {
+		t.Fatalf("drift pass: %v", err)
+	}
+	if !flipped {
+		t.Fatal("a real unattributable head must still flip to external")
+	}
+}

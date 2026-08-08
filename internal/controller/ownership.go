@@ -93,9 +93,42 @@ func (d *StageDriver) ReconcileOwnership(ctx context.Context, proj *tatarav1alph
 		// Initial classification is not a flip; do not announce or count.
 	}
 
-	if mr.Status.Ownership == tatarav1alpha1.OwnershipTatara &&
-		liveHead != "" && liveHead != mr.Status.LastBotHeadSHA {
-		return d.flipToExternal(ctx, proj, repo, mr, liveHead)
+	if mr.Status.Ownership == tatarav1alpha1.OwnershipTatara && liveHead != "" {
+		// NO BASELINE IS NOT A DRIFT. The backfill above seeds LastBotHeadSHA so
+		// this check cannot fire on the classification's own backfill, but that
+		// seed only runs when liveHead is already known - and a mirror is
+		// routinely classified on a reconcile that has not synced the head yet
+		// (a freshly opened PR whose head arrives a beat later). LastBotHeadSHA
+		// then stayed EMPTY, and the first reconcile that did know the head read
+		// liveHead != "" as drift and flipped the MR against tatara's OWN commit.
+		//
+		// That is not cosmetic: flipToExternal parks the owning Task
+		// ownership-lost, hands the MR to the review Task, and the issue restarts
+		// from scratch. Live, on tatara's own work: mr-mtg-decks-19 and
+		// mr-mtg-decks-15 both ended external with reason=external-push:<tatara's
+		// own commit> and lastBotHeadSHA empty, and a finished 4199-line deck PR
+		// was closed and rebuilt from nothing.
+		//
+		// With no baseline there is nothing to compare against, so seed the same
+		// way the backfill does - "whatever is on the branch right now was put
+		// there by the bot" - and let the NEXT head move be judged against it.
+		// The alternative, flipping on an unknowable question, is what the bug is.
+		if mr.Status.LastBotHeadSHA == "" {
+			if err := objbudget.FitMergeRequest(ctx, d.Client, sp, key, func(m *tatarav1alpha1.MergeRequest) {
+				if m.Status.LastBotHeadSHA == "" {
+					m.Status.LastBotHeadSHA = liveHead
+				}
+			}); err != nil {
+				return false, err
+			}
+			mr.Status.LastBotHeadSHA = liveHead
+			log.FromContext(ctx).Info("ownership: seeded the bot-head baseline on first known head",
+				"action", "ownership_seed_bot_head", "resource_id", mr.Name, "head", liveHead)
+			return false, nil
+		}
+		if liveHead != mr.Status.LastBotHeadSHA {
+			return d.flipToExternal(ctx, proj, repo, mr, liveHead)
+		}
 	}
 
 	if mr.Status.Ownership == tatarav1alpha1.OwnershipExternal {
