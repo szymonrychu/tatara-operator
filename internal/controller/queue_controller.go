@@ -733,7 +733,14 @@ func (r *DispatcherReconciler) reconcileDone(ctx context.Context, qes []tatarav1
 // +kubebuilder:rbac:groups=tatara.dev,resources=queuedevents,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=tatara.dev,resources=queuedevents/status,verbs=get;update;patch
 
+// The body is doReconcile; this wrapper is the #538 shutdown-cancellation
+// boundary (see classifyReconcileShutdown).
 func (r *DispatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	res, err := r.doReconcile(ctx, req)
+	return classifyReconcileShutdown(ctx, "dispatcher", req.Name, res, err)
+}
+
+func (r *DispatcherReconciler) doReconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var qe tatarav1alpha1.QueuedEvent
 	if err := r.Get(ctx, req.NamespacedName, &qe); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)

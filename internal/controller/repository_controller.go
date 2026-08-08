@@ -87,7 +87,14 @@ type RepositoryReconciler struct {
 
 // Reconcile launches and tracks the ingest Job for a Repository per the
 // re-ingest trigger contract.
+// The body is doReconcile; this wrapper is the #538 shutdown-cancellation
+// boundary (see classifyReconcileShutdown).
 func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	res, err := r.doReconcile(ctx, req)
+	return classifyReconcileShutdown(ctx, "repository", req.Name, res, err)
+}
+
+func (r *RepositoryReconciler) doReconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
 
 	var repo tataradevv1alpha1.Repository

@@ -59,6 +59,9 @@ func TestManagerOptions_LeaderElectionDisabled(t *testing.T) {
 // SIGTERM during a rollout, so the new leader waits out the full lease
 // duration before it can start dispatching - part of the observed 7m22s
 // alert-admission gap.
+//
+// It ALSO pins the #538 re-decision: the flag stays on. See managerOptions for
+// why turning it off would reinstate #395 without removing the ERROR lines.
 func TestManagerOptions_LeaderElectionReleaseOnCancel(t *testing.T) {
 	opts := managerOptions(config.Config{Namespace: "tatara", LeaderElection: true}, newScheme())
 	if !opts.LeaderElectionReleaseOnCancel {
