@@ -134,7 +134,14 @@ func (r *PodWatchReconciler) maxRecreations() int {
 	return maxPodRecreations
 }
 
+// The body is doReconcile; this wrapper is the #538 shutdown-cancellation
+// boundary (see classifyReconcileShutdown).
 func (r *PodWatchReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	res, err := r.doReconcile(ctx, req)
+	return classifyReconcileShutdown(ctx, "podclocks", req.Name, res, err)
+}
+
+func (r *PodWatchReconciler) doReconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	pod := &corev1.Pod{}
 	if err := r.Get(ctx, req.NamespacedName, pod); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)

@@ -231,7 +231,16 @@ type ProjectReconciler struct {
 // Reconcile validates spec.scmSecretRef and sets status.webhookURL plus the
 // Ready condition. A missing or malformed secret is reported via the Ready
 // condition (status False), not returned as an error.
+// The body is doReconcile; this wrapper is the #538 shutdown-cancellation
+// boundary (see classifyReconcileShutdown). The project reconcile fans out into
+// the scans, the reaper and the un-park drive, so it is the widest surface a
+// SIGTERM can abort mid-flight.
 func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	res, err := r.doReconcile(ctx, req)
+	return classifyReconcileShutdown(ctx, "project", req.Name, res, err)
+}
+
+func (r *ProjectReconciler) doReconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
 
 	var project tataradevv1alpha1.Project

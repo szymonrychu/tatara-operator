@@ -133,7 +133,15 @@ func isFieldSelectorUnsupported(err error) bool {
 //	caps  (F.4)   -> maxTurnsPerTask, maxPodRecreations, pod-stopped-no-outcome
 //	pod-less stage-> the operator does the work
 //	pod stage     -> ticket -> admission -> pod -> G.10 handshake -> turn-0
+//
+// The body is doReconcile; this wrapper is the #538 shutdown-cancellation
+// boundary (see classifyReconcileShutdown).
 func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	res, err := r.doReconcile(ctx, req)
+	return classifyReconcileShutdown(ctx, "task", req.Name, res, err)
+}
+
+func (r *TaskReconciler) doReconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
 
 	var task tatarav1alpha1.Task
