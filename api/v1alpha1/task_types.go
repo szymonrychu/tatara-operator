@@ -803,8 +803,15 @@ const (
 	// condition is the per-Task drill-down a human reads after the memory-stack
 	// alert fires, and operator_agent_pod_degraded_total is its fleet-wide view.
 	ConditionMemoryDegraded = "MemoryDegraded"
-	// ReasonSpawnedWithoutRecall is ConditionMemoryDegraded's only Reason.
+	// ReasonSpawnedWithoutRecall is ConditionMemoryDegraded's Reason when the
+	// project's memory stack exists but is not stably ready - a real degradation.
 	ReasonSpawnedWithoutRecall = "SpawnedWithoutRecall"
+	// ReasonMemoryDisabled is ConditionMemoryDegraded's Reason when the project
+	// has spec.memory.enabled=false. The condition is recorded as FALSE with this
+	// reason: the pod genuinely has no recall, but nothing is degraded, and a
+	// True/SpawnedWithoutRecall here would make every turn of a memory-free
+	// project look like an incident.
+	ReasonMemoryDisabled = "MemoryDisabled"
 )
 
 // OutcomeReasonFor is the condition Reason an outcome of agentKind commits. The

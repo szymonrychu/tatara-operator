@@ -58,6 +58,17 @@ nameOverride: ""
 #       provider: github
 #       owner: acme
 #       botLogin: acme-bot
+#     # The per-project memory stack (postgres + neo4j + lightrag + memory API).
+#     # ON by default: omit the block entirely and the stack is provisioned.
+#     # Setting enabled: false tears the WORKLOADS down. Volumes are treated
+#     # asymmetrically, on purpose:
+#     #   postgres + neo4j -> RETAINED (relabelled
+#     #     tatara.dev/retained-for-project=<name>, ownerReferences stripped);
+#     #     re-enabling reattaches them and the data comes back.
+#     #   lightrag         -> DELETED. Approved data removal; the index is
+#     #     derived data and is rebuilt by re-ingesting after a re-enable.
+#     memory:
+#       enabled: false
 project: {}
 
 # Repository CRs enrolled in the Project. projectRef is auto-bound to

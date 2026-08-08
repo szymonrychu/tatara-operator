@@ -34,6 +34,16 @@ const ReingestAnnotation = tataradevv1alpha1.ReingestRequestedAnnotation
 // re-evaluate the schedule reasonably soon.
 const maxScheduleRequeue = 6 * time.Hour
 
+// repoPhaseMemoryDisabled / repoReasonMemoryDisabled mark a Repository whose
+// owning Project has spec.memory.enabled=false. Ingest writes to the memory
+// stack and there is no stack, so ingest is NOT APPLICABLE - which is a
+// terminal, non-alarming state, distinct both from "gated, waiting for memory"
+// and from "ingest failed".
+const (
+	repoPhaseMemoryDisabled  = "MemoryDisabled"
+	repoReasonMemoryDisabled = "MemoryDisabled"
+)
+
 // ingestBackoff constants for exponential back-off between failed Job re-creations.
 const (
 	baseIngestBackoff = 30 * time.Second
@@ -128,6 +138,15 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 
 	if !tataradevv1alpha1.BoolVal(repo.Spec.IngestEnabled, true) {
+		// This early-return sits BEFORE the memory-disabled short-circuit below, so
+		// a repo that has ingest switched off never reaches it. Retire the two
+		// ingest series here too, or a memory-disabled project whose repos also
+		// have ingestEnabled=false keeps ageing a last-ingest timestamp nothing
+		// will ever refresh, straight into TataraIngestStale. For a repo with
+		// ingest off the honest value of both gauges is "no series", the same
+		// stance publishIngestHealth already takes on the failing gauge.
+		r.Metrics.SetRepositoryIngestGated(repo.Spec.ProjectRef, repo.Name, false)
+		r.Metrics.ClearRepositoryLastIngestTimestamp(repo.Spec.ProjectRef, repo.Name)
 		return ctrl.Result{}, nil
 	}
 
@@ -167,6 +186,40 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, fmt.Errorf("get owning project %q: %w", repo.Spec.ProjectRef, err)
 	}
 
+	// Memory DISABLED is not the same as memory not-ready, and must not be
+	// handled by the gate below. The gate is an unbounded 15s poll with no
+	// terminal state: it is correct for a stack that is going to become ready and
+	// catastrophic for one that never will. A disabled project would sit in it
+	// forever, holding operator_repository_ingest_gated at 1 (TataraIngestGated
+	// fires at 1h) and ageing operator_repository_last_ingest_timestamp_seconds
+	// past the staleness budget (TataraIngestStale). Short-circuit cleanly
+	// instead: ingest is not applicable here, and there is nothing to retry.
+	if tataradevv1alpha1.MemoryDisabled(&project) {
+		if err := r.patchStatus(ctx, &repo, func(fresh *tataradevv1alpha1.Repository) bool {
+			fresh.Status.Phase = repoPhaseMemoryDisabled
+			meta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
+				Type:               "MemoryNotReady",
+				Status:             metav1.ConditionFalse,
+				Reason:             repoReasonMemoryDisabled,
+				Message:            "project " + project.Name + " has memory disabled; ingest does not apply",
+				ObservedGeneration: fresh.Generation,
+			})
+			return true
+		}); err != nil {
+			r.Metrics.ReconcileResult("Repository", "error")
+			return ctrl.Result{}, fmt.Errorf("set memory-disabled ingest state: %w", err)
+		}
+		r.Metrics.SetRepositoryIngestGated(repo.Spec.ProjectRef, repo.Name, false)
+		// Retire the staleness series: publishIngestHealth republished it at the
+		// top of this pass from the last successful ingest, and nothing will ever
+		// refresh it again, so leaving it would age straight into TataraIngestStale.
+		r.Metrics.ClearRepositoryLastIngestTimestamp(repo.Spec.ProjectRef, repo.Name)
+		l.Info("ingest skipped: project memory is disabled",
+			"action", "ingest_memory_disabled", "resource_id", repo.Name, "project", project.Name)
+		r.Metrics.ReconcileResult("Repository", "success")
+		return ctrl.Result{}, nil
+	}
+
 	// THE ONE REMAINING MEMORY GATE. Ingest is the only path that WRITES to the
 	// memory stack, so a not-ready backend here means a partial corpus, not just
 	// reduced recall. Agent spawn and turn submission are deliberately NOT gated
@@ -201,13 +254,20 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// earlier not-ready reconcile. Persist immediately when it flips, so it clears
 	// even on reconciles that launch no ingest (already-ingested repos).
 	if err := r.patchStatus(ctx, &repo, func(fresh *tataradevv1alpha1.Repository) bool {
+		changed := false
+		// Drop a phase left behind by a memory-disabled episode so a re-enabled
+		// project does not read MemoryDisabled until its next ingest completes.
+		if fresh.Status.Phase == repoPhaseMemoryDisabled {
+			fresh.Status.Phase = ""
+			changed = true
+		}
 		return meta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
 			Type:               "MemoryNotReady",
 			Status:             metav1.ConditionFalse,
 			Reason:             "MemoryReady",
 			Message:            "project memory stack is Ready",
 			ObservedGeneration: fresh.Generation,
-		})
+		}) || changed
 	}); err != nil {
 		r.Metrics.ReconcileResult("Repository", "error")
 		return ctrl.Result{}, fmt.Errorf("clear MemoryNotReady condition: %w", err)

@@ -52,7 +52,11 @@ type RepositorySpec struct {
 
 // RepositoryStatus defines the observed state of a Repository.
 type RepositoryStatus struct {
-	// +kubebuilder:validation:Enum=Ingesting;Ingested;Failed
+	// MemoryDisabled is terminal and NON-alarming: the owning Project has
+	// spec.memory.enabled=false, so there is no recall corpus to write and ingest
+	// does not apply. It is deliberately distinct from Failed (ingest broke) and
+	// from the gated state (ingest is waiting for a stack that will become ready).
+	// +kubebuilder:validation:Enum=Ingesting;Ingested;Failed;MemoryDisabled
 	// +optional
 	Phase string `json:"phase,omitempty"`
 	// +optional

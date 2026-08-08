@@ -723,6 +723,20 @@ func (m *OperatorMetrics) SetRepositoryLastIngestTimestamp(project, repo string,
 	m.repositoryLastIngestTime.WithLabelValues(project, repo).Set(unixSeconds)
 }
 
+// ClearRepositoryLastIngestTimestamp retires
+// operator_repository_last_ingest_timestamp_seconds for a repo.
+//
+// TataraIngestStale alerts on time() - this gauge, so a series that will never
+// be refreshed again is not "stale data", it is a permanent false alarm. That
+// is exactly a repo whose project has memory disabled: ingest is not applicable
+// and no future ingest will ever stamp it. Deleting the series (rather than
+// zeroing it - 0 would read as 1970 and fire immediately) removes it from the
+// alert's input entirely. publishIngestHealth re-publishes it on the next pass
+// if the repo starts ingesting again.
+func (m *OperatorMetrics) ClearRepositoryLastIngestTimestamp(project, repo string) {
+	m.repositoryLastIngestTime.DeleteLabelValues(project, repo)
+}
+
 // RepositoryPhaseRepaired increments operator_repository_phase_repaired_total:
 // the reconciler found a Repository in the desynchronised (Phase=Failed,
 // IngestFailureCount=0) state and repaired it (issue #457).

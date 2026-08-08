@@ -526,6 +526,23 @@ func (r *ProjectReconciler) reconcileMemory(ctx context.Context, p *tataradevv1a
 	}
 
 	p.Status.Memory = ensureMemoryStatus(p)
+
+	// Memory is OPTIONAL (spec.memory.enabled=false) but ON BY DEFAULT: an unset
+	// or nil enabled keeps every pre-existing Project's stack exactly as it was.
+	if tataradevv1alpha1.MemoryDisabled(p) {
+		return 0, r.disableMemory(ctx, p)
+	}
+	// Leaving Disabled: re-adopt the volumes the teardown retained BEFORE the
+	// stack is applied, so cnpg and the lightrag apply meet PVCs that already
+	// carry the Project ownerRef instead of orphans. One-shot on the edge.
+	if p.Status.Memory.Phase == tataradevv1alpha1.MemoryPhaseDisabled {
+		if err := r.adoptRetainedMemoryPVCs(ctx, p); err != nil {
+			return 0, r.failMemory(p, "AdoptRetainedError", err)
+		}
+		p.Status.Memory.Phase = ""
+		p.Status.Memory.DisabledGeneration = 0
+	}
+
 	prevPhase := p.Status.Memory.Phase
 	p.Status.Memory.Endpoint = memory.Endpoint(p.Name, r.MemoryConfig.Namespace)
 	p.Status.Memory.ExternalEndpoint = memory.ExternalMemoryURL(p.Name, r.MemoryConfig)

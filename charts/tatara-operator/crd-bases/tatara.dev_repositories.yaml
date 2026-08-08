@@ -204,10 +204,16 @@ spec:
                   scoped to this repo. Computed on reconcile.
                 type: integer
               phase:
+                description: |-
+                  MemoryDisabled is terminal and NON-alarming: the owning Project has
+                  spec.memory.enabled=false, so there is no recall corpus to write and ingest
+                  does not apply. It is deliberately distinct from Failed (ingest broke) and
+                  from the gated state (ingest is waiting for a stack that will become ready).
                 enum:
                 - Ingesting
                 - Ingested
                 - Failed
+                - MemoryDisabled
                 type: string
             type: object
         type: object

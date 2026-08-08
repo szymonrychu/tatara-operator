@@ -100,9 +100,17 @@ func assignmentFor(agentKind string, task *tatarav1alpha1.Task, proj *tatarav1al
 	b.WriteString(promptguidance.PlatformProblemGuidance)
 	b.WriteString(promptguidance.ConcisenessGuidance)
 	// LAST, so it overrides PlatformProblemGuidance's stop-on-blocked rule for
-	// the memory tools. Only when recall is actually down: a healthy turn must
-	// not be told to expect failures it will not see.
-	if !tatarav1alpha1.MemoryStablyReady(proj, time.Now()) {
+	// the memory tools. Only when recall is actually unavailable: a healthy turn
+	// must not be told to expect failures it will not see.
+	//
+	// DISABLED and DEGRADED are different appendices on purpose. Degraded says
+	// "report it once, then carry on" because a down stack IS a platform problem;
+	// saying that on a project configured without memory produced one bogus
+	// internal-issue alert per turn (tatara-operator#523).
+	switch {
+	case tatarav1alpha1.MemoryDisabled(proj):
+		b.WriteString(promptguidance.MemoryDisabledGuidance)
+	case !tatarav1alpha1.MemoryStablyReady(proj, time.Now()):
 		b.WriteString(promptguidance.MemoryDegradedGuidance)
 	}
 	return b.String()

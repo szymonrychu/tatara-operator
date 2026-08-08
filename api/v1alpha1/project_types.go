@@ -16,6 +16,29 @@ import (
 // visible in the persisted object; the internal/memory builders no longer need
 // to carry fallback constants.
 type MemorySpec struct {
+	// Enabled gates the WHOLE per-Project memory stack (cnpg postgres, neo4j,
+	// lightrag, tatara-memory, and the stack's own ServiceMonitor/PodMonitor/
+	// PrometheusRule).
+	//
+	// It is a *bool with deliberately NO kubebuilder:default so nil is
+	// distinguishable from an explicit false: nil (the state of every Project
+	// written before this field existed, and of every Project that never mentions
+	// spec.memory) and true both mean ENABLED. Only an explicit false disables.
+	// Read it through Project.MemoryEnabled / MemoryDisabled - never open-code the
+	// nil check, and never gate on "== the default" (the DocumentationSpec.Enabled
+	// MEMORY trap).
+	//
+	// Disabling tears the compute and monitoring objects down. What happens to the
+	// data is deliberately NOT uniform (see reconcileMemory's teardown):
+	//   - the postgres (PGDATA + WAL) and neo4j volumes are RETAINED. The
+	//     object-store backup path is off by default and has no automatic restore,
+	//     so a cascade delete there would be unrecoverable loss. Re-enabling
+	//     reattaches them by name.
+	//   - the lightrag volume is DELETED. That data removal is an explicit owner
+	//     decision, and the lightrag index is derived data rebuilt by re-ingesting.
+	// Do not "make these consistent" in either direction.
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
 	// +kubebuilder:default=1
 	// +optional
 	PgInstances int `json:"pgInstances,omitempty"`
@@ -81,7 +104,36 @@ type MemoryStatus struct {
 	// instance-manager endpoint (see MEMORY.md 2026-07-26).
 	// +optional
 	PgPrimary string `json:"pgPrimary,omitempty"`
+	// DisabledGeneration is the Project generation whose disable teardown has
+	// already completed. It is the idempotence marker for the memory-disabled
+	// path: reconcileMemory issues the teardown deletes exactly once per
+	// generation and every later pass on the same generation is a cheap no-op
+	// instead of a delete storm against objects that are already gone. Cleared
+	// whenever memory is re-enabled.
+	// +optional
+	DisabledGeneration int64 `json:"disabledGeneration,omitempty"`
 }
+
+// MemoryPhaseDisabled is the terminal Status.Memory.Phase of a Project whose
+// spec.memory.enabled is false. It is deliberately distinct from Provisioning /
+// Degraded / Failed: a disabled stack is CONFIGURED that way, not broken, and
+// the memory alert set keys on the broken phases only.
+const MemoryPhaseDisabled = "Disabled"
+
+// MemoryEnabled reports whether p's memory stack should be provisioned.
+// nil spec.memory, or a spec.memory with enabled unset, means enabled - so
+// every Project written before spec.memory.enabled existed keeps its stack.
+func (p *Project) MemoryEnabled() bool {
+	if p == nil || p.Spec.Memory == nil {
+		return true
+	}
+	return BoolVal(p.Spec.Memory.Enabled, true)
+}
+
+// MemoryDisabled is the negation of Project.MemoryEnabled, as a free function so
+// packages that already read MemoryStablyReady (internal/agent, the controllers)
+// can express "configured off" the same way they express "not ready".
+func MemoryDisabled(p *Project) bool { return !p.MemoryEnabled() }
 
 // MemoryReadyStabilizationWindow is how long the memory stack must hold
 // Phase==Ready before callers treat it as stably ready. It mirrors the
