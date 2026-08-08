@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -2039,8 +2040,9 @@ func (o *outcomeCtx) brainstorm(p brainstormPayload) {
 		// marker factor, and putting it on the SCM issue (not just the CR) keeps it
 		// alive across a mirror refresh. Harmless when the flag is off.
 		body := tatarav1alpha1.StampProposalMarker(pr.Body, tatarav1alpha1.ProposalKindBrainstorm)
+		title := tatarav1alpha1.ClampIssueTitle(pr.Title)
 		created, err := writer.CreateIssue(ctx, repo.Spec.URL, token, scm.IssueReq{
-			Title: pr.Title, Body: body, Labels: []string{brainstormingLabel},
+			Title: title, Body: body, Labels: []string{brainstormingLabel},
 		})
 		controller.RecordSCM(s.metrics, providerOf(o.proj), "create_issue", err)
 		if err != nil {
@@ -2059,7 +2061,7 @@ func (o *outcomeCtx) brainstorm(p brainstormPayload) {
 			writeClientErr(o.w, err)
 			return
 		}
-		if err := s.mintIssueCR(ctx, o.proj, repo, child, number, created.URL, pr.Title, body,
+		if err := s.mintIssueCR(ctx, o.proj, repo, child, number, created.URL, title, body,
 			tatarav1alpha1.ProposalKindBrainstorm, nil); err != nil {
 			writeClientErr(o.w, err)
 			return
@@ -2233,15 +2235,21 @@ func (o *outcomeCtx) incident(p incidentPayload) {
 	// Provenance marker for the autoApproveTataraProposals carve-out (marker factor);
 	// stamped on both the forge issue and the CR so it survives a mirror refresh.
 	body := tatarav1alpha1.StampProposalMarker(p.Issue.Body, tatarav1alpha1.ProposalKindIncident)
-	issueReq := scm.IssueReq{Title: p.Issue.Title, Body: body}
+	title := tatarav1alpha1.ClampIssueTitle(p.Issue.Title)
+	issueReq := scm.IssueReq{Title: title, Body: body}
 	if ruleKey != "" {
 		issueReq.Labels = append(issueReq.Labels, forgeAlertRulePrefix+ruleKey)
 	}
 	created, err := writer.CreateIssue(ctx, repo.Spec.URL, token, issueReq)
 	controller.RecordSCM(s.metrics, providerOf(o.proj), "create_issue", err)
 	if err != nil {
+		// A forge 4xx here is otherwise undiagnosable from the log line alone:
+		// the title that caused it is never persisted anywhere.
 		s.log.ErrorContext(ctx, "restapi: filing the incident tracker issue failed",
-			append(reqLogFields(o.r), "task", o.task.Name, "repo", repo.Name, "error", err)...)
+			append(reqLogFields(o.r), "task", o.task.Name, "repo", repo.Name,
+				"title_chars", utf8.RuneCountInString(p.Issue.Title),
+				"title_prefix", tatarav1alpha1.TruncateRunes(p.Issue.Title, 80),
+				"error", err)...)
 		writeError(o.w, http.StatusBadGateway, "scm write failed")
 		return
 	}
@@ -2260,7 +2268,8 @@ func (o *outcomeCtx) incident(p incidentPayload) {
 	if len(crLabels) == 0 {
 		crLabels = nil
 	}
-	if err := s.mintIssueCR(ctx, o.proj, repo, o.task, number, created.URL, p.Issue.Title, body,
+	// The CR mirrors what the forge actually stored, so it gets the clamped title too.
+	if err := s.mintIssueCR(ctx, o.proj, repo, o.task, number, created.URL, title, body,
 		tatarav1alpha1.ProposalKindIncident, crLabels); err != nil {
 		writeClientErr(o.w, err)
 		return

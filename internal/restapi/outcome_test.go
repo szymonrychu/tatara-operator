@@ -8,8 +8,11 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/prometheus/client_golang/prometheus"
@@ -2254,6 +2257,147 @@ func TestOutcome_Incident_AlertRulesRequiredOnBothActions(t *testing.T) {
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
 		`{"kind":"incident","payload":{"action":"false_positive","alertRules":[],"reason":"r"}}`)
 	require.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+// --- title clamping ---
+
+// This is the path that fired: an over-long agent title 400s on GitLab and the
+// handler drops the whole submitted outcome.
+//
+// On the provider axis: the fake forge does not branch on provider, so these
+// cases cannot prove anything about a per-forge API. What they pin is that the
+// clamp is NOT conditional on the project's provider, which is the deliberate
+// choice recorded on IssueTitleMaxChars - GitLab's cap is applied to GitHub too.
+func TestOutcome_Incident_TitleIsClamped(t *testing.T) {
+	tests := []struct {
+		name      string
+		provider  string
+		titleLen  int // in runes
+		multiByte bool
+		wantClamp bool
+	}{
+		{"github_short", "github", 50, false, false},
+		{"github_long", "github", 300, false, true},
+		{"gitlab_short", "gitlab", 50, false, false},
+		{"gitlab_long", "gitlab", 300, false, true},
+		// 300 CJK characters is 900 bytes. A byte-based clamp would cut this to
+		// a third of the characters the forge would have taken.
+		{"gitlab_long_multibyte", "gitlab", 300, true, true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			title := "issue" + strings.Repeat("-X", tc.titleLen/2)
+			if tc.multiByte {
+				title = strings.Repeat("界", tc.titleLen)
+			}
+			e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(),
+				repoV2("tatara-operator", "tatara"),
+				taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+			p := e.project(t, "tatara")
+			p.Spec.Scm.Provider = tc.provider
+			require.NoError(t, e.c.Update(context.Background(), p))
+
+			w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+				fmt.Sprintf(`{"kind":"incident","payload":{"action":"file_issue","alertRules":["tatara-operator-down"],"reason":"real outage","issue":{"repo":"tatara-operator","title":%s,"body":"trace"}}}`,
+					strconv.Quote(title)))
+			require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+			expectedClamped := tatarav1alpha1.ClampIssueTitle(title)
+
+			// Assert the forge request title is clamped.
+			require.Len(t, e.forge.createdReqs, 1)
+			require.Equal(t, expectedClamped, e.forge.createdReqs[0].Title,
+				"forge must receive the clamped title, not the raw agent input")
+
+			// Assert the clamped title conforms to limits.
+			if tc.wantClamp {
+				require.True(t, strings.HasSuffix(e.forge.createdReqs[0].Title, "...(truncated)"),
+					"over-long title must end with the truncation marker")
+			}
+			require.LessOrEqual(t, utf8.RuneCountInString(e.forge.createdReqs[0].Title),
+				tatarav1alpha1.IssueTitleMaxChars,
+				"clamped title must fit the character limit")
+
+			// Assert the minted Issue CR's Status.Title matches the clamped title
+			// (the CR is a mirror of what the forge stored).
+			iss := e.issue(t, tatarav1alpha1.IssueName("tatara-operator", 101))
+			require.Equal(t, expectedClamped, iss.Status.Title,
+				"Issue CR Status.Title must match the clamped title sent to the forge")
+		})
+	}
+}
+
+// TestOutcome_Brainstorm_TitleIsClamped asserts that brainstorm propose clamps
+// over-long agent-supplied titles to IssueTitleMaxChars before filing on the
+// forge, and that the spawned clarify Task's Goal preserves the raw unclamped
+// title (the Goal is agent context, not a forge mirror).
+func TestOutcome_Brainstorm_TitleIsClamped(t *testing.T) {
+	tests := []struct {
+		name      string
+		provider  string
+		titleLen  int // in runes
+		wantClamp bool
+	}{
+		{"github_short", "github", 50, false},
+		{"github_long", "github", 300, true},
+		{"gitlab_short", "gitlab", 50, false},
+		{"gitlab_long", "gitlab", 300, true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			title := "proposal" + strings.Repeat("-Y", tc.titleLen/2)
+			e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(),
+				repoV2("tatara-operator", "tatara"),
+				taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StageBrainstorming, "brainstorm"))
+			p := e.project(t, "tatara")
+			p.Spec.Scm.Provider = tc.provider
+			require.NoError(t, e.c.Update(context.Background(), p))
+
+			w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+				fmt.Sprintf(`{"kind":"brainstorm","payload":{"action":"propose","proposals":[{"repo":"tatara-operator","title":%s,"body":"b","kind":"bug"}]}}`,
+					strconv.Quote(title)))
+			require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+			expectedClamped := tatarav1alpha1.ClampIssueTitle(title)
+
+			// Assert the forge request title is clamped.
+			require.Len(t, e.forge.createdReqs, 1)
+			require.Equal(t, expectedClamped, e.forge.createdReqs[0].Title,
+				"forge must receive the clamped title, not the raw agent input")
+
+			// Assert the clamped title conforms to limits.
+			if tc.wantClamp {
+				require.True(t, strings.HasSuffix(e.forge.createdReqs[0].Title, "...(truncated)"),
+					"over-long title must end with the truncation marker")
+			}
+			require.LessOrEqual(t, utf8.RuneCountInString(e.forge.createdReqs[0].Title),
+				tatarav1alpha1.IssueTitleMaxChars,
+				"clamped title must fit the character limit")
+
+			// Assert the minted Issue CR's Status.Title matches the clamped title.
+			iss := e.issue(t, tatarav1alpha1.IssueName("tatara-operator", 101))
+			require.Equal(t, expectedClamped, iss.Status.Title,
+				"Issue CR Status.Title must match the clamped title sent to the forge")
+
+			// Assert the spawned clarify Task's Goal begins with the RAW unclamped title.
+			// The Goal is agent context, not a forge mirror, so it is deliberately not
+			// clamped (it has its own GoalMaxBytes byte limit).
+			var tasks tatarav1alpha1.TaskList
+			require.NoError(t, e.c.List(context.Background(), &tasks, client.InNamespace(ns)))
+			var clarifyGoal string
+			for i := range tasks.Items {
+				if tasks.Items[i].Spec.Kind == "clarify" {
+					clarifyGoal = tasks.Items[i].Spec.Goal
+					break
+				}
+			}
+			require.NotEmpty(t, clarifyGoal, "spawned clarify task must exist")
+			require.True(t, strings.HasPrefix(clarifyGoal, title),
+				"clarify Task Goal must begin with the raw unclamped title")
+		})
+	}
 }
 
 // --- Fix 7 (#400): investigation-comment cooldown -------------------------

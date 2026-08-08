@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/require"
@@ -1082,6 +1083,98 @@ func TestIssueWrite_Create_NeverClaimsProposalProvenanceFromTheBody(t *testing.T
 	require.Equal(t, tatarav1alpha1.ProposalKindBrainstorm,
 		tatarav1alpha1.ProposalKindFromBody(iss.Status.Body),
 		"the body is stored verbatim; it is the SPEC that refuses the claim")
+}
+
+// TestIssueWrite_Create_TitleIsClamped asserts that the generic issue_write
+// action=create endpoint clamps over-long agent-supplied titles to
+// IssueTitleMaxChars before filing on the forge. The clamp is applied
+// uniformly across both GitHub and GitLab so a title valid on one is valid
+// on both.
+func TestIssueWrite_Create_TitleIsClamped(t *testing.T) {
+	tests := []struct {
+		name      string
+		provider  string
+		titleLen  int // in runes
+		wantClamp bool
+	}{
+		{"github_short", "github", 50, false},
+		{"github_long", "github", 300, true},
+		{"gitlab_short", "gitlab", 50, false},
+		{"gitlab_long", "gitlab", 300, true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			title := "issue" + strings.Repeat("-X", tc.titleLen/2)
+			e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(),
+				repoV2("tatara-operator", "tatara"),
+				taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"))
+			p := e.project(t, "tatara")
+			p.Spec.Scm.Provider = tc.provider
+			require.NoError(t, e.c.Update(context.Background(), p))
+
+			w := e.do(t, http.MethodPost, "/projects/tatara/scm/issue-write",
+				fmt.Sprintf(`{"task":"t1","action":"create","repo":"tatara-operator","title":%s,"body":"B"}`,
+					strconv.Quote(title)))
+			require.Equal(t, http.StatusOK, w.Code)
+
+			expectedClamped := tatarav1alpha1.ClampIssueTitle(title)
+
+			// Assert the forge request title is clamped.
+			require.Len(t, e.forge.createdReqs, 1)
+			require.Equal(t, expectedClamped, e.forge.createdReqs[0].Title,
+				"forge must receive the clamped title, not the raw agent input")
+
+			// Assert the clamped title conforms to limits.
+			if tc.wantClamp {
+				require.True(t, strings.HasSuffix(e.forge.createdReqs[0].Title, "...(truncated)"),
+					"over-long title must end with the truncation marker")
+			}
+			require.LessOrEqual(t, utf8.RuneCountInString(e.forge.createdReqs[0].Title),
+				tatarav1alpha1.IssueTitleMaxChars,
+				"clamped title must fit the character limit")
+
+			// Assert the minted Issue CR's Status.Title matches the clamped title
+			// (the CR is a mirror of what the forge stored).
+			iss := e.issue(t, tatarav1alpha1.IssueName("tatara-operator", 101))
+			require.Equal(t, expectedClamped, iss.Status.Title,
+				"Issue CR Status.Title must match the clamped title sent to the forge")
+		})
+	}
+}
+
+// issue_write(action=edit) defers the title through a pendingComments intent
+// that reviewpost.go replays into EditIssue, so it hits the SAME forge title cap
+// as the create path and has to be clamped in the SAME place. Its failure mode
+// is the worse of the two: reviewpost returns on the edit error BEFORE draining
+// the intent, so an over-long title requeues that Issue's reconcile forever and
+// blocks every intent queued behind it. Once the 20-entry cap fills, further
+// writes are dropped while the handler still answers 200.
+func TestIssueWrite_Edit_TitleIsClamped(t *testing.T) {
+	for _, provider := range []string{"github", "gitlab"} {
+		t.Run(provider, func(t *testing.T) {
+			title := "retitle" + strings.Repeat("-Z", 150)
+			e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+				repoV2("tatara-operator", "tatara"),
+				taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"),
+				issueV2("tatara-operator", 291, "t1"))
+			p := e.project(t, "tatara")
+			p.Spec.Scm.Provider = provider
+			require.NoError(t, e.c.Update(context.Background(), p))
+
+			w := e.do(t, http.MethodPost, "/projects/tatara/scm/issue-write",
+				fmt.Sprintf(`{"task":"t1","action":"edit","repo":"tatara-operator","number":291,"title":%s}`,
+					strconv.Quote(title)))
+			require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+			pcs := e.issue(t, tatarav1alpha1.IssueName("tatara-operator", 291)).Status.PendingComments
+			require.Len(t, pcs, 1)
+			require.Contains(t, pcs[0].Body, "title: "+tatarav1alpha1.ClampIssueTitle(title)+"\n",
+				"the queued edit intent must carry the clamped title")
+			require.NotContains(t, pcs[0].Body, title,
+				"the raw over-long title must not survive into the intent, or the replay 400s forever")
+		})
+	}
 }
 
 // The controller-ownership gate on EVERY action that names a number (fix 7).
