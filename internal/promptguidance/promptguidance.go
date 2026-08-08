@@ -34,6 +34,28 @@ const MemoryDegradedGuidance = "\n\n## Memory recall is unavailable this turn\n"
 	"so a reviewer knows what you could not check.\n" +
 	"  - COMPLETE the assignment with reduced recall. Declining for this reason alone is wrong."
 
+// MemoryDisabledGuidance is appended to a turn-0 directive when the project has
+// spec.memory.enabled=false.
+//
+// It exists because MemoryDegradedGuidance is WRONG for this case in one
+// specific, expensive way: it instructs the agent to call report_internal_issue,
+// which on a project that is CONFIGURED without memory manufactures one bogus
+// platform-problem alert every single turn (tatara-operator#523). The
+// operational advice is identical - work from the repository, do not stop, say
+// so in your outcome - minus the incident report, because there is no incident.
+const MemoryDisabledGuidance = "\n\n## This project has no memory or recall tooling\n" +
+	"Memory and code-graph tooling is NOT AVAILABLE on this project. This is a deliberate " +
+	"configuration, not a fault: nothing is broken, nothing is being fixed, and it will not come " +
+	"back later in this turn. It OVERRIDES the 'report it and stop' rule above for those tools " +
+	"specifically.\n" +
+	"  - Do NOT call `report_internal_issue` about it, do not open or comment on a tracker issue " +
+	"about it, and do not mention it as a platform problem. It is not one.\n" +
+	"  - Work from the repository itself: Serena/LSP, git history, and plain file reads are the " +
+	"whole toolset here, and they are sufficient.\n" +
+	"  - Do not call the memory or code-graph tools at all; if you do, they will fail, and that " +
+	"failure is still not a reason to stop.\n" +
+	"  - COMPLETE the assignment. Declining because this project has no recall is wrong."
+
 // ToolingNoteGuidance is appended to proposer-agent prompts (brainstorm,
 // healthCheck, refine, incident). It instructs the agent to fold any mise
 // tooling it needed into the issue it files, so the implementer can add it to

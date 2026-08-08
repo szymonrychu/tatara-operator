@@ -629,7 +629,13 @@ func (r *ProjectReconciler) updateBotRoundsGauge(ctx context.Context) {
 // memoryStackPhases is the full set of phases Project.Status.Memory reports.
 // updateMemoryStackCounts sets every one per project each pass so a phase a
 // project has left reads 0 rather than retaining its last value.
-var memoryStackPhases = []string{"Provisioning", "Ready", "Failed", "Degraded"}
+// "Disabled" is in the set so a project with spec.memory.enabled=false reports
+// an explicit, queryable 1 on its own phase and a 0 on Failed/Degraded - the
+// phases TataraMemoryStackFailed / TataraMemoryStackDegraded key on - rather
+// than dropping out of the gauge entirely.
+var memoryStackPhases = []string{
+	"Provisioning", "Ready", "Failed", "Degraded", tataradevv1alpha1.MemoryPhaseDisabled,
+}
 
 // updateMemoryStackCounts lists all Projects and sets operator_memory_stacks to
 // 1 for each project's current memory phase and 0 for the others (issue #425).

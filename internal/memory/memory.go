@@ -133,6 +133,17 @@ type Config struct {
 	Backup BackupConfig
 }
 
+// RetainedForProjectLabel marks a PersistentVolumeClaim that survived a memory
+// teardown (spec.memory.enabled flipped to false). The teardown strips the
+// PVC's ownerReferences so no cascade can reach it, which also makes it
+// unfindable from the Project; this label is how it is found again, both by a
+// human and by the re-enable path that re-adopts it. Value: the Project name.
+const RetainedForProjectLabel = "tatara.dev/retained-for-project"
+
+// ProjectLabel is the pin-set label every memory-stack object carries, naming
+// the owning Project.
+const ProjectLabel = "tatara.dev/project"
+
 // Names holds every object name in the mem-<proj>-* family for one Project.
 type Names struct {
 	PGCluster         string // cnpg Cluster
@@ -176,7 +187,7 @@ func labels(project string) map[string]string {
 	return map[string]string{
 		"app.kubernetes.io/name":     "tatara-memory",
 		"app.kubernetes.io/instance": "mem-" + project,
-		"tatara.dev/project":         project,
+		ProjectLabel:                 project,
 	}
 }
 

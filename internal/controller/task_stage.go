@@ -1552,17 +1552,31 @@ func (r *TaskReconciler) ensureStagePod(ctx context.Context, proj *tatarav1alpha
 	// signal; the Task condition is what a human reads on the CR. Deliberately
 	// NO issue comment: the memory-stack alert is the human-facing signal, and a
 	// comment per Task was noise-per-task.
+	//
+	// A project with memory DISABLED is not degraded: it has no stack by design.
+	// It still gets a condition (a human reading the Task must be able to see the
+	// agent had no recall) but as False/MemoryDisabled and with no
+	// operator_agent_pod_degraded_total increment, so a memory-free project does
+	// not read as a permanent fleet-wide degradation.
 	if !tatarav1alpha1.MemoryStablyReady(proj, time.Now()) {
-		r.Metrics.AgentPodDegraded(proj.Name, task.Spec.Kind, "memory")
+		disabled := tatarav1alpha1.MemoryDisabled(proj)
+		status, reason := metav1.ConditionTrue, tatarav1alpha1.ReasonSpawnedWithoutRecall
+		msg := "project memory stack is not stably ready; the agent runs with no recall"
+		if disabled {
+			status, reason = metav1.ConditionFalse, tatarav1alpha1.ReasonMemoryDisabled
+			msg = "memory is disabled for this project; the agent runs without recall by configuration"
+		} else {
+			r.Metrics.AgentPodDegraded(proj.Name, task.Spec.Kind, "memory")
+		}
 		log.FromContext(ctx).Info("agent pod spawned with memory recall unavailable",
 			"action", "agent_pod_degraded", "resource_id", task.Name,
-			"project", proj.Name, "subsystem", "memory")
+			"project", proj.Name, "subsystem", "memory", "configured_off", disabled)
 		if err := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 			return meta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
 				Type:               tatarav1alpha1.ConditionMemoryDegraded,
-				Status:             metav1.ConditionTrue,
-				Reason:             tatarav1alpha1.ReasonSpawnedWithoutRecall,
-				Message:            "project memory stack is not stably ready; the agent runs with no recall",
+				Status:             status,
+				Reason:             reason,
+				Message:            msg,
 				ObservedGeneration: fresh.Generation,
 			})
 		}); err != nil {

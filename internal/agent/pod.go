@@ -594,6 +594,11 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		// spawn gate, so an agent has to be TOLD, and the wrapper hands
 		// os.Environ() to the agent process wholesale.
 		{Name: "TATARA_MEMORY_DEGRADED", Value: strconv.FormatBool(!tatarav1alpha1.MemoryStablyReady(project, time.Now()))},
+		// Whether memory is unavailable BY CONFIGURATION rather than by failure.
+		// DEGRADED above answers "will the recall tools fail?" (yes, either way);
+		// this answers "is that a fault?" - and when it is false, the agent must
+		// not report it as one (tatara-operator#523).
+		{Name: "TATARA_MEMORY_DISABLED", Value: strconv.FormatBool(tatarav1alpha1.MemoryDisabled(project))},
 		// Operator REST URL: the agent's tatara-cli task_* MCP tools reach the
 		// operator API at TATARA_OPERATOR_URL.
 		{Name: "TATARA_OPERATOR_URL", Value: cfg.OperatorURL},

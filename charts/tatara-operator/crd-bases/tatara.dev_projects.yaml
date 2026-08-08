@@ -5699,6 +5699,25 @@ spec:
                   visible in the persisted object; the internal/memory builders no longer need
                   to carry fallback constants.
                 properties:
+                  enabled:
+                    description: |-
+                      Enabled gates the WHOLE per-Project memory stack (cnpg postgres, neo4j,
+                      lightrag, tatara-memory, and the stack's own ServiceMonitor/PodMonitor/
+                      PrometheusRule).
+
+                      It is a *bool with deliberately NO kubebuilder:default so nil is
+                      distinguishable from an explicit false: nil (the state of every Project
+                      written before this field existed, and of every Project that never mentions
+                      spec.memory) and true both mean ENABLED. Only an explicit false disables.
+                      Read it through Project.MemoryEnabled / MemoryDisabled - never open-code the
+                      nil check, and never gate on "== the default" (the DocumentationSpec.Enabled
+                      MEMORY trap).
+
+                      Disabling tears the compute and monitoring objects down but RETAINS every
+                      PersistentVolumeClaim in the stack (see reconcileMemory's teardown): the
+                      object-store backup path is off by default and has no automatic restore, so
+                      a cascade delete here would be unrecoverable data loss.
+                    type: boolean
                   neo4jStorage:
                     default: 10Gi
                     type: string
@@ -6251,6 +6270,16 @@ spec:
                   MemoryStatus reports the observed state of the per-Project memory stack.
                   Endpoint is the canonical in-cluster URL every other component reads.
                 properties:
+                  disabledGeneration:
+                    description: |-
+                      DisabledGeneration is the Project generation whose disable teardown has
+                      already completed. It is the idempotence marker for the memory-disabled
+                      path: reconcileMemory issues the teardown deletes exactly once per
+                      generation and every later pass on the same generation is a cheap no-op
+                      instead of a delete storm against objects that are already gone. Cleared
+                      whenever memory is re-enabled.
+                    format: int64
+                    type: integer
                   endpoint:
                     type: string
                   externalEndpoint:
