@@ -1027,6 +1027,17 @@ func (r *TaskReconciler) reconcilePodStage(ctx context.Context, proj *tatarav1al
 		if agent.TTLExpired(proj, task, now) {
 			return r.ttlStop(ctx, proj, task, agentKind, now)
 		}
+		// A STALLED TURN gets the SAME graceful stop as a TTL rotation. It used to
+		// get the opposite: the poll backstop deleted the session, the Pod and the
+		// Service outright, so a Task whose first turn stalled was handed back to
+		// the stage machine with an EMPTY notes journal - the next pod started from
+		// nothing and redid the work, and anything the agent had written but not
+		// pushed died with the workspace. Live: an mtg-decks implement agent lost a
+		// decklist, a meta capture and an hour of sim runs to this, twice.
+		if turnTimedOut(task.Annotations[annTurnStartedAt],
+			task.Annotations[annTurnLastActivity], proj.Spec.Agent.TurnTimeoutSeconds) {
+			return r.stalledTurnStop(ctx, proj, task, agentKind, now)
+		}
 	}
 
 	skipped, err := r.ensureStagePod(ctx, proj, task)
@@ -1157,6 +1168,91 @@ func (r *TaskReconciler) submitStageTurn(ctx context.Context, proj *tatarav1alph
 		}
 	}
 	return ctrl.Result{RequeueAfter: stageRequeue}, nil
+}
+
+// StalledTurnHandoffWait bounds the whole graceful stop of a STALLED turn.
+//
+// It is deliberately NOT derived from turnTimeoutSeconds the way the TTL path's
+// cap is. We only get here because a turn already burned its entire turn timeout
+// plus turnTimeoutGrace without a single activity tick, so spending another
+// 2*turnTimeout waiting on it would be waiting hours for the thing we just
+// declared dead. The only thing left worth waiting for is the seconds-wide race
+// where the turn completes between the stall check and this call - and if it
+// does clear, the agent gets its handoff turn like any other stop.
+const StalledTurnHandoffWait = 90 * time.Second
+
+// stalledTurnStop runs the SAME G.7 sequence as ttlStop for a turn that stopped
+// reporting activity, on a tight bound, and clears the turn annotations so a
+// late callback cannot resolve the Task afterwards.
+//
+// A genuinely hung wrapper never goes idle, so the usual outcome here is
+// synthetic_handoff: waitIdle times out, no handoff turn can be submitted (POST
+// /v1/messages 409s while a turn is in flight and there is no cancel primitive),
+// and the operator writes the handoff note itself. That is the entire point -
+// the old hard teardown left NO note at all, which is what made the next pod
+// start from nothing.
+func (r *TaskReconciler) stalledTurnStop(ctx context.Context, proj *tatarav1alpha1.Project,
+	task *tatarav1alpha1.Task, agentKind string, now time.Time) (ctrl.Result, error) {
+
+	turnID := task.Annotations[annCurrentTurn]
+	if r.Metrics != nil {
+		r.Metrics.TurnTimeout("stage_reconcile")
+	}
+	var sp objbudget.Spiller
+	if r.SpillerFor != nil {
+		sp = r.SpillerFor(proj)
+	}
+	stopper := &agent.TTLStopper{
+		Client:  r.Client,
+		Session: r.Session,
+		Notes: &agent.FitNoteAppender{
+			Client:    r.Client,
+			Spiller:   sp,
+			Namespace: task.Namespace,
+		},
+		Namespace: task.Namespace,
+		Record:    obs.AgentPodTTLExpired,
+	}
+	outcome, err := stopper.StopWithHandoff(ctx, task, agent.TTLStopInput{
+		BaseURL:     agent.BaseURL(task, task.Namespace),
+		CallbackURL: r.callbackURL(),
+		AgentKind:   agentKind,
+		// now, not a pod t0: the stall is what ended this pod, and the bound runs
+		// from the moment we noticed it.
+		Deadline:    now,
+		TurnTimeout: time.Duration(proj.Spec.Agent.TurnTimeoutSeconds) * time.Second,
+		MaxWait:     StalledTurnHandoffWait,
+	})
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("stalled turn stop %s: %w", task.Name, err)
+	}
+	// Clear the turn so a late callback cannot resolve it, and re-arm the pod
+	// clocks so the next reconcile spawns a continuation pod - the same re-arm
+	// ttlStop does, plus the annotation clearing the old hard-teardown path owned.
+	if err := r.patchTaskAnnotations(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
+		if fresh.Annotations == nil {
+			return false
+		}
+		delete(fresh.Annotations, annCurrentTurn)
+		delete(fresh.Annotations, annTurnStartedAt)
+		delete(fresh.Annotations, annTurnLastActivity)
+		delete(fresh.Annotations, annTurnComplete)
+		return true
+	}); err != nil {
+		return ctrl.Result{}, fmt.Errorf("stalled turn clear %s: %w", task.Name, err)
+	}
+	if err := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
+		fresh.Status.PodStartedAt = nil
+		fresh.Status.StateWorkStartedAt = nil
+		return true
+	}); err != nil {
+		return ctrl.Result{}, fmt.Errorf("stalled turn re-arm %s: %w", task.Name, err)
+	}
+	log.FromContext(ctx).Info("stalled turn stopped gracefully; handed off",
+		"action", "stalled_turn_stop", "resource_id", task.Name, "turn_id", turnID,
+		"agent_kind", agentKind, "outcome", outcome,
+		"wait", StalledTurnHandoffWait.String())
+	return ctrl.Result{RequeueAfter: agentBootRequeue}, nil
 }
 
 // ttlStop runs the G.7 stop sequence for a pod past its TTL and re-arms the Task

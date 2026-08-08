@@ -408,3 +408,59 @@ func TestTTLStop_NoPushedRepos(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, h.notes(t)[0].Body, "Repos pushed: none.")
 }
+
+// A STALLED turn must not be bounded by the turn timeout it already blew.
+//
+// The TTL path's cap is t0 + 2*turnTimeout + 60s, which is right when t0 is a
+// pod's lifetime boundary. It is absurd for the stalled-turn caller: that caller
+// only runs BECAUSE a turn burned its whole turnTimeout with no activity, so
+// re-deriving the wait from turnTimeout means waiting hours for the very turn we
+// just declared dead - and a hung wrapper never goes idle, so it is the full wait
+// every time, not a worst case.
+//
+// MaxWait replaces both bounds. The harness fakes Now/Sleep, so the clock it
+// advances IS the wait the operator would really sit through.
+func TestTTLStop_MaxWaitBoundsAStalledTurnStop(t *testing.T) {
+	const maxWait = 90 * time.Second
+	const turnTimeout = 30 * time.Minute
+
+	stalled := func(t *testing.T, withMaxWait bool) time.Duration {
+		t.Helper()
+		sess := &stopSession{states: []string{agent.SessionStateBusy}} // hung: never idle
+		h := newTTLHarness(t, sess)
+		start := h.now
+		in := h.input()
+		in.TurnTimeout = turnTimeout
+		in.Deadline = h.now // the stall is what ended this pod; the bound runs from now
+		if withMaxWait {
+			in.MaxWait = maxWait
+		}
+		outcome, err := h.stopper.StopWithHandoff(context.Background(), h.task, in)
+		require.NoError(t, err)
+		require.Equal(t, agent.TTLOutcomeSyntheticHandoff, outcome)
+		require.NotEmpty(t, h.notes(t),
+			"the whole point: the old hard teardown left NO note, so the next pod started from nothing")
+		return h.now.Sub(start)
+	}
+
+	bounded := stalled(t, true)
+	require.LessOrEqual(t, bounded, maxWait+time.Second,
+		"MaxWait must cap the stop: waited %s", bounded)
+
+	unbounded := stalled(t, false)
+	require.Greater(t, unbounded, maxWait*4,
+		"control: without MaxWait the stop still derives its bound from turnTimeout (waited %s)", unbounded)
+}
+
+// MaxWait must not touch the G.7 TTL path. Zero keeps the old arithmetic.
+func TestTTLStop_ZeroMaxWaitKeepsTheTTLBound(t *testing.T) {
+	sess := &stopSession{states: []string{agent.SessionStateReady}}
+	h := newTTLHarness(t, sess)
+	in := h.input()
+	require.Zero(t, in.MaxWait)
+
+	outcome, err := h.stopper.StopWithHandoff(context.Background(), h.task, in)
+	require.NoError(t, err)
+	require.Equal(t, agent.TTLOutcomeSyntheticHandoff, outcome)
+	require.NotEmpty(t, h.notes(t))
+}

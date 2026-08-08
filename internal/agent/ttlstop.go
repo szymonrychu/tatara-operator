@@ -138,9 +138,40 @@ type TTLStopInput struct {
 	// Deadline is t0.
 	Deadline time.Time
 	// TurnTimeout is Project.spec.agent.turnTimeoutSeconds.
-	TurnTimeout   time.Duration
+	TurnTimeout time.Duration
+	// MaxWait REPLACES the TurnTimeout-derived bounds when non-zero: the hard cap
+	// becomes Deadline+MaxWait and each wait is bounded by MaxWait rather than by
+	// TurnTimeout.
+	//
+	// It exists for the STALLED-TURN caller, where deriving the bound from
+	// TurnTimeout is not conservative but absurd: that caller only runs BECAUSE a
+	// turn already burned its entire TurnTimeout with no activity, so waiting
+	// another 2*TurnTimeout would be waiting hours for the very turn we just
+	// declared dead. The only thing worth waiting for there is the seconds-wide
+	// race where the turn completes between the stall check and this call, and
+	// MaxWait is sized for exactly that.
+	//
+	// Zero keeps the G.7 TTL behaviour (2*TurnTimeout + TTLGrace) untouched.
+	MaxWait       time.Duration
 	LastFinalText string
 	PushedRepos   []string
+}
+
+// waitBound is the per-step wait: MaxWait when the caller set one, else the
+// project's turn timeout.
+func (in TTLStopInput) waitBound() time.Duration {
+	if in.MaxWait > 0 {
+		return in.MaxWait
+	}
+	return in.TurnTimeout
+}
+
+// hardCap is the absolute end of the stop sequence.
+func (in TTLStopInput) hardCap() time.Time {
+	if in.MaxWait > 0 {
+		return in.Deadline.Add(in.MaxWait)
+	}
+	return in.Deadline.Add(2*in.TurnTimeout + TTLGrace)
 }
 
 // TTLStopper drives the G.7 stop sequence for one pod.
@@ -207,7 +238,7 @@ func (s *TTLStopper) poll() time.Duration {
 // The Task's notes are non-empty on return in ALL THREE outcomes. That is the
 // property the whole mechanism exists for.
 func (s *TTLStopper) StopWithHandoff(ctx context.Context, task *tatarav1alpha1.Task, in TTLStopInput) (string, error) {
-	hardCap := in.Deadline.Add(2*in.TurnTimeout + TTLGrace)
+	hardCap := in.hardCap()
 
 	before, err := s.handoffNoteCount(ctx, task.Name)
 	if err != nil {
@@ -216,7 +247,7 @@ func (s *TTLStopper) StopWithHandoff(ctx context.Context, task *tatarav1alpha1.T
 
 	// Step 2: wait out the in-flight turn, bounded by turnTimeoutSeconds and by
 	// the hard cap.
-	waitUntil := earliest(s.now().Add(in.TurnTimeout), hardCap)
+	waitUntil := earliest(s.now().Add(in.waitBound()), hardCap)
 	turnCleared := s.waitIdle(ctx, in.BaseURL, waitUntil)
 
 	// Step 3: submit THE handoff turn - the one turn the wrapper still admits past
@@ -225,7 +256,7 @@ func (s *TTLStopper) StopWithHandoff(ctx context.Context, task *tatarav1alpha1.T
 	if turnCleared && s.now().Before(hardCap) {
 		_, serr := s.Session.SubmitHandoffTurn(ctx, in.BaseURL, HandoffTurnText, in.CallbackURL)
 		if serr == nil {
-			deadline := earliest(s.now().Add(in.TurnTimeout), hardCap)
+			deadline := earliest(s.now().Add(in.waitBound()), hardCap)
 			if s.waitHandoffNote(ctx, task.Name, before, deadline) {
 				return s.finish(ctx, task, in, TTLOutcomeAgentHandoff)
 			}

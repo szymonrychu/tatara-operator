@@ -231,9 +231,23 @@ func TestPollOnce_StallAwareKeepsActiveTurnAlive(t *testing.T) {
 	}
 }
 
-// TestPollOnce_ExpiresStalledTurn verifies a turn that has gone silent past the
-// stall window is still failed by the backstop (hung-agent recovery unchanged).
-func TestPollOnce_ExpiresStalledTurn(t *testing.T) {
+// TestPollOnce_DoesNotTearDownAStalledTurn pins where the stall teardown lives.
+//
+// The backstop used to call expireTimedOutTurn here, which deleted the session,
+// the Pod and the Service outright - no handoff turn, no handoff note, and
+// anything the agent had written but not pushed died with the workspace. That
+// teardown now runs from TaskReconciler.stalledTurnStop, which puts a stalled
+// turn through the same G.7 graceful sequence as a TTL rotation.
+//
+// It moved rather than being wrapped in place for a second reason: the graceful
+// sequence BLOCKS on real timers, and this loop is one pass over every Task in
+// the namespace on a single 30s ticker. Blocking it per stalled Task would delay
+// result-recording for every other live turn in the cluster.
+//
+// So the backstop must now DETECT and LEAVE IT ALONE. If this test ever goes
+// back to asserting the annotation is cleared here, the graceful path has been
+// bypassed and the note-loss bug is back.
+func TestPollOnce_DoesNotTearDownAStalledTurn(t *testing.T) {
 	mkTaskProject(t, "p-stale", 3)
 	mkTaskRepository(t, "r-stale", "p-stale")
 	mkTask(t, "t-stale", "p-stale", "r-stale")
@@ -249,12 +263,12 @@ func TestPollOnce_ExpiresStalledTurn(t *testing.T) {
 	cb.PollOnce(context.Background())
 
 	tk := getTask(t, "t-stale")
-	if tk.Annotations[annCurrentTurn] != "" {
-		t.Errorf("annCurrentTurn = %q, want cleared: a stalled turn is expired and its pod torn down",
+	if tk.Annotations[annCurrentTurn] != "turn-stale" {
+		t.Errorf("annCurrentTurn = %q, want turn-stale: the backstop must leave the stalled turn for the reconciler to stop gracefully",
 			tk.Annotations[annCurrentTurn])
 	}
 	if tatarav1alpha1.TaskDone(tk) {
-		t.Error("a stalled TURN must not terminate the TASK: the stage machine respawns its pod")
+		t.Error("a stalled TURN must not terminate the TASK")
 	}
 }
 
