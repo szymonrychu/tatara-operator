@@ -2807,30 +2807,70 @@ func (s *Server) adopt(ctx context.Context, obj client.Object, from, to *tatarav
 // linkArtifact appends the umbrella as a PLAIN owner of a linked Issue/MR. A
 // plain owner's only job is to hold the GC open; the controller flag - and with
 // it the authorization to write to the forge - is untouched.
+//
+// UNLESS THERE IS NO CONTROLLER FLAG TO LEAVE UNTOUCHED (issue #536). That doc
+// comment's premise is sound only when a controller owner EXISTS, and against a
+// ZERO-OWNER artifact it does not: own.AddPlainOwner appends Controller unset
+// whether refs is empty or not, so this used to write the object's FIRST and
+// ONLY ownerRef as plain and break B.2 rule 5 outright. A zero-owner artifact is
+// not an error state - it is the reaper's designed hand-off to the sweep
+// (reaper.go's drop branch: "the next sweep re-mints and adopts") - and that
+// window is routinely hours wide, so links[] lands in it. iss-tatara-operator-526
+// on 2026-08-07 06:13:16Z: 1 h 41 m after the drop, a refine outcome's links[]
+// tripped the repair guard 2.5 s later.
+//
+// So a link onto an unclaimed artifact CLAIMS it, in ONE Update, exactly as the
+// fold's adopt does - never leaving a sole plain owner as a reachable end state.
+// Claiming rather than refusing, because the umbrella is definitionally live (it
+// is submitting an outcome right now) and so is a valid controller, while
+// refusing would fail a legitimate link with no recovery until the sweep runs;
+// and claiming rather than promoting some pre-existing plain owner, because that
+// is RepairZeroController's last-resort heuristic and it needs a liveness read
+// this path does not have. When the umbrella goes terminal the reaper releases
+// the artifact back to the sweep on the normal B.5 path.
+//
+// The write goes through controller.MutateArtifactOwnerRefs (fresh Get +
+// RetryOnConflict): it was a bare Update on a cached read, the same discipline
+// gap issue #524 documents on the reaper's release.
 func (s *Server) linkArtifact(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task, l linkRef) error {
 	var obj client.Object
 	if l.IsPR {
-		obj = &tatarav1alpha1.MergeRequest{}
-		if err := s.c.Get(ctx, types.NamespacedName{
-			Namespace: s.ns, Name: tatarav1alpha1.MergeRequestName(l.Repo, l.Number),
-		}, obj); err != nil {
-			return err
+		mr := &tatarav1alpha1.MergeRequest{}
+		mr.Name, mr.Namespace = tatarav1alpha1.MergeRequestName(l.Repo, l.Number), s.ns
+		if err := controller.MutateArtifactOwnerRefs(ctx, s.c, mr, linkOwnership[tatarav1alpha1.MergeRequest](task)); err != nil {
+			return fmt.Errorf("link %s onto %s: %w", mr.Name, task.Name, err)
 		}
+		obj = mr
 	} else {
-		obj = &tatarav1alpha1.Issue{}
-		if err := s.c.Get(ctx, types.NamespacedName{
-			Namespace: s.ns, Name: tatarav1alpha1.IssueName(l.Repo, l.Number),
-		}, obj); err != nil {
-			return err
+		iss := &tatarav1alpha1.Issue{}
+		iss.Name, iss.Namespace = tatarav1alpha1.IssueName(l.Repo, l.Number), s.ns
+		if err := controller.MutateArtifactOwnerRefs(ctx, s.c, iss, linkOwnership[tatarav1alpha1.Issue](task)); err != nil {
+			return fmt.Errorf("link %s onto %s: %w", iss.Name, task.Name, err)
 		}
-	}
-	if !own.AddPlainOwner(obj, task) {
-		return nil
-	}
-	if err := s.c.Update(ctx, obj); err != nil {
-		return fmt.Errorf("link %s onto %s: %w", obj.GetName(), task.Name, err)
+		obj = iss
 	}
 	return s.appendTaskRefFor(ctx, proj, task.Name, obj)
+}
+
+// linkOwnership is the owner-ref half of a links[] entry, applied to the FRESH
+// copy inside MutateArtifactOwnerRefs: append task as a plain owner, and - only
+// when the artifact carries no controller owner at all - claim the flag in the
+// SAME Update. See linkArtifact for why claiming is the right answer there.
+func linkOwnership[T any, PT interface {
+	client.Object
+	*T
+}](task *tatarav1alpha1.Task) func(PT) error {
+
+	return func(fresh PT) error {
+		added := own.AddPlainOwner(fresh, task)
+		if _, owned := own.ControllerOwner(fresh); owned {
+			if !added {
+				return controller.ErrOwnerRefsUnchanged
+			}
+			return nil
+		}
+		return own.HandOverController(fresh, nil, task)
+	}
 }
 
 func (s *Server) appendTaskRefFor(ctx context.Context, proj *tatarav1alpha1.Project, taskName string, obj client.Object) error {
