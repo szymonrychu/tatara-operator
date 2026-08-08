@@ -269,6 +269,13 @@ func TestReconcilerAppliesTheThreeClocks(t *testing.T) {
 				tk.Status.PodStartedAt = &pod
 				tk.Status.StateWorkStartedAt = &work
 				tk.Status.ConversationLastEventAt = &lastEvent
+				// The agent handed off, so the wait IS on a human. A live state whose
+				// pod ended with no agent-authored handoff note re-arms instead
+				// (#527 follow-up); that case is covered in livepods_no_handoff_test.go.
+				tk.Status.Notes = []tatarav1alpha1.Note{{
+					At: metav1.NewTime(now), Agent: "implement", Kind: agent.NoteKindHandoff,
+					Body: "need a decision on the migration order before I continue",
+				}}
 			},
 			wantParked: true, wantReason: stage.ReasonAwaitingHuman,
 		},

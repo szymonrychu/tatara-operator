@@ -117,38 +117,57 @@ func TestContractVersionIsFour(t *testing.T) {
 	}
 }
 
-// TestAssertContractVersion covers the G.10 handshake. On a mismatch - OR on a
-// response with no contractVersion field at all (an old wrapper) - the assertion
-// fails and NOT ONE turn is submitted.
+// TestAssertContractVersion covers the G.10 handshake. NOT ONE turn is submitted
+// on any non-matching version - that property is unchanged and is what the
+// handshake exists for.
+//
+// What the version buys the caller changed under #544. An ADJACENT version is a
+// non-atomic release train mid-flight (the agent image and the operator are
+// pinned in different helm releases), so it is a transient ContractSkewError the
+// caller waits out. Only a version that is NOT reachable by a train in flight -
+// no contractVersion field at all, or a gap of 2 or more - is the terminal
+// ContractMismatchError. Strict equality here is what destroyed 5 Tasks in a
+// 56-minute window on 2026-08-08.
 func TestAssertContractVersion(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		body    string
-		wantErr bool
-		wantGot int
+		name         string
+		body         string
+		wantSkew     bool
+		wantMismatch bool
+		wantGot      int
 	}{
 		{name: "matching version", body: `{"state":"ready","contractVersion":4}`},
-		{name: "old wrapper reports v3", body: `{"state":"ready","contractVersion":3}`, wantErr: true, wantGot: 3},
+		{name: "wrapper one behind is a train, not a break", body: `{"state":"ready","contractVersion":3}`, wantSkew: true, wantGot: 3},
+		{name: "wrapper one ahead is a train, not a break", body: `{"state":"ready","contractVersion":5}`, wantSkew: true, wantGot: 5},
 		{
-			name:    "old wrapper has no contractVersion field at all",
-			body:    `{"state":"ready","turnsCompleted":0,"turnsFinished":0,"model":"m","repo":"r","lastActivityAt":"2026-07-12T10:00:00Z"}`,
-			wantErr: true, wantGot: 0,
+			name:         "old wrapper has no contractVersion field at all",
+			body:         `{"state":"ready","turnsCompleted":0,"turnsFinished":0,"model":"m","repo":"r","lastActivityAt":"2026-07-12T10:00:00Z"}`,
+			wantMismatch: true, wantGot: 0,
 		},
-		{name: "future version", body: `{"state":"ready","contractVersion":5}`, wantErr: true, wantGot: 5},
+		{name: "two versions behind is unreachable by any train", body: `{"state":"ready","contractVersion":2}`, wantMismatch: true, wantGot: 2},
+		{name: "two versions ahead is unreachable by any train", body: `{"state":"ready","contractVersion":6}`, wantMismatch: true, wantGot: 6},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := &turnRefusingSession{t: t, body: tc.body}
 			err := agent.AssertContractVersion(context.Background(), s, "http://wrapper")
-			if !tc.wantErr {
+			switch {
+			case tc.wantSkew:
+				require.True(t, agent.IsContractSkew(err), "want a ContractSkewError, got %v", err)
+				require.False(t, agent.IsContractMismatch(err), "a rollout window must never reach the terminal park")
+				var se *agent.ContractSkewError
+				require.ErrorAs(t, err, &se)
+				require.Equal(t, agent.ContractVersion, se.Expected)
+				require.Equal(t, tc.wantGot, se.Got)
+			case tc.wantMismatch:
+				require.True(t, agent.IsContractMismatch(err), "want a ContractMismatchError, got %v", err)
+				require.False(t, agent.IsContractSkew(err))
+				var mm *agent.ContractMismatchError
+				require.ErrorAs(t, err, &mm)
+				require.Equal(t, agent.ContractVersion, mm.Expected)
+				require.Equal(t, tc.wantGot, mm.Got)
+			default:
 				require.NoError(t, err)
-				return
 			}
-			require.Error(t, err)
-			require.True(t, agent.IsContractMismatch(err), "want a ContractMismatchError, got %v", err)
-			var mm *agent.ContractMismatchError
-			require.ErrorAs(t, err, &mm)
-			require.Equal(t, agent.ContractVersion, mm.Expected)
-			require.Equal(t, tc.wantGot, mm.Got)
 		})
 	}
 }

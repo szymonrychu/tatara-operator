@@ -12,6 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
@@ -183,6 +184,10 @@ type TTLStopper struct {
 	// Record is the operator_agent_pod_ttl_expired_total hook
 	// (obs.AgentPodTTLExpired). Optional.
 	Record func(agentKind, outcome string)
+	// RecordEmptySynthetic is the operator_agent_synthetic_handoff_empty_total
+	// hook (obs.AgentSyntheticHandoffEmpty): a synthetic note was written with NO
+	// continuation state to put in it, which is the #527 failure. Optional.
+	RecordEmptySynthetic func(agentKind string)
 	// Now and Sleep are injectable so the sequence is testable without wall time.
 	Now   func() time.Time
 	Sleep func(ctx context.Context, d time.Duration) error
@@ -362,11 +367,37 @@ func (s *TTLStopper) handoffNoteCount(ctx context.Context, taskName string) (int
 	}
 	n := 0
 	for _, note := range fresh.Status.Notes {
-		if note.Kind == NoteKindHandoff && note.Agent != NoteAgentOperator {
+		if isAgentHandoffNote(note) {
 			n++
 		}
 	}
 	return n, nil
+}
+
+// isAgentHandoffNote reports whether a note is a handoff the AGENT wrote. The
+// operator's synthetic note is deliberately excluded: it is the operator talking
+// to the next pod, never the agent talking to a human.
+func isAgentHandoffNote(n tatarav1alpha1.Note) bool {
+	return n.Kind == NoteKindHandoff && n.Agent != NoteAgentOperator
+}
+
+// HasAgentHandoffNote reports whether the Task's notes journal carries a handoff
+// note the AGENT authored - i.e. whether the agent was ever actually given the
+// chance to say something, and said it.
+//
+// It is the predicate that separates a genuine human gate from wreckage: a Task
+// whose pod ended without one was never asked a question, so parking it
+// awaiting-human (which only a human comment un-parks) waits forever on a reply
+// nobody owes. The operator's own synthetic note does NOT count, however rich its
+// contents - it is continuation state for the next pod, not a question for a
+// person.
+func HasAgentHandoffNote(t *tatarav1alpha1.Task) bool {
+	for _, n := range t.Status.Notes {
+		if isAgentHandoffNote(n) {
+			return true
+		}
+	}
+	return false
 }
 
 // writeSyntheticNote is G.7 step 4: the operator's own handoff note, built from
@@ -380,6 +411,23 @@ func (s *TTLStopper) writeSyntheticNote(ctx context.Context, task *tatarav1alpha
 	final := strings.TrimSpace(in.LastFinalText)
 	if final == "" {
 		final = "(none)"
+		// LOUD, because for ~19 days this was the ONLY thing this function ever
+		// wrote and nothing said so: the note satisfied the non-empty-notes
+		// invariant while carrying zero continuation state, the next pod resumed
+		// from nothing, re-ran turn-0 and re-charged maxTurnsPerTask, and the Task
+		// looked healthy throughout (#527). A note that resolves to "(none)" is
+		// the failure this whole path exists to prevent, not a success.
+		//
+		// It is a counter rather than an ERROR line on purpose: it happens once
+		// per stop, it is a RATE that matters (a Task whose very first turn never
+		// completed legitimately has no last-turn state), and a counter is what an
+		// alert can express.
+		if s.RecordEmptySynthetic != nil {
+			s.RecordEmptySynthetic(in.AgentKind)
+		}
+		log.FromContext(ctx).Info("synthetic handoff note has no continuation state to carry",
+			"action", "synthetic_handoff_empty", "resource_id", task.Name,
+			"agent_kind", in.AgentKind, "pushed_repos", len(in.PushedRepos))
 	}
 	body := fmt.Sprintf("TTL stop. Last turn's final text: %s. Repos pushed: %s. No agent handoff was captured.", final, pushed)
 	n := tatarav1alpha1.Note{

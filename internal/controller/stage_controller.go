@@ -41,7 +41,14 @@ type StageReconciler struct {
 
 // Reconcile drives one Task through merging or deploying. Every other stage is
 // a no-op here.
+// The body is doReconcile; this wrapper is the #538 shutdown-cancellation
+// boundary (see classifyReconcileShutdown).
 func (r *StageReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	res, err := r.doReconcile(ctx, req)
+	return classifyReconcileShutdown(ctx, "taskstage", req.Name, res, err)
+}
+
+func (r *StageReconciler) doReconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	if r.Driver == nil {
 		return ctrl.Result{}, nil
 	}

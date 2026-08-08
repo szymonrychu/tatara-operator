@@ -1,7 +1,11 @@
 package controller
 
 import (
+	"context"
 	"errors"
+
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
@@ -23,6 +27,62 @@ func isPermanentTargetGone(err error) bool {
 		return he.Status == 404 || he.Status == 410
 	}
 	return false
+}
+
+// isShutdownCancellation reports whether err is the manager's OWN shutdown
+// reaching a reconcile mid-flight, rather than a failure worth an ERROR line.
+//
+// Issue #538: controller-runtime logs every non-nil Reconcile error as
+// ERROR msg="Reconciler error", and the Loki rule "Tatara operator error
+// recurring" counts ERROR lines regardless of cause. On SIGTERM the manager
+// cancels the reconcile context, every in-flight SCM/API call aborts with
+// context.Canceled, and the reconciler returned it raw - so a rolling restart
+// that cancelled >=2 in-flight calls deterministically fired the alert. It had
+// fired 49 times. Nothing was ever wrong: the cancelled work is re-reconciled
+// by the informer resync of whichever replica takes the lease next.
+//
+// BOTH HALVES ARE LOAD-BEARING and this is deliberately NOT a bare
+// errors.Is(err, context.Canceled):
+//
+//   - The reconcile ctx must itself be cancelled. controller-runtime derives it
+//     from the manager context and cancels it ONLY when the manager stops, so a
+//     cancelled ctx IS the shutdown signal. Without this clause any per-call
+//     cancellation (a caller-scoped context, an aborted sub-request) on a
+//     perfectly healthy manager would be silently swallowed.
+//   - The error must carry the cancellation. Without this clause a genuine
+//     failure that merely happened to land during the shutdown window - an
+//     etcd timeout, an SCM 500 - would be swallowed too.
+//
+// context.DeadlineExceeded is deliberately NOT matched: a timeout is a real
+// failure whoever's clock it was.
+func isShutdownCancellation(ctx context.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		return false
+	}
+	return errors.Is(err, context.Canceled)
+}
+
+// classifyReconcileShutdown is the Reconcile-boundary classifier every
+// reconciler in this package returns through. A shutdown cancellation is
+// downgraded to (empty result, nil) plus one INFO line; everything else passes
+// through untouched.
+//
+// The empty result is correct rather than merely convenient: a requeue asked for
+// by a reconcile that is being cancelled is never serviced, because the work
+// queue is shutting down with it.
+func classifyReconcileShutdown(ctx context.Context, controller, name string,
+	res ctrl.Result, err error) (ctrl.Result, error) {
+
+	if !isShutdownCancellation(ctx, err) {
+		return res, err
+	}
+	log.FromContext(ctx).Info("reconcile aborted by manager shutdown; not an error",
+		"action", "reconcile_shutdown_cancel", "controller", controller,
+		"resource_id", name, "cause", err.Error())
+	return ctrl.Result{}, nil
 }
 
 // RecordSCM records the outcome of one SCM call on operator_scm_writes_total

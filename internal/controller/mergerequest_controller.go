@@ -62,7 +62,14 @@ func (r *MergeRequestReconciler) spiller(proj *tatarav1alpha1.Project) objbudget
 // +kubebuilder:rbac:groups=tatara.dev,resources=mergerequests/status,verbs=get;update;patch
 
 // Reconcile converges one MergeRequest.
+// The body is doReconcile; this wrapper is the #538 shutdown-cancellation
+// boundary (see classifyReconcileShutdown).
 func (r *MergeRequestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	res, err := r.doReconcile(ctx, req)
+	return classifyReconcileShutdown(ctx, "mergerequest", req.Name, res, err)
+}
+
+func (r *MergeRequestReconciler) doReconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var mr tatarav1alpha1.MergeRequest
 	if err := r.Get(ctx, req.NamespacedName, &mr); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)

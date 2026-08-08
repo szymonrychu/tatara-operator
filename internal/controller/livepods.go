@@ -28,12 +28,22 @@ import (
 // per-project live-pod ceiling) is a ROUTINE mechanism rather than a rare edge
 // case, so this sequence runs often and must be correct.
 //
-// cause is "idle" or "evicted" and lands on the log line and the metric; it is
-// not otherwise behavioural. The park reason is awaiting-human either way: a
-// conversation that ended without a decision is a Task waiting on a human, and
-// awaiting-human already has the re-entry rule that resumes it on the next
-// comment. The Task does NOT move state - park is orthogonal to state (#521) -
-// so the un-park drops it straight back into the live state it was talking in.
+// cause is "idle" or "evicted". It lands on the log line and the metric, and it
+// gates ONE behaviour (see below): an eviction is a capacity decision the
+// operator made on purpose and always parks, an idle exit is a pod that stopped
+// producing and may deserve a replacement instead.
+//
+// AWAITING-HUMAN IS FOR TASKS THAT ACTUALLY ASKED SOMETHING. It is UnparkHuman,
+// so it resumes only on a non-bot comment - and a Task whose pod died without the
+// agent writing a handoff note never posed a question, so no reply is owed and
+// none arrives. Measured live: 45 Tasks parked awaiting-human, only 20 with a
+// real agent handoff; the other 25 were pod-death wreckage sitting on a human
+// gate nobody knew existed, released only when an unrelated comment happened to
+// land on their issue. Those re-arm for a fresh pod instead, bounded by the
+// pod-recreation budget (stage.ReArmAfterPodLoss). A Task that DID hand off
+// parks exactly as before: the Task does NOT move state - park is orthogonal to
+// state (#521) - so the un-park drops it straight back into the live state it
+// was talking in.
 func (r *TaskReconciler) liveHandoffAndPark(ctx context.Context, proj *tatarav1alpha1.Project,
 	task *tatarav1alpha1.Task, mrs []tatarav1alpha1.MergeRequest, cause string, now time.Time) error {
 
@@ -53,8 +63,9 @@ func (r *TaskReconciler) liveHandoffAndPark(ctx context.Context, proj *tatarav1a
 				Spiller:   sp,
 				Namespace: task.Namespace,
 			},
-			Namespace: task.Namespace,
-			Record:    obs.AgentPodTTLExpired,
+			Namespace:            task.Namespace,
+			Record:               obs.AgentPodTTLExpired,
+			RecordEmptySynthetic: obs.AgentSyntheticHandoffEmpty,
 		}
 		in := agent.TTLStopInput{
 			BaseURL:     agent.BaseURL(task, task.Namespace),
@@ -65,6 +76,10 @@ func (r *TaskReconciler) liveHandoffAndPark(ctx context.Context, proj *tatarav1a
 			// sequence rather than any pod TTL.
 			Deadline:    now,
 			TurnTimeout: time.Duration(proj.Spec.Agent.TurnTimeoutSeconds) * time.Second,
+			// #527: the persisted last-turn continuation state, so the synthetic
+			// note carries what the agent actually did instead of "(none)".
+			LastFinalText: task.Status.LastTurnFinalText,
+			PushedRepos:   task.Status.LastTurnPushedRepos,
 		}
 		outcome, err := stopper.StopWithHandoff(ctx, task, in)
 		if err != nil {
@@ -73,6 +88,19 @@ func (r *TaskReconciler) liveHandoffAndPark(ctx context.Context, proj *tatarav1a
 		log.FromContext(ctx).Info("conversation handed off",
 			"action", "conversing_handoff", "resource_id", task.Name,
 			"cause", cause, "outcome", outcome)
+	}
+
+	// THE HUMAN-GATE TEST. An eviction is exempt: the ceiling deliberately chose
+	// to take this pod's slot, and handing it straight back would defeat the
+	// mechanism.
+	if cause != causeEvicted {
+		asked, err := r.agentAskedSomething(ctx, task)
+		if err != nil {
+			return err
+		}
+		if !asked {
+			return r.reArmWithoutHandoff(ctx, proj, task, sp, cause, now)
+		}
 	}
 
 	if err := ParkTask(ctx, r.Client, sp, r.Metrics, task, stage.ReasonAwaitingHuman, now, nil); err != nil {
@@ -84,6 +112,57 @@ func (r *TaskReconciler) liveHandoffAndPark(ctx context.Context, proj *tatarav1a
 	if r.Metrics != nil {
 		r.Metrics.LiveClosed(task.Spec.ProjectRef, cause)
 	}
+	return nil
+}
+
+// causeIdle / causeEvicted are liveHandoffAndPark's two callers.
+const (
+	causeIdle    = "idle"
+	causeEvicted = "evicted"
+)
+
+// agentAskedSomething re-reads the Task from the API server and reports whether
+// an AGENT-authored handoff note exists. It re-reads deliberately: the stop
+// sequence that just ran may have appended one microseconds ago, and the caller's
+// copy predates it.
+func (r *TaskReconciler) agentAskedSomething(ctx context.Context, task *tatarav1alpha1.Task) (bool, error) {
+	fresh := &tatarav1alpha1.Task{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+		return false, fmt.Errorf("livepods: reload %s for the handoff check: %w", task.Name, err)
+	}
+	return agent.HasAgentHandoffNote(fresh), nil
+}
+
+// reArmWithoutHandoff is the non-park exit: the pod ended without the agent
+// saying anything, so the Task gets a replacement pod rather than a fabricated
+// human gate. The pod-recreation budget bounds it, and spending that budget
+// terminates at parked(pod-recreation-exhausted) - which is the correct terminal
+// for repeated pod death and already carries no re-entry.
+func (r *TaskReconciler) reArmWithoutHandoff(ctx context.Context, proj *tatarav1alpha1.Project,
+	task *tatarav1alpha1.Task, sp objbudget.Spiller, cause string, now time.Time) error {
+
+	var exhausted bool
+	if err := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
+		_, terminal := stage.ReArmAfterPodLoss(fresh, taskMaxPodRecreations(proj), now)
+		exhausted = terminal
+		return !terminal
+	}); err != nil {
+		return fmt.Errorf("livepods: re-arm %s after a handoff-less pod: %w", task.Name, err)
+	}
+	l := log.FromContext(ctx)
+	if exhausted {
+		l.Info("pod ended with no agent handoff and the recreation budget is spent; parking",
+			"action", "live_rearm_exhausted", "resource_id", task.Name, "cause", cause,
+			"pod_recreations", task.Status.Stats.PodRecreations)
+		if err := ParkTask(ctx, r.Client, sp, r.Metrics, task,
+			stage.ReasonPodRecreationExhausted, now, nil); err != nil {
+			return fmt.Errorf("livepods: park %s after the recreation budget: %w", task.Name, err)
+		}
+		return nil
+	}
+	l.Info("pod ended with no agent handoff; re-arming for a replacement pod instead of waiting on a human",
+		"action", "live_rearm_no_handoff", "resource_id", task.Name, "cause", cause,
+		"state", task.Status.State, "project", task.Spec.ProjectRef)
 	return nil
 }
 
@@ -337,7 +416,7 @@ func (r *ProjectReconciler) enforceLivePodCeiling(ctx context.Context, proj *tat
 			"action", "live_evicting", "resource_id", t.Name, "project", proj.Name,
 			"live", len(live), "ceiling", ceiling,
 			"idle_since", conversationIdleSince(t).UTC().Format(time.RFC3339))
-		if eErr := r.Tasks.liveHandoffAndPark(ctx, proj, t, mrs, "evicted", now); eErr != nil {
+		if eErr := r.Tasks.liveHandoffAndPark(ctx, proj, t, mrs, causeEvicted, now); eErr != nil {
 			log.FromContext(ctx).Error(eErr, "livepods: eviction failed",
 				"action", "live_evict_error", "resource_id", t.Name, "project", proj.Name)
 			if firstErr == nil {

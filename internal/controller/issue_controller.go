@@ -75,8 +75,16 @@ func (r *IssueReconciler) metrics() *obs.OperatorMetrics {
 // +kubebuilder:rbac:groups=tatara.dev,resources=issues,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=tatara.dev,resources=issues/status,verbs=get;update;patch
 
-// Reconcile converges one Issue.
+// Reconcile converges one Issue. The body is doReconcile; this wrapper is the
+// #538 shutdown-cancellation boundary (see classifyReconcileShutdown): the
+// mirror read at issue_controller.go's cadence sync and the label projection
+// below are the two calls a SIGTERM caught mid-flight in production.
 func (r *IssueReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	res, err := r.doReconcile(ctx, req)
+	return classifyReconcileShutdown(ctx, "issue", req.Name, res, err)
+}
+
+func (r *IssueReconciler) doReconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var iss tatarav1alpha1.Issue
 	if err := r.Get(ctx, req.NamespacedName, &iss); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)

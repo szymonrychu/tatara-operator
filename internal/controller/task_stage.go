@@ -313,7 +313,7 @@ func (r *TaskReconciler) reconcileClocks(ctx context.Context, proj *tatarav1alph
 			"action", "stage_deadline", "resource_id", task.Name, "state", task.Status.State,
 			"clock", clock, "budget", budget.String(), "elapsed", elapsed.String(),
 			"to", edge.To, "park_reason", edge.Reason)
-		return ctrl.Result{}, true, r.liveHandoffAndPark(ctx, proj, task, mrs, "idle", now)
+		return ctrl.Result{}, true, r.liveHandoffAndPark(ctx, proj, task, mrs, causeIdle, now)
 	}
 
 	mrs, mrErr := ownedMergeRequests(ctx, r.Client, task)
@@ -335,7 +335,7 @@ func (r *TaskReconciler) reconcileClocks(ctx context.Context, proj *tatarav1alph
 	// WS3-I5: on the FIRST park at deploy-timeout, surface the stuck deploy to the
 	// human with ONE rate-limited operator comment per owned issue.
 	if edge.Reason == stage.ReasonDeployTimeout {
-		if err := r.enqueueDeployTimeoutComment(ctx, proj, task, mrs, now); err != nil {
+		if err := enqueueDeployTimeoutComment(ctx, r.Client, r.spiller(proj), task, mrs, now); err != nil {
 			return ctrl.Result{}, true, err
 		}
 	}
@@ -351,10 +351,14 @@ func (r *TaskReconciler) reconcileClocks(ctx context.Context, proj *tatarav1alph
 // deploy-blocked never has one producer clobber the other's cooldown. It reuses
 // the existing PendingComments drain; it spawns no agent. Leader-only (this whole
 // reconcile is).
-func (r *TaskReconciler) enqueueDeployTimeoutComment(ctx context.Context, proj *tatarav1alpha1.Project,
+// It is a free function rather than a TaskReconciler method because
+// StageDriver.parkOnStalledFanout parks at the SAME reason from the deploy poll
+// (#512) and must post the same notice; a park at deploy-timeout that a human
+// never hears about is what made the 2026-07-29 wedge invisible for two hours.
+func enqueueDeployTimeoutComment(ctx context.Context, c client.Client, sp objbudget.Spiller,
 	task *tatarav1alpha1.Task, mrs []tatarav1alpha1.MergeRequest, now time.Time) error {
 
-	issues, err := loadTaskIssues(ctx, r.Client, task)
+	issues, err := loadTaskIssues(ctx, c, task)
 	if err != nil {
 		return err
 	}
@@ -373,7 +377,6 @@ func (r *TaskReconciler) enqueueDeployTimeoutComment(ctx context.Context, proj *
 	body := fmt.Sprintf("Deployment of `%s` has not completed after `%s`; retry `%d`/`%d`. tatara keeps retrying until it succeeds or the deploy budget is exhausted.",
 		repos, budget, task.Status.DeployReentries, tatarav1alpha1.MaxDeployReentries)
 
-	sp := r.spiller(proj)
 	stamp := metav1.NewTime(now)
 	for i := range issues {
 		iss := &issues[i]
@@ -381,7 +384,7 @@ func (r *TaskReconciler) enqueueDeployTimeoutComment(ctx context.Context, proj *
 			continue // closed, or already commented on the first timeout (own cooldown).
 		}
 		key := client.ObjectKeyFromObject(iss)
-		if err := objbudget.FitIssue(ctx, r.Client, sp, key, func(cur *tatarav1alpha1.Issue) {
+		if err := objbudget.FitIssue(ctx, c, sp, key, func(cur *tatarav1alpha1.Issue) {
 			if cur.Status.LastDeployTimeoutCommentAt != nil || len(cur.Status.PendingComments) >= 20 {
 				return
 			}
@@ -1210,8 +1213,9 @@ func (r *TaskReconciler) stalledTurnStop(ctx context.Context, proj *tatarav1alph
 			Spiller:   sp,
 			Namespace: task.Namespace,
 		},
-		Namespace: task.Namespace,
-		Record:    obs.AgentPodTTLExpired,
+		Namespace:            task.Namespace,
+		Record:               obs.AgentPodTTLExpired,
+		RecordEmptySynthetic: obs.AgentSyntheticHandoffEmpty,
 	}
 	outcome, err := stopper.StopWithHandoff(ctx, task, agent.TTLStopInput{
 		BaseURL:     agent.BaseURL(task, task.Namespace),
@@ -1222,6 +1226,11 @@ func (r *TaskReconciler) stalledTurnStop(ctx context.Context, proj *tatarav1alph
 		Deadline:    now,
 		TurnTimeout: time.Duration(proj.Spec.Agent.TurnTimeoutSeconds) * time.Second,
 		MaxWait:     StalledTurnHandoffWait,
+		// #527: the same persisted continuation state ttlStop uses. A stalled turn
+		// is the case that needs it MOST - a genuinely hung wrapper never goes
+		// idle, so this caller almost always lands on the synthetic note.
+		LastFinalText: task.Status.LastTurnFinalText,
+		PushedRepos:   task.Status.LastTurnPushedRepos,
 	})
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("stalled turn stop %s: %w", task.Name, err)
@@ -1280,8 +1289,9 @@ func (r *TaskReconciler) ttlStop(ctx context.Context, proj *tatarav1alpha1.Proje
 			Spiller:   sp,
 			Namespace: task.Namespace,
 		},
-		Namespace: task.Namespace,
-		Record:    obs.AgentPodTTLExpired,
+		Namespace:            task.Namespace,
+		Record:               obs.AgentPodTTLExpired,
+		RecordEmptySynthetic: obs.AgentSyntheticHandoffEmpty,
 	}
 	in := agent.TTLStopInput{
 		BaseURL:     agent.BaseURL(task, task.Namespace),
@@ -1289,9 +1299,12 @@ func (r *TaskReconciler) ttlStop(ctx context.Context, proj *tatarav1alpha1.Proje
 		AgentKind:   agentKind,
 		Deadline:    deadline,
 		TurnTimeout: time.Duration(proj.Spec.Agent.TurnTimeoutSeconds) * time.Second,
-		// LastFinalText/PushedRepos are not persisted on the Task (only recordResult
-		// stamps turn-complete), so the synthetic note degrades to "(none)". The
-		// non-empty-notes guarantee still holds: agent handoff, else synthetic.
+		// The last turn-complete callback's finalText + pushedRepos, persisted onto
+		// the Task by CallbackServer.stampLastTurn. Without them the synthetic note
+		// degraded to "(none)"/"none" on EVERY synthetic path, which is what made
+		// the non-empty-notes guarantee vacuous (#527).
+		LastFinalText: task.Status.LastTurnFinalText,
+		PushedRepos:   task.Status.LastTurnPushedRepos,
 	}
 	outcome, err := stopper.StopWithHandoff(ctx, task, in)
 	if err != nil {
