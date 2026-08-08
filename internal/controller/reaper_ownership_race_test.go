@@ -245,3 +245,80 @@ func TestReleaseOwnershipCountsAPermanentUpdateFailureAsGCBlocked(t *testing.T) 
 	require.Greater(t, gcBlocked(), before,
 		"a rejection no requeue can resolve IS a GC block and must still be counted")
 }
+
+// TestDeleteReapedTaskSkipsTheReleaseItAlreadyDid is issue #545.
+//
+// reapTerminal runs the release TWICE - releaseTerminal, then deleteReapedTask -
+// and only the first was idempotent. ownedIssues keys off status.issueRefs, not
+// off ownership, so the second pass re-derives the exact artifact set the first
+// pass just released, ~22 ms later, off a cache that has usually but not always
+// observed the first write. 4 of 25 releases over 48 h 409'd against the
+// reaper's OWN commit that way.
+//
+// The fixture IS that stale view: the Task carries AnnTerminalReleased (the
+// release provably completed) while the artifact copy the second pass would
+// re-derive still shows it as controller owner. The second release must not
+// happen at all - a retry loop only masks it, leaving the redundant re-Get and
+// re-Update per reap.
+func TestDeleteReapedTaskSkipsTheReleaseItAlreadyDid(t *testing.T) {
+	ctx := context.Background()
+	proj := reapProject("dblrel")
+	repo := reapRepo("dblrel", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
+
+	released := reapTask("dblrel", "rel-task", "clarify",
+		tatarav1alpha1.StateRejected, stage.ReasonDeclined, time.Now().Add(-25*time.Hour))
+	released.Annotations = map[string]string{AnnTerminalReleased: "true"}
+	released.Status.IssueRefs = []string{tatarav1alpha1.IssueName(repo.Name, 9)}
+	iss := raceIssue(repo.Name, 9, "dblrel", "rel-task")
+
+	var (
+		mu      sync.Mutex
+		updates int
+	)
+	c := newMirrorClientIntercepted(t, interceptor.Funcs{
+		Update: func(ctx context.Context, cl client.WithWatch, obj client.Object,
+			opts ...client.UpdateOption) error {
+			if _, ok := obj.(*tatarav1alpha1.Issue); ok {
+				mu.Lock()
+				updates++
+				mu.Unlock()
+			}
+			return cl.Update(ctx, obj, opts...)
+		},
+	}, proj, repo, reapSecret(), released, iss)
+
+	before := gcBlocked()
+	require.NoError(t, r0(c).deleteReapedTask(ctx, proj, released, map[string]bool{"rel-task": true}))
+
+	mu.Lock()
+	got := updates
+	mu.Unlock()
+	require.Zero(t, got,
+		"deleteReapedTask re-ran the release of an already-released Task; that redundant write is what 409s against the reaper's own commit")
+	require.Equal(t, before, gcBlocked())
+
+	_, alive := mustGetTask(t, c, "rel-task")
+	require.False(t, alive, "the Task must still be collected")
+}
+
+// TestDeleteReapedTaskStillReleasesWhenNotYetReleased is the guard on #545's
+// guard. resume.go's collection reaches deleteReapedTask WITHOUT a prior
+// releaseTerminal, and so does reapDelivered and the backlog-sweep park branch;
+// for those the release is the ONLY one there will ever be. Gating it on the
+// annotation must not delete it.
+func TestDeleteReapedTaskStillReleasesWhenNotYetReleased(t *testing.T) {
+	ctx := context.Background()
+	proj := reapProject("firstrel")
+	repo := reapRepo("firstrel", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
+
+	unreleased := reapTask("firstrel", "res-task", "clarify",
+		tatarav1alpha1.StateDone, "", time.Now().Add(-25*time.Hour))
+	unreleased.Status.IssueRefs = []string{tatarav1alpha1.IssueName(repo.Name, 9)}
+	iss := raceIssue(repo.Name, 9, "firstrel", "res-task")
+
+	c := newMirrorClientIntercepted(t, interceptor.Funcs{}, proj, repo, reapSecret(), unreleased, iss)
+
+	require.NoError(t, r0(c).deleteReapedTask(ctx, proj, unreleased, map[string]bool{"res-task": true}))
+	require.Empty(t, mustGetIssue(t, c, iss.Name).OwnerReferences,
+		"a Task collected without a prior releaseTerminal must still have its artifacts released")
+}
