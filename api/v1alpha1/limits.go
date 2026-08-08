@@ -129,18 +129,40 @@ func TruncateRunes(s string, maxRunes int) string {
 // marker visible when it had to cut. Trailing whitespace is trimmed off the cut
 // first, so the marker never trails a half-written word by three spaces.
 //
-// Every agent-supplied title handed to the forge goes through this. It is the
-// clamp the limits contract was missing: the body beside it on the same request
-// has been clamped since #495, the title never was, and a GitLab 400 on an
-// over-long title discards the whole outcome the agent had just submitted.
+// Every agent-supplied ISSUE title handed to the forge goes through this: the
+// three CreateIssue sites in internal/restapi, and - twice - the deferred edit
+// path, once where the intent is queued and again where reviewpost replays it.
+// The replay clamp is not redundant: intents live on the Issue CR, so ones
+// queued before this existed are still in etcd carrying raw titles, and the
+// replay is the only gate they will ever pass again.
+//
+// It is the clamp the limits contract was missing: the body beside it on the
+// same request has been clamped since #495, the title never was, and a GitLab
+// 400 on an over-long title discards the whole outcome the agent had just
+// submitted.
+//
+// MR titles are a KNOWN GAP and are deliberately not routed through here yet.
+// GitLab applies the same 255-character Issuable validation to a merge request,
+// so mrOpen can take the same 400 - but it maps a forge 4xx (status and body)
+// straight back to the caller, so the agent is told what happened and loses
+// nothing. That is the whole difference: the issue paths swallow the rejection
+// into a 502 after the outcome is already spent, the MR path does not. Widening
+// the clamp to MR titles is worth doing; it is not what closes #529.
 func ClampIssueTitle(title string) string {
-	if utf8.RuneCountInString(title) <= IssueTitleMaxChars {
-		return title
-	}
-	// A title only over the cap because of the whitespace around it is not over
-	// it at all: the forge strips before it length-validates. Trimming here also
-	// stops a long enough run of LEADING whitespace from spending the entire cut
-	// and clamping the title down to nothing but the marker.
+	// Trimmed BEFORE the length check, not after it. A title only over the cap
+	// because of the whitespace around it is not over it at all (the forge strips
+	// before it length-validates), and trimming first also stops a long enough run
+	// of LEADING whitespace from spending the entire cut and clamping the title
+	// down to nothing but the marker.
+	//
+	// Doing it first is what makes a whitespace-only title collapse to "". Such a
+	// title is UNDER the cap, so a length check in front of the trim returns it
+	// verbatim and the forge gets a blank title it rejects. On the deferred edit
+	// path that rejection is unrecoverable rather than merely noisy: EditIssue
+	// 400s on every replay and the drain returns on that error before
+	// removePendingComments, so the intent requeues forever and blocks every
+	// intent queued behind it. Callers that must not send an empty title already
+	// reject one upstream; this only stops whitespace from smuggling past them.
 	title = strings.TrimSpace(title)
 	if utf8.RuneCountInString(title) <= IssueTitleMaxChars {
 		return title

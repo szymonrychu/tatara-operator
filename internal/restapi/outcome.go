@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -2046,8 +2045,10 @@ func (o *outcomeCtx) brainstorm(p brainstormPayload) {
 		})
 		controller.RecordSCM(s.metrics, providerOf(o.proj), "create_issue", err)
 		if err != nil {
+			fields := append(reqLogFields(o.r), "task", o.task.Name, "repo", repo.Name)
+			fields = append(fields, titleLogFields(pr.Title, title)...)
 			s.log.ErrorContext(ctx, "restapi: filing a brainstorm proposal failed",
-				append(reqLogFields(o.r), "task", o.task.Name, "repo", repo.Name, "error", err)...)
+				append(fields, "error", err)...)
 			writeError(o.w, http.StatusBadGateway, "scm write failed")
 			return
 		}
@@ -2245,11 +2246,10 @@ func (o *outcomeCtx) incident(p incidentPayload) {
 	if err != nil {
 		// A forge 4xx here is otherwise undiagnosable from the log line alone:
 		// the title that caused it is never persisted anywhere.
+		fields := append(reqLogFields(o.r), "task", o.task.Name, "repo", repo.Name)
+		fields = append(fields, titleLogFields(p.Issue.Title, title)...)
 		s.log.ErrorContext(ctx, "restapi: filing the incident tracker issue failed",
-			append(reqLogFields(o.r), "task", o.task.Name, "repo", repo.Name,
-				"title_chars", utf8.RuneCountInString(p.Issue.Title),
-				"title_prefix", tatarav1alpha1.TruncateRunes(p.Issue.Title, 80),
-				"error", err)...)
+			append(fields, "error", err)...)
 		writeError(o.w, http.StatusBadGateway, "scm write failed")
 		return
 	}

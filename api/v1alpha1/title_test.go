@@ -39,9 +39,11 @@ func TestTruncateRunes(t *testing.T) {
 	}
 }
 
-// A title that already fits comes back BYTE-IDENTICAL. Callers compare stored
-// values (the Issue CR mirror is matched against what the forge holds), so an
-// unconditional rewrite would not be free.
+// A title that already fits and carries no surrounding whitespace comes back
+// BYTE-IDENTICAL. Callers compare stored values (the Issue CR mirror is matched
+// against what the forge holds), so a gratuitous rewrite would not be free. The
+// one rewrite that does happen is the trim, and that one earns its keep - see
+// TestClampIssueTitle_TrimsPaddingOffTitlesThatAlreadyFit.
 func TestClampIssueTitle_TitlesThatFitAreUntouched(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -128,6 +130,43 @@ func TestClampIssueTitle_WhitespaceDoesNotSpendTheBudget(t *testing.T) {
 			"the clamp must spend its budget on the title, not on the padding in front of it")
 		require.LessOrEqual(t, utf8.RuneCountInString(got), IssueTitleMaxChars)
 	})
+}
+
+// A title that is nothing but whitespace is UNDER the cap, so a clamp that
+// length-checks before it trims hands it back byte-identical and the forge sees
+// a blank title. Both forges reject that, and on the deferred edit path the
+// rejection is unrecoverable: EditIssue 400s on every replay, the drain returns
+// on that error before removePendingComments, and the intent requeues forever
+// with every intent queued behind it stuck too. Trimming has to happen BEFORE
+// the length check, not after it.
+func TestClampIssueTitle_WhitespaceOnlyTitlesCollapseToEmpty(t *testing.T) {
+	cases := []struct {
+		name  string
+		title string
+	}{
+		{"spaces", "   "},
+		{"tabs", "\t\t"},
+		{"newlines", "\n\n"},
+		{"mixed ascii whitespace", " \t \n "},
+		{"unicode non-breaking space", "  "},
+		{"ideographic space", "　"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, "", ClampIssueTitle(tc.title),
+				"a whitespace-only title must collapse to empty so callers can drop it, "+
+					"not reach the forge as a blank title it will reject")
+		})
+	}
+}
+
+// Trimming moved above the length check, so a title that fits but carries
+// padding is no longer returned byte-identical. That is deliberate: the forge
+// strips before it stores, so the trimmed value is what the mirror will hold
+// anyway and matching it here stops a spurious Status.Title diff on every
+// refresh.
+func TestClampIssueTitle_TrimsPaddingOffTitlesThatAlreadyFit(t *testing.T) {
+	require.Equal(t, "a short title", ClampIssueTitle("  a short title\n"))
 }
 
 // Cutting at a fixed offset routinely lands inside the run of spaces between two

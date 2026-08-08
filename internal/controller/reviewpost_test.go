@@ -804,3 +804,60 @@ func TestAppendOperatorNote_ClampsOversizedBody(t *testing.T) {
 		t.Fatalf("re-appending the same oversized note wrote it twice: %d notes", len(again))
 	}
 }
+
+// parseEditIntent is the decoder half of a line-oriented encoding whose encoder
+// (editIntentBody) lives in internal/restapi. The split is why the two drifted:
+// the encoder omitted the "title: " line when the title was empty, which put the
+// agent-supplied BODY on line 1, and this decoder then read that body back as a
+// title. Such a title never passed ClampIssueTitle, so it reaches EditIssue
+// either blank or over the 255-char forge cap - and an EditIssue 400 is the
+// unrecoverable one: the drain returns before removePendingComments, so the
+// Issue's reconcile requeues that intent forever and blocks every intent behind
+// it. These cases are written against the WIRE FORMAT, so they pin the decoder
+// independently of whatever the encoder currently does.
+func TestParseEditIntent_TitleNeverExceedsTheForgeCap(t *testing.T) {
+	long := strings.Repeat("q", 400)
+	cases := []struct {
+		name      string
+		wire      string
+		wantTitle string
+		wantBody  string
+	}{
+		{
+			// The encoding as it is written today for an empty title.
+			name:      "explicit empty title line leaves the body alone",
+			wire:      editIntentMarker + "\ntitle: \nreal body",
+			wantTitle: "",
+			wantBody:  "real body",
+		},
+		{
+			// A LEGACY intent, already persisted in an Issue CR before the restapi
+			// clamp existed. The replay is the only gate it will still pass.
+			name:      "legacy over-long title is clamped at replay",
+			wire:      editIntentMarker + "\ntitle: " + long + "\nbody",
+			wantTitle: tatarav1alpha1.ClampIssueTitle(long),
+			wantBody:  "body",
+		},
+		{
+			name:      "legacy whitespace-only title collapses to empty",
+			wire:      editIntentMarker + "\ntitle:   \nbody",
+			wantTitle: "",
+			wantBody:  "body",
+		},
+		{
+			name:      "ordinary title is untouched",
+			wire:      editIntentMarker + "\ntitle: a real title\nbody",
+			wantTitle: "a real title",
+			wantBody:  "body",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotTitle, gotBody := parseEditIntent(tc.wire)
+			require.Equal(t, tc.wantTitle, gotTitle)
+			require.Equal(t, tc.wantBody, gotBody)
+			require.LessOrEqual(t, len([]rune(gotTitle)), tatarav1alpha1.IssueTitleMaxChars,
+				"a title leaving the decoder must already fit the forge cap")
+		})
+	}
+}

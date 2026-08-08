@@ -1135,8 +1135,10 @@ func (s *Server) issueCreate(w http.ResponseWriter, r *http.Request, proj *tatar
 	created, err := writer.CreateIssue(ctx, repo.Spec.URL, token, scm.IssueReq{Title: title, Body: req.Body})
 	controller.RecordSCM(s.metrics, providerOf(proj), "create_issue", err)
 	if err != nil {
+		fields := append(reqLogFields(r), "task", task.Name, "repo", repo.Name)
+		fields = append(fields, titleLogFields(req.Title, title)...)
 		s.log.ErrorContext(ctx, "restapi: creating issue failed",
-			append(reqLogFields(r), "repo", repo.Name, "error", err)...)
+			append(fields, "error", err)...)
 		writeError(w, http.StatusBadGateway, "scm write failed")
 		return
 	}
@@ -1349,12 +1351,18 @@ func pendingAction(action string) string {
 }
 
 // editIntentBody encodes an edit intent's title/body pair.
+//
+// The "title: " line is ALWAYS emitted, even when the title is empty. Omitting
+// it put the agent-supplied body on line 1, and parseEditIntent reads line 1 as
+// the title whenever it starts with "title: " - so a body beginning with that
+// literal was decoded back as a title that had never been through
+// ClampIssueTitle, reaching EditIssue blank or over the forge's 255-char cap.
+// An unconditional line costs 8 bytes and makes the encoding unambiguous:
+// whatever the body contains, it can only ever be line 2 onwards.
 func editIntentBody(title, body string) string {
 	var b strings.Builder
 	b.WriteString("<!-- tatara-edit -->\n")
-	if title != "" {
-		b.WriteString("title: " + title + "\n")
-	}
+	b.WriteString("title: " + title + "\n")
 	if body != "" {
 		b.WriteString(body)
 	}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 	chiMiddleware "github.com/go-chi/chi/v5/middleware"
@@ -213,6 +214,28 @@ func (s *Server) getTask(w http.ResponseWriter, r *http.Request) {
 // truncateValidUTF8 cuts s to at most maxBytes bytes on a rune boundary.
 func truncateValidUTF8(s string, maxBytes int) string {
 	return tatarav1alpha1.TruncateUTF8(s, maxBytes)
+}
+
+// titleLogPrefixChars is how much of a rejected title goes on the log line:
+// enough to recognise which outcome it was, short enough not to wrap the line.
+const titleLogPrefixChars = 80
+
+// titleLogFields describes a failed issue-title forge write. BOTH lengths are
+// on the line on purpose. Now that titles are clamped, a length-caused 4xx is
+// impossible, so a line carrying only the raw agent-supplied count reports a
+// cause that cannot be the one firing - "title_chars=900" beside a 400 that the
+// 255-rune value actually took - while the value that did reach the forge
+// appears nowhere. raw says what the agent wrote, sent says what was rejected,
+// and the two differing is itself the signal that the clamp engaged.
+//
+// The prefix is taken from the SENT title so every field on the line describes
+// the same request.
+func titleLogFields(raw, sent string) []any {
+	return []any{
+		"title_chars", utf8.RuneCountInString(raw),
+		"sent_title_chars", utf8.RuneCountInString(sent),
+		"title_prefix", tatarav1alpha1.TruncateRunes(sent, titleLogPrefixChars),
+	}
 }
 
 // validChangeSignificance is the closed set of semver levels an agent may

@@ -59,6 +59,7 @@ type recordingForge struct {
 	addSubIssueErr error              // returned by AddSubIssue when set (e.g. scm.ErrSubIssuesUnsupported)
 	commentErr     error              // returned by Comment when set (e.g. cross-repo 403 on the parent)
 	openChangeErr  error              // returned by OpenChange when set (e.g. a 422 or a transport error)
+	createIssueErr error              // returned by CreateIssue when set (e.g. the GitLab 400 that #529 is about)
 }
 
 type recordedComment struct {
@@ -86,6 +87,14 @@ func (f *recordingForge) GetPRHead(_ context.Context, _, _ string, number int) (
 }
 
 func (f *recordingForge) CreateIssue(_ context.Context, repoURL, _ string, req scm.IssueReq) (scm.CreatedIssue, error) {
+	if f.createIssueErr != nil {
+		// Still recorded: a test asserting on the failure log needs to know what
+		// the forge was actually handed. NOTE this is the one path on which
+		// createdReqs and createdRefs stop being index-aligned - a failed call has
+		// a request but no ref. Pair them by index only when createIssueErr is nil.
+		f.createdReqs = append(f.createdReqs, req)
+		return scm.CreatedIssue{}, f.createIssueErr
+	}
 	f.nextNumber++
 	ref := fmt.Sprintf("acme/%s#%d", lastSeg(repoURL), f.nextNumber)
 	f.createdRefs = append(f.createdRefs, ref)
@@ -1090,46 +1099,44 @@ func TestIssueWrite_Create_NeverClaimsProposalProvenanceFromTheBody(t *testing.T
 // IssueTitleMaxChars before filing on the forge. The clamp is applied
 // uniformly across both GitHub and GitLab so a title valid on one is valid
 // on both.
+// The `want` values are written out from the CONTRACT (cap 255, a 14-rune
+// marker, so a 241-rune cut) rather than from ClampIssueTitle. Calling the
+// function under test to build its own expectation asserts nothing: it holds
+// for any implementation, including one that returns the bare marker.
 func TestIssueWrite_Create_TitleIsClamped(t *testing.T) {
 	tests := []struct {
-		name      string
-		provider  string
-		titleLen  int // in runes
-		wantClamp bool
+		name     string
+		provider string
+		title    string
+		want     string
 	}{
-		{"github_short", "github", 50, false},
-		{"github_long", "github", 300, true},
-		{"gitlab_short", "gitlab", 50, false},
-		{"gitlab_long", "gitlab", 300, true},
+		{"github_short", "github", "issue" + strings.Repeat("-X", 25),
+			"issue" + strings.Repeat("-X", 25)},
+		{"github_long", "github", "issue" + strings.Repeat("-X", 150),
+			"issue" + strings.Repeat("-X", 118) + "...(truncated)"},
+		{"gitlab_short", "gitlab", "issue" + strings.Repeat("-X", 25),
+			"issue" + strings.Repeat("-X", 25)},
+		{"gitlab_long", "gitlab", "issue" + strings.Repeat("-X", 150),
+			"issue" + strings.Repeat("-X", 118) + "...(truncated)"},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			title := "issue" + strings.Repeat("-X", tc.titleLen/2)
 			e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(),
 				repoV2("tatara-operator", "tatara"),
-				taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"))
+				taskV2("t1", "tatara", "clarify", tatarav1alpha1.StateRefined, "clarify"))
 			p := e.project(t, "tatara")
 			p.Spec.Scm.Provider = tc.provider
 			require.NoError(t, e.c.Update(context.Background(), p))
 
 			w := e.do(t, http.MethodPost, "/projects/tatara/scm/issue-write",
 				fmt.Sprintf(`{"task":"t1","action":"create","repo":"tatara-operator","title":%s,"body":"B"}`,
-					strconv.Quote(title)))
+					strconv.Quote(tc.title)))
 			require.Equal(t, http.StatusOK, w.Code)
 
-			expectedClamped := tatarav1alpha1.ClampIssueTitle(title)
-
-			// Assert the forge request title is clamped.
 			require.Len(t, e.forge.createdReqs, 1)
-			require.Equal(t, expectedClamped, e.forge.createdReqs[0].Title,
+			require.Equal(t, tc.want, e.forge.createdReqs[0].Title,
 				"forge must receive the clamped title, not the raw agent input")
-
-			// Assert the clamped title conforms to limits.
-			if tc.wantClamp {
-				require.True(t, strings.HasSuffix(e.forge.createdReqs[0].Title, "...(truncated)"),
-					"over-long title must end with the truncation marker")
-			}
 			require.LessOrEqual(t, utf8.RuneCountInString(e.forge.createdReqs[0].Title),
 				tatarav1alpha1.IssueTitleMaxChars,
 				"clamped title must fit the character limit")
@@ -1137,7 +1144,7 @@ func TestIssueWrite_Create_TitleIsClamped(t *testing.T) {
 			// Assert the minted Issue CR's Status.Title matches the clamped title
 			// (the CR is a mirror of what the forge stored).
 			iss := e.issue(t, tatarav1alpha1.IssueName("tatara-operator", 101))
-			require.Equal(t, expectedClamped, iss.Status.Title,
+			require.Equal(t, tc.want, iss.Status.Title,
 				"Issue CR Status.Title must match the clamped title sent to the forge")
 		})
 	}
@@ -1154,9 +1161,10 @@ func TestIssueWrite_Edit_TitleIsClamped(t *testing.T) {
 	for _, provider := range []string{"github", "gitlab"} {
 		t.Run(provider, func(t *testing.T) {
 			title := "retitle" + strings.Repeat("-Z", 150)
+			want := "retitle" + strings.Repeat("-Z", 117) + "...(truncated)"
 			e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 				repoV2("tatara-operator", "tatara"),
-				taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"),
+				taskV2("t1", "tatara", "clarify", tatarav1alpha1.StateRefined, "clarify"),
 				issueV2("tatara-operator", 291, "t1"))
 			p := e.project(t, "tatara")
 			p.Spec.Scm.Provider = provider
@@ -1169,12 +1177,62 @@ func TestIssueWrite_Edit_TitleIsClamped(t *testing.T) {
 
 			pcs := e.issue(t, tatarav1alpha1.IssueName("tatara-operator", 291)).Status.PendingComments
 			require.Len(t, pcs, 1)
-			require.Contains(t, pcs[0].Body, "title: "+tatarav1alpha1.ClampIssueTitle(title)+"\n",
+			require.Contains(t, pcs[0].Body, "title: "+want+"\n",
 				"the queued edit intent must carry the clamped title")
 			require.NotContains(t, pcs[0].Body, title,
 				"the raw over-long title must not survive into the intent, or the replay 400s forever")
 		})
 	}
+}
+
+// action=edit validates title and body with an AND, so a whitespace-only title
+// rides in on a legitimate body edit. It is UNDER the cap, so a clamp that
+// length-checks before it trims passes it through untouched, parseEditIntent
+// reads it back non-empty, and EditIssue is handed a blank title the forge
+// rejects - forever, because the drain returns on that error before
+// removePendingComments. The intent must carry no title line at all.
+func TestIssueWrite_Edit_WhitespaceOnlyTitleIsDroppedFromTheIntent(t *testing.T) {
+	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StateRefined, "clarify"),
+		issueV2("tatara-operator", 291, "t1"))
+
+	w := e.do(t, http.MethodPost, "/projects/tatara/scm/issue-write",
+		`{"task":"t1","action":"edit","repo":"tatara-operator","number":291,"title":"   ","body":"a real body edit"}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	pcs := e.issue(t, tatarav1alpha1.IssueName("tatara-operator", 291)).Status.PendingComments
+	require.Len(t, pcs, 1)
+	require.Contains(t, pcs[0].Body, "title: \n",
+		"the title line is always emitted, and a whitespace-only title must render it EMPTY: "+
+			"the replay would otherwise send a blank title, 400 on every attempt, and requeue "+
+			"that Issue's reconcile forever")
+	require.Contains(t, pcs[0].Body, "a real body edit",
+		"the body edit it rode in on must still be queued")
+}
+
+// The encoder half of the ambiguity parseEditIntent decodes. With the title line
+// omitted for an empty title, an agent-supplied body beginning with "title: "
+// landed on line 1 and was read back as a title that had never been clamped -
+// #529 re-opened through the body field. The title line is now unconditional, so
+// the body always starts on line 2.
+func TestIssueWrite_Edit_BodyCannotImpersonateTheTitleLine(t *testing.T) {
+	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StateRefined, "clarify"),
+		issueV2("tatara-operator", 291, "t1"))
+
+	// An empty title plus a body whose first line impersonates the encoding.
+	smuggled := "title: " + strings.Repeat("z", 400) + "\nreal body"
+	w := e.do(t, http.MethodPost, "/projects/tatara/scm/issue-write",
+		fmt.Sprintf(`{"task":"t1","action":"edit","repo":"tatara-operator","number":291,"body":%s}`,
+			strconv.Quote(smuggled)))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	pcs := e.issue(t, tatarav1alpha1.IssueName("tatara-operator", 291)).Status.PendingComments
+	require.Len(t, pcs, 1)
+	require.True(t, strings.HasPrefix(pcs[0].Body, "<!-- tatara-edit -->\ntitle: \n"),
+		"the empty title must still occupy line 1, or the body becomes the title: %q", pcs[0].Body)
 }
 
 // The controller-ownership gate on EVERY action that names a number (fix 7).

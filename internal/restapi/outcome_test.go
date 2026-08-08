@@ -2270,51 +2270,44 @@ func TestOutcome_Incident_AlertRulesRequiredOnBothActions(t *testing.T) {
 // choice recorded on IssueTitleMaxChars - GitLab's cap is applied to GitHub too.
 func TestOutcome_Incident_TitleIsClamped(t *testing.T) {
 	tests := []struct {
-		name      string
-		provider  string
-		titleLen  int // in runes
-		multiByte bool
-		wantClamp bool
+		name     string
+		provider string
+		title    string
+		want     string
 	}{
-		{"github_short", "github", 50, false, false},
-		{"github_long", "github", 300, false, true},
-		{"gitlab_short", "gitlab", 50, false, false},
-		{"gitlab_long", "gitlab", 300, false, true},
+		{"github_short", "github", "issue" + strings.Repeat("-X", 25),
+			"issue" + strings.Repeat("-X", 25)},
+		{"github_long", "github", "issue" + strings.Repeat("-X", 150),
+			"issue" + strings.Repeat("-X", 118) + "...(truncated)"},
+		{"gitlab_short", "gitlab", "issue" + strings.Repeat("-X", 25),
+			"issue" + strings.Repeat("-X", 25)},
+		{"gitlab_long", "gitlab", "issue" + strings.Repeat("-X", 150),
+			"issue" + strings.Repeat("-X", 118) + "...(truncated)"},
 		// 300 CJK characters is 900 bytes. A byte-based clamp would cut this to
-		// a third of the characters the forge would have taken.
-		{"gitlab_long_multibyte", "gitlab", 300, true, true},
+		// a third of the characters the forge would have taken - the literal
+		// below pins 241 CHARACTERS kept, which is the whole point of the rune
+		// clamp and the one assertion TruncateUTF8 could not satisfy.
+		{"gitlab_long_multibyte", "gitlab", strings.Repeat("界", 300),
+			strings.Repeat("界", 241) + "...(truncated)"},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			title := "issue" + strings.Repeat("-X", tc.titleLen/2)
-			if tc.multiByte {
-				title = strings.Repeat("界", tc.titleLen)
-			}
 			e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(),
 				repoV2("tatara-operator", "tatara"),
-				taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+				taskV2("t1", "tatara", "incident", tatarav1alpha1.StateRefined, "incident"))
 			p := e.project(t, "tatara")
 			p.Spec.Scm.Provider = tc.provider
 			require.NoError(t, e.c.Update(context.Background(), p))
 
 			w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
 				fmt.Sprintf(`{"kind":"incident","payload":{"action":"file_issue","alertRules":["tatara-operator-down"],"reason":"real outage","issue":{"repo":"tatara-operator","title":%s,"body":"trace"}}}`,
-					strconv.Quote(title)))
+					strconv.Quote(tc.title)))
 			require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 
-			expectedClamped := tatarav1alpha1.ClampIssueTitle(title)
-
-			// Assert the forge request title is clamped.
 			require.Len(t, e.forge.createdReqs, 1)
-			require.Equal(t, expectedClamped, e.forge.createdReqs[0].Title,
+			require.Equal(t, tc.want, e.forge.createdReqs[0].Title,
 				"forge must receive the clamped title, not the raw agent input")
-
-			// Assert the clamped title conforms to limits.
-			if tc.wantClamp {
-				require.True(t, strings.HasSuffix(e.forge.createdReqs[0].Title, "...(truncated)"),
-					"over-long title must end with the truncation marker")
-			}
 			require.LessOrEqual(t, utf8.RuneCountInString(e.forge.createdReqs[0].Title),
 				tatarav1alpha1.IssueTitleMaxChars,
 				"clamped title must fit the character limit")
@@ -2322,7 +2315,7 @@ func TestOutcome_Incident_TitleIsClamped(t *testing.T) {
 			// Assert the minted Issue CR's Status.Title matches the clamped title
 			// (the CR is a mirror of what the forge stored).
 			iss := e.issue(t, tatarav1alpha1.IssueName("tatara-operator", 101))
-			require.Equal(t, expectedClamped, iss.Status.Title,
+			require.Equal(t, tc.want, iss.Status.Title,
 				"Issue CR Status.Title must match the clamped title sent to the forge")
 		})
 	}
@@ -2334,23 +2327,27 @@ func TestOutcome_Incident_TitleIsClamped(t *testing.T) {
 // title (the Goal is agent context, not a forge mirror).
 func TestOutcome_Brainstorm_TitleIsClamped(t *testing.T) {
 	tests := []struct {
-		name      string
-		provider  string
-		titleLen  int // in runes
-		wantClamp bool
+		name     string
+		provider string
+		title    string
+		want     string
 	}{
-		{"github_short", "github", 50, false},
-		{"github_long", "github", 300, true},
-		{"gitlab_short", "gitlab", 50, false},
-		{"gitlab_long", "gitlab", 300, true},
+		{"github_short", "github", "proposal" + strings.Repeat("-Y", 25),
+			"proposal" + strings.Repeat("-Y", 25)},
+		{"github_long", "github", "proposal" + strings.Repeat("-Y", 150),
+			"proposal" + strings.Repeat("-Y", 116) + "-" + "...(truncated)"},
+		{"gitlab_short", "gitlab", "proposal" + strings.Repeat("-Y", 25),
+			"proposal" + strings.Repeat("-Y", 25)},
+		{"gitlab_long", "gitlab", "proposal" + strings.Repeat("-Y", 150),
+			"proposal" + strings.Repeat("-Y", 116) + "-" + "...(truncated)"},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			title := "proposal" + strings.Repeat("-Y", tc.titleLen/2)
+			title := tc.title
 			e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(),
 				repoV2("tatara-operator", "tatara"),
-				taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StageBrainstorming, "brainstorm"))
+				taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StateRefined, "brainstorm"))
 			p := e.project(t, "tatara")
 			p.Spec.Scm.Provider = tc.provider
 			require.NoError(t, e.c.Update(context.Background(), p))
@@ -2360,44 +2357,140 @@ func TestOutcome_Brainstorm_TitleIsClamped(t *testing.T) {
 					strconv.Quote(title)))
 			require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 
-			expectedClamped := tatarav1alpha1.ClampIssueTitle(title)
-
-			// Assert the forge request title is clamped.
 			require.Len(t, e.forge.createdReqs, 1)
-			require.Equal(t, expectedClamped, e.forge.createdReqs[0].Title,
+			require.Equal(t, tc.want, e.forge.createdReqs[0].Title,
 				"forge must receive the clamped title, not the raw agent input")
-
-			// Assert the clamped title conforms to limits.
-			if tc.wantClamp {
-				require.True(t, strings.HasSuffix(e.forge.createdReqs[0].Title, "...(truncated)"),
-					"over-long title must end with the truncation marker")
-			}
 			require.LessOrEqual(t, utf8.RuneCountInString(e.forge.createdReqs[0].Title),
 				tatarav1alpha1.IssueTitleMaxChars,
 				"clamped title must fit the character limit")
 
 			// Assert the minted Issue CR's Status.Title matches the clamped title.
 			iss := e.issue(t, tatarav1alpha1.IssueName("tatara-operator", 101))
-			require.Equal(t, expectedClamped, iss.Status.Title,
+			require.Equal(t, tc.want, iss.Status.Title,
 				"Issue CR Status.Title must match the clamped title sent to the forge")
 
-			// Assert the spawned clarify Task's Goal begins with the RAW unclamped title.
-			// The Goal is agent context, not a forge mirror, so it is deliberately not
-			// clamped (it has its own GoalMaxBytes byte limit).
+			// Assert the spawned Task's Goal begins with the RAW unclamped title.
+			// The Goal is agent context, not a forge mirror, so it is deliberately
+			// not clamped (it has its own GoalMaxBytes BYTE limit). The clamp must
+			// not leak out of the forge-write path into the prompt the agent reads.
 			var tasks tatarav1alpha1.TaskList
 			require.NoError(t, e.c.List(context.Background(), &tasks, client.InNamespace(ns)))
-			var clarifyGoal string
+			var spawnedGoal string
 			for i := range tasks.Items {
-				if tasks.Items[i].Spec.Kind == "clarify" {
-					clarifyGoal = tasks.Items[i].Spec.Goal
+				if tasks.Items[i].Spec.Kind == controller.SweepIssueKind {
+					spawnedGoal = tasks.Items[i].Spec.Goal
 					break
 				}
 			}
-			require.NotEmpty(t, clarifyGoal, "spawned clarify task must exist")
-			require.True(t, strings.HasPrefix(clarifyGoal, title),
-				"clarify Task Goal must begin with the raw unclamped title")
+			require.NotEmpty(t, spawnedGoal, "brainstorm propose must spawn a follow-up task")
+			require.True(t, strings.HasPrefix(spawnedGoal, title),
+				"spawned Task Goal must begin with the raw unclamped title")
 		})
 	}
+}
+
+// Once titles are clamped, a length-caused 400 is IMPOSSIBLE - so a log line
+// that reports only the raw agent-supplied length points whoever reads it at a
+// cause that cannot be the one firing ("title_chars=900" beside a 400 that the
+// 255-rune value actually took), while the title that did reach the forge
+// appears nowhere at all. Both counts have to be on the line: the raw one says
+// what the agent wrote, the sent one says what was rejected.
+func TestOutcome_Incident_ForgeFailureLogsRawAndSentTitleLengths(t *testing.T) {
+	var logBuf bytes.Buffer
+	e := buildV2(t, v2Opts{logger: slog.New(slog.NewJSONHandler(&logBuf, nil))},
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StateRefined, "incident"))
+	e.forge.createIssueErr = fmt.Errorf(
+		`scm: /projects/szymonrychu%%2Fcharts/issues -> 400: {"message":{"title":["is too long (maximum is 255 characters)"]}}`)
+
+	title := "incident" + strings.Repeat("-X", 400) // 808 runes, well over the cap
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		fmt.Sprintf(`{"kind":"incident","payload":{"action":"file_issue","alertRules":["tatara-operator-down"],"reason":"real outage","issue":{"repo":"tatara-operator","title":%s,"body":"trace"}}}`,
+			strconv.Quote(title)))
+	require.Equal(t, http.StatusBadGateway, w.Code, w.Body.String())
+
+	require.Len(t, e.forge.createdReqs, 1)
+	sent := e.forge.createdReqs[0].Title
+	require.Equal(t, tatarav1alpha1.IssueTitleMaxChars, utf8.RuneCountInString(sent),
+		"precondition: the forge was handed the clamped title")
+
+	// The prefix is written out literally rather than as TruncateRunes(sent, 80):
+	// deriving it with the same call the field is built from would hold for any
+	// implementation of TruncateRunes, including a broken one.
+	entry := lastErrorLog(t, &logBuf, "restapi: filing the incident tracker issue failed")
+	require.Equal(t, float64(808), entry["title_chars"],
+		"title_chars must report what the AGENT supplied")
+	require.Equal(t, float64(255), entry["sent_title_chars"],
+		"sent_title_chars must report what actually reached the forge - without it the "+
+			"rejected value is unrecoverable from the log line")
+	require.Equal(t, "incident"+strings.Repeat("-X", 36), entry["title_prefix"],
+		"title_prefix must be the first 80 runes of the SENT title, so the line describes one request")
+}
+
+// The sibling issue-filing paths take the same forge 400 and were diagnosable
+// only from the incident one. All three log identically or none of them is
+// reliably diagnosable.
+func TestOutcome_Brainstorm_ForgeFailureLogsRawAndSentTitleLengths(t *testing.T) {
+	var logBuf bytes.Buffer
+	e := buildV2(t, v2Opts{logger: slog.New(slog.NewJSONHandler(&logBuf, nil))},
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StateRefined, "brainstorm"))
+	e.forge.createIssueErr = fmt.Errorf("scm: 400 title is too long")
+
+	title := "proposal" + strings.Repeat("-Y", 400)
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		fmt.Sprintf(`{"kind":"brainstorm","payload":{"action":"propose","proposals":[{"repo":"tatara-operator","title":%s,"body":"b","kind":"bug"}]}}`,
+			strconv.Quote(title)))
+	require.Equal(t, http.StatusBadGateway, w.Code, w.Body.String())
+
+	require.Len(t, e.forge.createdReqs, 1)
+	entry := lastErrorLog(t, &logBuf, "restapi: filing a brainstorm proposal failed")
+	require.Equal(t, float64(808), entry["title_chars"])
+	require.Equal(t, float64(255), entry["sent_title_chars"])
+	require.Equal(t, "proposal"+strings.Repeat("-Y", 36), entry["title_prefix"])
+}
+
+// The third CreateIssue site. Two of three pinned is not "all three log
+// identically": the unpinned one is free to regress silently.
+func TestIssueWrite_Create_ForgeFailureLogsRawAndSentTitleLengths(t *testing.T) {
+	var logBuf bytes.Buffer
+	e := buildV2(t, v2Opts{logger: slog.New(slog.NewJSONHandler(&logBuf, nil))},
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StateRefined, "clarify"))
+	e.forge.createIssueErr = fmt.Errorf("scm: 400 title is too long")
+
+	title := "issue" + strings.Repeat("-X", 400)
+	w := e.do(t, http.MethodPost, "/projects/tatara/scm/issue-write",
+		fmt.Sprintf(`{"task":"t1","action":"create","repo":"tatara-operator","title":%s,"body":"B"}`,
+			strconv.Quote(title)))
+	require.Equal(t, http.StatusBadGateway, w.Code, w.Body.String())
+
+	entry := lastErrorLog(t, &logBuf, "restapi: creating issue failed")
+	require.Equal(t, float64(805), entry["title_chars"])
+	require.Equal(t, float64(255), entry["sent_title_chars"])
+	require.Equal(t, "issue"+strings.Repeat("-X", 37)+"-", entry["title_prefix"])
+	require.Equal(t, "t1", entry["task"],
+		"the failure line needs the Task name to correlate against the agent run; "+
+			"both sibling sites and this handler's own success line carry it")
+}
+
+// lastErrorLog returns the last JSON log record in buf whose msg matches, so an
+// assertion names the field it wants rather than substring-matching the line.
+func lastErrorLog(t *testing.T, buf *bytes.Buffer, msg string) map[string]any {
+	t.Helper()
+	var found map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var entry map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &entry), "log line is not JSON: %s", line)
+		if entry["msg"] == msg && entry["level"] == "ERROR" {
+			found = entry
+		}
+	}
+	require.NotNil(t, found, "no ERROR log with msg=%q in:\n%s", msg, buf.String())
+	return found
 }
 
 // --- Fix 7 (#400): investigation-comment cooldown -------------------------
