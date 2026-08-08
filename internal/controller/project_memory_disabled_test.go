@@ -84,6 +84,10 @@ func mkStackPVC(t *testing.T, p *tataradevv1alpha1.Project, name string, labels 
 // seedStackPVCs creates the PVCs the memory stack owns that no controller
 // creates under envtest: the two cnpg volumes and the neo4j StatefulSet volume.
 // The lightrag PVC is applied by applyMemoryStack itself.
+//
+// It returns the volumes that must SURVIVE a disable. The lightrag PVC is
+// deliberately NOT among them - see tearDownMemoryStack: its removal on disable
+// is an explicit, approved decision, unlike the postgres corpus and the graph.
 func seedStackPVCs(t *testing.T, p *tataradevv1alpha1.Project) []string {
 	t.Helper()
 	n := memory.NamesFor(p.Name)
@@ -101,7 +105,7 @@ func seedStackPVCs(t *testing.T, p *tataradevv1alpha1.Project) []string {
 	// StatefulSet, so it can never be added). Name-prefix matching is the only
 	// way to find it.
 	mkStackPVC(t, p, neo4j, nil, "")
-	return []string{pgData, pgWAL, neo4j, n.LightragPVC}
+	return []string{pgData, pgWAL, neo4j}
 }
 
 func getPVC(t *testing.T, name string) *corev1.PersistentVolumeClaim {
@@ -112,6 +116,46 @@ func getPVC(t *testing.T, name string) *corev1.PersistentVolumeClaim {
 		t.Fatalf("get pvc %s: %v", name, err)
 	}
 	return pvc
+}
+
+// pvcDeleted reports whether a Delete has been issued against the PVC.
+//
+// It accepts "gone" OR "terminating", because envtest cannot produce the former
+// for a PVC: the apiserver's StorageObjectInUseProtection admission plugin
+// stamps kubernetes.io/pvc-protection at CREATE, and the controller that
+// removes that finalizer lives in kube-controller-manager, which envtest does
+// not run. So a deleted PVC keeps its object with a deletionTimestamp forever
+// here, while on a real cluster it is collected as soon as nothing mounts it.
+func pvcDeleted(t *testing.T, name string) bool {
+	t.Helper()
+	pvc := &corev1.PersistentVolumeClaim{}
+	err := k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: name}, pvc)
+	if apierrors.IsNotFound(err) {
+		return true
+	}
+	if err != nil {
+		t.Fatalf("get pvc %s: %v", name, err)
+	}
+	return pvc.DeletionTimestamp != nil
+}
+
+// releasePVCFinalizers does by hand what kube-controller-manager's PVC
+// protection controller does on a real cluster, so a test can observe the
+// object actually disappear. See pvcDeleted for why this is necessary.
+func releasePVCFinalizers(t *testing.T, name string) {
+	t.Helper()
+	ctx := context.Background()
+	pvc := &corev1.PersistentVolumeClaim{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, pvc); err != nil {
+		if apierrors.IsNotFound(err) {
+			return
+		}
+		t.Fatalf("get pvc %s: %v", name, err)
+	}
+	pvc.Finalizers = nil
+	if err := k8sClient.Update(ctx, pvc); err != nil {
+		t.Fatalf("release finalizers on pvc %s: %v", name, err)
+	}
 }
 
 func objAbsent(t *testing.T, name string, obj client.Object) bool {
@@ -229,27 +273,44 @@ func TestReconcileMemory_DisabledTearsDownComputeObjects(t *testing.T) {
 	}
 }
 
-// THE data-safety assertion. spec.memory.enabled=false is a config change, not
-// a delete request: every PVC in the stack must survive it, with the owner
-// references that would cascade it away stripped and a label that finds it
-// again. memoryBackup.enabled is off by default and nothing calls the restore
-// path automatically, so a cascade here is unrecoverable.
-func TestReconcileMemory_DisabledRetainsPVCsWithOwnerRefsStripped(t *testing.T) {
+// THE data-safety assertion, and the asymmetry that goes with it.
+//
+// spec.memory.enabled=false is a config change, not a delete request - for the
+// postgres corpus and the neo4j graph. Those must survive it, with the owner
+// references that would cascade them away stripped and a label that finds them
+// again; memoryBackup.enabled is off by default and nothing calls the restore
+// path automatically, so a cascade there is unrecoverable.
+//
+// LightRAG is the ONE exception, by explicit owner decision: its PVC is DELETED
+// on disable. This test asserts BOTH halves precisely so the split cannot be
+// "tidied up" later in either direction - not into deleting all four, and not
+// into retaining all four.
+func TestReconcileMemory_DisabledRetainsPgAndNeo4jButDeletesLightrag(t *testing.T) {
 	r := newMemoryReconciler()
 	p := mkMemoryProject(t, "mem-retain")
 
 	if _, err := reconcileMemory(t, r, p.Name); err != nil {
 		t.Fatalf("provision reconcile: %v", err)
 	}
-	pvcs := seedStackPVCs(t, p)
+	retained := seedStackPVCs(t, p)
+	lightragPVC := memory.NamesFor(p.Name).LightragPVC
+	if objAbsent(t, lightragPVC, &corev1.PersistentVolumeClaim{}) {
+		t.Fatal("provision reconcile did not create the lightrag PVC; the deletion half proves nothing")
+	}
 
 	setProjectMemoryEnabled(t, p.Name, false)
 	if _, err := reconcileMemory(t, r, p.Name); err != nil {
 		t.Fatalf("disable reconcile: %v", err)
 	}
 
-	for _, name := range pvcs {
+	// Half one: postgres + neo4j survive, unreachable by any cascade, findable,
+	// and with no delete even ATTEMPTED against them.
+	for _, name := range retained {
 		pvc := getPVC(t, name) // fatals if the PVC is gone
+		if pvc.DeletionTimestamp != nil {
+			t.Errorf("pvc %s is terminating: the postgres corpus and the graph must be retained, "+
+				"only lightrag is approved for removal", name)
+		}
 		if len(pvc.OwnerReferences) != 0 {
 			t.Errorf("pvc %s still carries ownerReferences %+v: a cascade would take the data with it",
 				name, pvc.OwnerReferences)
@@ -258,6 +319,28 @@ func TestReconcileMemory_DisabledRetainsPVCsWithOwnerRefsStripped(t *testing.T) 
 			t.Errorf("pvc %s label %s = %q, want %q so the volume can be found again",
 				name, memory.RetainedForProjectLabel, got, p.Name)
 		}
+	}
+
+	// Half two: lightrag is REMOVED. Approved and intended, not an oversight.
+	if !pvcDeleted(t, lightragPVC) {
+		got := getPVC(t, lightragPVC)
+		t.Errorf("lightrag PVC %s survived the disable: its removal is approved and intended "+
+			"(labels=%v ownerRefs=%d)", lightragPVC, got.Labels, len(got.OwnerReferences))
+	}
+	// And it must not have been retained on the way out: no stripped-ownerRef
+	// orphan left behind under the retention label.
+	var list corev1.PersistentVolumeClaimList
+	if err := k8sClient.List(context.Background(), &list, client.InNamespace(testNS),
+		client.MatchingLabels{memory.RetainedForProjectLabel: p.Name}); err != nil {
+		t.Fatalf("list retained pvcs: %v", err)
+	}
+	for i := range list.Items {
+		if list.Items[i].Name == lightragPVC {
+			t.Errorf("lightrag PVC %s was retained; it must be deleted, not kept", lightragPVC)
+		}
+	}
+	if len(list.Items) != len(retained) {
+		t.Errorf("retained PVC count = %d, want %d (exactly pg + neo4j)", len(list.Items), len(retained))
 	}
 }
 
@@ -317,9 +400,37 @@ func TestReconcileMemory_ReEnableReadoptsRetainedPVCs(t *testing.T) {
 		uidBefore[name] = getPVC(t, name).UID
 	}
 
+	// LightRAG was DELETED on disable, so re-enable must PROVISION IT FRESH
+	// rather than re-adopt it. Let the deleted object actually go first - envtest
+	// pins it on the pvc-protection finalizer with no controller to release it
+	// (see pvcDeleted) - so "recreated" is observable rather than assumed.
+	lightragPVC := memory.NamesFor(p.Name).LightragPVC
+	if !pvcDeleted(t, lightragPVC) {
+		t.Fatalf("lightrag PVC %s was not deleted on disable; the re-provision half proves nothing",
+			lightragPVC)
+	}
+	lightragUIDBefore := getPVC(t, lightragPVC).UID
+	releasePVCFinalizers(t, lightragPVC)
+	if !objAbsent(t, lightragPVC, &corev1.PersistentVolumeClaim{}) {
+		t.Fatalf("lightrag PVC %s still present after its finalizer was released", lightragPVC)
+	}
+
 	setProjectMemoryEnabled(t, p.Name, true)
 	if _, err := reconcileMemory(t, r, p.Name); err != nil {
 		t.Fatalf("re-enable reconcile: %v", err)
+	}
+
+	if objAbsent(t, lightragPVC, &corev1.PersistentVolumeClaim{}) {
+		t.Errorf("lightrag PVC %s was not re-provisioned on re-enable", lightragPVC)
+	} else {
+		fresh := getPVC(t, lightragPVC)
+		if fresh.UID == lightragUIDBefore {
+			t.Errorf("lightrag PVC %s kept its old identity (uid %s): it must be a FRESH, empty volume",
+				lightragPVC, fresh.UID)
+		}
+		if _, still := fresh.Labels[memory.RetainedForProjectLabel]; still {
+			t.Errorf("re-provisioned lightrag PVC %s carries a retention label", lightragPVC)
+		}
 	}
 
 	var list corev1.PersistentVolumeClaimList

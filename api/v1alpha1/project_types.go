@@ -28,10 +28,15 @@ type MemorySpec struct {
 	// nil check, and never gate on "== the default" (the DocumentationSpec.Enabled
 	// MEMORY trap).
 	//
-	// Disabling tears the compute and monitoring objects down but RETAINS every
-	// PersistentVolumeClaim in the stack (see reconcileMemory's teardown): the
-	// object-store backup path is off by default and has no automatic restore, so
-	// a cascade delete here would be unrecoverable data loss.
+	// Disabling tears the compute and monitoring objects down. What happens to the
+	// data is deliberately NOT uniform (see reconcileMemory's teardown):
+	//   - the postgres (PGDATA + WAL) and neo4j volumes are RETAINED. The
+	//     object-store backup path is off by default and has no automatic restore,
+	//     so a cascade delete there would be unrecoverable loss. Re-enabling
+	//     reattaches them by name.
+	//   - the lightrag volume is DELETED. That data removal is an explicit owner
+	//     decision, and the lightrag index is derived data rebuilt by re-ingesting.
+	// Do not "make these consistent" in either direction.
 	// +optional
 	Enabled *bool `json:"enabled,omitempty"`
 	// +kubebuilder:default=1

@@ -25,10 +25,14 @@ import (
 // disableMemory is the spec.memory.enabled=false branch of reconcileMemory.
 //
 // It tears the memory stack's COMPUTE and MONITORING objects down and leaves
-// the Project in the terminal Disabled phase. It does NOT touch the data: every
-// PersistentVolumeClaim (and every cnpg-generated Secret) is retained first, so
-// re-enabling picks the same volumes back up. See retainMemoryData for why that
-// is mandatory rather than nice-to-have.
+// the Project in the terminal Disabled phase.
+//
+// The stack's DATA is handled asymmetrically, by explicit owner decision:
+// the postgres volumes (PGDATA + WAL), the neo4j volume and the cnpg-generated
+// Secrets are retained first, so re-enabling picks them back up (see
+// retainMemoryData for why that is mandatory rather than nice-to-have), while
+// the lightrag volume is deleted outright (see tearDownMemoryStack). Neither
+// half is an oversight; do not unify them.
 //
 // The teardown itself runs at most ONCE per Project generation. A disabled
 // Project is still reconciled on every watch event forever, and re-issuing a
@@ -51,7 +55,8 @@ func (r *ProjectReconciler) disableMemory(ctx context.Context, p *tataradevv1alp
 			return r.failMemory(p, "TeardownError", err)
 		}
 		st.DisabledGeneration = p.Generation
-		l.Info("memory stack disabled: compute and monitoring torn down, data retained",
+		l.Info("memory stack disabled: compute and monitoring torn down, "+
+			"postgres and neo4j retained, lightrag deleted",
 			"action", "memory_disable",
 			"resource_id", p.Name,
 			"generation", p.Generation,
@@ -78,8 +83,9 @@ func (r *ProjectReconciler) disableMemory(ctx context.Context, p *tataradevv1alp
 		Status: metav1.ConditionFalse,
 		Reason: "Disabled",
 		Message: "memory is disabled for this project (spec.memory.enabled=false); " +
-			"the stack's volumes are retained and labelled " +
-			memory.RetainedForProjectLabel + "=" + p.Name,
+			"the postgres and neo4j volumes are retained and labelled " +
+			memory.RetainedForProjectLabel + "=" + p.Name +
+			"; the lightrag volume was deleted",
 		ObservedGeneration: p.Generation,
 	})
 	return nil
@@ -105,6 +111,29 @@ func (r *ProjectReconciler) tearDownMemoryStack(ctx context.Context, p *tatarade
 		&corev1.ConfigMap{ObjectMeta: objMeta(ns, n.Memory)},
 		&appsv1.Deployment{ObjectMeta: objMeta(ns, n.Lightrag)},
 		&corev1.Service{ObjectMeta: objMeta(ns, n.Lightrag)},
+		// ---------------------------------------------------------------------
+		// DELIBERATE ASYMMETRY - DO NOT "FIX" THIS INTO CONSISTENCY.
+		//
+		// The lightrag PVC is DELETED on disable. Its data removal is an EXPLICIT,
+		// APPROVED owner decision, not an oversight and not a copy-paste slip.
+		//
+		// The other three volumes of this stack - the cnpg PGDATA and WAL PVCs and
+		// the neo4j PVC - are RETAINED, deliberately and by the same decision (see
+		// retainMemoryData). That approval covered lightrag ONLY; the postgres
+		// corpus and the graph must stay recoverable.
+		//
+		// So there are two wrong "cleanups" here, and both destroy the intent:
+		// deleting all four (loses the corpus and the graph, unrecoverably - there
+		// is no automatic restore path), or retaining all four (contradicts the
+		// approved removal). If you are about to make these four consistent with
+		// each other, stop and re-read this comment.
+		//
+		// Deleted explicitly rather than left to cascade: it carries a Project
+		// ownerRef, and the Project is NOT being deleted here, so nothing would
+		// collect it. Re-enabling simply provisions a fresh, empty volume - the
+		// lightrag index is derived data, rebuildable by re-ingesting.
+		// ---------------------------------------------------------------------
+		&corev1.PersistentVolumeClaim{ObjectMeta: objMeta(ns, n.LightragPVC)},
 		&appsv1.StatefulSet{ObjectMeta: objMeta(ns, n.Neo4j)},
 		&corev1.Service{ObjectMeta: objMeta(ns, n.Neo4j)},
 		// The ingress is named after the Project, not the mem-* family.
@@ -154,6 +183,12 @@ func memoryDeleteTolerable(err error) bool {
 // not called automatically by anything. So an unhandled cascade here is
 // unrecoverable loss, not an inconvenience.
 //
+// EXACTLY ONE volume is excluded: the lightrag PVC, whose data removal on
+// disable is an explicit owner decision. It is skipped here and deleted in
+// tearDownMemoryStack instead - read the block comment at that deletion site
+// before changing either side. This asymmetry is intentional in BOTH
+// directions: lightrag goes, postgres and neo4j stay.
+//
 // Two things are done to each retained object:
 //
 //   - ALL ownerReferences are stripped, not only the Project's. The cnpg PVCs
@@ -189,6 +224,12 @@ func (r *ProjectReconciler) retainMemoryData(ctx context.Context, p *tataradevv1
 	}
 	for i := range pvcs.Items {
 		pvc := &pvcs.Items[i]
+		// The one approved deletion. It carries the tatara.dev/project label and
+		// would otherwise match the first clause below, so it must be excluded
+		// BEFORE the match, not after.
+		if pvc.Name == n.LightragPVC {
+			continue
+		}
 		if pvc.Labels[memory.ProjectLabel] != p.Name &&
 			pvc.Labels[cnpgClusterLabel] != n.PGCluster &&
 			!strings.HasPrefix(pvc.Name, neo4jPVCPrefix) {
