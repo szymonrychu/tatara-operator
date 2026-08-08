@@ -1187,7 +1187,12 @@ func TestNoStampsIsClock1(t *testing.T) {
 // CLAIM.
 func tsReviewTaskWithOutcome(reason string, recreations int, at time.Time) *tatarav1alpha1.Task {
 	stamp := metav1.NewTime(at)
-	task := tsTask("rev", "review", tatarav1alpha1.StateAwaitingReview, at)
+	// The Task reached awaiting-review BEFORE its review agent committed, because
+	// a review pod has to be scheduled, booted and run in between. Modelling the
+	// entry and the commit at the same instant made the fixture describe the one
+	// shape that means the opposite thing - an outcome written in the same etcd
+	// write as the entry it CAUSED, which is not a handoff at all (#547).
+	task := tsTask("rev", "review", tatarav1alpha1.StateAwaitingReview, at.Add(-time.Minute))
 	task.Status.PodStartedAt = &stamp
 	task.Status.StateWorkStartedAt = &stamp
 	task.Status.Stats.PodRecreations = recreations
@@ -1374,6 +1379,9 @@ func TestReviewTask_CommittedOutcomePlusLostPodReachesAwaitingHuman(t *testing.T
 	ctx := context.Background()
 	now := time.Unix(1000, 0)
 	stamp := metav1.NewTime(now.Add(-time.Minute))
+	// Entered awaiting-review BEFORE the review agent committed: a commit sharing
+	// the entry's instant is the transition's OWN outcome, not a handoff (#547).
+	entered := metav1.NewTime(now.Add(-2 * time.Minute))
 
 	proj := tsProject(3)
 	repo := mdRepo("tatara-agent-skills")
@@ -1383,7 +1391,7 @@ func TestReviewTask_CommittedOutcomePlusLostPodReachesAwaitingHuman(t *testing.T
 		Status: tatarav1alpha1.TaskStatus{
 			State:              tatarav1alpha1.StateAwaitingReview,
 			AgentKind:          "review",
-			StateEnteredAt:     &stamp,
+			StateEnteredAt:     &entered,
 			PodStartedAt:       &stamp,
 			StateWorkStartedAt: &stamp,
 			// podRuns=5 => 4 recreations => 4 > 3 => failed(pod-recreation-exhausted)
@@ -1922,6 +1930,105 @@ func TestReconcile_CommittedOutcomeWithNoDrainParksHandoffStalled(t *testing.T) 
 		if got.Status.ParkReason != stage.ReasonHandoffStalled {
 			t.Fatalf("reason = %q, want handoff-stalled: the 5m handoff deadline must fire first",
 				got.Status.ParkReason)
+		}
+	})
+}
+
+// #547: the outcome that CAUSED the transition is not the new state's handoff.
+//
+// AgentKindFor returns the SAME agent for refined and under-implementation once
+// clarify folded into implement (#521), so the OutcomeAccepted{Reason=Implement}
+// that /outcome writes on the approval edge names the agent of the state it
+// lands in. Both stamps come from that one write and metav1.Time is
+// second-granular, so they are EQUAL and the strict Before() occupancy guard
+// let it through: every approved implement Task had its implementation turn
+// suppressed by B2 and parked handoff-stalled 5m later, recoverable only by a
+// human comment. Two of two approvals in the 24h after v2.0.1 hit it
+// (mtg-decks#18, tatara-operator#529).
+func TestReconcile_TheOutcomeThatCausedTheTransitionIsNotTheNewStatesHandoff(t *testing.T) {
+	base := time.Unix(1000, 0)
+
+	// tsApprovedImplementTask is the exact post-approval shape: under-implementation,
+	// entered by the same /outcome write that stamped the commit, no pod yet.
+	tsApprovedImplementTask := func(condAt time.Time) *tatarav1alpha1.Task {
+		task := tsTask("appr", stage.AgentImplement,
+			tatarav1alpha1.StateUnderImplementation, base)
+		task.Status.Conditions = []metav1.Condition{{
+			Type:               tatarav1alpha1.ConditionOutcomeAccepted,
+			Status:             metav1.ConditionTrue,
+			Reason:             tatarav1alpha1.OutcomeReasonFor(stage.AgentImplement),
+			Message:            "fp",
+			LastTransitionTime: metav1.NewTime(condAt),
+		}}
+		return task
+	}
+
+	tsImplementReconciler := func(t *testing.T, proj *tatarav1alpha1.Project,
+		task *tatarav1alpha1.Task) *TaskReconciler {
+		t.Helper()
+		readySince := metav1.NewTime(base.Add(-time.Hour))
+		proj.Status.Memory.ReadySince = &readySince
+		r := tsReconciler(newMirrorClient(t, proj, mdSecret(), task))
+		r.PodConfig = agent.PodConfig{
+			Namespace:           mdNS,
+			AnthropicSecretName: "anthropic",
+			CLIOIDCSecretName:   "cli-oidc",
+		}
+		return r
+	}
+
+	// The regression itself: commit and entry stamped in the SAME write.
+	t.Run("a commit stamped AT stateEnteredAt never arms the handoff deadline", func(t *testing.T) {
+		proj := tsProject(3)
+		task := tsApprovedImplementTask(base)
+		r := tsImplementReconciler(t, proj, task)
+
+		got := tsReconcile(t, r, proj, task, base.Add(tatarav1alpha1.HandoffDeadline+time.Second))
+
+		if got.Status.ParkReason == stage.ReasonHandoffStalled {
+			t.Fatalf("reason = handoff-stalled: the approval that CAUSED under-implementation is not that state's handoff")
+		}
+		if got.Status.State != tatarav1alpha1.StateUnderImplementation {
+			t.Fatalf("state = %q(%s), want under-implementation: the approved Task must stay and work",
+				got.Status.State, got.Status.ParkReason)
+		}
+	})
+
+	// The B2 pod suppression rides the same predicate, and it is what actually
+	// cost the delivery: for the whole 5m before the park, ensureStagePod
+	// refused to spawn the implement pod that was supposed to write the code.
+	t.Run("the implement pod still spawns", func(t *testing.T) {
+		proj := tsProject(3)
+		task := tsApprovedImplementTask(base)
+		r := tsImplementReconciler(t, proj, task)
+
+		if _, err := r.reconcileStage(context.Background(), proj, task, base.Add(time.Second)); err != nil {
+			t.Fatalf("reconcileStage: %v", err)
+		}
+
+		var pods corev1.PodList
+		if err := r.List(context.Background(), &pods, client.InNamespace(mdNS)); err != nil {
+			t.Fatalf("list pods: %v", err)
+		}
+		if len(pods.Items) != 1 {
+			t.Fatalf("pods = %d, want 1: the approved Task's own implement pod must spawn", len(pods.Items))
+		}
+	})
+
+	// The structural half of the fix, independent of any stamp ordering:
+	// under-implementation has no deferred second reconciler to wait on, so it
+	// can never hold an outstanding handoff even when the commit is genuinely
+	// later than the entry.
+	t.Run("no state but awaiting-review can hold an outstanding handoff", func(t *testing.T) {
+		proj := tsProject(3)
+		task := tsApprovedImplementTask(base.Add(time.Minute))
+		r := tsImplementReconciler(t, proj, task)
+
+		got := tsReconcile(t, r, proj, task,
+			base.Add(time.Minute+tatarav1alpha1.HandoffDeadline+time.Second))
+
+		if got.Status.ParkReason == stage.ReasonHandoffStalled {
+			t.Fatalf("reason = handoff-stalled: only awaiting-review defers its advance to a second reconciler")
 		}
 	})
 }
