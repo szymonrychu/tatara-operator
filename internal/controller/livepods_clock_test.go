@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/agent"
 )
 
 // reconcileClocks must substitute the project's scm.conversationIdleMinutes for
@@ -29,6 +30,14 @@ func TestReconcileClocksUsesTheProjectIdleBudget(t *testing.T) {
 		task.Status.StateWorkStartedAt = &metav1.Time{Time: time.Now().Add(-10 * time.Minute)}
 		lastEvent := metav1.NewTime(time.Now().Add(-6 * time.Minute))
 		task.Status.ConversationLastEventAt = &lastEvent
+		// The agent DID hand off, so this is a genuine human gate. Without an
+		// agent-authored handoff note the idle exit re-arms for a replacement pod
+		// instead of parking - nothing was asked, so awaiting-human would wait on a
+		// reply nobody owes (#527 follow-up, livepods.liveHandoffAndPark).
+		task.Status.Notes = []tatarav1alpha1.Note{{
+			At: metav1.Now(), Agent: "implement", Kind: agent.NoteKindHandoff,
+			Body: "blocked on which auth mode you want; see the two options above",
+		}}
 
 		c := newMirrorClient(t, proj, mdSecret(), task)
 		r := tsReconciler(c)

@@ -741,6 +741,33 @@ type TaskStatus struct {
 	// set on reconcile so `kubectl get task` is scannable without describe.
 	// +optional
 	ShortDescription string `json:"shortDescription,omitempty"`
+	// LastTurnFinalText and LastTurnPushedRepos are THE LAST TURN'S CONTINUATION
+	// STATE, and they exist for exactly one reader: the G.7 synthetic handoff
+	// note (agent.TTLStopper.writeSyntheticNote).
+	//
+	// Both values arrive on every turn-complete callback
+	// (turnCompletePayload.FinalText / .PushedRepos) and neither was persisted
+	// anywhere, so ttlStop had nothing to build the note FROM and every synthetic
+	// note ever written read exactly "TTL stop. Last turn's final text: (none).
+	// Repos pushed: none." Dozens of those were confirmed in-cluster (#527): the
+	// non-empty-notes invariant held syntactically and was worthless
+	// semantically, and every TTL stop silently reset its Task's continuation
+	// state, re-ran turn-0 and re-charged maxTurnsPerTask.
+	//
+	// LastTurnFinalText is truncated to the Note.Body budget on the way in: it can
+	// only ever be RENDERED into a note, so retaining more than a note can hold
+	// buys nothing and spends the A.7 object budget.
+	//
+	// LastTurnPushedRepos is OVERWRITTEN on every turn, including with an empty
+	// list. That is the point of retaining pushedRepos on the wire at all (G.2):
+	// "the agent pushed nothing this turn" and "the agent pushed tatara-operator
+	// two turns ago" must not render as the same note.
+	// +optional
+	// +kubebuilder:validation:MaxLength=4096
+	LastTurnFinalText string `json:"lastTurnFinalText,omitempty"`
+	// +optional
+	// +kubebuilder:validation:MaxItems=20
+	LastTurnPushedRepos []string `json:"lastTurnPushedRepos,omitempty"`
 }
 
 // +kubebuilder:object:root=true
