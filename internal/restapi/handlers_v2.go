@@ -71,11 +71,17 @@ type NoteFetcher interface {
 // A nil verifier FAILS CLOSED: decision=implement then parks the Task at
 // identity-unverified rather than granting an unverified mandate.
 type ApprovalVerifier interface {
-	// VerifyApproval reports whether iss carries a valid human approval that the
-	// supplied citations resolve to, and the single-use evidence that proves it.
-	VerifyApproval(ctx context.Context, proj *tatarav1alpha1.Project,
+	// VerifyApprovalDeclared reports whether iss carries a valid human approval
+	// that the supplied citations resolve to, and the single-use evidence that
+	// proves it. declared is the agent's approvingMaintainer, a BOUND
+	// CROSS-CHECK and never a second authority: empty means the auto-approve
+	// path and the two declared-approver refusals are skipped entirely.
+	//
+	// The third return is the refusal REASON, so the gate's 200 body can name
+	// which of the eight conditions refused instead of shrugging.
+	VerifyApprovalDeclared(ctx context.Context, proj *tatarav1alpha1.Project,
 		iss *tatarav1alpha1.Issue,
-		citations []tatarav1alpha1.ApprovalCitation) (*tatarav1alpha1.ApprovalEvidence, bool)
+		citations []tatarav1alpha1.ApprovalCitation, declared string) (*tatarav1alpha1.ApprovalEvidence, bool, string)
 }
 
 // --- shared lookups -------------------------------------------------------
@@ -356,8 +362,8 @@ func (s *Server) postNote(w http.ResponseWriter, r *http.Request) {
 		writeClientErr(w, err)
 		return
 	}
-	if tatarav1alpha1.StageTerminal(task) {
-		writeError(w, http.StatusConflict, "task is in a terminal stage")
+	if tatarav1alpha1.TaskDone(task) || tatarav1alpha1.Parked(task) {
+		writeError(w, http.StatusConflict, "task is done or parked")
 		return
 	}
 	agent := task.Status.AgentKind
@@ -374,6 +380,11 @@ func (s *Server) postNote(w http.ResponseWriter, r *http.Request) {
 		Kind:  req.Kind,
 		Body:  truncateValidUTF8(req.Body, noteBodyMaxBytes),
 	}
+	// THE NOTE ID, and the agent cannot quote a planNoteId it was never given.
+	// It is a pure function of (at, kind, body), so it is derivable from the note
+	// alone and CHANGES when the body changes - which is exactly what the
+	// approval gate's plan pin needs.
+	note.ID = tatarav1alpha1.NewNoteID(note.At, note.Kind, note.Body)
 
 	spiller := s.spillerForOrNil(proj)
 
@@ -415,6 +426,7 @@ func (s *Server) postNote(w http.ResponseWriter, r *http.Request) {
 			t.Status.Stats.NotesSpilled += drop
 			t.Status.Stats.NotesSpilledRefs = append(t.Status.Stats.NotesSpilledRefs, trackID)
 		}
+		t.Status.PinnedPlanNoteID = pinnedPlanNoteID(t)
 	})
 	if errors.Is(err, objbudget.ErrObjectTooLarge) {
 		// The ONE way this write can still fail (fix L32). It does not 409 the
@@ -442,9 +454,39 @@ func (s *Server) postNote(w http.ResponseWriter, r *http.Request) {
 	}
 	s.log.InfoContext(ctx, "restapi: note appended",
 		append(reqLogFields(r), "action", "task_note", "task", task.Name,
-			"agent_kind", agent, "note_kind", req.Kind, "spilled", spillN)...)
-	writeJSON(w, http.StatusCreated, toTaskDTO(*fresh))
+			"agent_kind", agent, "note_kind", req.Kind, "note_id", note.ID, "spilled", spillN)...)
+	writeJSON(w, http.StatusCreated, noteCreatedDTO{NoteID: note.ID, Task: toTaskDTO(*fresh)})
 }
+
+// noteCreatedDTO is postNote's response. It carries the Task as before PLUS the
+// id of the note just written: the approval gate requires a planNoteId, and an
+// agent cannot quote back an id it was never given.
+type noteCreatedDTO struct {
+	NoteID string  `json:"noteId"`
+	Task   TaskDTO `json:"task"`
+}
+
+// pinnedPlanNoteID is the NEWEST plan note's id, re-derived on every note write.
+//
+// THE SPILL IS WHY IT EXISTS. status.notes is capped at 50 with drop-oldest and
+// the evicted batch goes to tatara-memory, so a long-running Task can spill the
+// very plan note the gate pinned - and findNote would then refuse a legitimate
+// submit with plan-note-missing. The id is kept here, on the status, so the
+// gate's re-check survives the spill even though the body does not; a plan whose
+// body has been spilled cannot be re-hashed, which is exactly why the pin is
+// stored on the ApprovalEvidence at grant rather than recomputed at submit.
+func pinnedPlanNoteID(t *tatarav1alpha1.Task) string {
+	for i := len(t.Status.Notes) - 1; i >= 0; i-- {
+		if t.Status.Notes[i].Kind == planNoteKind {
+			return t.Status.Notes[i].ID
+		}
+	}
+	return t.Status.PinnedPlanNoteID
+}
+
+// planNoteKind is the note kind the approval gate's plan pin is taken over. It
+// is one of the three postNote accepts, and the only one the pin will hash.
+const planNoteKind = "plan"
 
 // --- 9/10/11. the MIRROR reads. ZERO forge requests. ----------------------
 

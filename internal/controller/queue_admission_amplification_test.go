@@ -150,7 +150,7 @@ func TestBlockedAdmission_ReleasedSlotAdmitsImmediately(t *testing.T) {
 	if !ok {
 		t.Fatalf("minted task %q not found", admittedFirst.Status.TaskRef)
 	}
-	task.Status.Stage = tatarav1alpha1.StageDelivered
+	task.Status.State = tatarav1alpha1.StateDone
 	mustStatusUpdate(t, ctx, task)
 
 	// mapTaskToQE routes that Task change back to the QueuedEvent it was

@@ -58,7 +58,7 @@ func TestPostNote_SpillerFor_PerProjectEvictionNoPanic(t *testing.T) {
 				return spillers[proj.Name]
 			}
 
-			task := taskV2("t1", tc.project, "implement", tatarav1alpha1.StageImplementing, "implement")
+			task := taskV2("t1", tc.project, "implement", tatarav1alpha1.StateUnderImplementation, "implement")
 			// 45 notes * ~20KB = ~900KB, already over the 800,000-byte
 			// ObjectByteBudget before the handler's own note is appended, and
 			// well under the 50-note cap so postNote's pre-spill gate never
@@ -119,7 +119,7 @@ func TestTaskContext_MemoryFor_PerProjectRehydrate(t *testing.T) {
 			require.NoError(t, err)
 			memories[tc.project].byTrack["track-1"] = spilled
 
-			task := taskV2("t1", tc.project, "clarify", tatarav1alpha1.StageImplementing, "implement")
+			task := taskV2("t1", tc.project, "clarify", tatarav1alpha1.StateUnderImplementation, "implement")
 			task.Status.Notes = []tatarav1alpha1.Note{
 				{At: metav1.NewTime(frozenNow), Agent: "implement", Kind: "handoff", Body: "LIVE-NOTE"},
 			}

@@ -11,9 +11,11 @@ func TestRequiredSkillsForKind(t *testing.T) {
 		kind string
 		want []string
 	}{
-		{"implement", []string{"tatara-implement-workflow", "test-driven-development"}},
+		// #521: implement is the MERGED kind (clarify's gate + the code), so it
+		// now also carries tatara-implement-gate. clarify itself is gone: the
+		// spec.kind CRD enum no longer has it (api/v1alpha1/task_types.go).
+		{"implement", []string{"tatara-implement-gate", "tatara-implement-workflow", "test-driven-development"}},
 		{"review", []string{"tatara-review-checklist"}},
-		{"clarify", []string{"tatara-clarify-conversation"}},
 		{"triageIssue", nil}, // retired kind -> no skills
 		{"brainstorm", []string{"tatara-brainstorm-guardrails"}},
 		{"issueLifecycle", nil}, // retired kind -> no skills
@@ -67,7 +69,7 @@ func TestSkillsDirective_RequiredWording(t *testing.T) {
 
 // TestSkillsDirective_ConsultWording asserts advisory "Consult" wording for REFERENCE kinds.
 func TestSkillsDirective_ConsultWording(t *testing.T) {
-	for _, kind := range []string{"brainstorm", "clarify"} {
+	for _, kind := range []string{"brainstorm"} {
 		t.Run(kind, func(t *testing.T) {
 			d := skillsDirective(kind)
 			if d == "" {
@@ -104,6 +106,7 @@ func TestSkillsDirective_NamesAppearsInOutput(t *testing.T) {
 		kind  string
 		skill string
 	}{
+		{"implement", "tatara-implement-gate"},
 		{"implement", "tatara-implement-workflow"},
 		{"implement", "test-driven-development"},
 		{"review", "tatara-review-checklist"},

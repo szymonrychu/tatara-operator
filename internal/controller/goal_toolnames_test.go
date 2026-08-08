@@ -29,7 +29,6 @@ func TestGoalBuildersNameOnlyRealTools(t *testing.T) {
 	}
 	for _, kind := range []string{
 		stage.AgentBrainstorm,
-		stage.AgentClarify,
 		stage.AgentIncident,
 		stage.AgentRefine,
 		stage.AgentImplement,

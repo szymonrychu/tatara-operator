@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -56,15 +57,19 @@ func upServer(t *testing.T, cachedClient client.Client, apiReader client.Reader,
 	})
 }
 
-func upTask(name, kind, stageReason string) *tatarav1.Task {
-	return &tatarav1.Task{
+// upTask builds a Task fixture already parked (via stage.Park) at parkReason,
+// WHERE IT IS - v1alpha1.StateRefined, mirroring the old model's implicit
+// "clarifying"/"reviewing" precursor now that park never moves state.
+func upTask(name, kind, parkReason string) *tatarav1.Task {
+	task := &tatarav1.Task{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: peNS},
 		Spec:       tatarav1.TaskSpec{Kind: kind, ProjectRef: "pe-proj", Goal: "g"},
-		Status: tatarav1.TaskStatus{
-			Stage:       tatarav1.StageParked,
-			StageReason: stageReason,
-		},
+		Status:     tatarav1.TaskStatus{State: tatarav1.StateRefined},
 	}
+	if err := stage.Park(task, parkReason, time.Now()); err != nil {
+		panic(err)
+	}
+	return task
 }
 
 // upLogLines parses each JSON line in buf into a msg->fields map, for a
@@ -103,14 +108,19 @@ func TestDriveCommentUnpark_UsesLiveReadNotCachedGet(t *testing.T) {
 
 	s.driveCommentUnpark(context.Background(), proj, stale)
 
-	// conversing, not bare reviewing: TestDriveCommentUnpark_ParkedAwaitingHuman_OpensConversation
-	// below documents the same F.6 awaiting-human unpark preferring a live
+	// Un-parked, and STILL refined: un-park never moves state under #521 (there
+	// is no separate "conversing" stage to land in any more).
+	// TestDriveCommentUnpark_ParkedAwaitingHuman_OpensConversation below
+	// documents the same F.6 awaiting-human unpark preferring a live
 	// conversation over conversingHasRoom, which this project has by default.
 	// This assertion predates that feature landing.
 	got := getPETask(t, liveClient, stale.Name)
-	if got.Status.Stage != tatarav1.StageConversing {
+	if tatarav1.Parked(got) {
 		t.Fatalf("driveCommentUnpark declined despite a fresh non-bot pendingEvent on the live read; "+
-			"stage=%s(%s), want conversing", got.Status.Stage, got.Status.StageReason)
+			"state=%s(%s), want un-parked", got.Status.State, got.Status.ParkReason)
+	}
+	if got.Status.State != tatarav1.StateRefined {
+		t.Fatalf("state = %q, want unchanged refined", got.Status.State)
 	}
 }
 
@@ -124,7 +134,7 @@ func TestDriveCommentUnpark_UsesLiveReadNotCachedGet(t *testing.T) {
 // feature exists to fix.
 func TestDriveCommentUnpark_ParkedAwaitingHuman_OpensConversation(t *testing.T) {
 	proj := peProject("tatara-bot", "maintainer")
-	task := upTask("t-awaiting-conv", "clarify", stage.ReasonAwaitingHuman)
+	task := upTask("t-awaiting-conv", "implement", stage.ReasonAwaitingHuman)
 	iss := peIssue(7, task) // State=open, Status="new" (unapproved)
 	task.Status.IssueRefs = []string{iss.Name}
 	task.Status.PendingEvents = []tatarav1.TaskEvent{{
@@ -137,10 +147,15 @@ func TestDriveCommentUnpark_ParkedAwaitingHuman_OpensConversation(t *testing.T) 
 
 	s.driveCommentUnpark(context.Background(), proj, task)
 
+	// Un-parked and STILL refined (un-park never moves state under #521) with
+	// its idle clock armed - the live agent conversation this test's name
+	// promises, minus a distinct "conversing" state to name it by.
 	got := getPETask(t, c, task.Name)
-	if got.Status.Stage != tatarav1.StageConversing {
-		t.Fatalf("driveCommentUnpark on an unapproved parked(awaiting-human) Task landed at %s(%s), want conversing",
-			got.Status.Stage, got.Status.StageReason)
+	if tatarav1.Parked(got) {
+		t.Fatalf("driveCommentUnpark on an unapproved parked(awaiting-human) Task stayed parked(%s), want un-parked", got.Status.ParkReason)
+	}
+	if got.Status.State != tatarav1.StateRefined {
+		t.Fatalf("state = %q, want unchanged refined", got.Status.State)
 	}
 	if got.Status.ConversationLastEventAt == nil {
 		t.Fatal("ConversationLastEventAt is nil: the idle clock was never armed, so this conversation would never time out")
@@ -148,7 +163,7 @@ func TestDriveCommentUnpark_ParkedAwaitingHuman_OpensConversation(t *testing.T) 
 }
 
 // The decline path (target=="", err==nil) must log at INFO with the task
-// name and stageReason - a silent decline here is what hid the cache-lag
+// name and park_reason - a silent decline here is what hid the cache-lag
 // race for a full day with zero errors.
 func TestDriveCommentUnpark_DeclineLogsInfo(t *testing.T) {
 	proj := peProject("tatara-bot")
@@ -165,8 +180,8 @@ func TestDriveCommentUnpark_DeclineLogsInfo(t *testing.T) {
 	s.driveCommentUnpark(context.Background(), proj, task)
 
 	got := getPETask(t, c, task.Name)
-	if got.Status.Stage != tatarav1.StageParked {
-		t.Fatalf("bot-only event must not un-park; stage=%s", got.Status.Stage)
+	if !tatarav1.Parked(got) {
+		t.Fatalf("bot-only event must not un-park; parkReason=%q", got.Status.ParkReason)
 	}
 
 	var found map[string]any
@@ -182,7 +197,7 @@ func TestDriveCommentUnpark_DeclineLogsInfo(t *testing.T) {
 	if found["task"] != task.Name {
 		t.Fatalf("decline log missing task=%q: %+v", task.Name, found)
 	}
-	if found["stage_reason"] != stage.ReasonAwaitingHuman {
-		t.Fatalf("decline log missing stage_reason=%q: %+v", stage.ReasonAwaitingHuman, found)
+	if found["park_reason"] != stage.ReasonAwaitingHuman {
+		t.Fatalf("decline log missing park_reason=%q: %+v", stage.ReasonAwaitingHuman, found)
 	}
 }

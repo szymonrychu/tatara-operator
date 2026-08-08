@@ -63,7 +63,7 @@ func mdSuccessfulApply(sha string) scm.WorkflowRun {
 // deployedVersion are stamped ON THE MERGEREQUEST, the Task delivers, and the
 // owned Issue is closed BEFORE deliveredAt is stamped (contract C.4, Section I).
 func TestDeployingStampsDeployedAtAndDelivers(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageDeploying)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateDeployed)
 	mr := mdDeployingMR(task, "tatara-operator", 7)
 	iss := mdIssue(task, "tatara-operator", 41)
 	c := newMirrorClient(t, mdProject(), mdSecret(), mdRepo("tatara-operator"), mdHelmfileRepo(), task, mr, iss)
@@ -99,15 +99,15 @@ func TestDeployingStampsDeployedAtAndDelivers(t *testing.T) {
 		t.Fatalf("closed %d issues, want 1", len(f.closedIssues))
 	}
 	got := mdGetTask(t, c, "t1")
-	if got.Status.Stage != tatarav1alpha1.StageDelivered || got.Status.DeliveredAt == nil {
-		t.Fatalf("stage = %q deliveredAt = %v, want delivered/set", got.Status.Stage, got.Status.DeliveredAt)
+	if got.Status.State != tatarav1alpha1.StateDone || got.Status.DeliveredAt == nil {
+		t.Fatalf("stage = %q deliveredAt = %v, want delivered/set", got.Status.State, got.Status.DeliveredAt)
 	}
 }
 
 // An apply that does NOT carry this MR's version leaves it undeployed: the Task
 // stays in deploying and closes nothing.
 func TestDeployingWaitsForTheApply(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageDeploying)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateDeployed)
 	mrA := mdDeployingMR(task, "tatara-operator", 7)
 	mrB := mdDeployingMR(task, "tatara-cli", 9)
 	iss := mdIssue(task, "tatara-operator", 41)
@@ -140,15 +140,15 @@ func TestDeployingWaitsForTheApply(t *testing.T) {
 	if len(f.closedIssues) != 0 {
 		t.Fatalf("an Issue was closed while an owned MR was still undeployed")
 	}
-	if got := mdGetTask(t, c, "t1"); got.Status.Stage != tatarav1alpha1.StageDeploying || got.Status.DeliveredAt != nil {
-		t.Fatalf("stage = %q deliveredAt = %v, want deploying/nil", got.Status.Stage, got.Status.DeliveredAt)
+	if got := mdGetTask(t, c, "t1"); got.Status.State != tatarav1alpha1.StateDeployed || got.Status.DeliveredAt != nil {
+		t.Fatalf("stage = %q deliveredAt = %v, want deploying/nil", got.Status.State, got.Status.DeliveredAt)
 	}
 }
 
 // A SUCCESSFUL apply that predates the merge proves nothing: it cannot have
 // carried a commit that did not exist when it ran.
 func TestDeployingIgnoresAnApplyThatPredatesTheMerge(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageDeploying)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateDeployed)
 	mr := mdDeployingMR(task, "tatara-operator", 7)
 	c := newMirrorClient(t, mdProject(), mdSecret(), mdRepo("tatara-operator"), mdHelmfileRepo(), task, mr)
 
@@ -174,7 +174,7 @@ func TestDeployingIgnoresAnApplyThatPredatesTheMerge(t *testing.T) {
 // to observe. Waiting for a pin that will never move is a WEDGE: the merge IS
 // the delivery.
 func TestDeployingUnpinnedRepoDeliversOnMerge(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageDeploying)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateDeployed)
 	mr := mdDeployingMR(task, "tatara-documentation", 7)
 	iss := mdIssue(task, "tatara-documentation", 41)
 	c := newMirrorClient(t, mdProject(), mdSecret(), mdRepo("tatara-documentation"), mdHelmfileRepo(), task, mr, iss)
@@ -190,8 +190,8 @@ func TestDeployingUnpinnedRepoDeliversOnMerge(t *testing.T) {
 	if mdGetMR(t, c, mr.Name).Status.DeployedAt == nil {
 		t.Fatalf("a repo carrying no helmfile pin must deliver on merge, not wedge at deploying")
 	}
-	if got := mdGetTask(t, c, "t1"); got.Status.Stage != tatarav1alpha1.StageDelivered {
-		t.Fatalf("stage = %q, want delivered", got.Status.Stage)
+	if got := mdGetTask(t, c, "t1"); got.Status.State != tatarav1alpha1.StateDone {
+		t.Fatalf("stage = %q, want delivered", got.Status.State)
 	}
 }
 
@@ -202,7 +202,7 @@ type mdPlainReader struct{ scm.SCMReader }
 // An unobservable cascade fails OPEN. The alternative is that every Task on a
 // non-GitHub project wedges at deploying forever.
 func TestDeployingWithoutADeployWatcherDeliversOnMerge(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageDeploying)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateDeployed)
 	mr := mdDeployingMR(task, "tatara-operator", 7)
 	c := newMirrorClient(t, mdProject(), mdSecret(), mdRepo("tatara-operator"), mdHelmfileRepo(), task, mr)
 
@@ -215,14 +215,14 @@ func TestDeployingWithoutADeployWatcherDeliversOnMerge(t *testing.T) {
 	if mdGetMR(t, c, mr.Name).Status.DeployedAt == nil {
 		t.Fatalf("an unobservable cascade must fail OPEN: merge is delivery")
 	}
-	if got := mdGetTask(t, c, "t1"); got.Status.Stage != tatarav1alpha1.StageDelivered {
-		t.Fatalf("stage = %q, want delivered", got.Status.Stage)
+	if got := mdGetTask(t, c, "t1"); got.Status.State != tatarav1alpha1.StateDone {
+		t.Fatalf("stage = %q, want delivered", got.Status.State)
 	}
 }
 
 // A Task in deploying that owns an UNMERGED MR never delivers.
 func TestDeployingNeverDeliversAnUnmergedMR(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageDeploying)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateDeployed)
 	mr := mdMR(task, "tatara-operator", 7) // open, not merged
 	c := newMirrorClient(t, mdProject(), mdSecret(), mdRepo("tatara-operator"), mdHelmfileRepo(), task, mr)
 
@@ -234,8 +234,8 @@ func TestDeployingNeverDeliversAnUnmergedMR(t *testing.T) {
 	if mdGetMR(t, c, mr.Name).Status.DeployedAt != nil {
 		t.Fatalf("an UNMERGED MR must never be stamped deployed")
 	}
-	if got := mdGetTask(t, c, "t1"); got.Status.Stage != tatarav1alpha1.StageDeploying {
-		t.Fatalf("stage = %q, want deploying", got.Status.Stage)
+	if got := mdGetTask(t, c, "t1"); got.Status.State != tatarav1alpha1.StateDeployed {
+		t.Fatalf("stage = %q, want deploying", got.Status.State)
 	}
 }
 
@@ -308,8 +308,8 @@ func oneLoggedAction(t *testing.T, entries []kvLogEntry, want string) kvLogEntry
 // line must say WHY it is still pending: the count alone does not distinguish an
 // apply that never went green (issue #513) from a pin that is merely behind.
 func TestDeployingLogsWaitingWithThePendingMRs(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageDeploying)
-	task.Status.StageEnteredAt = &mdMergedAt // 11:00; mdNewDriver's clock is 12:00
+	task := mdTask("t1", "implement", tatarav1alpha1.StateDeployed)
+	task.Status.StateEnteredAt = &mdMergedAt // 11:00; mdNewDriver's clock is 12:00
 	// A deploy-timeout un-park already folded 2h into the carry. stalled_seconds
 	// must ADD it, not report the bare hour since this entry - without a non-zero
 	// carry here the assertion below passes identically for an UN-adjusted reading.
@@ -362,8 +362,8 @@ func TestDeployingLogsWaitingWithThePendingMRs(t *testing.T) {
 // pending count says an MR is not deployed, it never said the apply is the thing
 // that is broken.
 func TestDeployingLogsWaitingWhenNoApplyRunWentGreen(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageDeploying)
-	task.Status.StageEnteredAt = &mdMergedAt
+	task := mdTask("t1", "implement", tatarav1alpha1.StateDeployed)
+	task.Status.StateEnteredAt = &mdMergedAt
 	mr := mdDeployingMR(task, "tatara-operator", 7)
 	c := newMirrorClient(t, mdProject(), mdSecret(), mdRepo("tatara-operator"), mdHelmfileRepo(), task, mr)
 
@@ -390,8 +390,8 @@ func TestDeployingLogsWaitingWhenNoApplyRunWentGreen(t *testing.T) {
 // THE EMPTY SET (C.4) is the silent wedge that ends at parked(deploy-timeout)
 // with no explanation at all: it must say that it owns none.
 func TestDeployingLogsWaitingWhenItOwnsNoMergeRequests(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageDeploying)
-	task.Status.StageEnteredAt = &mdMergedAt
+	task := mdTask("t1", "implement", tatarav1alpha1.StateDeployed)
+	task.Status.StateEnteredAt = &mdMergedAt
 	c := newMirrorClient(t, mdProject(), mdSecret(), mdRepo("tatara-operator"), mdHelmfileRepo(), task)
 
 	d := mdNewDriver(t, newFakeForge(t), c)

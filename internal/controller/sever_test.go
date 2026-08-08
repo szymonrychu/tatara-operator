@@ -14,19 +14,28 @@ import (
 )
 
 // severTask builds a Task carrying issName in Status.IssueRefs at the given
-// stage/reason.
-func severTask(stg, reason string, issRefs ...string) *tatarav1alpha1.Task {
-	return &tatarav1alpha1.Task{
+// state, with reason on whichever field state implies: status.stateReason for
+// done/rejected, status.parkReason otherwise.
+func severTask(state, reason string, issRefs ...string) *tatarav1alpha1.Task {
+	t := &tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{Name: "t-1", Namespace: testNS},
 		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "proj"},
-		Status:     tatarav1alpha1.TaskStatus{Stage: stg, StageReason: reason, IssueRefs: issRefs},
+		Status:     tatarav1alpha1.TaskStatus{State: state, IssueRefs: issRefs},
 	}
+	if reason != "" {
+		if state == tatarav1alpha1.StateDone || state == tatarav1alpha1.StateRejected {
+			t.Status.StateReason = reason
+		} else {
+			t.Status.ParkReason = reason
+		}
+	}
+	return t
 }
 
 func TestSeverIssueFromTask_DeleteCR_LeavesNoCRAndNoRef(t *testing.T) {
 	ctx := context.Background()
 	issName := tatarav1alpha1.IssueName("tatara-operator", 1)
-	task := severTask(tatarav1alpha1.StageRejected, "issue-closed", issName)
+	task := severTask(tatarav1alpha1.StateRejected, "issue-closed", issName)
 	iss := ownedIssue(issName, 1, task, tatarav1alpha1.IssueStatus{State: "closed"})
 	c := newMirrorClient(t, task, iss)
 
@@ -43,7 +52,7 @@ func TestSeverIssueFromTask_DeleteCR_LeavesNoCRAndNoRef(t *testing.T) {
 func TestSeverIssueFromTask_Orphan_LeavesOwnerlessCRNoParkedLabel(t *testing.T) {
 	ctx := context.Background()
 	issName := tatarav1alpha1.IssueName("tatara-operator", 2)
-	task := severTask(tatarav1alpha1.StageParked, "review-loop-exhausted", issName)
+	task := severTask(tatarav1alpha1.StateAwaitingReview, "review-loop-exhausted", issName)
 	iss := ownedIssue(issName, 2, task, tatarav1alpha1.IssueStatus{
 		State: "open", Labels: []string{TataraParkedLabel, "bug"},
 	})
@@ -68,7 +77,7 @@ func TestSeverIssueFromTask_CrashBetweenStepsBenign(t *testing.T) {
 	ctx := context.Background()
 	issName := tatarav1alpha1.IssueName("tatara-operator", 3)
 	// Crash state: the Task no longer lists the issue, but the CR is still owned.
-	task := severTask(tatarav1alpha1.StageRejected, "issue-closed")
+	task := severTask(tatarav1alpha1.StateRejected, "issue-closed")
 	iss := ownedIssue(issName, 3, task, tatarav1alpha1.IssueStatus{State: "closed"})
 	c := newMirrorClient(t, task, iss)
 
@@ -91,7 +100,7 @@ func TestSeverIssueFromTask_CrashBetweenStepsBenign(t *testing.T) {
 func TestSeverIssueFromTask_Orphan_HandsOverToSurvivingOwner(t *testing.T) {
 	ctx := context.Background()
 	issName := tatarav1alpha1.IssueName("tatara-operator", 5)
-	taskA := severTask(tatarav1alpha1.StageParked, "review-loop-exhausted", issName)
+	taskA := severTask(tatarav1alpha1.StateAwaitingReview, "review-loop-exhausted", issName)
 	taskB := &tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{Name: "t-2", Namespace: testNS},
 		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "proj"},
@@ -118,7 +127,7 @@ func TestSeverIssueFromTask_Orphan_HandsOverToSurvivingOwner(t *testing.T) {
 func TestSeverIssueFromTask_Idempotent(t *testing.T) {
 	ctx := context.Background()
 	issName := tatarav1alpha1.IssueName("tatara-operator", 4)
-	task := severTask(tatarav1alpha1.StageRejected, "issue-closed", issName)
+	task := severTask(tatarav1alpha1.StateRejected, "issue-closed", issName)
 	iss := ownedIssue(issName, 4, task, tatarav1alpha1.IssueStatus{State: "closed"})
 	c := newMirrorClient(t, task, iss)
 

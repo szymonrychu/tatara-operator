@@ -266,7 +266,7 @@ func TestEnqueueEvent_DedupGatedByTaskTerminalState(t *testing.T) {
 	task, err := BuildTaskFromQueuedEvent(qe, proj, c.Scheme())
 	require.NoError(t, err)
 	require.NoError(t, c.Create(context.Background(), task))
-	task.Status.Stage = tatarav1alpha1.StageInvestigating
+	task.Status.State = tatarav1alpha1.StateRefined
 	require.NoError(t, c.Status().Update(context.Background(), task))
 	require.NoError(t, c.Delete(context.Background(), qe))
 
@@ -275,8 +275,10 @@ func TestEnqueueEvent_DedupGatedByTaskTerminalState(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, created2, "dedup while incident Task non-terminal")
 
-	// Mark the Task terminal; third firing -> fresh event created.
-	task.Status.Stage = tatarav1alpha1.StageFailed
+	// Mark the Task terminal; third firing -> fresh event created. TaskDone is
+	// EXACTLY state in {done, rejected} post-#521 - a park does NOT count, so
+	// this must be a real terminal state, not the deleted `failed` stage.
+	task.Status.State = tatarav1alpha1.StateRejected
 	require.NoError(t, c.Status().Update(context.Background(), task))
 	_, created3, err := EnqueueEvent(context.Background(), c, seq, proj, tatarav1alpha1.QueueClassAlert, false, "rulehash", pay)
 	require.NoError(t, err)
@@ -385,7 +387,7 @@ func TestDedupExists_LiveTaskSuppresses(t *testing.T) {
 		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: proj},
 	}
 	require.NoError(t, c.Create(context.Background(), task))
-	task.Status.Stage = tatarav1alpha1.StageInvestigating
+	task.Status.State = tatarav1alpha1.StateRefined
 	require.NoError(t, c.Status().Update(context.Background(), task))
 
 	got, err := dedupExists(context.Background(), c, ns, proj, key, true)

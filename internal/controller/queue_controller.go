@@ -212,22 +212,38 @@ func (r *DispatcherReconciler) mintedTask(ctx context.Context, q *tatarav1alpha1
 	return found, nil
 }
 
-// queueTaskDone reports whether a Task's work is over: a closed-set terminal
-// (rejected/failed/parked) or delivered. A parked(backlog-sweep) Task runs no
-// pod at all and must not eat the pool; delivered is quasi-terminal (the reaper
-// collects it at 48h) and runs no pod either.
+// queueTaskDone reports whether a Task's work is over. It is exactly
+// TaskDone - {done, rejected} - and NOT parked: #521 stopped folding parked in,
+// and a parked Task keeps its QueuedEvent because it re-acquires a slot when it
+// un-parks.
 func queueTaskDone(t *tatarav1alpha1.Task) bool {
 	return tatarav1alpha1.TaskDone(t)
 }
 
-// queueTaskHoldsSlot reports whether a Task still occupies a pod slot. A
-// POD-LESS stage (triaging/approved/merging/deploying) is not done but runs no
-// agent, so it holds no slot: counting it re-creates the lane-starvation trap
-// (operator-laneoccupancy-starves-recovery-2026-06-15). It is NOT treated as
-// done, though - it re-acquires a slot at its next pod stage - so its
-// QueuedEvent is kept, not GC'd.
+// queueTaskHoldsSlot reports whether a Task still occupies a pod slot.
+//
+// THREE exclusions, and the third is new with #521. An OPERATOR-DRIVEN state
+// (merged/deployed) runs no agent, and neither does `new` (operator triage,
+// which leaves immediately) - counting them re-creates the lane-starvation trap
+// (operator-laneoccupancy-starves-recovery-2026-06-15). And a PARKED Task runs
+// no pod at all: park is what takes the pod down. It is NOT treated as done,
+// though - it re-acquires a slot when it un-parks - so its QueuedEvent is kept,
+// not GC'd.
 func queueTaskHoldsSlot(t *tatarav1alpha1.Task) bool {
-	return !queueTaskDone(t) && !tatarav1alpha1.StagePodless(t.Status.Stage)
+	if queueTaskDone(t) || tatarav1alpha1.Parked(t) {
+		return false
+	}
+	// A Task whose CREATE EDGE HAS NOT RUN YET (state == "") is mid-mint and
+	// will land on a pod state within one reconcile. It holds the lane its own
+	// mint admission reserved, and dropping it over-admits the pool by exactly
+	// the number of in-flight mints - the shape that saturated the pool before
+	// the queue existed. The old predicate got this free from
+	// StagePodless(""), which was false; stage.Live("") is false, so it has to
+	// be explicit.
+	if t.Status.State == "" {
+		return true
+	}
+	return stage.Live(t.Status.State)
 }
 
 // ticketSpent reports whether an Admitted QueuedEvent's pod slot is spent
@@ -248,22 +264,22 @@ func queueTaskHoldsSlot(t *tatarav1alpha1.Task) bool {
 func ticketSpent(q *tatarav1alpha1.QueuedEvent, t *tatarav1alpha1.Task) bool {
 	want := q.Spec.Payload.AgentKind
 	if want == "" {
-		switch t.Status.Stage {
-		case "", tatarav1alpha1.StageTriaging:
+		switch t.Status.State {
+		case "", tatarav1alpha1.StateNew:
 			return false // still bootstrapping; the mint holds the lane
 		default:
-			return true // in the stage machine; the per-stage ticket accounts for the slot
+			return true // in the state machine; the per-state ticket accounts for the slot
 		}
 	}
-	if cur := stage.AgentKindFor(t.Status.Stage); cur != "" {
+	if cur := stage.AgentKindFor(t.Status.State, t.Spec.Kind); cur != "" {
 		return cur != want
 	}
-	// Pod-less. triaging is PRE-pod (the ticket it enqueues is for the NEXT
-	// stage's pod, F.2) and approved is the implement admission gate itself; an
-	// unstamped stage is a Task the stage machine has not touched yet. Every
-	// other pod-less stage is POST-pod: the ticket is spent.
-	switch t.Status.Stage {
-	case "", tatarav1alpha1.StageTriaging, tatarav1alpha1.StageApproved:
+	// The state runs no agent. `new` is PRE-pod (the ticket it enqueues is for
+	// the NEXT state's pod) and an unstamped state is a Task the machine has not
+	// touched yet. merged/deployed/done/rejected are all POST-pod: the ticket is
+	// spent.
+	switch t.Status.State {
+	case "", tatarav1alpha1.StateNew:
 		return false
 	default:
 		return true
@@ -613,30 +629,30 @@ func (r *DispatcherReconciler) admitTicket(ctx context.Context, q *tatarav1alpha
 		return "", ticketDropped, r.dropTicket(ctx, q, "task_terminal")
 	}
 
-	from := task.Status.Stage
-	target := from
-	if stage.AgentKindFor(from) == "" {
+	from := task.Status.State
+	if stage.AgentKindFor(from, task.Spec.Kind) == "" {
 		switch from {
-		case "", tatarav1alpha1.StageTriaging:
-			// Not at a pod stage yet: triaging is pure operator work and picks the
-			// next stage from spec.kind (F.2). The ticket waits, Queued.
+		case "", tatarav1alpha1.StateNew:
+			// Not at a pod state yet: `new` is pure operator triage and picks the
+			// next state from spec.kind. The ticket waits, Queued.
 			return "", ticketDeferred, nil
-		case tatarav1alpha1.StageApproved:
-			// F.3, `approved -> implementing`: "a QueuedEvent for the implement pod
-			// is ADMITTED". approved is the POD-LESS admission gate - the Task waits
-			// there, and THIS is the moment it stops waiting. The edge exists nowhere
-			// else, so it is applied here, at the admission that triggers it.
-			target = tatarav1alpha1.StageImplementing
 		default:
-			// merging / deploying: the Task is past its pods. Stale ticket.
-			return "", ticketDropped, r.dropTicket(ctx, q, "stage_podless")
+			// merged / deployed: the Task is past its pods. Stale ticket.
+			//
+			// THE OLD `approved -> implementing` ADMISSION EDGE IS GONE (#521).
+			// approved was a POD-LESS gate the Task waited in, and admission was
+			// what moved it into implementing. `refined` replaced it and is a LIVE
+			// state that runs the gate agent itself, so admission spawns a pod
+			// there like any other live state, and the ONLY thing that moves a Task
+			// to under-implementation is restapi's approval gate granting.
+			return "", ticketDropped, r.dropTicket(ctx, q, "state_runs_no_agent")
 		}
 	}
-	agentKind := stage.AgentKindFor(target)
+	agentKind := stage.AgentKindFor(from, task.Spec.Kind)
 	if want := q.Spec.Payload.AgentKind; want != "" && want != agentKind {
 		lg.Info("queue: ticket agentKind disagrees with the stage, the STAGE wins",
 			"action", "queue_ticket_kind_mismatch", "resource_id", q.Name, "task", task.Name,
-			"payloadAgentKind", want, "stage", target, "agentKind", agentKind)
+			"payloadAgentKind", want, "state", from, "agentKind", agentKind)
 	}
 
 	if task.Labels[queue.LabelQueuedEvent] != q.Name {
@@ -653,72 +669,20 @@ func (r *DispatcherReconciler) admitTicket(ctx context.Context, q *tatarav1alpha
 			return "", ticketDeferred, err
 		}
 	}
-	entering := target != from
-	switch {
-	case entering:
-		if err := stage.Enter(task, nil, target, "", now); err != nil {
-			// Bug-catcher: approved -> implementing is the only edge that reaches
-			// here and a kind=review Task can never be approved. Drop the ticket
-			// rather than wedge the head of the pool on an error that never clears.
-			lg.Error(err, "queue: ticket names an illegal stage transition, dropping",
-				"action", "queue_ticket_illegal", "resource_id", q.Name, "task", task.Name,
-				"from", from, "to", target)
-			return "", ticketDropped, r.dropTicket(ctx, q, "illegal_transition")
-		}
-	case task.Status.AgentKind == agentKind:
+	// ADMISSION NO LONGER APPLIES AN EDGE (#521). It used to: `approved` was a
+	// POD-LESS gate the Task waited in, and admitting its ticket was what moved
+	// it into `implementing`. That state is gone - `refined` replaced it and is a
+	// LIVE state that runs the gate agent itself - so admission spawns a pod
+	// where the Task already is, and the ONLY thing that moves a Task into
+	// under-implementation is restapi's approval gate granting. What is left here
+	// is the agentKind self-heal.
+	if task.Status.AgentKind == agentKind {
 		return task.Name, ticketAdmitted, nil // already consistent; no status write
-	default:
-		// Self-heal: status.agentKind is what the pod spec and /outcome key on, and
-		// an empty one 409s the agent's submit.
-		task.Status.AgentKind = agentKind
 	}
-	// task already carries the exact final state (stage.Enter/AgentKind were
-	// applied above and already validated); patchTaskStatus just needs a
-	// conflict-safe carrier to the API, so the fresh copy is stamped with these
-	// precomputed absolute values, never re-derived (transition.go's own
-	// "ABSOLUTE ASSIGNMENTS only" rule) and never touching fields this write
-	// doesn't own (podwatch/turncallback/etc. may have moved fresh's Stats or
-	// PendingEvents in the meantime; only the entering-branch fields below and
-	// AgentKind are ours to write).
+	// Self-heal: status.agentKind is what the pod spec and /outcome key on, and
+	// an empty one 409s the agent's submit.
+	task.Status.AgentKind = agentKind
 	if err := patchTaskStatus(ctx, r.Client, task, func(fresh *tatarav1alpha1.Task) bool {
-		if entering {
-			fresh.Status.Stage = task.Status.Stage
-			fresh.Status.StageReason = task.Status.StageReason
-			fresh.Status.AgentKind = task.Status.AgentKind
-			fresh.Status.StageEnteredAt = task.Status.StageEnteredAt
-			fresh.Status.PodStartedAt = task.Status.PodStartedAt
-			fresh.Status.StageWorkStartedAt = task.Status.StageWorkStartedAt
-			fresh.Status.Stats.PodRecreations = task.Status.Stats.PodRecreations
-			// StageElapsedCarrySeconds is deliberately NOT copied, and that is safe
-			// only because of what this branch's ONE edge is. approved -> implementing
-			// always arrives with a carry of 0 (stage.Enter only ever accumulates one
-			// on a merging/deploying -> parked(merge-timeout|deploy-timeout) edge) and
-			// lands on a POD stage, whose clocks never read the field at all
-			// (ArmedClock's carry branch is podless-only). The NEXT podless admission
-			// edge added here must revisit this: dropping a live carry would hand a
-			// timeout re-entry the full stage budget instead of TimeoutReentryBudget
-			// and under-report its residency by a whole lap (issues #480, #513).
-			// ConversationLastEventAt: target here is always implementing today (the
-			// bug-catcher above notes approved -> implementing is the only edge that
-			// reaches this branch), so stage.Enter never actually stamped it on this
-			// path - but copying it anyway keeps this field-by-field mirror honest
-			// against stage.Enter's real output rather than against today's ONE
-			// caller, so a future admission edge that DID target conversing could
-			// never silently lose the idle clock's arming to this omission
-			// (2026-07-28 security review Minor).
-			//
-			// This DOES overwrite fresh's live value with the outer, earlier-captured
-			// task's - a concurrent AppendTaskEvent landing on fresh between the Get
-			// above and this write would be clobbered (2026-07-28 security review
-			// follow-up). Judged inert, not fixed: this branch only ever fires on
-			// approved -> implementing, which never reads ConversationLastEventAt
-			// (ArmedClock's conversing-only branch is the sole reader), and any LATER
-			// conversing entry re-stamps this field unconditionally (stage.Enter, this
-			// package's EnterConversing) regardless of what it held going in - so a
-			// clobbered stale value here is never observed by anything.
-			fresh.Status.ConversationLastEventAt = task.Status.ConversationLastEventAt
-			return true
-		}
 		if fresh.Status.AgentKind == agentKind {
 			return false
 		}

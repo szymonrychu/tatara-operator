@@ -12,6 +12,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/agent"
+	"github.com/szymonrychu/tatara-operator/internal/objbudget"
+	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
@@ -94,13 +97,13 @@ type UnparkDecline string
 const (
 	// DeclineNone means ApplyUnpark did not decline (target != "").
 	DeclineNone UnparkDecline = ""
-	// DeclineGuard means the live Task's Stage/StageReason no longer matched
+	// DeclineGuard means the live Task's State/ParkReason no longer matched
 	// what the caller believed was parked (raced past by another writer, or
 	// re-parked under a different reason). Rare and anomalous: the caller's
 	// view of the world had already drifted from the apiserver.
 	DeclineGuard UnparkDecline = "guard"
 	// DeclineRule is the FALLBACK for a stage-level decline code this package
-	// does not recognise. It is a bug-catcher: every code stage.UnparkDetailed
+	// does not recognise. It is a bug-catcher: every code stage.Unpark
 	// can return has its own constant below, and a "rule" label appearing in
 	// operator_unpark_declined_total means the two vocabularies have drifted.
 	DeclineRule UnparkDecline = "rule"
@@ -112,13 +115,14 @@ const (
 	// accident.
 	DeclineNoHumanEvent     UnparkDecline = stage.DeclineNoHumanEvent
 	DeclineOverCap          UnparkDecline = stage.DeclineOverCap
-	DeclineNoConversingRoom UnparkDecline = stage.DeclineNoConversingRoom
+	DeclineNoLiveRoom       UnparkDecline = stage.DeclineNoLiveRoom
 	DeclineNoOpenIssues     UnparkDecline = stage.DeclineNoOpenIssues
 	DeclineMergedMR         UnparkDecline = stage.DeclineMergedMR
 	DeclineRoundsExhausted  UnparkDecline = stage.DeclineRoundsExhausted
 	DeclineTurnsExhausted   UnparkDecline = stage.DeclineTurnsExhausted
 	DeclineWrongParkedFrom  UnparkDecline = stage.DeclineWrongParkedFrom
-	DeclineIllegalEdge      UnparkDecline = stage.DeclineIllegalEdge
+	DeclineNotParked        UnparkDecline = stage.DeclineNotParked
+	DeclineRetryBudgetSpent UnparkDecline = stage.DeclineRetryBudgetSpent
 	DeclineNoReentry        UnparkDecline = stage.DeclineNoReentry
 )
 
@@ -129,10 +133,10 @@ func DeclineFor(code string) UnparkDecline {
 	switch code {
 	case stage.DeclineNone:
 		return DeclineNone
-	case stage.DeclineNoHumanEvent, stage.DeclineOverCap, stage.DeclineNoConversingRoom,
+	case stage.DeclineNoHumanEvent, stage.DeclineOverCap, stage.DeclineNoLiveRoom,
 		stage.DeclineNoOpenIssues, stage.DeclineMergedMR,
 		stage.DeclineRoundsExhausted, stage.DeclineTurnsExhausted, stage.DeclineWrongParkedFrom,
-		stage.DeclineIllegalEdge, stage.DeclineNoReentry:
+		stage.DeclineNotParked, stage.DeclineRetryBudgetSpent, stage.DeclineNoReentry:
 		return UnparkDecline(code)
 	default:
 		return DeclineRule
@@ -165,13 +169,13 @@ func DeclineFor(code string) UnparkDecline {
 // capacity question (NeedsConversingRoom names which stageReasons ever consult
 // it). It is a PARAMETER, not computed in here, on purpose: driveUnparks calls
 // ApplyUnpark once per parked Task in a loop (tatara-operator#368 is the whole
-// reason that loop is paced at all), and ConversingHasRoom's countConversing is
+// reason that loop is paced at all), and LiveHasRoom's countLive is
 // an unindexed namespace List - computing it per-Task here would multiply that
 // List by the parked backlog on every pass, exactly the hot-path regression
 // #368 exists to prevent. Callers hoist it ONCE per pass instead (2026-07-28
 // security review IMPORTANT 4).
 func ApplyUnpark(ctx context.Context, c client.Client, reader client.Reader, proj *tatarav1alpha1.Project,
-	task *tatarav1alpha1.Task, activeTasks, maxOpen int, conversingHasRoom bool, now time.Time) (string, UnparkDecline, error) {
+	task *tatarav1alpha1.Task, activeTasks, maxOpen int, liveHasRoom bool, now time.Time) (bool, UnparkDecline, error) {
 
 	// c (cached) is safe here, unlike the retry-loop Task Get below: by the time
 	// driveCommentUnpark reaches this call the owning Issue CR is guaranteed to
@@ -184,11 +188,11 @@ func ApplyUnpark(ctx context.Context, c client.Client, reader client.Reader, pro
 	// clarifying, never into the silent decline this fix is about.
 	issues, err := loadTaskIssues(ctx, c, task)
 	if err != nil {
-		return "", DeclineNone, err
+		return false, DeclineNone, err
 	}
 	mrs, err := loadTaskMRs(ctx, c, task)
 	if err != nil {
-		return "", DeclineNone, err
+		return false, DeclineNone, err
 	}
 	maxTurns := taskMaxTurns(proj, task)
 	botLogin := botLoginOf(proj)
@@ -198,8 +202,13 @@ func ApplyUnpark(ctx context.Context, c client.Client, reader client.Reader, pro
 		getter = c
 	}
 
-	var target string
+	var unparked bool
 	var decline UnparkDecline
+	// persisted is whatever copy the loop actually wrote, handed back to the
+	// caller below. fromReason is captured HERE because that write-back clears
+	// Status.ParkReason, and the log line still has to name the park it left.
+	var persisted *tatarav1alpha1.Task
+	fromReason := task.Status.ParkReason
 	key := client.ObjectKeyFromObject(task)
 	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.Task{}
@@ -208,47 +217,95 @@ func ApplyUnpark(ctx context.Context, c client.Client, reader client.Reader, pro
 		}
 		// Raced past this park by another writer (or already un-parked): nothing to
 		// do. The reason must also still match, or a different park is in play.
-		if fresh.Status.Stage != tatarav1alpha1.StageParked ||
-			fresh.Status.StageReason != task.Status.StageReason {
-			target = ""
+		if !tatarav1alpha1.Parked(fresh) ||
+			fresh.Status.ParkReason != task.Status.ParkReason {
+			unparked = false
 			decline = DeclineGuard
 			return nil
 		}
 		// Every field UnparkInput HAS is set here. There is no verdict field to
 		// omit any more (step C deleted it), so parked(identity-unverified) can
-		// only reach conversing or decline, never implementing.
-		to, code := stage.UnparkDetailed(stage.UnparkInput{
-			Task:              fresh,
-			Issues:            issues,
-			MRs:               mrs,
-			ActiveTasks:       activeTasks,
-			MaxOpenTasks:      maxOpen,
-			BotLogin:          botLogin,
-			MaxTurnsPerTask:   maxTurns,
-			ConversingHasRoom: conversingHasRoom,
-			Now:               now,
+		// only clear the flag or decline, never grant anything.
+		code := stage.Unpark(stage.UnparkInput{
+			Task:            fresh,
+			Issues:          issues,
+			MRs:             mrs,
+			ActiveTasks:     activeTasks,
+			MaxOpenTasks:    maxOpen,
+			BotLogin:        botLogin,
+			MaxTurnsPerTask: maxTurns,
+			LiveHasRoom:     liveHasRoom,
+			Now:             now,
 		})
-		if to == "" {
-			target = ""
+		// DeclineRetryBudgetSpent RE-PARKED the Task with a blocked reason, so its
+		// status HAS changed and must be persisted even though nothing un-parked.
+		if code != stage.DeclineNone && code != stage.DeclineRetryBudgetSpent {
+			unparked = false
 			decline = DeclineFor(code)
 			return nil
 		}
 		if err := c.Status().Update(ctx, fresh); err != nil {
 			return err
 		}
-		target = to
-		decline = DeclineNone
+		persisted = fresh
+		unparked = code == stage.DeclineNone
+		decline = DeclineFor(code)
 		return nil
 	})
 	if err != nil {
-		return "", DeclineNone, fmt.Errorf("unpark: apply on %s: %w", task.Name, err)
+		return false, DeclineNone, fmt.Errorf("unpark: apply on %s: %w", task.Name, err)
 	}
-	if target != "" {
+	// Hand the persisted copy back. Without it the caller carries a Task that
+	// still reads parked for the whole rest of the pass, against an API server
+	// that no longer agrees - the silent-stale-read failure class #521 exists to
+	// remove. It happens AFTER the loop, never inside it: the in-loop guard
+	// compares the live parkReason against task's, and clearing task's mid-retry
+	// would turn a Conflict retry into a spurious DeclineGuard.
+	if persisted != nil {
+		*task = *persisted
+	}
+	if unparked {
 		log.FromContext(ctx).Info("unparked task",
-			"action", "unpark", "resource_id", task.Name, "stage", target,
-			"reason_from", task.Status.StageReason)
+			"action", "unpark", "resource_id", task.Name, "state", task.Status.State,
+			"reason_from", fromReason)
 	}
-	return target, decline, nil
+	return unparked, decline, nil
+}
+
+// UnparkTakeoverTask persists stage.UnparkTakeover - the ONE un-park that clears
+// the park flag AND moves state in the same write - through the objbudget
+// writer, and tears down the pod of the state being left, exactly as EnterStage
+// does. Its two call sites are the takeover mint and the stand-down merge
+// re-drive; there is no third and there must not be one.
+func UnparkTakeoverTask(ctx context.Context, c client.Client, sp objbudget.Spiller, m *obs.OperatorMetrics,
+	task *tatarav1alpha1.Task, to string, now time.Time) error {
+
+	from := task.Status.State
+	leavingPodStage := stage.AgentKindFor(from, task.Spec.Kind) != ""
+
+	var uErr error
+	key := client.ObjectKeyFromObject(task)
+	if err := objbudget.FitTask(ctx, c, sp, key, func(t *tatarav1alpha1.Task) {
+		uErr = stage.UnparkTakeover(t, to, now)
+	}); err != nil {
+		return fmt.Errorf("unpark: takeover write task %s: %w", key.Name, err)
+	}
+	if uErr != nil {
+		return fmt.Errorf("unpark: takeover %s -> %s on %s: %w", from, to, key.Name, uErr)
+	}
+	if err := stage.UnparkTakeover(task, to, now); err != nil {
+		return fmt.Errorf("unpark: takeover in memory: %w", err)
+	}
+	if leavingPodStage {
+		if err := agent.DeleteWrapper(ctx, c, key.Namespace, task); err != nil {
+			return err
+		}
+	}
+	log.FromContext(ctx).Info("takeover un-park",
+		"action", "unpark_takeover", "resource_id", task.Name,
+		"from", from, "to", to, "kind", task.Spec.Kind)
+	m.TaskTerminalEntry(task.Spec.Kind, from, to, "")
+	return nil
 }
 
 // driveUnparksPaced runs driveUnparks for proj at most once per
@@ -283,15 +340,23 @@ func (r *ProjectReconciler) driveUnparksPaced(ctx context.Context, proj *tatarav
 	return interval, nil
 }
 
-// NeedsConversingRoom reports whether stageReason is one of the two F.6 rules
-// that ever consult UnparkInput.ConversingHasRoom (stage.go's ReasonAwaitingHuman
-// and ReasonIdentityUnverified branches). Every other parked reason (merge-
-// timeout, deploy-timeout, no-outcome, handoff-stalled, backlog-sweep, ...)
-// never reads the field, so a caller sweeping a mixed batch can skip the
-// capacity List entirely when nothing in it would use the answer (2026-07-28
-// security review IMPORTANT 4).
-func NeedsConversingRoom(stageReason string) bool {
-	return stageReason == stage.ReasonAwaitingHuman || stageReason == stage.ReasonIdentityUnverified
+// NeedsLiveRoom reports whether a park with this reason could resume a LIVE
+// state and therefore consult UnparkInput.LiveHasRoom. A caller sweeping a mixed
+// batch skips the capacity List entirely when nothing in it would use the answer
+// (2026-07-28 security review IMPORTANT 4).
+//
+// It is keyed on the REASON alone, deliberately over-approximating: the true
+// predicate also needs the Task's state, and the whole point of this helper is
+// to answer BEFORE paying for a List. The three comment-driven reasons plus
+// no-outcome are the only ones that can land on a live state at all.
+func NeedsLiveRoom(parkReason string) bool {
+	switch parkReason {
+	case stage.ReasonAwaitingHuman, stage.ReasonIdentityUnverified,
+		stage.ReasonHandoffStalled, stage.ReasonNoOutcome:
+		return true
+	default:
+		return false
+	}
 }
 
 // driveUnparks applies stage.Unpark to every parked Task in proj whose park
@@ -328,19 +393,19 @@ func (r *ProjectReconciler) driveUnparks(ctx context.Context, proj *tatarav1alph
 	// actually lands on conversing, below, so this pass can never admit more
 	// than the ceiling has room for. Skipped entirely when nothing in this
 	// batch would ever consult it. A transient List error degrades to "no room"
-	// (always the SAFE fallback - see UnparkInput.ConversingHasRoom's own doc)
+	// (always the SAFE fallback - see UnparkInput.LiveHasRoom's own doc)
 	// rather than failing the whole pass closed for every OTHER park reason,
 	// which never asked the question in the first place.
-	conversingRoomBudget := 0
+	liveRoomBudget := 0
 	for i := range tl.Items {
 		t := &tl.Items[i]
-		if t.Spec.ProjectRef == proj.Name && t.Status.Stage == tatarav1alpha1.StageParked && NeedsConversingRoom(t.Status.StageReason) {
-			live, listErr := countConversing(ctx, r.Client, proj)
+		if t.Spec.ProjectRef == proj.Name && tatarav1alpha1.Parked(t) && NeedsLiveRoom(t.Status.ParkReason) {
+			live, listErr := countLive(ctx, r.Client, proj)
 			if listErr != nil {
-				log.FromContext(ctx).Error(listErr, "unpark: conversing capacity check failed; treating this pass as no room",
-					"action", "unpark_conversing_room_error", "project", proj.Name)
-			} else if ceiling := tatarav1alpha1.MaxConversingPods(proj); ceiling > len(live) {
-				conversingRoomBudget = ceiling - len(live)
+				log.FromContext(ctx).Error(listErr, "unpark: live capacity check failed; treating this pass as no room",
+					"action", "unpark_live_room_error", "project", proj.Name)
+			} else if ceiling := tatarav1alpha1.MaxLivePods(proj); ceiling > len(live) {
+				liveRoomBudget = ceiling - len(live)
 			}
 			break
 		}
@@ -352,25 +417,26 @@ func (r *ProjectReconciler) driveUnparks(ctx context.Context, proj *tatarav1alph
 			return ctx.Err()
 		}
 		t := &tl.Items[i]
-		if t.Spec.ProjectRef != proj.Name || t.Status.Stage != tatarav1alpha1.StageParked {
+		if t.Spec.ProjectRef != proj.Name || !tatarav1alpha1.Parked(t) {
 			continue
 		}
-		conversingRoom := NeedsConversingRoom(t.Status.StageReason) && conversingRoomBudget > 0
-		target, decline, err := ApplyUnpark(ctx, r.Client, r.APIReader, proj, t, active, maxOpen, conversingRoom, now)
+		liveRoom := NeedsLiveRoom(t.Status.ParkReason) && liveRoomBudget > 0
+		wasLive := stage.Live(t.Status.State)
+		unparked, decline, err := ApplyUnpark(ctx, r.Client, r.APIReader, proj, t, active, maxOpen, liveRoom, now)
 		if err != nil {
 			log.FromContext(ctx).Error(err, "unpark: apply failed",
-				"action", "unpark_error", "resource_id", t.Name, "reason", t.Status.StageReason)
+				"action", "unpark_error", "resource_id", t.Name, "reason", t.Status.ParkReason)
 			if firstErr == nil {
 				firstErr = err
 			}
 			continue
 		}
-		if target == tatarav1alpha1.StageConversing && conversingRoomBudget > 0 {
-			// SPEND the budget: this Task actually landed on conversing this
-			// pass and now occupies one of the slots the room check above
-			// answered for. The next candidate in this same loop must see the
-			// remaining room, not the room this pass STARTED with.
-			conversingRoomBudget--
+		if unparked && wasLive && liveRoomBudget > 0 {
+			// SPEND the budget: this Task actually resumed a LIVE state this pass
+			// and now occupies one of the slots the room check above answered for.
+			// The next candidate in this same loop must see the remaining room,
+			// not the room this pass STARTED with.
+			liveRoomBudget--
 		}
 		// GUARD declines are always anomalous (the live object had already
 		// drifted from what this pass believed was parked) and worth surfacing
@@ -391,15 +457,15 @@ func (r *ProjectReconciler) driveUnparks(ctx context.Context, proj *tatarav1alph
 		switch decline {
 		case DeclineGuard:
 			log.FromContext(ctx).Info("unpark: declined (drift guard)",
-				"action", "unpark_declined", "resource_id", t.Name, "reason", t.Status.StageReason, "decline", string(decline))
-		case DeclineNoConversingRoom:
-			log.FromContext(ctx).Info("unpark: declined (project is at its conversing ceiling; the pending event is retained and the next pass retries)",
-				"action", "unpark_declined", "resource_id", t.Name, "reason", t.Status.StageReason, "decline", string(decline))
+				"action", "unpark_declined", "resource_id", t.Name, "reason", t.Status.ParkReason, "decline", string(decline))
+		case DeclineNoLiveRoom:
+			log.FromContext(ctx).Info("unpark: declined (project is at its live-pod ceiling; the pending event is retained and the next pass retries)",
+				"action", "unpark_declined", "resource_id", t.Name, "reason", t.Status.ParkReason, "decline", string(decline))
 		}
 		if decline != DeclineNone && r.Metrics != nil {
-			r.Metrics.UnparkDeclined(t.Status.StageReason, string(decline))
+			r.Metrics.UnparkDeclined(t.Status.ParkReason, string(decline))
 		}
-		if target != "" {
+		if unparked {
 			active++ // the re-entered Task is now active; keep the cap honest this pass.
 		}
 	}

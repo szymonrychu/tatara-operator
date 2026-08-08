@@ -97,13 +97,13 @@ type QueuedTaskBlueprint struct {
 	Annotations map[string]string `json:"annotations,omitempty"`
 }
 
-// validAgentKinds are the 7 kinds a QueuedEventPayload.AgentKind may name
-// (contract B.7). Deliberately narrower than IsKnownKind (task_types.go),
-// which also accepts the retired legacy kinds for already-persisted Tasks.
+// validAgentKinds are the 6 AGENT kinds a QueuedEventPayload.AgentKind may name
+// (contract B.7). `clarify` was the seventh until #521 folded it into implement.
+// Deliberately narrower than IsKnownKind (task_types.go), which is the ORIGIN
+// vocabulary and also carries `takeover`.
 var validAgentKinds = map[string]bool{
 	"brainstorm":    true,
 	"incident":      true,
-	"clarify":       true,
 	"refine":        true,
 	"review":        true,
 	"documentation": true,

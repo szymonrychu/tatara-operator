@@ -10,6 +10,7 @@ import (
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
+	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
 // mkDocTask creates a documentation Task in the given stage.
@@ -24,7 +25,7 @@ func mkDocTask(t *testing.T, name, project, docsRepo, stg string) *tatarav1alpha
 	}
 	require.NoError(t, k8sClient.Create(context.Background(), task))
 	t.Cleanup(func() { _ = k8sClient.Delete(context.Background(), task) })
-	task.Status.Stage = stg
+	task.Status.State = stg
 	require.NoError(t, k8sClient.Status().Update(context.Background(), task))
 	return task
 }
@@ -38,7 +39,7 @@ func TestDocumentationScan_InFlightGuard(t *testing.T) {
 	docsURL := "https://github.com/o/docsg.git"
 	proj, repos := seedDocumentationProject(t, "doc-inflight", docsURL, []string{"o/ag"})
 	// A doc Task is already running (non-terminal).
-	mkDocTask(t, "doc-inflight-live", proj.Name, "doc-inflight-docs", tatarav1alpha1.StageDocumenting)
+	mkDocTask(t, "doc-inflight-live", proj.Name, "doc-inflight-docs", tatarav1alpha1.StateUnderImplementation)
 
 	reader := &docFakeReader{
 		headBySlug: map[string]string{"o/ag": "headsha2"},
@@ -55,13 +56,20 @@ func TestDocumentationScan_InFlightGuard(t *testing.T) {
 		"a new doc Task must not be created while a doc Task is already in-flight")
 }
 
-// TestDocumentationScan_FinishedDocTaskDoesNotBlock: a parked doc Task is
-// FINISHED (the reaper collects it), so it must not hold the in-flight guard and
-// block the next cycle from minting a fresh batch.
-func TestDocumentationScan_FinishedDocTaskDoesNotBlock(t *testing.T) {
+// TestDocumentationScan_ParkedDocTaskStillBlocks: #521 made parked/failed a
+// FLAG orthogonal to State, and documentationInFlightProject counts in-flight
+// with tatarav1alpha1.TaskDone, which is state-only (done|rejected) and FALSE
+// for a parked Task. A parked doc Task may still resume, so it must keep
+// holding the in-flight guard - minting a second batch under it would let two
+// doc Tasks cover the same heads concurrently, exactly the overlap this guard
+// exists to prevent. (Before #521, TaskDone incorrectly reported true for a
+// parked Task, which is what let this guard - wrongly - treat it as finished.)
+func TestDocumentationScan_ParkedDocTaskStillBlocks(t *testing.T) {
 	docsURL := "https://github.com/o/docsp.git"
 	proj, repos := seedDocumentationProject(t, "doc-parked", docsURL, []string{"o/ap"})
-	mkDocTask(t, "doc-parked-task", proj.Name, "doc-parked-docs", tatarav1alpha1.StageParked)
+	parked := mkDocTask(t, "doc-parked-task", proj.Name, "doc-parked-docs", tatarav1alpha1.StateUnderImplementation)
+	parked.Status.ParkReason = stage.ReasonAwaitingHuman
+	require.NoError(t, k8sClient.Status().Update(context.Background(), parked))
 
 	reader := &docFakeReader{
 		headBySlug: map[string]string{"o/ap": "headsha9"},
@@ -74,6 +82,6 @@ func TestDocumentationScan_FinishedDocTaskDoesNotBlock(t *testing.T) {
 
 	r.documentationScan(context.Background(), proj, reader, repos)
 
-	require.NotEmpty(t, listDocumentationQEs(t, "doc-parked"),
-		"a parked doc Task is finished and must not block a fresh doc cycle")
+	require.Empty(t, listDocumentationQEs(t, "doc-parked"),
+		"a parked doc Task is NOT done; it must keep blocking a fresh doc cycle")
 }

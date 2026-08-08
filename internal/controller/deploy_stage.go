@@ -143,7 +143,7 @@ func (d *StageDriver) logDeployWaiting(ctx context.Context, task *tatarav1alpha1
 	log.FromContext(ctx).Info("deploy: waiting",
 		"action", "deploy_waiting", "resource_id", task.Name, "reason", why,
 		"pending", pending, "pending_mrs", strings.Join(pendingRefs, ","),
-		"stalled_seconds", stage.StageElapsedSeconds(task, d.now()))
+		"stalled_seconds", stage.StateElapsedSeconds(task, d.now()))
 }
 
 // resolveDeployed reports whether one merged MR's change is live on the cluster,

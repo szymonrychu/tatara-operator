@@ -66,7 +66,7 @@ func TestModelForKind_Exported(t *testing.T) {
 // (documentation/refine). An explicit ModelByKind override still wins.
 func TestModelForKind_PerKindDefaults(t *testing.T) {
 	proj := &tatarav1alpha1.Project{} // empty Model, nil ModelByKind
-	opusKinds := []string{"brainstorm", "incident", "clarify", "implement", "review"}
+	opusKinds := []string{"brainstorm", "incident", "implement", "review"}
 	for _, k := range opusKinds {
 		t.Run("opus/"+k, func(t *testing.T) {
 			if got := modelForKind(proj, k, ""); got != "claude-opus-5" {

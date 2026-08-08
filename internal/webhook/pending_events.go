@@ -136,17 +136,17 @@ func (s *Server) deliverPendingEvent(ctx context.Context, proj tatarav1.Project,
 		s.syncOwnedIssueThread(ctx, &proj, task, repo.Name, ev.Number)
 	}
 
-	if task.Status.Stage == tatarav1.StageParked &&
-		(task.Status.StageReason == stage.ReasonAwaitingHuman ||
-			task.Status.StageReason == stage.ReasonBacklogSweep ||
-			task.Status.StageReason == stage.ReasonIdentityUnverified) {
+	if tatarav1.Parked(task) &&
+		(task.Status.ParkReason == stage.ReasonAwaitingHuman ||
+			task.Status.ParkReason == stage.ReasonBacklogSweep ||
+			task.Status.ParkReason == stage.ReasonIdentityUnverified) {
 		s.driveCommentUnpark(ctx, &proj, task)
 	}
-	// A LIVE conversational stage. The event is already queued above, but a
-	// clarifying/reviewing Task whose pod has finished its turn is deaf to it
-	// until something moves: conversing is what gives the comment a live agent on
-	// the other end and an idle clock that resets per event.
-	s.driveConversingEntry(ctx, &proj, task)
+	// A LIVE state. The event is already queued above, but a Task whose pod has
+	// finished its turn is deaf to it until something moves: this is what gives
+	// the comment a live agent on the other end and an idle clock that resets
+	// per event.
+	s.driveLiveTurn(ctx, &proj, task)
 }
 
 // deliverAgentComment is the D4 cross-kind path: an agent-authored comment on an
@@ -192,7 +192,7 @@ func (s *Server) deliverAgentComment(ctx context.Context, proj tatarav1.Project,
 		s.log.InfoContext(ctx, "pendingEvents: agent comment unresolved; refusing",
 			"action", "agent_comment_declined", "task", task.Name, "project", proj.Name,
 			"author_kind", authorKind, "reacting_kind", reactingKind)
-		s.cfg.Metrics.ConversingEntryDeclined(proj.Name, "unresolved")
+		s.cfg.Metrics.LiveEntryDeclined(proj.Name, controller.LiveEntryDeclineNotLive)
 		return
 	}
 
@@ -224,7 +224,7 @@ func (s *Server) deliverAgentComment(ctx context.Context, proj tatarav1.Project,
 		s.log.InfoContext(ctx, "pendingEvents: agent comment landed same-kind; round counted, no trigger",
 			"action", "agent_comment_same_kind", "task", task.Name, "project", proj.Name,
 			"author_kind", authorKind, "reacting_kind", reactingKind, "bot_rounds", rounds)
-		s.cfg.Metrics.ConversingEntryDeclined(proj.Name, "same-kind")
+		s.cfg.Metrics.LiveEntryDeclined(proj.Name, controller.LiveEntryDeclineNotLive)
 		return
 	}
 
@@ -243,29 +243,38 @@ func (s *Server) deliverAgentComment(ctx context.Context, proj tatarav1.Project,
 	// citation to make visible and no forge read worth buying. A parked Task's
 	// queued event rides along, counted above, and waits for a genuine human
 	// comment or the daily sweep.
-	// driveConversingEntry itself is a harmless no-op on a non-live-stage Task
-	// (ConversingEntryEligible), so this call is exactly as narrow for a parked
-	// Task as it is active for one in clarifying/reviewing.
-	s.driveConversingEntry(ctx, &proj, task)
+	// driveLiveTurn itself is a harmless no-op on a Task that is not in a live
+	// state (LiveEntryEligible), so this call is exactly as narrow for a parked
+	// Task as it is active for one in refined/under-implementation/awaiting-review.
+	s.driveLiveTurn(ctx, &proj, task)
 }
 
-// driveConversingEntry moves a live clarifying/reviewing Task into conversing on
-// a qualifying comment, so the comment reaches an agent instead of only sitting
-// in pendingEvents. Best-effort, like every other side effect in this file: a
+// driveLiveTurn delivers a qualifying comment to a Task that is ALREADY in a
+// live state, so the comment reaches an agent instead of only sitting in
+// pendingEvents. Best-effort, like every other side effect in this file: a
 // failure is logged and never surfaced to the SCM as a non-2xx.
-func (s *Server) driveConversingEntry(ctx context.Context, proj *tatarav1.Project, task *tatarav1.Task) {
+//
+// It used to be driveConversingEntry and it used to be a TRANSITION - the Task
+// moved from clarifying/reviewing into `conversing`. #521 dissolved that stage:
+// the three work states ARE live, so there is nowhere to move to and what is
+// left is the ceiling check and the refusals.
+//
+// EVERY DECLINE NAMES ITS CONDITION. The pre-#521 counter recorded the literal
+// "unresolved" on all 27 declines in the live cluster - a counter that cannot
+// say which guard refused is the exact defect the SweepSkip and UnparkDecline
+// vocabularies exist to prevent.
+func (s *Server) driveLiveTurn(ctx context.Context, proj *tatarav1.Project, task *tatarav1.Task) {
 	// The cheap check FIRST: most comments land on a Task that could never
-	// qualify (delivered, merging, implementing, parked-for-a-non-conversational
-	// reason, ...), and this is a free map lookup versus ConversingHasRoom's
-	// namespace List - which used to run unconditionally, on EVERY webhook
-	// comment, before this stage even mattered (2026-07-28 security review
+	// qualify (done, merging, parked, ...), and this is a free map lookup versus
+	// LiveHasRoom's namespace List - which used to run unconditionally, on EVERY
+	// webhook comment, before the state even mattered (2026-07-28 security review
 	// IMPORTANT 5).
-	if !controller.ConversingEntryEligible(task.Status.Stage) {
+	if !controller.LiveEntryEligible(task.Status.State) || tatarav1.Parked(task) {
 		return
 	}
-	room, err := controller.ConversingHasRoom(ctx, s.reader(), proj)
+	room, err := controller.LiveHasRoom(ctx, s.reader(), proj)
 	if err != nil {
-		s.log.ErrorContext(ctx, "pendingEvents: conversing capacity check failed", "error", err, "task", task.Name)
+		s.log.ErrorContext(ctx, "pendingEvents: live capacity check failed", "error", err, "task", task.Name)
 		return
 	}
 	if !room {
@@ -273,10 +282,10 @@ func (s *Server) driveConversingEntry(ctx context.Context, proj *tatarav1.Projec
 		// and rides into the Task's next turn whenever one happens. The metric is
 		// what makes the ceiling visible to the operator (there is no
 		// acknowledgement layer, per decision D5).
-		s.log.InfoContext(ctx, "pendingEvents: conversing ceiling reached; the event stays queued",
-			"action", "conversing_entry_declined", "task", task.Name,
-			"project", proj.Name, "decline", "over-ceiling")
-		s.cfg.Metrics.ConversingEntryDeclined(proj.Name, "over-ceiling")
+		s.log.InfoContext(ctx, "pendingEvents: live-pod ceiling reached; the event stays queued",
+			"action", "live_entry_declined", "task", task.Name,
+			"project", proj.Name, "decline", controller.LiveEntryDeclineCeilingFull)
+		s.cfg.Metrics.LiveEntryDeclined(proj.Name, controller.LiveEntryDeclineCeilingFull)
 		return
 	}
 	sp := s.cfg.SpillerFor(proj)
@@ -285,16 +294,13 @@ func (s *Server) driveConversingEntry(ctx context.Context, proj *tatarav1.Projec
 		s.log.ErrorContext(ctx, "pendingEvents: load owned MRs failed", "error", err, "task", task.Name)
 		return
 	}
-	entered, err := controller.EnterConversing(ctx, s.cfg.Client, sp, s.cfg.Metrics, proj, task, mrs, time.Now())
-	if err != nil {
-		s.log.ErrorContext(ctx, "pendingEvents: conversing entry failed", "error", err, "task", task.Name)
+	delivered, decline := controller.DeliverLiveTurn(ctx, s.cfg.Client, sp, s.cfg.Metrics, proj, task, mrs, time.Now())
+	if !delivered {
+		s.cfg.Metrics.LiveEntryDeclined(proj.Name, decline)
 		return
 	}
-	if !entered {
-		return
-	}
-	s.log.InfoContext(ctx, "pendingEvents: opened a conversation on a human comment",
-		"action", "pending_event_conversing", "task", task.Name, "project", proj.Name)
+	s.log.InfoContext(ctx, "pendingEvents: delivered a human comment to a live agent",
+		"action", "pending_event_live_turn", "task", task.Name, "project", proj.Name)
 }
 
 // resolveOwningTask maps a mirror CR onto the Task the pending event belongs
@@ -340,11 +346,10 @@ func (s *Server) resolveOwningTask(ctx context.Context, proj *tatarav1.Project,
 		}
 		return nil
 	}
-	if task.DeletionTimestamp != nil || task.Status.Stage == tatarav1.StageFailed ||
-		task.Status.Stage == tatarav1.StageRejected || task.Status.Stage == tatarav1.StageDelivered {
+	if task.DeletionTimestamp != nil || tatarav1.TaskDone(task) {
 		s.log.InfoContext(ctx, "pendingEvents: mirror has no controller owner and its intake task is not live; dropping event",
 			"action", "pending_event_owner_fallback_miss", "mirror", obj.GetName(), "task", name,
-			"stage", task.Status.Stage)
+			"state", task.Status.State)
 		return nil
 	}
 	// The natural key encodes (project, kind, repo, number), but the Task under
@@ -360,7 +365,7 @@ func (s *Server) resolveOwningTask(ctx context.Context, proj *tatarav1.Project,
 	}
 	s.log.InfoContext(ctx, "pendingEvents: mirror has no controller owner; routed to its intake task by natural key",
 		"action", "pending_event_owner_fallback", "mirror", obj.GetName(), "task", name,
-		"repo", repo.Name, "number", ev.Number, "stage", task.Status.Stage)
+		"repo", repo.Name, "number", ev.Number, "state", task.Status.State)
 	return task
 }
 
@@ -391,47 +396,47 @@ func (s *Server) driveCommentUnpark(ctx context.Context, proj *tatarav1.Project,
 	if maxOpen <= 0 {
 		maxOpen = 6
 	}
-	// backlog-sweep never consults ConversingHasRoom, but awaiting-human AND
+	// backlog-sweep never consults LiveHasRoom, but awaiting-human AND
 	// identity-unverified both do (controller.NeedsConversingRoom is the single
 	// definition, shared with driveUnparks). Gating on awaiting-human alone
 	// would leave the identity-unverified conversing edge STRUCTURALLY INERT on
 	// this webhook fast path. A transient List failure degrades to "no room"
 	// (the safe fallback) rather than aborting this comment-driven unpark
 	// entirely (2026-07-28 security review IMPORTANT 4).
-	conversingRoom := false
-	if controller.NeedsConversingRoom(task.Status.StageReason) {
-		room, roomErr := controller.ConversingHasRoom(ctx, s.reader(), proj)
+	liveRoom := false
+	if controller.NeedsLiveRoom(task.Status.ParkReason) {
+		room, roomErr := controller.LiveHasRoom(ctx, s.reader(), proj)
 		if roomErr != nil {
-			s.log.ErrorContext(ctx, "pendingEvents: conversing capacity check failed; treating as no room", "error", roomErr, "task", task.Name)
+			s.log.ErrorContext(ctx, "pendingEvents: live capacity check failed; treating as no room", "error", roomErr, "task", task.Name)
 		} else {
-			conversingRoom = room
+			liveRoom = room
 		}
 	}
-	target, decline, err := controller.ApplyUnpark(ctx, s.cfg.Client, s.cfg.APIReader, proj, task, active, maxOpen, conversingRoom, time.Now())
+	unparked, decline, err := controller.ApplyUnpark(ctx, s.cfg.Client, s.cfg.APIReader, proj, task, active, maxOpen, liveRoom, time.Now())
 	if err != nil {
 		s.log.ErrorContext(ctx, "pendingEvents: comment-driven unpark failed", "error", err, "task", task.Name)
 		return
 	}
 	if decline != controller.DeclineNone {
-		s.cfg.Metrics.UnparkDeclined(task.Status.StageReason, string(decline))
+		s.cfg.Metrics.UnparkDeclined(task.Status.ParkReason, string(decline))
 	}
-	if target == "" {
+	if !unparked {
 		// NOT an error (a decline is a normal outcome of stage.Unpark), but this
 		// call site fires in direct reaction to a human comment the operator was
 		// just asked to act on, so a silent decline here is exactly what hid the
 		// cache-lag race (fresh.Status.PendingEvents read stale-empty) for a full
 		// day with zero errors and zero "unparked" logs to explain the silence.
 		// Both GUARD and RULE declines are logged here (driveUnparks surfaces
-		// only GUARD plus the one no-conversing-room rule decline): this fires
+		// only GUARD plus the one no-live-room rule decline): this fires
 		// once, in direct reaction to a human action, where silence - of either
 		// kind - is anomalous.
 		s.log.InfoContext(ctx, "pendingEvents: comment-driven unpark declined",
-			"action", "pending_event_unpark_declined", "task", task.Name, "stage_reason", task.Status.StageReason,
+			"action", "pending_event_unpark_declined", "task", task.Name, "park_reason", task.Status.ParkReason,
 			"decline_kind", string(decline))
 		return
 	}
 	s.log.InfoContext(ctx, "pendingEvents: unparked task on human comment",
-		"action", "pending_event_unpark", "task", task.Name, "stage", target, "reason_from", task.Status.StageReason)
+		"action", "pending_event_unpark", "task", task.Name, "state", task.Status.State, "reason_from", task.Status.ParkReason)
 }
 
 // syncOwnedIssueThread is D2's one forge read: it re-syncs the owned Issue's

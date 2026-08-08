@@ -85,11 +85,11 @@ func TestDrainStandDownMerge_ApprovedExternalPushMergesViaParkedOwnerTask(t *tes
 		t.Fatal(err)
 	}
 	tk := getTask(t, "takeover-repo-a-22")
-	if tk.Status.Stage != tatarav1alpha1.StageMerging {
-		t.Fatalf("parked owner Task must be re-driven to merging, got %q", tk.Status.Stage)
+	if tk.Status.State != tatarav1alpha1.StateMerged {
+		t.Fatalf("parked owner Task must be re-driven to merging, got %q", tk.Status.State)
 	}
-	if tk.Status.StageReason != stage.ReasonOwnershipLost {
-		t.Fatalf("re-drive must stamp Reason=ownership-lost explicitly, got %q", tk.Status.StageReason)
+	if tatarav1alpha1.Parked(tk) {
+		t.Fatalf("the re-drive goes through UnparkTakeoverTask, which clears the park flag; still parked(%q)", tk.Status.ParkReason)
 	}
 	got := getMR(t, ctx, proj, repo, 22)
 	if ctrl, ok := ownerControllerName(got); !ok || ctrl != "takeover-repo-a-22" {
@@ -111,8 +111,8 @@ func TestDrainStandDownMerge_NormalKindOwnerAlsoRedriven(t *testing.T) {
 		t.Fatal(err)
 	}
 	tk := getTask(t, "clarify-repo-a-25")
-	if tk.Status.Stage != tatarav1alpha1.StageMerging {
-		t.Fatalf("normal-kind parked owner Task must be re-driven to merging, got %q", tk.Status.Stage)
+	if tk.Status.State != tatarav1alpha1.StateMerged {
+		t.Fatalf("normal-kind parked owner Task must be re-driven to merging, got %q", tk.Status.State)
 	}
 	got := getMR(t, ctx, proj, repo, 25)
 	if ctrl, ok := ownerControllerName(got); !ok || ctrl != "clarify-repo-a-25" {
@@ -235,7 +235,7 @@ func seedStoodDownApprovedMR(t *testing.T, ctx context.Context, proj *tatarav1al
 	if err := k8sClient.Create(ctx, parked); err != nil {
 		t.Fatalf("create parked owner task: %v", err)
 	}
-	stampTaskStatus(t, ctx, parked, tatarav1alpha1.StageParked, stage.ReasonOwnershipLost)
+	stampTaskStatus(t, ctx, parked, tatarav1alpha1.StateUnderImplementation, stage.ReasonOwnershipLost)
 
 	mr := &tatarav1alpha1.MergeRequest{
 		ObjectMeta: metav1.ObjectMeta{

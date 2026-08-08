@@ -71,8 +71,8 @@ func proposalMirror(task *tatarav1alpha1.Task, kind string, stamped bool) *tatar
 func seedClosedProposal(t *testing.T, kind string, stamped bool) (client.Client, *tatarav1alpha1.Task, *tatarav1alpha1.Issue) {
 	t.Helper()
 	proj, repo := mirrorProject("tatara-bot"), mirrorRepo()
-	task := taskAtStage(tatarav1alpha1.StageClarifying, "")
-	task.Spec.Kind = "clarify"
+	task := taskAtStage(tatarav1alpha1.StateRefined, "")
+	task.Spec.Kind = "implement"
 	iss := proposalMirror(task, kind, stamped)
 	task.Status.IssueRefs = []string{iss.Name}
 	return newMirrorClient(t, proj, repo, task, iss, scmSecret()), task, iss
@@ -108,8 +108,8 @@ func TestIssueClosedStopRetainsABrainstormProposalMirror(t *testing.T) {
 			require.True(t, stopped)
 
 			gotTask := getTaskCR(t, c, task.Name)
-			require.Equal(t, tatarav1alpha1.StageRejected, gotTask.Status.Stage)
-			require.Equal(t, stage.ReasonIssueClosed, gotTask.Status.StageReason)
+			require.Equal(t, tatarav1alpha1.StateRejected, gotTask.Status.State)
+			require.Equal(t, stage.ReasonIssueClosed, gotTask.Status.StateReason)
 			require.NotContains(t, gotTask.Status.IssueRefs, iss.Name,
 				"the Task side is always severed so the reaper never walks a stale ref")
 
@@ -235,7 +235,7 @@ func TestIssueReconcileReSeverKeepsARetainedProposal(t *testing.T) {
 // window the hardening exists for is unchanged for every non-proposal issue.
 func TestIssueReconcileReSeverStillFinishesAnOrdinaryCrashedDelete(t *testing.T) {
 	proj, repo := mirrorProject("tatara-bot"), mirrorRepo()
-	task := taskAtStage(tatarav1alpha1.StageRejected, stage.ReasonIssueClosed)
+	task := taskAtStage(tatarav1alpha1.StateRejected, stage.ReasonIssueClosed)
 	iss := proposalMirror(task, "", false)
 	c := newMirrorClient(t, proj, repo, task, iss, scmSecret())
 
@@ -249,8 +249,8 @@ func TestIssueReconcileReSeverStillFinishesAnOrdinaryCrashedDelete(t *testing.T)
 func seedRetainedDecline(t *testing.T) (client.Client, *tatarav1alpha1.Project, *tatarav1alpha1.Repository, string) {
 	t.Helper()
 	proj, repo := sweepProject("reopen-proj"), sweepRepo("reopen-proj")
-	task := taskAtStage(tatarav1alpha1.StageClarifying, "")
-	task.Spec.Kind = "clarify"
+	task := taskAtStage(tatarav1alpha1.StateRefined, "")
+	task.Spec.Kind = "implement"
 	iss := proposalMirror(task, tatarav1alpha1.ProposalKindBrainstorm, true)
 	iss.Spec.ProjectRef = proj.Name
 	task.Status.IssueRefs = []string{iss.Name}
@@ -307,7 +307,7 @@ func TestSweepUndoesRetentionOnAReopenedProposal(t *testing.T) {
 // TestSweepLeavesAnOrdinaryRejectedIssueAlone: the undo is brainstorm-scoped.
 func TestSweepLeavesAnOrdinaryRejectedIssueAlone(t *testing.T) {
 	proj, repo := sweepProject("ord-proj"), sweepRepo("ord-proj")
-	task := taskAtStage(tatarav1alpha1.StageParked, stage.ReasonAwaitingHuman)
+	task := taskAtStage(tatarav1alpha1.StateRefined, stage.ReasonAwaitingHuman)
 	iss := proposalMirror(task, "", false)
 	iss.Spec.ProjectRef = proj.Name
 	iss.Status.State, iss.Status.Status = "open", "rejected"
@@ -376,8 +376,8 @@ func TestReopenUndoOrphansBeforeClearingTheVerdict(t *testing.T) {
 func seedParkedProposalClose(t *testing.T, reason, kind string, stamped bool) (client.Client, *tatarav1alpha1.Task, *tatarav1alpha1.Issue) {
 	t.Helper()
 	proj, repo := mirrorProject("tatara-bot"), mirrorRepo()
-	task := taskAtStage(tatarav1alpha1.StageParked, reason)
-	task.Spec.Kind = "clarify"
+	task := taskAtStage(tatarav1alpha1.StateRefined, reason)
+	task.Spec.Kind = "implement"
 	iss := proposalMirror(task, kind, stamped)
 	task.Status.IssueRefs = []string{iss.Name}
 	return newMirrorClient(t, proj, repo, task, iss, scmSecret()), task, iss
@@ -400,9 +400,10 @@ func TestParkedProposalCloseIsRecordedWithoutStoppingTheTask(t *testing.T) {
 			reconcileIssue(t, r, iss.Name)
 
 			gotTask := getTaskCR(t, c, task.Name)
-			require.Equal(t, tatarav1alpha1.StageParked, gotTask.Status.Stage,
-				"recording a decline must never move the owner's stage")
-			require.Equal(t, reason, gotTask.Status.StageReason)
+			require.Equal(t, tatarav1alpha1.StateRefined, gotTask.Status.State,
+				"recording a decline must never move the owner's state")
+			require.True(t, tatarav1alpha1.Parked(gotTask), "the owner must still be parked")
+			require.Equal(t, reason, gotTask.Status.ParkReason)
 			require.NotContains(t, gotTask.Status.IssueRefs, iss.Name,
 				"the sever still runs: that is what puts the mirror in the retained shape")
 			require.NotEmpty(t, gotTask.Annotations[AnnProposalDeclinedAt],
@@ -471,8 +472,10 @@ func TestReopenAfterAParkedDeclineRecoversTheSameWay(t *testing.T) {
 	require.False(t, owned,
 		"a parked owner that already severed the mirror must release it too, or the reopen wedges one shape over")
 
-	require.Equal(t, tatarav1alpha1.StageParked, getTaskCR(t, c, task.Name).Status.Stage,
-		"the reopen undo does not move the owner's stage either")
+	gotTask := getTaskCR(t, c, task.Name)
+	require.Equal(t, tatarav1alpha1.StateRefined, gotTask.Status.State,
+		"the reopen undo does not move the owner's state either")
+	require.True(t, tatarav1alpha1.Parked(gotTask), "the reopen undo does not un-park the owner either")
 }
 
 // TestReopenNeverOrphansAMirrorTheOwnerIsStillWorking: the retained-shape key
@@ -480,7 +483,7 @@ func TestReopenAfterAParkedDeclineRecoversTheSameWay(t *testing.T) {
 func TestReopenNeverOrphansAMirrorTheOwnerIsStillWorking(t *testing.T) {
 	ctx := context.Background()
 	proj, repo := mirrorProject("tatara-bot"), mirrorRepo()
-	task := taskAtStage(tatarav1alpha1.StageClarifying, "")
+	task := taskAtStage(tatarav1alpha1.StateRefined, "")
 	iss := proposalMirror(task, tatarav1alpha1.ProposalKindBrainstorm, true)
 	iss.Status.State, iss.Status.Status = "open", "rejected"
 	task.Status.IssueRefs = []string{iss.Name}
@@ -508,15 +511,20 @@ func TestReopenNeverOrphansAMirrorTheOwnerIsStillWorking(t *testing.T) {
 // forge issue tatara-declined. The verdict guard alone cannot prevent it: the
 // sever runs first.
 func TestDeliveredProposalCloseIsNeverRecordedAsADecline(t *testing.T) {
+	// under-implementation is deliberately NOT a case here: unlike deployed and
+	// done, it IS in stage.AllowsIssueClosedStop's set, and CloseIssuesOnDelivery
+	// never closes an issue while its Task is still implementing (it only runs
+	// at deploying -> delivered per its own doc comment) - so a human closing the
+	// driving issue at under-implementation is a REAL WS3-I3 stop, not this
+	// regression's shape, and must not be suppressed.
 	for _, stg := range []string{
-		tatarav1alpha1.StageDeploying,
-		tatarav1alpha1.StageDelivered,
-		tatarav1alpha1.StageDocumenting,
+		tatarav1alpha1.StateDeployed,
+		tatarav1alpha1.StateDone,
 	} {
 		t.Run(stg, func(t *testing.T) {
 			proj, repo := mirrorProject("tatara-bot"), mirrorRepo()
 			task := taskAtStage(stg, "")
-			task.Spec.Kind = "clarify"
+			task.Spec.Kind = "implement"
 			iss := proposalMirror(task, tatarav1alpha1.ProposalKindBrainstorm, true)
 			// Exactly what CloseIssuesOnDelivery leaves behind.
 			iss.Status.State, iss.Status.Status = "closed", "done"
@@ -566,8 +574,8 @@ func TestDeclineVerdictNeverOverwritesDone(t *testing.T) {
 func TestDeclineClockIsRetriedAfterAFailedStamp(t *testing.T) {
 	ctx := context.Background()
 	proj, repo := mirrorProject("tatara-bot"), mirrorRepo()
-	task := taskAtStage(tatarav1alpha1.StageParked, stage.ReasonBacklogSweep)
-	task.Spec.Kind = "clarify"
+	task := taskAtStage(tatarav1alpha1.StateNew, stage.ReasonBacklogSweep)
+	task.Spec.Kind = "implement"
 	iss := proposalMirror(task, tatarav1alpha1.ProposalKindBrainstorm, true)
 	task.Status.IssueRefs = []string{iss.Name}
 
@@ -640,8 +648,8 @@ func TestDeclineClockNeverSlidesForward(t *testing.T) {
 func TestIssueClosedStopTearsDownTheWrapperBeforeAnyFallibleStep(t *testing.T) {
 	ctx := context.Background()
 	proj, repo := mirrorProject("tatara-bot"), mirrorRepo()
-	task := taskAtStage(tatarav1alpha1.StageClarifying, "")
-	task.Spec.Kind = "clarify"
+	task := taskAtStage(tatarav1alpha1.StateRefined, "")
+	task.Spec.Kind = "implement"
 	iss := proposalMirror(task, tatarav1alpha1.ProposalKindBrainstorm, true)
 	task.Status.IssueRefs = []string{iss.Name}
 
@@ -677,7 +685,7 @@ func TestIssueClosedStopTearsDownTheWrapperBeforeAnyFallibleStep(t *testing.T) {
 // conjunction and the body must evaluate all of it. A Task that does not own the
 // mirror is not in the retained shape however its ref list reads.
 func TestSeveredButStillOwnedEvaluatesOwnershipItself(t *testing.T) {
-	owner := taskAtStage(tatarav1alpha1.StageParked, stage.ReasonBacklogSweep)
+	owner := taskAtStage(tatarav1alpha1.StateNew, stage.ReasonBacklogSweep)
 	stranger := &tatarav1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: "other-task", Namespace: testNS}}
 	iss := proposalMirror(owner, tatarav1alpha1.ProposalKindBrainstorm, true)
 
@@ -722,4 +730,38 @@ func TestDeclineClockWriteOnceIsStructural(t *testing.T) {
 	require.Equal(t, anchored, stale.Annotations[AnnProposalDeclinedAt],
 		"and the caller's copy is refreshed to the authoritative value")
 	_ = iss
+}
+
+// TestIssueClosedStopSkipsAParkedTaskBeforeTheFoldBarrier restores a guard the
+// #521 state/parkReason split silently dropped.
+//
+// Pre-split, `parked` WAS a stage, so the in-loop AllowsIssueClosedStop
+// re-check refused a parked Task outright and returned before anything else in
+// the loop ran. Post-split the same Task reads as state=refined with a
+// parkReason, sails through that re-check, and reaches the fold barrier - which
+// reports a live fold as "deferring the stop" on a Task this edge was never
+// going to stop in the first place. The stop itself is still refused (stage.Enter
+// rejects a parked Task), so the damage is a lying operator-facing log on the
+// diagnosis path for a wedged fold, not a bad write.
+func TestIssueClosedStopSkipsAParkedTaskBeforeTheFoldBarrier(t *testing.T) {
+	now := time.Now()
+	proj, repo := mirrorProject("tatara-bot"), mirrorRepo()
+	task := taskAtStage(tatarav1alpha1.StateRefined, stage.ReasonAwaitingHuman)
+	task.Spec.Kind = "implement"
+	task.Status.FoldInFlight = []string{"member-1"}
+	task.Status.FoldInFlightSince = &metav1.Time{Time: now}
+	iss := proposalMirror(task, "", false)
+	task.Status.IssueRefs = []string{iss.Name}
+	c := newMirrorClient(t, proj, repo, task, iss, scmSecret())
+
+	ctx, lines := recordingCtx()
+	stopped, err := ApplyIssueClosedStop(ctx, c, task, iss.Name, now)
+	require.NoError(t, err)
+	require.False(t, stopped, "a parked Task is never stopped by the WS3-I3 edge")
+	require.False(t, containsLine(*lines, "issue closed while a fold adoption is in flight: deferring the stop"),
+		"the parked guard must short-circuit BEFORE the fold barrier; a parked Task is not a deferred stop")
+
+	fresh := getTaskCR(t, c, task.Name)
+	require.Equal(t, tatarav1alpha1.StateRefined, fresh.Status.State)
+	require.Equal(t, stage.ReasonAwaitingHuman, fresh.Status.ParkReason)
 }

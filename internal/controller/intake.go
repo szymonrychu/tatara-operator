@@ -246,11 +246,11 @@ func (m *Minter) MintIssueTask(ctx context.Context, proj *tatarav1alpha1.Project
 			Namespace: proj.Namespace,
 		},
 		Spec: tatarav1alpha1.TaskSpec{
-			ProjectRef:         proj.Name,
-			Kind:               SweepIssueKind,
-			Goal:               issueGoal(ext),
-			InitialStage:       stg,
-			InitialStageReason: reason,
+			ProjectRef:        proj.Name,
+			Kind:              SweepIssueKind,
+			Goal:              issueGoal(ext),
+			InitialState:      stg,
+			InitialParkReason: reason,
 			Source: &tatarav1alpha1.TaskSource{
 				Provider:    providerOf(proj),
 				IssueRef:    fmt.Sprintf("%s#%d", ext.URL, ext.Number),
@@ -292,7 +292,7 @@ func (m *Minter) MintIssueTask(ctx context.Context, proj *tatarav1alpha1.Project
 	if err := ownIssueForTask(ctx, m.Client, proj.Namespace, issName, task); err != nil {
 		return mintErr(SweepIssueKind, err)
 	}
-	// The STAGE comes from Spec.InitialStage via the TaskReconciler create-edge
+	// The STAGE comes from Spec.InitialState via the TaskReconciler create-edge
 	// (fix C5): NO racing post-create stage write. Only issueRefs is stamped here,
 	// under RetryOnConflict, so it survives the reconciler winning the create-edge
 	// race and stamping the stage first.
@@ -328,11 +328,11 @@ func (m *Minter) MintReviewTask(ctx context.Context, proj *tatarav1alpha1.Projec
 			Namespace: proj.Namespace,
 		},
 		Spec: tatarav1alpha1.TaskSpec{
-			ProjectRef:         proj.Name,
-			Kind:               SweepReviewKind,
-			Goal:               fmt.Sprintf("Review %s", ext.URL),
-			InitialStage:       stg,
-			InitialStageReason: reason,
+			ProjectRef:        proj.Name,
+			Kind:              SweepReviewKind,
+			Goal:              fmt.Sprintf("Review %s", ext.URL),
+			InitialState:      stg,
+			InitialParkReason: reason,
 			Source: &tatarav1alpha1.TaskSource{
 				Provider:    providerOf(proj),
 				IssueRef:    ext.URL,
@@ -371,7 +371,7 @@ func (m *Minter) MintReviewTask(ctx context.Context, proj *tatarav1alpha1.Projec
 	if err := m.bindMRToTask(ctx, proj, repo, ext, task, sp, expectFrom...); err != nil {
 		return mintErr(SweepReviewKind, err)
 	}
-	// Stage from Spec.InitialStage via the create-edge (fix C5); mrRefs +
+	// Stage from Spec.InitialState via the create-edge (fix C5); mrRefs +
 	// humanReviewRounds stamped under RetryOnConflict so they survive the reconciler
 	// winning the create-edge race.
 	mrName := tatarav1alpha1.MergeRequestName(repo.Name, pr.Number)
@@ -458,20 +458,25 @@ func (m *Minter) createTaskRaceSafe(ctx context.Context, task *tatarav1alpha1.Ta
 //
 // Deliberately reads through m.Client (cached), NOT m.reader(). A 2026-07-28
 // review round tried switching this to the uncached reader (the same idiom
-// MarkWebhookOriginated now uses) and it broke
-// TestResumeNoReentryPark_DirectMintCacheLagStillActive: resumeOne (resume.go)
-// severs an issue's ownership via r.Client THEN calls MintForItem in the SAME
-// pass, and that sever's write is exactly what this Get must observe. In
-// production APIReader would see it too (an uncached read always reflects a
-// completed write to the same API server), but resumeOne's own doc comment
-// establishes the actual pattern this package uses: ONLY the specific
-// re-entrant read that needs it (liveIssue, for comment visibility) goes
-// through APIReader - the broader orphan/ownership classification stays on
-// the cached Client. cr=nil vs. cr=<a freshly-created, still-ownerless CR> is
-// also provably equivalent for IsOrphanIssue's own verdict (its cr!=nil guard
-// only ever changes the outcome when cr IS owned), so MarkWebhookOriginated's
-// own create-time stamp and reader threading are what close the read-after-
-// write race for THIS read's caller - this Get does not need to duplicate it.
+// MarkWebhookOriginated uses) and reverted it. Two things justify the cached
+// read on their own, neither of which depends on any one caller:
+//
+//   - THE PACKAGE PATTERN. Only the specific re-entrant read that genuinely
+//     needs freshness is promoted to APIReader; the broader orphan/ownership
+//     CLASSIFICATION read stays on the cached Client. Promoting this one would
+//     make the exception the rule.
+//   - THE VERDICT IS INSENSITIVE TO IT. cr=nil and cr=<a freshly-created,
+//     still-ownerless CR> are equivalent for IsOrphanIssue: its cr!=nil guard
+//     only ever changes the outcome when cr IS owned. So the read-after-write
+//     race is closed for this read's caller by MarkWebhookOriginated's own
+//     create-time stamp and reader threading, and this Get does not need to
+//     duplicate that.
+//
+// The resume path is back (resume.go, finding H8) and it is again a caller that
+// severs an Issue's ownership through m.Client and then calls MintForItem in the
+// SAME pass, so this Get must keep observing that sever. That is a consequence
+// of the two reasons above, not a third one: the reasoning is what pins this
+// decision, not any one caller or test name.
 func (m *Minter) issueCR(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, number int) (*tatarav1alpha1.Issue, error) {
 	var iss tatarav1alpha1.Issue
 	key := types.NamespacedName{Namespace: proj.Namespace, Name: tatarav1alpha1.IssueName(repo.Name, number)}
@@ -499,7 +504,7 @@ func (m *Minter) mergeRequestCR(ctx context.Context, proj *tatarav1alpha1.Projec
 
 // stampMintStatus stamps a freshly minted Task's STATUS (issueRefs / mrRefs /
 // humanReviewRounds) under RetryOnConflict, WITHOUT touching the stage - the
-// stage is derived by the TaskReconciler create-edge from Spec.InitialStage (fix
+// stage is derived by the TaskReconciler create-edge from Spec.InitialState (fix
 // C5). mutate must be idempotent (it runs on every retry against the fresh
 // object).
 func (m *Minter) stampMintStatus(ctx context.Context, task *tatarav1alpha1.Task, mutate func(*tatarav1alpha1.Task)) error {

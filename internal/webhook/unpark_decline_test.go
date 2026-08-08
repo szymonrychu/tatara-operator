@@ -29,7 +29,7 @@ func TestDriveCommentUnpark_GuardDecline_LogsKindAndCounts(t *testing.T) {
 		At: metav1.Now(), Kind: "issue_comment", Author: "human", Body: "go ahead",
 	}}
 	drifted := task.DeepCopy()
-	drifted.Status.StageReason = stage.ReasonMergeTimeout
+	drifted.Status.ParkReason = stage.ReasonMergeTimeout
 
 	liveClient := peClient(t, proj, task)
 	apiReader := &upStaleGetClient{Client: liveClient, stale: drifted}
@@ -39,8 +39,8 @@ func TestDriveCommentUnpark_GuardDecline_LogsKindAndCounts(t *testing.T) {
 	s.driveCommentUnpark(context.Background(), proj, task)
 
 	got := getPETask(t, liveClient, task.Name)
-	if got.Status.Stage != tatarav1.StageParked {
-		t.Fatalf("guard decline must not mutate the live Task; stage=%s", got.Status.Stage)
+	if !tatarav1.Parked(got) {
+		t.Fatalf("guard decline must not mutate the live Task; parkReason=%q", got.Status.ParkReason)
 	}
 
 	var found map[string]any

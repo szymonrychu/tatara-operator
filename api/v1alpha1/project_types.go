@@ -724,13 +724,52 @@ func ConversationIdle(p *Project) time.Duration {
 	return ConversationIdleDefault
 }
 
-// MaxConversingPods is the per-project conversing ceiling for p, defaulting to
-// DefaultMaxConversingPods.
-func MaxConversingPods(p *Project) int {
-	if p != nil && p.Spec.MaxConversingPods > 0 {
-		return p.Spec.MaxConversingPods
+// MaxConcurrentAgents is p's agent-pod concurrency cap, defaulted to
+// DefaultMaxConcurrentAgents when unset.
+//
+// IT DEFAULTS, SO IT MUST NEVER BE USED TO DETECT A PAUSE. MaxConcurrentAgents
+// == 0 is the full-project pause kill switch and this helper turns that 0 into
+// 3. Its only legitimate consumer is the MaxLivePods clamp below, which needs a
+// concrete ceiling to compare against. Every pause check is a direct
+// p.Spec.MaxConcurrentAgents == 0 read (see TestQueueCapacity_PauseMustNotUseFloor
+// for the same trap on QueueCapacity).
+func MaxConcurrentAgents(p *Project) int {
+	if p != nil && p.Spec.MaxConcurrentAgents > 0 {
+		return p.Spec.MaxConcurrentAgents
 	}
-	return DefaultMaxConversingPods
+	return DefaultMaxConcurrentAgents
+}
+
+// MaxLivePods is the per-project ceiling on simultaneously LIVE agent pods.
+//
+// IT CLAMPS. A configured value at or above MaxConcurrentAgents can never bind
+// - the agent-concurrency cap saturates first - so a project configured that
+// way silently has no live-pod ceiling at all. Clamping to
+// MaxConcurrentAgents-1 keeps at least one slot for non-conversational work,
+// whatever a maintainer types.
+//
+// THE STRICTLY-BELOW PROPERTY HOLDS FOR maxConcurrentAgents >= 2 ONLY, and the
+// exception is deliberate. At a cap of 1 the clamp would produce a ceiling of
+// 0, which deadlocks the project outright: no Task could ever enter a live
+// state, so no conversation could ever start or finish. The floor of 1 wins
+// there and the ceiling EQUALS the cap - one live pod, zero slots left for
+// non-conversational work - because a one-agent project has no better trade to
+// make. A deadlock is worse than a starved queue that at least drains.
+//
+// TestMaxLivePodsIsStrictlyBelowMaxConcurrentAgentsForAnyProject checks exactly
+// that split contract: strict inequality at every cap >= 2, equality at 1.
+func MaxLivePods(p *Project) int {
+	want := DefaultMaxLivePods
+	if p != nil && p.Spec.MaxLivePods > 0 {
+		want = p.Spec.MaxLivePods
+	}
+	if ceiling := MaxConcurrentAgents(p) - 1; want > ceiling {
+		want = ceiling
+	}
+	if want < 1 {
+		want = 1
+	}
+	return want
 }
 
 // ProjectSpec defines the desired state of a Project.
@@ -757,26 +796,28 @@ type ProjectSpec struct {
 	// +kubebuilder:validation:Minimum=300
 	// +optional
 	AgentPodTTLSeconds int `json:"agentPodTTLSeconds,omitempty"`
-	// MaxConversingPods caps how many Tasks in this project may sit in the
-	// conversing stage at once. A conversing Task holds a live agent pod and
-	// therefore a REAL MaxConcurrentAgents slot for as long as the conversation
-	// stays open (queueTaskHoldsSlot counts it) - the two caps COMPOSE, so this
-	// one MUST stay strictly below MaxConcurrentAgents or a handful of chatty
-	// threads can occupy the project's entire agent concurrency and starve
-	// every implement/review/merge Task indefinitely (2026-07-28 final review
-	// IMPORTANT 1; see DefaultMaxConversingPods for the default-pair reasoning).
+	// MaxLivePods caps how many Tasks in this project may sit in a LIVE state
+	// at once. A live Task holds a live agent pod and therefore a REAL
+	// MaxConcurrentAgents slot for as long as the conversation stays open
+	// (queueTaskHoldsSlot counts it) - the two caps COMPOSE, so this one MUST
+	// stay strictly below MaxConcurrentAgents or a handful of chatty threads can
+	// occupy the project's entire agent concurrency and starve every
+	// implement/review/merge Task indefinitely (2026-07-28 final review
+	// IMPORTANT 1; see DefaultMaxLivePods for the default-pair reasoning).
+	// v1alpha1.MaxLivePods CLAMPS a value that violates it rather than trusting
+	// the typist.
 	//
-	// Reaching the ceiling DECLINES a new conversation ("over-ceiling"; the
+	// Reaching the ceiling DECLINES a new conversation ("live-ceiling-full"; the
 	// event stays queued in PendingEvents and rides the Task's next turn) - it
 	// does NOT evict an existing one. Eviction is a separate, rarer path
-	// (enforceConversingCeiling, the project-reconcile backstop) that only
-	// fires once live conversations EXCEED the ceiling, which reaching it
+	// (enforceLivePodCeiling, the project-reconcile backstop) that only
+	// fires once live pods EXCEED the ceiling, which reaching it
 	// exactly never does.
-	// Zero means DefaultMaxConversingPods (2).
+	// Zero means DefaultMaxLivePods (2).
 	// +kubebuilder:default=2
 	// +kubebuilder:validation:Minimum=0
 	// +optional
-	MaxConversingPods int `json:"maxConversingPods,omitempty"`
+	MaxLivePods int `json:"maxLivePods,omitempty"`
 	// MaxNewTasksPerSweep caps how many Tasks ONE sweep pass may mint (fix B1).
 	// +kubebuilder:default=5
 	// +kubebuilder:validation:Minimum=1

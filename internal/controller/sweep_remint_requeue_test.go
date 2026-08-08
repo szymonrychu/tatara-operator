@@ -42,7 +42,7 @@ func seedDeadIntakeTwin(t *testing.T, proj *tatarav1alpha1.Project, repo *tatara
 	if err := k8sClient.Create(ctx, dead); err != nil {
 		t.Fatalf("create dead twin: %v", err)
 	}
-	dead.Status.Stage = tatarav1alpha1.StageDelivered
+	dead.Status.State = tatarav1alpha1.StateDone
 	if err := k8sClient.Status().Update(ctx, dead); err != nil {
 		t.Fatalf("stamp dead twin terminal: %v", err)
 	}

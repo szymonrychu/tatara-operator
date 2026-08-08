@@ -147,10 +147,10 @@ func (d *StageDriver) driveOwnerReentry(ctx context.Context, proj *tatarav1alpha
 		}
 		return
 	}
-	if task.Status.Stage != tatarav1alpha1.StageParked ||
-		(task.Status.StageReason != stage.ReasonAwaitingHuman &&
-			task.Status.StageReason != stage.ReasonBacklogSweep &&
-			task.Status.StageReason != stage.ReasonIdentityUnverified) {
+	if !tatarav1alpha1.Parked(&task) ||
+		(task.Status.ParkReason != stage.ReasonAwaitingHuman &&
+			task.Status.ParkReason != stage.ReasonBacklogSweep &&
+			task.Status.ParkReason != stage.ReasonIdentityUnverified) {
 		return
 	}
 	active, err := CountActiveTasks(ctx, d.Client, proj)
@@ -163,29 +163,29 @@ func (d *StageDriver) driveOwnerReentry(ctx context.Context, proj *tatarav1alpha
 	if maxOpen <= 0 {
 		maxOpen = 6
 	}
-	conversingRoom := false
-	if NeedsConversingRoom(task.Status.StageReason) {
-		room, roomErr := ConversingHasRoom(ctx, d.Client, proj)
+	liveRoom := false
+	if NeedsLiveRoom(task.Status.ParkReason) {
+		room, roomErr := LiveHasRoom(ctx, d.Client, proj)
 		if roomErr != nil {
-			log.FromContext(ctx).Error(roomErr, "redeliver: conversing capacity check failed; treating as no room",
+			log.FromContext(ctx).Error(roomErr, "redeliver: live capacity check failed; treating as no room",
 				"action", "redeliver_reentry_room_failed", "resource_id", ownerName)
 		} else {
-			conversingRoom = room
+			liveRoom = room
 		}
 	}
-	target, decline, err := ApplyUnpark(ctx, d.Client, d.APIReader, proj, &task, active, maxOpen, conversingRoom, time.Now())
+	unparked, decline, err := ApplyUnpark(ctx, d.Client, d.APIReader, proj, &task, active, maxOpen, liveRoom, time.Now())
 	if err != nil {
 		log.FromContext(ctx).Error(err, "redeliver: comment-driven unpark failed",
 			"action", "redeliver_reentry_failed", "resource_id", ownerName)
 		return
 	}
-	if target == "" {
+	if !unparked {
 		log.FromContext(ctx).Info("redeliver: comment-driven unpark declined",
 			"action", "redeliver_reentry_declined", "resource_id", ownerName,
-			"stage_reason", task.Status.StageReason, "decline_kind", string(decline))
+			"park_reason", task.Status.ParkReason, "decline_kind", string(decline))
 		return
 	}
 	log.FromContext(ctx).Info("redeliver: unparked task on sweep-delivered comment",
-		"action", "redeliver_reentry", "resource_id", ownerName, "stage", target,
-		"reason_from", task.Status.StageReason)
+		"action", "redeliver_reentry", "resource_id", ownerName, "state", task.Status.State,
+		"reason_from", task.Status.ParkReason)
 }

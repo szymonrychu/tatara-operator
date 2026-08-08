@@ -60,7 +60,7 @@ func ApplyReviewChangesRequested(ctx context.Context, c client.Client, reader cl
 				return nil
 			}
 		}
-		prevStage = fresh.Status.Stage
+		prevStage = fresh.Status.State
 		if !stage.ReenterOnReviewChangesRequested(fresh, mrs, maxTurns, now) {
 			return nil
 		}
@@ -79,14 +79,14 @@ func ApplyReviewChangesRequested(ctx context.Context, c client.Client, reader cl
 		// human review event races the driver's own reconcile loop, so unlike
 		// EnterStage's callers this write is not made from inside it and must tear
 		// the old pod down itself or it leaks as an orphan.
-		if stage.AgentKindFor(prevStage) != "" {
+		if stage.AgentKindFor(prevStage, task.Spec.Kind) != "" {
 			if err := agent.DeleteWrapper(ctx, c, task.Namespace, task); err != nil {
 				return true, fmt.Errorf("review: delete wrapper pod for %s: %w", task.Name, err)
 			}
 		}
 		log.FromContext(ctx).Info("review: maintainer requested changes; re-entered stage machine",
 			"action", "review_reenter_implementing", "resource_id", task.Name,
-			"from_stage", prevStage, "to_stage", task.Status.Stage)
+			"from_stage", prevStage, "to_stage", task.Status.State)
 	}
 	return reentered, nil
 }
@@ -115,7 +115,7 @@ func ApplyReviewApproval(ctx context.Context, c client.Client, reader client.Rea
 	if err := rdr.Get(ctx, key, live); err != nil {
 		return false, err
 	}
-	if live.Status.Stage != tatarav1alpha1.StageReviewing {
+	if live.Status.State != tatarav1alpha1.StateAwaitingReview {
 		return false, nil // approval arrived off reviewing; fold to the comment path
 	}
 	mrs, err := ownedMergeRequests(ctx, rdr, task)
@@ -187,10 +187,10 @@ func ApplyReviewApproval(ctx context.Context, c client.Client, reader client.Rea
 		if err := rdr.Get(ctx, key, t); err != nil {
 			return err
 		}
-		if t.Status.Stage != tatarav1alpha1.StageReviewing {
+		if t.Status.State != tatarav1alpha1.StateAwaitingReview {
 			return nil
 		}
-		if err := stage.Enter(t, fresh, tatarav1alpha1.StageMerging, "", now); err != nil {
+		if err := stage.Enter(t, fresh, tatarav1alpha1.StateMerged, "", now); err != nil {
 			return nil // guard refused (e.g. gate still closed); leave untouched
 		}
 		if err := c.Status().Update(ctx, t); err != nil {

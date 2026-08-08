@@ -59,8 +59,9 @@ func TestReconcileOwnership_FlipsOnUnattributableDrift(t *testing.T) {
 		t.Fatalf("flip counter not incremented")
 	}
 	// The bound takeover Task is parked ownership-lost.
-	if tk := ownerTaskOf(t, ctx, got); tk.Status.Stage != tatarav1alpha1.StageParked || tk.Status.StageReason != stage.ReasonOwnershipLost {
-		t.Fatalf("bound task not parked ownership-lost: %q/%q", tk.Status.Stage, tk.Status.StageReason)
+	if tk := ownerTaskOf(t, ctx, got); tk.Status.State != tatarav1alpha1.StateUnderImplementation ||
+		!tatarav1alpha1.Parked(tk) || tk.Status.ParkReason != stage.ReasonOwnershipLost {
+		t.Fatalf("bound task not parked ownership-lost: %q/%q", tk.Status.State, tk.Status.ParkReason)
 	}
 }
 
@@ -101,8 +102,8 @@ func TestReconcileOwnership_FlipsNormalImplementOwner(t *testing.T) {
 	if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: proj.Namespace, Name: implName}, &implTask); err != nil {
 		t.Fatalf("get normal owner task %s: %v", implName, err)
 	}
-	if implTask.Status.Stage != tatarav1alpha1.StageParked || implTask.Status.StageReason != stage.ReasonOwnershipLost {
-		t.Fatalf("normal owner task not parked ownership-lost: %q/%q", implTask.Status.Stage, implTask.Status.StageReason)
+	if implTask.Status.State != tatarav1alpha1.StateUnderImplementation || !tatarav1alpha1.Parked(&implTask) || implTask.Status.ParkReason != stage.ReasonOwnershipLost {
+		t.Fatalf("normal owner task not parked ownership-lost: %q/%q", implTask.Status.State, implTask.Status.ParkReason)
 	}
 
 	reviewName := tatarav1alpha1.IntakeTaskName(proj.Name, SweepReviewKind, repo.Name, 6)
@@ -232,8 +233,8 @@ func TestReconcileOwnership_FlipsMainlineWithExistingReviewTask(t *testing.T) {
 	if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: proj.Namespace, Name: implName}, &implTask); err != nil {
 		t.Fatalf("get owner task %s: %v", implName, err)
 	}
-	if implTask.Status.Stage != tatarav1alpha1.StageParked || implTask.Status.StageReason != stage.ReasonOwnershipLost {
-		t.Fatalf("owner task not parked ownership-lost: %q/%q", implTask.Status.Stage, implTask.Status.StageReason)
+	if implTask.Status.State != tatarav1alpha1.StateUnderImplementation || !tatarav1alpha1.Parked(&implTask) || implTask.Status.ParkReason != stage.ReasonOwnershipLost {
+		t.Fatalf("owner task not parked ownership-lost: %q/%q", implTask.Status.State, implTask.Status.ParkReason)
 	}
 
 	if ctrl, ok := ownerControllerName(got); !ok || ctrl != reviewName {
@@ -293,8 +294,8 @@ func TestReconcileOwnership_ResumesHalfCompletedFlip(t *testing.T) {
 	if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: proj.Namespace, Name: takeoverName}, &task); err != nil {
 		t.Fatalf("get takeover task: %v", err)
 	}
-	task.Status.Stage = tatarav1alpha1.StageImplementing
-	task.Status.StageReason = ""
+	task.Status.State = tatarav1alpha1.StateUnderImplementation
+	task.Status.ParkReason = ""
 	if err := k8sClient.Status().Update(ctx, &task); err != nil {
 		t.Fatalf("un-park owner task: %v", err)
 	}
@@ -326,8 +327,8 @@ func TestReconcileOwnership_ResumesHalfCompletedFlip(t *testing.T) {
 	if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: proj.Namespace, Name: takeoverName}, &taskAfter); err != nil {
 		t.Fatalf("get takeover task after resume: %v", err)
 	}
-	if taskAfter.Status.Stage != tatarav1alpha1.StageParked || taskAfter.Status.StageReason != stage.ReasonOwnershipLost {
-		t.Fatalf("owner task must be re-parked ownership-lost by the resume: %q/%q", taskAfter.Status.Stage, taskAfter.Status.StageReason)
+	if taskAfter.Status.State != tatarav1alpha1.StateUnderImplementation || !tatarav1alpha1.Parked(&taskAfter) || taskAfter.Status.ParkReason != stage.ReasonOwnershipLost {
+		t.Fatalf("owner task must be re-parked ownership-lost by the resume: %q/%q", taskAfter.Status.State, taskAfter.Status.ParkReason)
 	}
 
 	after := getMR(t, ctx, proj, repo, 10)
@@ -457,7 +458,7 @@ func seedTataraOwnedMRWithOwnerTask(t *testing.T, ctx context.Context, proj *tat
 	if err := k8sClient.Create(ctx, task); err != nil {
 		t.Fatalf("create owner task: %v", err)
 	}
-	stampTaskStatus(t, ctx, task, tatarav1alpha1.StageImplementing, "")
+	stampTaskStatus(t, ctx, task, tatarav1alpha1.StateUnderImplementation, "")
 
 	mr := &tatarav1alpha1.MergeRequest{
 		ObjectMeta: metav1.ObjectMeta{

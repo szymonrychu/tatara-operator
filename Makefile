@@ -85,7 +85,7 @@ chart-lint:
 			exit 1; \
 		fi
 	@rendered="$$($(HELM_BIN) template charts/tatara-operator)"; \
-	for m in operator_reconcile_total operator_task_terminal_total operator_turn_timeout_total operator_agent_boot_crash_total operator_agent_unreachable_termination_total operator_ingest_job_total operator_scm_writes_total operator_reap_delete_error_total operator_push_receive_total operator_memory_stacks operator_tasks_inflight operator_tasks_minted_per_sweep operator_sweep_mint_cap_hit_total operator_sweep_skipped_total tatara_lifecycle_giveup_total operator_admission_blocked_total operator_token_budget_used_ratio; do \
+	for m in operator_reconcile_total operator_task_terminal_total operator_task_parked_total operator_task_residency_exceeded_total operator_task_parked_with_live_pod_repaired_total operator_turn_timeout_total operator_agent_boot_crash_total operator_agent_unreachable_termination_total operator_ingest_job_total operator_scm_writes_total operator_reap_delete_error_total operator_push_receive_total operator_memory_stacks operator_tasks_inflight operator_tasks_minted_per_sweep operator_sweep_mint_cap_hit_total operator_sweep_skipped_total tatara_lifecycle_giveup_total operator_admission_blocked_total operator_token_budget_used_ratio; do \
 		if ! grep -q "$$m" <<<"$$rendered"; then \
 			echo "chart-lint: PrometheusRule references unknown/absent metric $$m"; \
 			exit 1; \

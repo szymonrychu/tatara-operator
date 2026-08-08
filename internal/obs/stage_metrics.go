@@ -26,22 +26,19 @@ func init() {
 	// series at all - a sustained-rate alert added later has something to
 	// evaluate against on the very first real drift (metric-wiring audit,
 	// issue #370). IllegalStageTransitionTotal and StageRaceLostTotal are NOT
-	// pre-seeded: their {from,to} cardinality (16x16) makes a full matrix
-	// 256 series apiece against K.1 cardinality discipline, and no rule reads
+	// pre-seeded: their {from,to} cardinality (8x8) makes a full matrix
+	// 64 series apiece against K.1 cardinality discipline, and no rule reads
 	// a pair that has never fired. The cost is real and known: an alert using
 	// increase() sees a series BORN mid-window and has no zero to extrapolate
 	// from, so it under-reports the true count (issue #478 - the counter had
 	// reached 2 while the 15m increase() reported 1). Under-reporting a
 	// must-be-zero counter is acceptable; 256 idle series are not.
-	for _, stg := range []string{
-		tatarav1alpha1.StageTriaging, tatarav1alpha1.StageBrainstorming, tatarav1alpha1.StageClarifying,
-		tatarav1alpha1.StageInvestigating, tatarav1alpha1.StageRefining, tatarav1alpha1.StageApproved,
-		tatarav1alpha1.StageImplementing, tatarav1alpha1.StageReviewing, tatarav1alpha1.StageMerging,
-		tatarav1alpha1.StageDeploying, tatarav1alpha1.StageDelivered, tatarav1alpha1.StageDocumenting,
-		tatarav1alpha1.StageRejected, tatarav1alpha1.StageFailed, tatarav1alpha1.StageParked,
-		tatarav1alpha1.StageConversing,
+	for _, st := range []string{
+		tatarav1alpha1.StateNew, tatarav1alpha1.StateRefined, tatarav1alpha1.StateUnderImplementation,
+		tatarav1alpha1.StateAwaitingReview, tatarav1alpha1.StateMerged, tatarav1alpha1.StateDeployed,
+		tatarav1alpha1.StateDone, tatarav1alpha1.StateRejected,
 	} {
-		StageDriftTotal.WithLabelValues(stg)
+		StageDriftTotal.WithLabelValues(st)
 	}
 }
 
@@ -141,7 +138,7 @@ func (m *OperatorMetrics) TaskTerminalEntry(kind, from, to, reason string) {
 	if m == nil || m.taskMetrics == nil {
 		return
 	}
-	if from == "" || !tatarav1alpha1.StageIsTerminalOutcome(to) {
+	if from == "" || !tatarav1alpha1.TaskIsTerminalOutcome(to) {
 		return
 	}
 	m.TaskTerminal(kind, to, reason)

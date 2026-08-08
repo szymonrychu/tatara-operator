@@ -251,8 +251,8 @@ func TestRedeliverMRComments_DrivesTakeoverReentryOnParkedAwaitingHuman(t *testi
 	}
 
 	tk := getTask(t, "op12-takeover-task-80")
-	tk.Status.Stage = tatarav1alpha1.StageParked
-	tk.Status.StageReason = stage.ReasonAwaitingHuman
+	tk.Status.State = tatarav1alpha1.StateAwaitingReview
+	tk.Status.ParkReason = stage.ReasonAwaitingHuman
 	tk.Status.HumanReviewRounds = tatarav1alpha1.MaxHumanReviewRounds
 	tk.Status.MRRefs = []string{mr.Name}
 	if err := k8sClient.Status().Update(ctx, tk); err != nil {
@@ -267,9 +267,9 @@ func TestRedeliverMRComments_DrivesTakeoverReentryOnParkedAwaitingHuman(t *testi
 	}
 
 	got := getTask(t, "op12-takeover-task-80")
-	if got.Status.Stage != tatarav1alpha1.StageReviewing {
+	if got.Status.State != tatarav1alpha1.StateAwaitingReview {
 		t.Fatalf("stage = %q, want reviewing: a take-over comment delivered only via OP12 sweep convergence must still re-engage the parked review Task",
-			got.Status.Stage)
+			got.Status.State)
 	}
 }
 

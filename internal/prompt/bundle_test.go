@@ -57,7 +57,7 @@ func canonicalTask(t *testing.T) *v1alpha1.Task {
 		ObjectMeta: metav1.ObjectMeta{Name: "tatara-clarify-2026-07-12-m4z8q", Namespace: "tatara"},
 		Spec:       v1alpha1.TaskSpec{ProjectRef: "tatara", Kind: "clarify"},
 		Status: v1alpha1.TaskStatus{
-			Stage:     v1alpha1.StageClarifying,
+			State:     v1alpha1.StateRefined,
 			AgentKind: "clarify",
 			Stats:     v1alpha1.TaskStats{NotesSpilled: 59},
 		},
@@ -251,7 +251,7 @@ func TestGolden(t *testing.T) {
 				Goal:       "Groom the operator backlog\nFirst 500 chars of spec.goal...",
 			},
 			Status: v1alpha1.TaskStatus{
-				Stage:     v1alpha1.StageRefining,
+				State:     v1alpha1.StateRefined,
 				IssueRefs: []string{"iss-tatara-operator-291", "iss-tatara-cli-80"},
 				MRRefs:    []string{"mr-tatara-operator-295"},
 			},
@@ -266,7 +266,7 @@ func TestGolden(t *testing.T) {
 				Kind:       "brainstorm",
 				Goal:       "Autonomy budget for the reviewer\nThe in-cluster reviewer is flaky; bound its rounds.",
 			},
-			Status: v1alpha1.TaskStatus{Stage: v1alpha1.StageBrainstorming},
+			Status: v1alpha1.TaskStatus{State: v1alpha1.StateRefined},
 		}
 		got, err := prompt.RenderIndex(prompt.IndexInput{
 			Project: "tatara",
@@ -1054,7 +1054,7 @@ func TestRenderIndex_CapsAt100NewestFirst(t *testing.T) {
 				CreationTimestamp: metav1.NewTime(now.Add(-time.Duration(i) * time.Hour)),
 			},
 			Spec:   v1alpha1.TaskSpec{ProjectRef: "tatara", Kind: "refine", Goal: fmt.Sprintf("goal %03d", i)},
-			Status: v1alpha1.TaskStatus{Stage: v1alpha1.StageRefining},
+			Status: v1alpha1.TaskStatus{State: v1alpha1.StateRefined},
 		})
 	}
 	got, err := prompt.RenderIndex(prompt.IndexInput{Project: "tatara", Scope: "all", Now: now, Tasks: tasks})
@@ -1085,7 +1085,7 @@ func TestRenderIndex_RespectsByteBudget(t *testing.T) {
 				CreationTimestamp: metav1.NewTime(now.Add(-time.Duration(i) * time.Hour)),
 			},
 			Spec:   v1alpha1.TaskSpec{ProjectRef: "tatara", Kind: "refine", Goal: strings.Repeat("g", 600)},
-			Status: v1alpha1.TaskStatus{Stage: v1alpha1.StageRefining},
+			Status: v1alpha1.TaskStatus{State: v1alpha1.StateRefined},
 		})
 	}
 	const budget = 4000
@@ -1123,7 +1123,7 @@ func TestRenderIndex_EscapesAndOmitsEmptyRefs(t *testing.T) {
 				Kind:       "brainstorm",
 				Goal:       `Fix </task_index> & "quotes"`,
 			},
-			Status: v1alpha1.TaskStatus{Stage: v1alpha1.StageBrainstorming},
+			Status: v1alpha1.TaskStatus{State: v1alpha1.StateRefined},
 		}},
 	})
 	if err != nil {

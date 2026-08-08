@@ -178,7 +178,6 @@ var typeAbbrevs = map[string]string{
 	"brainstorm":    "brs",
 	"refine":        "ref",
 	"incident":      "inc",
-	"clarify":       "clr",
 	"review":        "rev",
 	"implement":     "imp",
 	"documentation": "doc",
@@ -329,11 +328,11 @@ func podLabels(task *tatarav1alpha1.Task) map[string]string {
 	if task.UID != "" {
 		l[LabelTaskUID] = string(task.UID)
 	}
-	// The agent kind this pod was built for (the CURRENT stage's kind, since
-	// BuildPod is only ever called for the stage the Task is presently in). The
-	// reaper reads this back to catch a pod left running past a stage advance;
-	// omitted when the stage is pod-less (AgentKindFor returns "").
-	if kind := stage.AgentKindFor(task.Status.Stage); kind != "" {
+	// The agent kind this pod was built for (the CURRENT state's kind, since
+	// BuildPod is only ever called for the state the Task is presently in). The
+	// reaper reads this back to catch a pod left running past a state advance;
+	// omitted when the state runs no pod (AgentKindFor returns "").
+	if kind := stage.AgentKindFor(task.Status.State, task.Spec.Kind); kind != "" {
 		l[LabelAgentKind] = kind
 	}
 	return l
@@ -477,12 +476,12 @@ func AgentKind(task *tatarav1alpha1.Task) string {
 	return task.Spec.Kind
 }
 
-// agentRepoEnv is TATARA_REPO: the Repository CR name. Under the stage machine
+// agentRepoEnv is TATARA_REPO: the Repository CR name. Under the state machine
 // it is narrowed to the documentation agent (contract G.9) - every other agent
 // kind is project-scoped and sees the whole enrolled repo set via TATARA_REPOS.
-// Legacy phase-driven Tasks (no stage) keep the un-narrowed value.
+// Legacy phase-driven Tasks (no state) keep the un-narrowed value.
 func agentRepoEnv(task *tatarav1alpha1.Task) string {
-	if task.Status.Stage == "" {
+	if task.Status.State == "" {
 		return task.Spec.RepositoryRef
 	}
 	if AgentKind(task) == "documentation" {
@@ -491,29 +490,43 @@ func agentRepoEnv(task *tatarav1alpha1.Task) string {
 	return ""
 }
 
-// PodTTLSeconds is G.7's pod-lifetime budget for THIS task's current stage, in
+// PodTTLSeconds is G.7's pod-lifetime budget for THIS task's current state, in
 // seconds. It is the SINGLE source of truth for the value: AgentEnv stamps it as
 // AGENT_POD_TTL_SECONDS (which is what the wrapper computes its own 410-Gone
 // deadline from) and TTLDeadline computes t0 from it, so the operator and the
 // pod can never disagree about when turns stop being admitted.
 //
-// The conversing stage gets the CONVERSATION idle window rather than the flat
-// project TTL. That is the resolution of the one real conflict in this design:
-// the wrapper refuses turns past podStart + this value and the wrapper is not
-// being changed, so a conversing pod cannot outlive a flat cap. It does not need
-// to. The two clocks answer different questions - this one says when ONE POD
-// rotates, Task.status.conversationLastEventAt says when the CONVERSATION ends -
-// and ttlStop leaves the STAGE unchanged, taking the handoff turn and re-arming
-// the Task so a replacement pod resumes from the handoff note. An
-// actively-replied-to conversation therefore keeps going indefinitely (decision
-// D6) while every individual pod stays bounded. Matching the pod TTL to the idle
-// window also means an idle conversation's pod dies at the same instant the idle
-// clock parks the Task, so there is no wasted rotation.
+// A LIVE state gets the LONGER of the flat project TTL and the CONVERSATION idle
+// window. The two clocks answer different questions - this one says when ONE POD
+// rotates, the Task's idle clock says when the CONVERSATION ends - and ttlStop
+// leaves the STATE unchanged, taking the handoff turn and re-arming the Task so a
+// replacement pod resumes from the handoff note. An actively-replied-to
+// conversation therefore keeps going indefinitely (decision D6) while every
+// individual pod stays bounded, and stage.ResidencyExceeded is the absolute bound
+// on the whole thing.
+//
+// THE MAX, NOT THE SUBSTITUTION, and this is the pod-side half of the #521 idle
+// clock fix. `conversing` SUBSTITUTED the idle window for the project TTL, and
+// #521 widened that substitution to every live state - which rotated an implement
+// pod every idle window, mid-turn, with no completed turn to hand off from, so
+// the stop force-deleted it and the agent's work went with it. The substitution
+// only ever bought one thing: an idle conversation's pod not outliving the park
+// that is about to tear it down anyway. Since the park DOES tear it down, a
+// LONGER pod TTL costs nothing on the idle path - and it is the only thing that
+// lets an agent work for longer than one idle window.
+//
+// The idle window is still taken when IT is the longer of the two, which is the
+// original conflict this function was written for: the wrapper refuses turns past
+// podStart + this value, so a pod rotating at a flat 30m in the middle of a 90m
+// conversation window would be refused turns the operator still believes in.
 func PodTTLSeconds(project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) int {
-	if task != nil && task.Status.Stage == tatarav1alpha1.StageConversing {
-		return int(tatarav1alpha1.ConversationIdle(project) / time.Second)
+	ttl := project.Spec.AgentPodTTLSeconds
+	if task != nil && stage.Live(task.Status.State) {
+		if idle := int(tatarav1alpha1.ConversationIdle(project) / time.Second); idle > ttl {
+			return idle
+		}
 	}
-	return project.Spec.AgentPodTTLSeconds
+	return ttl
 }
 
 // AgentEnv is the contract G.9 agent-pod env block: task identity, the agent
@@ -935,17 +948,21 @@ func buildPodSecurityContext(cfg PodConfig) *corev1.PodSecurityContext {
 // report a terminal outcome at all. It is not fail-open, whatever earlier
 // comments here claimed. healthCheck shares Kind=brainstorm, so it is not a
 // distinct entry.
+//
+// `clarify` was a seventh entry until #521 folded that kind into implement. Its
+// absence is now LOAD-BEARING for a kind that used to exist: a stale Task or a
+// hand-rolled client claiming kind=clarify gets no profile and therefore no
+// submit_outcome, rather than a working path around the new approval gate.
 var kindProfiles = map[string]string{
 	"implement":     "implement",
 	"review":        "review",
-	"clarify":       "clarify",
 	"brainstorm":    "brainstorm",
 	"incident":      "incident",
 	"refine":        "refine",
 	"documentation": "documentation",
 }
 
-// profileForKind looks up kind in kindProfiles, returning "" (fail-open) for
+// profileForKind looks up kind in kindProfiles, returning "" (fail-CLOSED) for
 // an unknown/empty kind.
 func profileForKind(kind string) string {
 	return kindProfiles[kind]
@@ -976,14 +993,13 @@ func resolveByKind(byKind map[string]string, kind, activity, fallback string) st
 // kindDefaultModel is the locked per-kind model tier for the 7-kind model
 // (design decision, cross-repo contract). It is the fallback when the project
 // sets no per-kind ModelByKind override: opus for the reasoning kinds
-// (brainstorm/incident/clarify/implement/review), sonnet for the cheaper
+// (brainstorm/incident/implement/review), sonnet for the cheaper
 // recurring kinds (documentation/refine). A project ModelByKind override still
 // wins (resolveByKind precedence). Kinds absent here (retired legacy kinds) fall
 // back to the project-wide Model as before.
 var kindDefaultModel = map[string]string{
 	"brainstorm":    "claude-opus-5",
 	"incident":      "claude-opus-5",
-	"clarify":       "claude-opus-5",
 	"implement":     "claude-opus-5",
 	"review":        "claude-opus-5",
 	"documentation": "claude-sonnet-5",
@@ -1011,7 +1027,7 @@ const helmfileTargetRepo = "tatara-helmfile"
 // when the task targets the self-heal repo (helmfileTargetRepo). documentation
 // and refine (the cheap, freely-tierable kinds) are deliberately absent.
 var modelFloorKinds = map[string]bool{
-	"brainstorm": true, "incident": true, "clarify": true, "implement": true, "review": true,
+	"brainstorm": true, "incident": true, "implement": true, "review": true, "takeover": true,
 }
 
 // modelFloorAppliesOnRepo reports whether the tier-revert self-heal model floor

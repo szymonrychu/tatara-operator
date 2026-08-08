@@ -60,7 +60,7 @@ func TestDriveUnparks_GuardDecline_LogsAndCounts(t *testing.T) {
 	// live StageReason has already moved to merge-timeout by the time the
 	// retry-loop Get runs.
 	drifted := task.DeepCopy()
-	drifted.Status.StageReason = stage.ReasonMergeTimeout
+	drifted.Status.ParkReason = stage.ReasonMergeTimeout
 	apiReader := &staleGetClient{Client: c, stale: drifted}
 
 	metrics := wfMetrics()
@@ -77,8 +77,8 @@ func TestDriveUnparks_GuardDecline_LogsAndCounts(t *testing.T) {
 		t.Fatalf("operator_unpark_declined_total{awaiting-human,guard} = %v, want 1", got)
 	}
 	got := mdGetTask(t, c, task.Name)
-	if got.Status.Stage != tatarav1alpha1.StageParked {
-		t.Fatalf("guard decline must not mutate the live Task; stage=%s", got.Status.Stage)
+	if !tatarav1alpha1.Parked(got) {
+		t.Fatalf("guard decline must not mutate the live Task; parked=%v", tatarav1alpha1.Parked(got))
 	}
 }
 
@@ -121,8 +121,8 @@ func TestDriveUnparks_RuleDecline_CountsButDoesNotLog(t *testing.T) {
 		t.Fatalf("operator_unpark_declined_total{awaiting-human,no-human-event} = %v, want 1", got)
 	}
 	got := mdGetTask(t, c, task.Name)
-	if got.Status.Stage != tatarav1alpha1.StageParked {
-		t.Fatalf("non-guard decline must not mutate the live Task; stage=%s", got.Status.Stage)
+	if !tatarav1alpha1.Parked(got) {
+		t.Fatalf("non-guard decline must not mutate the live Task; parked=%v", tatarav1alpha1.Parked(got))
 	}
 }
 

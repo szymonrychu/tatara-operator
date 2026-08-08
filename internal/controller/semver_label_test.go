@@ -78,7 +78,7 @@ func TestSemverLabelProjection(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			task := mdTask("t1", "implement", tatarav1alpha1.StageReviewing)
+			task := mdTask("t1", "implement", tatarav1alpha1.StateAwaitingReview)
 			mr := mdMR(task, "tatara-operator", 7)
 			mr.Status.Significance = tc.significance
 			if tc.annotation != "" {
@@ -108,7 +108,7 @@ func TestSemverLabelProjection(t *testing.T) {
 // projection then recognises its own annotation and writes NOTHING. The PR keeps
 // semver:minor; a flaky reviewer cannot downgrade a minor release to a patch.
 func TestSemverLabelNeverLowers(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageReviewing)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateAwaitingReview)
 	mr := mdMR(task, "tatara-operator", 7)
 	mr.Status.Significance = "minor" // a review asked for patch; /outcome kept minor
 	mr.Annotations = map[string]string{AnnSemverLabel: "semver:minor"}
@@ -143,7 +143,7 @@ func TestSemverLabelBothProviders(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			task := mdTask("t1", "implement", tatarav1alpha1.StageReviewing)
+			task := mdTask("t1", "implement", tatarav1alpha1.StateAwaitingReview)
 			mr := mdMR(task, "tatara-operator", 7)
 			mr.Status.Significance = "patch"
 			c := newMirrorClient(t, tc.proj, mdSecret(), tc.repo, task, mr)
@@ -162,7 +162,7 @@ func TestSemverLabelBothProviders(t *testing.T) {
 // implement outcome stamps status.significance - not by some sweep an hour
 // later. This is the wiring test: without it the projection is dead code.
 func TestMergeRequestReconcilerProjectsSemverLabel(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageReviewing)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateAwaitingReview)
 	mr := mdMR(task, "tatara-operator", 7)
 	mr.Status.Significance = "minor"
 	c := newMirrorClient(t, mdProject(), mdSecret(), mdRepo("tatara-operator"), task, mr)
@@ -183,7 +183,7 @@ func TestMergeRequestReconcilerProjectsSemverLabel(t *testing.T) {
 // the merge commit. A merge that lands first and a label that lands second is a
 // release that never gets tagged.
 func TestMergeProjectsSemverLabelBeforeMerging(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageMerging)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateMerged)
 	task.Spec.MergeOrder = []string{"tatara-operator"}
 	mr := mdMR(task, "tatara-operator", 7)
 	mr.Status.ReviewedSHA = "sha-a"
@@ -216,7 +216,7 @@ func TestMergeProjectsSemverLabelBeforeMerging(t *testing.T) {
 func TestMergeWithoutSignificanceIsLoud(t *testing.T) {
 	before := testutil.ToFloat64(obs.SemverLabelMissingTotal.WithLabelValues("tatara-operator"))
 
-	task := mdTask("t1", "implement", tatarav1alpha1.StageMerging)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateMerged)
 	task.Spec.MergeOrder = []string{"tatara-operator"}
 	mr := mdMR(task, "tatara-operator", 7)
 	mr.Status.ReviewedSHA = "sha-a"

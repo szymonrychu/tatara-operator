@@ -408,7 +408,7 @@
     },
     {
       "type": "timeseries",
-      "title": "Terminal transitions by phase/reason (per hour)",
+      "title": "Terminal states and parks by reason (per hour)",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -425,10 +425,10 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (phase, reason) (increase(operator_task_terminal_total[1h]))",
+          "expr": "sum by (state, stateReason) (increase(operator_task_terminal_total[1h])) or sum by (state, parkReason) (increase(operator_task_parked_total[1h]))",
           "refId": "A",
           "editorMode": "code",
-          "legendFormat": "{{phase}} / {{reason}}",
+          "legendFormat": "{{state}} / {{stateReason}}{{parkReason}}",
           "format": "time_series"
         }
       ],
@@ -459,7 +459,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(operator_task_terminal_total{phase=\"Succeeded\"}[6h])) / clamp_min(sum(rate(operator_task_terminal_total[6h])), 1)",
+          "expr": "sum(rate(operator_task_terminal_total{state=\"done\"}[6h])) / clamp_min(sum(rate(operator_task_terminal_total[6h])) + sum(rate(operator_task_parked_total[6h])), 1)",
           "refId": "A",
           "editorMode": "code",
           "legendFormat": "success rate",

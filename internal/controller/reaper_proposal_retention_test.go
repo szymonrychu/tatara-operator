@@ -68,7 +68,7 @@ func TestReapKeepsAnOpenUndecidedProposalCountable(t *testing.T) {
 			// The clarify Task that filed the proposal, parked 8 days ago: PAST
 			// parkRetention, so this reap pass deletes it.
 			task := reapTask("openprop", "clarify-task", "clarify",
-				tatarav1alpha1.StageParked, stage.ReasonAwaitingHuman, time.Now().Add(-8*24*time.Hour))
+				tatarav1alpha1.StateRefined, stage.ReasonAwaitingHuman, time.Now().Add(-8*24*time.Hour))
 			iss := reapProposalIssue("openprop", repo.Name, task.Name, "open", tc.status, 11)
 			task.Status.IssueRefs = []string{iss.Name}
 
@@ -127,7 +127,7 @@ func TestDeclinedProposalRetentionBoundary(t *testing.T) {
 			// rejected(issue-closed) and no longer lists the issue (the sever cleared
 			// IssueRefs), the mirror is closed, stamped rejected, and still owned.
 			task := reapTask("declprop", "clarify-task", "clarify",
-				tatarav1alpha1.StageRejected, stage.ReasonIssueClosed, time.Now().Add(-tc.age))
+				tatarav1alpha1.StateRejected, stage.ReasonIssueClosed, time.Now().Add(-tc.age))
 			iss := reapProposalIssue("declprop", repo.Name, task.Name, "closed", "rejected", 12)
 
 			c := newMirrorClient(t, proj, repo, reapSecret(), task, iss)
@@ -178,7 +178,7 @@ func TestDeclinedProposalHoldIsScopedToTheRetainedShape(t *testing.T) {
 			repo := reapRepo("scopeprop", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
 
 			task := reapTask("scopeprop", "clarify-task", "clarify",
-				tatarav1alpha1.StageRejected, stage.ReasonIssueClosed,
+				tatarav1alpha1.StateRejected, stage.ReasonIssueClosed,
 				time.Now().Add(-tatarav1alpha1.RejectedRetention-time.Hour))
 			objs := []client.Object{proj, repo, reapSecret(), task}
 			if tc.withIssue {
@@ -238,7 +238,7 @@ func TestParkedDeclineMirrorSurvivesToTheSameBoundary(t *testing.T) {
 			// out - and the decline happened sinceClose ago. The window has to be
 			// anchored on the decline, or it expired long before the maintainer acted.
 			task := reapTask("parkdecl", "clarify-task", "clarify",
-				tatarav1alpha1.StageParked, stage.ReasonBacklogSweep, time.Now().Add(-90*24*time.Hour))
+				tatarav1alpha1.StateRefined, stage.ReasonBacklogSweep, time.Now().Add(-90*24*time.Hour))
 			task.Annotations = map[string]string{
 				AnnProposalDeclinedAt: time.Now().Add(-tc.sinceClose).UTC().Format(time.RFC3339),
 			}
@@ -281,7 +281,7 @@ func TestParkedTaskStillWorkingItsIssueIsNotHeld(t *testing.T) {
 	repo := reapRepo("notheld", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
 
 	task := reapTask("notheld", "clarify-task", "clarify",
-		tatarav1alpha1.StageParked, stage.ReasonBacklogSweep, time.Now().Add(-time.Hour))
+		tatarav1alpha1.StateRefined, stage.ReasonBacklogSweep, time.Now().Add(-time.Hour))
 	task.Annotations = map[string]string{AnnProposalDeclinedAt: time.Now().Format(time.RFC3339)}
 	iss := reapProposalIssue("notheld", repo.Name, task.Name, "closed", "rejected", 32)
 	// STILL LISTED: this is not a severed retention.
@@ -311,7 +311,7 @@ func TestHeldTaskStillReleasesItsOtherArtifacts(t *testing.T) {
 	repo := reapRepo("heldrel", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
 
 	task := reapTask("heldrel", "clarify-task", "clarify",
-		tatarav1alpha1.StageParked, stage.ReasonAwaitingHuman, time.Now().Add(-8*24*time.Hour))
+		tatarav1alpha1.StateRefined, stage.ReasonAwaitingHuman, time.Now().Add(-8*24*time.Hour))
 	task.Annotations = map[string]string{AnnProposalDeclinedAt: time.Now().Format(time.RFC3339)}
 
 	// The retained decline (severed: not in IssueRefs).

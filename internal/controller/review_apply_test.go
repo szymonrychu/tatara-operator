@@ -72,9 +72,9 @@ func reviewingTask(name, kind string) *tatarav1alpha1.Task {
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS},
 		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "p", Kind: kind, Goal: "g"},
 	}
-	task.Status.Stage = tatarav1alpha1.StageReviewing
+	task.Status.State = tatarav1alpha1.StateAwaitingReview
 	ent := metav1.NewTime(time.Now().Add(-time.Hour))
-	task.Status.StageEnteredAt = &ent
+	task.Status.StateEnteredAt = &ent
 	return task
 }
 
@@ -107,19 +107,20 @@ func TestApplyReviewChangesRequested_ReentersImplementing(t *testing.T) {
 
 	var got tatarav1alpha1.Task
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "t1"}, &got))
-	require.Equal(t, tatarav1alpha1.StageImplementing, got.Status.Stage)
+	require.Equal(t, tatarav1alpha1.StateUnderImplementation, got.Status.State)
 }
 
-// parkedReviewTask builds a parked Task with the given reason, owned by "p".
-func parkedReviewTask(name, kind, reason string) *tatarav1alpha1.Task {
+// parkedReviewTask builds a Task parked for reason at state (park does not
+// move state), owned by "p".
+func parkedReviewTask(name, kind, state, reason string) *tatarav1alpha1.Task {
 	task := &tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS},
 		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "p", Kind: kind, Goal: "g"},
 	}
-	task.Status.Stage = tatarav1alpha1.StageParked
-	task.Status.StageReason = reason
+	task.Status.State = state
+	task.Status.ParkReason = reason
 	ent := metav1.NewTime(time.Now().Add(-time.Hour))
-	task.Status.StageEnteredAt = &ent
+	task.Status.StateEnteredAt = &ent
 	return task
 }
 
@@ -127,7 +128,7 @@ func parkedReviewTask(name, kind, reason string) *tatarav1alpha1.Task {
 // implementing), accounting one MergeReentries - exactly like Unpark (F1).
 func TestApplyReviewChangesRequested_ParkedMergeTimeout_ResumesMerging(t *testing.T) {
 	proj := sweepProject("p")
-	task := parkedReviewTask("t-mt", "clarify", stage.ReasonMergeTimeout)
+	task := parkedReviewTask("t-mt", "clarify", tatarav1alpha1.StateMerged, stage.ReasonMergeTimeout)
 	mr := ownedMR("mr-tatara-operator-42", "t-mt", "tatara-operator", 42)
 	c := newMirrorClient(t, proj, task, mr)
 	reentered, err := ApplyReviewChangesRequested(context.Background(), c, c, proj, task, time.Now())
@@ -136,7 +137,7 @@ func TestApplyReviewChangesRequested_ParkedMergeTimeout_ResumesMerging(t *testin
 
 	var got tatarav1alpha1.Task
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "t-mt"}, &got))
-	require.Equal(t, tatarav1alpha1.StageMerging, got.Status.Stage)
+	require.Equal(t, tatarav1alpha1.StateMerged, got.Status.State)
 	require.Equal(t, 1, got.Status.MergeReentries)
 }
 
@@ -145,7 +146,7 @@ func TestApplyReviewChangesRequested_ParkedMergeTimeout_ResumesMerging(t *testin
 // maxReviewRounds one review at a time (F1).
 func TestApplyReviewChangesRequested_ParkedReviewLoopExhausted_Folds(t *testing.T) {
 	proj := sweepProject("p")
-	task := parkedReviewTask("t-rle", "clarify", stage.ReasonReviewLoopExhausted)
+	task := parkedReviewTask("t-rle", "clarify", tatarav1alpha1.StateAwaitingReview, stage.ReasonReviewLoopExhausted)
 	mr := ownedMR("mr-tatara-operator-42", "t-rle", "tatara-operator", 42)
 	c := newMirrorClient(t, proj, task, mr)
 	reentered, err := ApplyReviewChangesRequested(context.Background(), c, c, proj, task, time.Now())
@@ -154,7 +155,8 @@ func TestApplyReviewChangesRequested_ParkedReviewLoopExhausted_Folds(t *testing.
 
 	var got tatarav1alpha1.Task
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "t-rle"}, &got))
-	require.Equal(t, tatarav1alpha1.StageParked, got.Status.Stage)
+	require.Equal(t, tatarav1alpha1.StateAwaitingReview, got.Status.State, "a fold never moves state")
+	require.True(t, tatarav1alpha1.Parked(&got), "review-loop-exhausted stays parked")
 }
 
 // changes_requested on a Task whose owned MR is MERGED does NOT rewind.
@@ -170,7 +172,7 @@ func TestApplyReviewChangesRequested_MergedMR_NoRewind(t *testing.T) {
 
 	var got tatarav1alpha1.Task
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "t2"}, &got))
-	require.Equal(t, tatarav1alpha1.StageReviewing, got.Status.Stage)
+	require.Equal(t, tatarav1alpha1.StateAwaitingReview, got.Status.State)
 }
 
 // approved on a reviewing non-review Task clears PendingReview and enters merging.
@@ -192,7 +194,7 @@ func TestApplyReviewApproval_EntersMerging(t *testing.T) {
 
 	var got tatarav1alpha1.Task
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "t3"}, &got))
-	require.Equal(t, tatarav1alpha1.StageMerging, got.Status.Stage)
+	require.Equal(t, tatarav1alpha1.StateMerged, got.Status.State)
 }
 
 // approved on a kind=review Task never merges.
@@ -230,7 +232,7 @@ func TestApplyReviewChangesRequested_MergedInLiveReaderOnly_Folds(t *testing.T) 
 
 	var got tatarav1alpha1.Task
 	require.NoError(t, cached.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "t-f2"}, &got))
-	require.Equal(t, tatarav1alpha1.StageReviewing, got.Status.Stage, "no rewind on the cached store either")
+	require.Equal(t, tatarav1alpha1.StateAwaitingReview, got.Status.State, "no rewind on the cached store either")
 }
 
 // F5 ordering: the review pod is deleted AFTER the live reviewing-confirm read and
@@ -263,7 +265,7 @@ func TestApplyReviewApproval_DeletesPodBeforeClearingPendingReview(t *testing.T)
 // short-circuits before either.
 func TestApplyReviewApproval_ParkedTask_FoldsWithoutPodDeleteOrMutation(t *testing.T) {
 	proj := sweepProject("p")
-	task := parkedReviewTask("t-f5b", "clarify", stage.ReasonMergeTimeout)
+	task := parkedReviewTask("t-f5b", "clarify", tatarav1alpha1.StateMerged, stage.ReasonMergeTimeout)
 	mr := ownedMR("mr-tatara-operator-42", "t-f5b", "tatara-operator", 42)
 	mr.Status.PendingReview = &tatarav1alpha1.PendingReview{Round: 1}
 	base := newMirrorClient(t, proj, task, mr)
@@ -322,5 +324,5 @@ func TestApplyReviewApproval_EmptySHAAndEmptyMirrorHead_NoHalfApply(t *testing.T
 
 	var got tatarav1alpha1.Task
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "t-m5b"}, &got))
-	require.Equal(t, tatarav1alpha1.StageReviewing, got.Status.Stage)
+	require.Equal(t, tatarav1alpha1.StateAwaitingReview, got.Status.State)
 }

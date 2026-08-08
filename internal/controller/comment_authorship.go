@@ -49,26 +49,28 @@ var conversationalParkReasons = map[string]bool{
 // ReactingAgentKind is the agent kind a comment on this Task would wake, or ""
 // when the Task is not in a live conversational state.
 //
-// Decision D2: agent work starts only for clarifying, reviewing, conversing, or
-// a park that is still waiting on a human. A comment on a settled, delivered,
-// merging or closed Task is mirrored and queued and starts nothing.
+// Decision D2: agent work starts only for a LIVE state, or a park that is still
+// waiting on a human. A comment on a settled, done, merging or closed Task is
+// mirrored and queued and starts nothing.
+//
+// A PARKED Task in a live state answers with the kind its OWN state would run
+// once un-parked - not with a fixed conversational kind, which is what the
+// deleted `conversing` stage forced. The two axes are orthogonal now, so the
+// kind is a pure function of (state, origin kind) either way.
 func ReactingAgentKind(task *tatarav1alpha1.Task) string {
 	if task == nil {
 		return ""
 	}
-	switch task.Status.Stage {
-	case tatarav1alpha1.StageClarifying, tatarav1alpha1.StageReviewing, tatarav1alpha1.StageConversing:
-		return stage.AgentKindFor(task.Status.Stage)
-	case tatarav1alpha1.StageParked:
-		if conversationalParkReasons[task.Status.StageReason] {
-			// A park that is waiting on a human resumes into a conversation, and
-			// conversing runs the clarify agent (F.2).
-			return stage.AgentKindFor(tatarav1alpha1.StageConversing)
+	if tatarav1alpha1.Parked(task) {
+		if !conversationalParkReasons[task.Status.ParkReason] {
+			return ""
 		}
-		return ""
-	default:
+		return stage.AgentKindFor(task.Status.ParkedFromState, task.Spec.Kind)
+	}
+	if !stage.Live(task.Status.State) {
 		return ""
 	}
+	return stage.AgentKindFor(task.Status.State, task.Spec.Kind)
 }
 
 // CrossKindTriggers reports whether an agent-authored comment may start work.

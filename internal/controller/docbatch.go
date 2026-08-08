@@ -72,7 +72,7 @@ func (r *ProjectReconciler) MintDocBatch(ctx context.Context, proj *tatarav1alph
 	var covered []string
 	for i := range tl.Items {
 		t := &tl.Items[i]
-		if t.Spec.ProjectRef != proj.Name || t.Status.Stage != tatarav1alpha1.StageDelivered {
+		if t.Spec.ProjectRef != proj.Name || t.Status.State != tatarav1alpha1.StateDone {
 			continue
 		}
 		// A batch already in flight OWNS this night's parents. Minting a second one
@@ -112,8 +112,8 @@ func (r *ProjectReconciler) MintDocBatch(ctx context.Context, proj *tatarav1alph
 			RepositoryRef:  docsRepo.Name,
 			DocumentsTasks: covered,
 			// Create -> documenting is derived by the reconciler create-edge from
-			// Spec.InitialStage (fix C5): no racing post-create stage write.
-			InitialStage: tatarav1alpha1.StageDocumenting,
+			// Spec.InitialState (fix C5): no racing post-create stage write.
+			InitialState: tatarav1alpha1.StateUnderImplementation,
 			Goal:         docBatchGoal(covered),
 		},
 	}
@@ -130,7 +130,7 @@ func (r *ProjectReconciler) MintDocBatch(ctx context.Context, proj *tatarav1alph
 	obs.DocBatchMintTotal.WithLabelValues(obs.DocMintMinted).Inc()
 	// Create -> documenting is an F.3 edge in its own right: the batch is minted
 	// STRAIGHT into its agent stage, with no triage. The stage is carried in
-	// Spec.InitialStage and applied by the reconciler create-edge (fix C5), so no
+	// Spec.InitialState and applied by the reconciler create-edge (fix C5), so no
 	// post-create status write races the reconciler.
 	l.Info("minted the nightly documentation batch",
 		"action", "doc_batch_mint", "resource_id", batch.Name, "project", proj.Name,
@@ -163,15 +163,15 @@ func (r *ProjectReconciler) ResolveDocBatch(ctx context.Context, proj *tatarav1a
 	}
 	l := log.FromContext(ctx)
 
-	abandoned := batch.Status.Stage == tatarav1alpha1.StageParked ||
-		(batch.Status.Stage == tatarav1alpha1.StageDelivered && batch.Status.StageReason == stage.ReasonDocTimeout)
+	abandoned := tatarav1alpha1.Parked(batch) ||
+		(batch.Status.State == tatarav1alpha1.StateDone && batch.Status.StateReason == stage.ReasonDocTimeout)
 
 	if abandoned && batch.Status.Stats.PodRuns == 0 {
 		obs.DocTaskAbandonedTotal.WithLabelValues(obs.DocAbandonedNeverRan).Inc()
 		l.Info("documentation batch NEVER RAN (zero pod runs); its members stay undocumented for the next night",
 			"action", "doc_batch_abandoned", "resource_id", batch.Name,
 			"reason", obs.DocAbandonedNeverRan, "covers", len(batch.Spec.DocumentsTasks),
-			"stage", batch.Status.Stage, "stage_reason", batch.Status.StageReason)
+			"state", batch.Status.State, "park_reason", batch.Status.ParkReason)
 		return r.annotateTask(ctx, batch, AnnDocBatchResolved, "true")
 	}
 	if abandoned {
@@ -239,7 +239,7 @@ func (r *ProjectReconciler) forceDocTimeout(ctx context.Context, proj *tatarav1a
 	// must fire operator_task_terminal_total like every other one.
 	stamp := metav1.NewTime(now)
 	if err := EnterStage(ctx, r.Client, r.spillerFor(proj), r.Metrics, batch, mrs,
-		tatarav1alpha1.StageDelivered, stage.ReasonDocTimeout, now, func(t *tatarav1alpha1.Task) {
+		tatarav1alpha1.StateDone, stage.ReasonDocTimeout, now, func(t *tatarav1alpha1.Task) {
 			t.Status.DeliveredAt = &stamp
 		}); err != nil {
 		return fmt.Errorf("docbatch: force %s to delivered(doc-timeout): %w", batch.Name, err)
@@ -317,13 +317,10 @@ func docBatchInFlight(tasks []tatarav1alpha1.Task, project string) string {
 		if t.Spec.ProjectRef != project || t.Spec.Kind != DocBatchKind || len(t.Spec.DocumentsTasks) == 0 {
 			continue
 		}
-		switch t.Status.Stage {
-		case "", tatarav1alpha1.StageDelivered, tatarav1alpha1.StageRejected,
-			tatarav1alpha1.StageFailed, tatarav1alpha1.StageParked:
+		if t.Status.State == "" || tatarav1alpha1.TaskDone(t) || tatarav1alpha1.Parked(t) {
 			continue
-		default:
-			return t.Name
 		}
+		return t.Name
 	}
 	return ""
 }

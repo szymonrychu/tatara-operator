@@ -153,7 +153,7 @@ func TestProposalHistoryNilCases(t *testing.T) {
 		proj      *tatarav1alpha1.Project
 		agentKind string
 	}{
-		{"the block is brainstorm-only", historyProject(20), stage.AgentClarify},
+		{"the block is brainstorm-only", historyProject(20), stage.AgentImplement},
 		{"an explicit zero window disables the block", historyProject(0), stage.AgentBrainstorm},
 		{"a project with no scm has no proposals", &tatarav1alpha1.Project{
 			ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "tatara"},
@@ -239,12 +239,12 @@ func TestRenderBundleOmitsTheHistoryForOtherAgents(t *testing.T) {
 	seedHistoryIssue(t, c, "tatara", "demo", "brainstorm", 1, 1, "open", "new")
 
 	r := &TaskReconciler{Client: c}
-	out, err := r.renderBundle(ctx, historyProject(20), brainstormTaskFixture(), stage.AgentClarify)
+	out, err := r.renderBundle(ctx, historyProject(20), brainstormTaskFixture(), stage.AgentImplement)
 	if err != nil {
 		t.Fatalf("renderBundle: %v", err)
 	}
 	if strings.Contains(out, "<proposal_history ") {
-		t.Fatalf("a clarify bundle carries the brainstorm history block:\n%s", out)
+		t.Fatalf("an implement bundle carries the brainstorm history block:\n%s", out)
 	}
 }
 

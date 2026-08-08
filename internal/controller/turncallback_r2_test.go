@@ -57,7 +57,7 @@ func TestRecordUsage_TerminalTaskIsNoop(t *testing.T) {
 	mkTaskProject(t, "p-ru2", 3)
 	mkTaskRepository(t, "r-ru2", "p-ru2")
 	mkTask(t, "t-ru2", "p-ru2", "r-ru2")
-	setTaskStage(t, "t-ru2", tatarav1alpha1.StageFailed)
+	setTaskStage(t, "t-ru2", tatarav1alpha1.StateRejected)
 	setTaskTokens(t, "t-ru2", 999)
 	annotate(t, "t-ru2", map[string]string{annCurrentTurn: "turn-ru2"})
 

@@ -25,18 +25,23 @@ import (
 // parkedFromStage - the exact shape the watchdog's r.enter leaves behind.
 func pbTask(name string) *tatarav1alpha1.Task {
 	task := mbTask(name, time.Hour)
-	task.Status.Stage = tatarav1alpha1.StageParked
-	task.Status.StageReason = stage.ReasonAwaitingHuman
-	task.Status.ParkedFromStage = tatarav1alpha1.StageReviewing
+	task.Status.State = tatarav1alpha1.StateAwaitingReview
+	task.Status.ParkReason = stage.ReasonAwaitingHuman
+	task.Status.ParkedFromState = tatarav1alpha1.StateAwaitingReview
 	return task
 }
 
-// TestParkedBindingRepair_RepairsAndUnparks is the primary self-heal case,
-// driven through reconcileStage to prove the wiring runs BEFORE the terminal
-// early-return that hands every parked Task to the reaper: a parked
+// TestParkedBindingRepair_RepairsRefsButStaysParked is the primary self-heal
+// case, driven through reconcileStage to prove the wiring runs BEFORE the
+// terminal early-return that hands every parked Task to the reaper: a parked
 // interrupted-mint Task with a repairable unowned MR stub is repaired (refs
-// stamped, CR owned) AND unparked back to its parkedFromStage.
-func TestParkedBindingRepair_RepairsAndUnparks(t *testing.T) {
+// stamped, CR owned). #521: the repair NO LONGER UN-PARKS - park is a flag
+// orthogonal to state, so there is nothing to derive a re-entry target from
+// and no exception to make (see reconcileParkedBindingRepair's own doc
+// comment) - it stamps the refs and leaves the Task parked exactly where it
+// was; the ordinary awaiting-human re-entry rule resumes it on the Task's
+// NEXT human comment, not automatically here.
+func TestParkedBindingRepair_RepairsRefsButStaysParked(t *testing.T) {
 	ctx := context.Background()
 	proj := tsProject(3)
 	task := pbTask("mt-r-tatara-cli-87")
@@ -51,9 +56,10 @@ func TestParkedBindingRepair_RepairsAndUnparks(t *testing.T) {
 	}
 
 	got := mdGetTask(t, c, task.Name)
-	if got.Status.Stage != tatarav1alpha1.StageReviewing {
-		t.Fatalf("stage = %s(%s), want reviewing (unparked back to parkedFromStage)",
-			got.Status.Stage, got.Status.StageReason)
+	if got.Status.State != tatarav1alpha1.StateAwaitingReview || !tatarav1alpha1.Parked(got) ||
+		got.Status.ParkReason != stage.ReasonAwaitingHuman {
+		t.Fatalf("state=%q parked=%v reason=%q, want awaiting-review/parked/awaiting-human (repaired, but still parked)",
+			got.Status.State, tatarav1alpha1.Parked(got), got.Status.ParkReason)
 	}
 	wantRef := tatarav1alpha1.MergeRequestName("tatara-cli", 87)
 	if len(got.Status.MRRefs) != 1 || got.Status.MRRefs[0] != wantRef {
@@ -82,8 +88,8 @@ func TestParkedBindingRepair_NonEmptyRefsUntouched(t *testing.T) {
 		t.Fatalf("reconcileParkedBindingRepair = %v, %v, want handled=false, err=nil", handled, err)
 	}
 	got := mdGetTask(t, c, task.Name)
-	if got.Status.Stage != tatarav1alpha1.StageParked || got.Status.StageReason != stage.ReasonAwaitingHuman {
-		t.Fatalf("stage = %s(%s), want untouched parked(awaiting-human)", got.Status.Stage, got.Status.StageReason)
+	if got.Status.State != tatarav1alpha1.StateAwaitingReview || !tatarav1alpha1.Parked(got) || got.Status.ParkReason != stage.ReasonAwaitingHuman {
+		t.Fatalf("state=%q parked=%v reason=%q, want awaiting-review/untouched parked(awaiting-human)", got.Status.State, tatarav1alpha1.Parked(got), got.Status.ParkReason)
 	}
 }
 
@@ -95,7 +101,7 @@ func TestParkedBindingRepair_OtherReasonsUntouched(t *testing.T) {
 	ctx := context.Background()
 	proj := tsProject(3)
 	task := pbTask("t-identity-unverified")
-	task.Status.StageReason = stage.ReasonIdentityUnverified
+	task.Status.ParkReason = stage.ReasonIdentityUnverified
 	c := newMirrorClient(t, proj, mdSecret(), mdRepo("tatara-cli"), task)
 	r, _ := mbReconciler(c, &mbWriter{})
 	r.Scheme = c.Scheme()
@@ -105,8 +111,8 @@ func TestParkedBindingRepair_OtherReasonsUntouched(t *testing.T) {
 		t.Fatalf("reconcileParkedBindingRepair = %v, %v, want handled=false, err=nil", handled, err)
 	}
 	got := mdGetTask(t, c, task.Name)
-	if got.Status.Stage != tatarav1alpha1.StageParked || got.Status.StageReason != stage.ReasonIdentityUnverified {
-		t.Fatalf("stage = %s(%s), want untouched parked(identity-unverified)", got.Status.Stage, got.Status.StageReason)
+	if got.Status.State != tatarav1alpha1.StateAwaitingReview || !tatarav1alpha1.Parked(got) || got.Status.ParkReason != stage.ReasonIdentityUnverified {
+		t.Fatalf("state=%q parked=%v reason=%q, want awaiting-review/untouched parked(identity-unverified)", got.Status.State, tatarav1alpha1.Parked(got), got.Status.ParkReason)
 	}
 }
 
@@ -128,8 +134,8 @@ func TestParkedBindingRepair_RepairFailureStaysParked(t *testing.T) {
 		t.Fatalf("reconcileParkedBindingRepair = %v, %v, want handled=false, err=nil", handled, err)
 	}
 	got := mdGetTask(t, c, task.Name)
-	if got.Status.Stage != tatarav1alpha1.StageParked || got.Status.StageReason != stage.ReasonAwaitingHuman {
-		t.Fatalf("stage = %s(%s), want still parked(awaiting-human)", got.Status.Stage, got.Status.StageReason)
+	if got.Status.State != tatarav1alpha1.StateAwaitingReview || !tatarav1alpha1.Parked(got) || got.Status.ParkReason != stage.ReasonAwaitingHuman {
+		t.Fatalf("state=%q parked=%v reason=%q, want awaiting-review/still parked(awaiting-human)", got.Status.State, tatarav1alpha1.Parked(got), got.Status.ParkReason)
 	}
 	if len(got.Status.MRRefs) != 0 {
 		t.Fatalf("mrRefs = %v, want empty (foreign-owned CR is never stolen)", got.Status.MRRefs)
@@ -144,7 +150,7 @@ func TestParkedBindingRepair_NoParkedFromStageStaysParked(t *testing.T) {
 	ctx := context.Background()
 	proj := tsProject(3)
 	task := pbTask("mt-r-tatara-cli-87")
-	task.Status.ParkedFromStage = ""
+	task.Status.ParkedFromState = ""
 	mr := mdMR(task, "tatara-cli", 87)
 	mr.OwnerReferences = nil
 	c := newMirrorClient(t, proj, mdSecret(), mdRepo("tatara-cli"), task, mr)
@@ -156,7 +162,7 @@ func TestParkedBindingRepair_NoParkedFromStageStaysParked(t *testing.T) {
 		t.Fatalf("reconcileParkedBindingRepair = %v, %v, want handled=false, err=nil", handled, err)
 	}
 	got := mdGetTask(t, c, task.Name)
-	if got.Status.Stage != tatarav1alpha1.StageParked || got.Status.StageReason != stage.ReasonAwaitingHuman {
-		t.Fatalf("stage = %s(%s), want still parked(awaiting-human)", got.Status.Stage, got.Status.StageReason)
+	if got.Status.State != tatarav1alpha1.StateAwaitingReview || !tatarav1alpha1.Parked(got) || got.Status.ParkReason != stage.ReasonAwaitingHuman {
+		t.Fatalf("state=%q parked=%v reason=%q, want awaiting-review/still parked(awaiting-human)", got.Status.State, tatarav1alpha1.Parked(got), got.Status.ParkReason)
 	}
 }

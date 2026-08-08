@@ -68,7 +68,7 @@ func liveBrainstormTask(proj *tatarav1alpha1.Project) tatarav1alpha1.Task {
 	tk.Namespace = proj.Namespace
 	tk.Labels = map[string]string{labelActivity: "brainstorm"}
 	tk.Spec = tatarav1alpha1.TaskSpec{ProjectRef: proj.Name, Goal: "g", Kind: "brainstorm"}
-	tk.Status.Stage = tatarav1alpha1.StageBrainstorming
+	tk.Status.State = tatarav1alpha1.StateRefined
 	return tk
 }
 

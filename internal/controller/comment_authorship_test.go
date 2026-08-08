@@ -66,29 +66,55 @@ func TestCrossKindTriggers(t *testing.T) {
 	}
 }
 
+// The `conversing` stage is DISSOLVED (#521): entry into a live state is no
+// longer its own stage, it is the stage.Live(state) property over
+// refined/under-implementation/awaiting-review. ReactingAgentKind's job is
+// unchanged - answer with the kind the Task's OWN state (or, parked, its
+// ParkedFromState) would run - but the cases now exercise that property
+// across more than one live state, plus a park whose ParkedFromState carries
+// the same information the deleted stage used to encode directly.
 func TestReactingAgentKind(t *testing.T) {
 	cases := []struct {
-		name   string
-		stage  string
-		reason string
-		want   string
+		name            string
+		specKind        string
+		state           string
+		parkReason      string
+		parkedFromState string
+		want            string
 	}{
-		{name: "reviewing", stage: tatarav1alpha1.StageReviewing, want: stage.AgentReview},
-		{name: "clarifying", stage: tatarav1alpha1.StageClarifying, want: stage.AgentClarify},
-		{name: "conversing", stage: tatarav1alpha1.StageConversing, want: stage.AgentClarify},
-		{name: "parked awaiting-human is a live conversational state", stage: tatarav1alpha1.StageParked, reason: stage.ReasonAwaitingHuman, want: stage.AgentClarify},
-		{name: "parked identity-unverified is a live conversational state", stage: tatarav1alpha1.StageParked, reason: stage.ReasonIdentityUnverified, want: stage.AgentClarify},
-		{name: "parked stage-deadline is NOT", stage: tatarav1alpha1.StageParked, reason: stage.ReasonStageDeadline, want: ""},
-		{name: "delivered is settled", stage: tatarav1alpha1.StageDelivered, want: ""},
-		{name: "merging runs no agent", stage: tatarav1alpha1.StageMerging, want: ""},
+		{name: "reviewing", specKind: "implement", state: tatarav1alpha1.StateAwaitingReview, want: stage.AgentReview},
+		{name: "refined (a live state) resolves off spec.kind", specKind: "implement", state: tatarav1alpha1.StateRefined, want: stage.AgentImplement},
+		{name: "under-implementation (a live state) resolves off spec.kind", specKind: "implement", state: tatarav1alpha1.StateUnderImplementation, want: stage.AgentImplement},
+		{
+			name:     "parked awaiting-human is a live conversational state: resolves off parkedFromState",
+			specKind: "implement", state: tatarav1alpha1.StateUnderImplementation,
+			parkReason: stage.ReasonAwaitingHuman, parkedFromState: tatarav1alpha1.StateUnderImplementation,
+			want: stage.AgentImplement,
+		},
+		{
+			name:     "parked identity-unverified is a live conversational state: resolves off parkedFromState",
+			specKind: "implement", state: tatarav1alpha1.StateAwaitingReview,
+			parkReason: stage.ReasonIdentityUnverified, parkedFromState: tatarav1alpha1.StateAwaitingReview,
+			want: stage.AgentReview,
+		},
+		{
+			name:     "parked stage-deadline is NOT a live conversational state",
+			specKind: "implement", state: tatarav1alpha1.StateUnderImplementation,
+			parkReason: stage.ReasonStageDeadline, parkedFromState: tatarav1alpha1.StateUnderImplementation,
+			want: "",
+		},
+		{name: "done is settled", specKind: "implement", state: tatarav1alpha1.StateDone, want: ""},
+		{name: "merged runs no agent", specKind: "implement", state: tatarav1alpha1.StateMerged, want: ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			task := &tatarav1alpha1.Task{}
-			task.Status.Stage = tc.stage
-			task.Status.StageReason = tc.reason
+			task.Spec.Kind = tc.specKind
+			task.Status.State = tc.state
+			task.Status.ParkReason = tc.parkReason
+			task.Status.ParkedFromState = tc.parkedFromState
 			if got := ReactingAgentKind(task); got != tc.want {
-				t.Errorf("ReactingAgentKind(%s/%s) = %q, want %q", tc.stage, tc.reason, got, tc.want)
+				t.Errorf("ReactingAgentKind(%s/%s) = %q, want %q", tc.state, tc.parkReason, got, tc.want)
 			}
 		})
 	}

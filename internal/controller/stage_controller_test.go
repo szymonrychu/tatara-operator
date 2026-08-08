@@ -39,7 +39,7 @@ func mdIssueReconciler(c client.Client, d *StageDriver) *IssueReconciler {
 // forge and the Task advances off reviewing. Without this wiring /outcome writes
 // an intent nobody ever performs.
 func TestMergeRequestReconcilerDrainsPendingReview(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageReviewing)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateAwaitingReview)
 	task.Spec.MergeOrder = []string{"tatara-operator"}
 	mr := mdMR(task, "tatara-operator", 7)
 	pr := pendingReviewFixture("approve", 1, "sha-a")
@@ -60,15 +60,15 @@ func TestMergeRequestReconcilerDrainsPendingReview(t *testing.T) {
 	if gm := mdGetMR(t, c, mr.Name); gm.Status.PendingReview != nil {
 		t.Fatalf("pendingReview not cleared")
 	}
-	if got := mdGetTask(t, c, "t1"); got.Status.Stage != tatarav1alpha1.StageMerging {
-		t.Fatalf("stage = %q, want merging: the review drain is what advances the Task", got.Status.Stage)
+	if got := mdGetTask(t, c, "t1"); got.Status.State != tatarav1alpha1.StateMerged {
+		t.Fatalf("stage = %q, want merging: the review drain is what advances the Task", got.Status.State)
 	}
 }
 
 // A kind=review Task NEVER reaches merging, through the WIRED path. The fake
 // forge's Merge PANICS.
 func TestMergeRequestReconcilerReviewKindNeverMerges(t *testing.T) {
-	task := mdTask("t1", "review", tatarav1alpha1.StageReviewing)
+	task := mdTask("t1", "review", tatarav1alpha1.StateAwaitingReview)
 	mr := mdMR(task, "tatara-operator", 7)
 	pr := pendingReviewFixture("approve", 1, "sha-a")
 	pr.Findings = nil
@@ -84,8 +84,9 @@ func TestMergeRequestReconcilerReviewKindNeverMerges(t *testing.T) {
 		t.Fatalf("Reconcile: %v", err)
 	}
 	got := mdGetTask(t, c, "t1")
-	if got.Status.Stage != tatarav1alpha1.StageParked {
-		t.Fatalf("stage = %q, want parked: a human's PR is merged by a HUMAN", got.Status.Stage)
+	if got.Status.State != tatarav1alpha1.StateAwaitingReview || !tatarav1alpha1.Parked(got) {
+		t.Fatalf("state/park = %q/parked=%v, want awaiting-review, parked: a human's PR is merged by a HUMAN",
+			got.Status.State, tatarav1alpha1.Parked(got))
 	}
 	// And the stage reconciler refuses to drive it into merging even if asked.
 	sr := &StageReconciler{Client: c, Driver: d}
@@ -100,7 +101,7 @@ func TestMergeRequestReconcilerReviewKindNeverMerges(t *testing.T) {
 // The Issue reconciler DRAINS pendingComments: an agent's issue_write lands on
 // the forge.
 func TestIssueReconcilerDrainsPendingComments(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageClarifying)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateRefined)
 	iss := mdIssue(task, "tatara-operator", 41)
 	iss.Status.PendingComments = []tatarav1alpha1.PendingComment{
 		{RequestID: "req-1", Action: "comment", Body: "clarifying question"},
@@ -122,7 +123,7 @@ func TestIssueReconcilerDrainsPendingComments(t *testing.T) {
 
 // The MergeRequest reconciler drains pendingComments on an MR too.
 func TestMergeRequestReconcilerDrainsPendingComments(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageImplementing)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateUnderImplementation)
 	mr := mdMR(task, "tatara-operator", 7)
 	mr.Status.PendingComments = []tatarav1alpha1.PendingComment{
 		{RequestID: "req-2", Action: "comment", Body: "addressed in the last push"},
@@ -145,7 +146,7 @@ func TestMergeRequestReconcilerDrainsPendingComments(t *testing.T) {
 // The stage reconciler is what drives merging and deploying: nothing else in
 // the operator owns those two pod-less stages.
 func TestStageReconcilerMergesThenDelivers(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageMerging)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateMerged)
 	task.Spec.MergeOrder = []string{"tatara-operator"}
 	mr := mdMR(task, "tatara-operator", 7)
 	mr.Status.ReviewedSHA = "sha-a"
@@ -170,8 +171,8 @@ func TestStageReconcilerMergesThenDelivers(t *testing.T) {
 	if f.mergeCalls != 1 {
 		t.Fatalf("merge calls = %d, want 1", f.mergeCalls)
 	}
-	if got := mdGetTask(t, c, "t1"); got.Status.Stage != tatarav1alpha1.StageDeploying {
-		t.Fatalf("stage = %q, want deploying", got.Status.Stage)
+	if got := mdGetTask(t, c, "t1"); got.Status.State != tatarav1alpha1.StateDeployed {
+		t.Fatalf("stage = %q, want deploying", got.Status.State)
 	}
 	// The merge landed at the reviewed head, not at the mirror's stale one.
 	if f.mergedHeads[0] != "sha-a" {
@@ -191,8 +192,8 @@ func TestStageReconcilerMergesThenDelivers(t *testing.T) {
 		t.Fatalf("closed %d issues, want 1", len(f.closedIssues))
 	}
 	got := mdGetTask(t, c, "t1")
-	if got.Status.Stage != tatarav1alpha1.StageDelivered || got.Status.DeliveredAt == nil {
-		t.Fatalf("stage = %q deliveredAt = %v, want delivered/set", got.Status.Stage, got.Status.DeliveredAt)
+	if got.Status.State != tatarav1alpha1.StateDone || got.Status.DeliveredAt == nil {
+		t.Fatalf("stage = %q deliveredAt = %v, want delivered/set", got.Status.State, got.Status.DeliveredAt)
 	}
 }
 
@@ -207,7 +208,7 @@ func mdSetMergedAt(c client.Client, name string) error {
 
 // A terminal Task is not driven at all.
 func TestStageReconcilerIgnoresOtherStages(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageImplementing)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateUnderImplementation)
 	mr := mdMR(task, "tatara-operator", 7)
 	c := newMirrorClient(t, mdProject(), mdSecret(), mdRepo("tatara-operator"), task, mr)
 

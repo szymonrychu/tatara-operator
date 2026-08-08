@@ -257,7 +257,7 @@ var sweepSkipReasons = []string{
 // WithLabelValues call has NO series at all, so increase(...[1h]) is blind to
 // the first mint after every pod roll. Kept literal (no reverse import of
 // internal/controller) exactly like sweepSeedReasons.
-var mintOutcomeKinds = []string{"clarify", "review"}
+var mintOutcomeKinds = []string{"implement", "review"}
 var mintOutcomes = []string{"not_owed", "created", "existing_live", "tombstone_deleted", MintOutcomeError}
 
 // sweepActivities is the closed {activity} set for the two intake-funnel

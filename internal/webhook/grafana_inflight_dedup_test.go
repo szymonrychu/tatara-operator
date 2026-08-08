@@ -22,7 +22,7 @@ func inflightRepo(project, name, slug string) *tatarav1.Repository {
 
 // inflightTask builds a Task that spans repoRef (a Repository CR name) via
 // Spec.RepositoryRef - the field repoHasNonTerminalTask matches implicated
-// repos against - with Stage defaulting to a non-terminal stage (TaskDone
+// repos against - with State defaulting to a non-terminal state (TaskDone
 // false).
 func inflightTask(name, project, repoRef, issueRef string, number int) *tatarav1.Task {
 	return &tatarav1.Task{
@@ -31,7 +31,7 @@ func inflightTask(name, project, repoRef, issueRef string, number int) *tatarav1
 			ProjectRef: project, RepositoryRef: repoRef, Kind: "implement", Goal: "g",
 			Source: &tatarav1.TaskSource{Provider: "github", IssueRef: issueRef, Number: number},
 		},
-		Status: tatarav1.TaskStatus{Stage: tatarav1.StageImplementing},
+		Status: tatarav1.TaskStatus{State: tatarav1.StateUnderImplementation},
 	}
 }
 
@@ -75,7 +75,7 @@ func TestGrafana_InflightRepo_SpawnsWhenNoLiveTask(t *testing.T) {
 // implicated repo does not block a new incident.
 func TestGrafana_InflightRepo_TerminalTaskDoesNotBlock(t *testing.T) {
 	done := inflightTask("pif3-done", "pif3", "pif3-operator", "szymonrychu/tatara-operator#5", 5)
-	done.Status.Stage = tatarav1.StageDelivered
+	done.Status.State = tatarav1.StateDone
 	r, fc := grafanaRouter(t,
 		grafanaProject("pif3"), grafanaSecret("pif3"),
 		inflightRepo("pif3", "pif3-operator", "tatara-operator"),

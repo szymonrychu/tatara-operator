@@ -10,6 +10,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
@@ -20,7 +21,7 @@ import (
 func wfMetrics() *obs.OperatorMetrics { return obs.NewOperatorMetrics(prometheus.NewRegistry()) }
 
 // ---------------------------------------------------------------------------
-// C5: the create-edge honors Spec.InitialStage, so a backlog-swept issue lands
+// C5: the create-edge honors Spec.InitialState, so a backlog-swept issue lands
 // parked(backlog-sweep) even when the TaskReconciler runs the create-edge FIRST
 // (before the sweep's status stamp). Before the fix the reconciler stamped
 // triaging and the sweep's stale non-retrying Status().Update 409'd, leaving the
@@ -33,10 +34,10 @@ func TestCreateEdge_HonorsInitialStage(t *testing.T) {
 		initStage, initReason string
 		wantStage, wantReason string
 	}{
-		{"backlog-sweep", tatarav1alpha1.StageParked, stage.ReasonBacklogSweep, tatarav1alpha1.StageParked, stage.ReasonBacklogSweep},
-		{"active-sweep-triaging", tatarav1alpha1.StageTriaging, "", tatarav1alpha1.StageTriaging, ""},
-		{"empty-defaults-triaging", "", "", tatarav1alpha1.StageTriaging, ""},
-		{"doc-batch-documenting", tatarav1alpha1.StageDocumenting, "", tatarav1alpha1.StageDocumenting, ""},
+		{"backlog-sweep", tatarav1alpha1.StateNew, stage.ReasonBacklogSweep, tatarav1alpha1.StateNew, stage.ReasonBacklogSweep},
+		{"active-sweep-triaging", tatarav1alpha1.StateNew, "", tatarav1alpha1.StateNew, ""},
+		{"empty-defaults-triaging", "", "", tatarav1alpha1.StateNew, ""},
+		{"doc-batch-documenting", tatarav1alpha1.StateUnderImplementation, "", tatarav1alpha1.StateUnderImplementation, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -44,15 +45,104 @@ func TestCreateEdge_HonorsInitialStage(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Name: "t-" + tc.name, Namespace: mdNS, UID: types.UID("uid-" + tc.name)},
 				Spec: tatarav1alpha1.TaskSpec{
 					Kind: "clarify", ProjectRef: "proj", Goal: "g",
-					InitialStage: tc.initStage, InitialStageReason: tc.initReason,
+					InitialState: tc.initStage, InitialParkReason: tc.initReason,
 				},
 			}
 			c := newMirrorClient(t, task)
 			r := tsReconciler(c)
 			got := tsReconcile(t, r, tsProject(3), task, time.Now())
-			if got.Status.Stage != tc.wantStage || got.Status.StageReason != tc.wantReason {
+			if got.Status.State != tc.wantStage || got.Status.ParkReason != tc.wantReason {
 				t.Fatalf("create-edge stamped %s(%s), want %s(%s)",
-					got.Status.Stage, got.Status.StageReason, tc.wantStage, tc.wantReason)
+					got.Status.State, got.Status.ParkReason, tc.wantStage, tc.wantReason)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// THE MINT AND ITS PARK ARE ONE WRITE.
+//
+// A Task minted with Spec.InitialParkReason was minted TO BE PARKED. Applying
+// the state and the park reason as two separate status writes puts a window
+// between them in which the Task is LIVE with no park reason - and a crash, a
+// conflict or an eviction inside that window leaves it there permanently. It is
+// then picked up and worked: the sweep alone mints 52 parked(backlog-sweep)
+// owners through this path, and every one of them is an agent pod that was
+// never supposed to spawn.
+//
+// This is the exact non-atomicity annotations were rejected for. Park and its
+// reason must be ONE write on the status subresource, and #521's create edge
+// reintroduced the split it removed everywhere else.
+// ---------------------------------------------------------------------------
+
+func TestCreateEdge_MintsParkedInOneStatusWrite(t *testing.T) {
+	for _, tc := range []struct{ name, initState, initReason string }{
+		{"the sweep's backlog mint", tatarav1alpha1.StateNew, stage.ReasonBacklogSweep},
+		{"a review mint held for a human", tatarav1alpha1.StateNew, stage.ReasonAwaitingHuman},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			task := &tatarav1alpha1.Task{
+				ObjectMeta: metav1.ObjectMeta{Name: "t-mint", Namespace: mdNS, UID: types.UID("uid-t-mint")},
+				Spec: tatarav1alpha1.TaskSpec{
+					Kind: "refine", ProjectRef: "proj", Goal: "g",
+					InitialState: tc.initState, InitialParkReason: tc.initReason,
+				},
+			}
+
+			// EVERY status write the mint makes, in order. The status subresource
+			// is the unit of atomicity, so this is what "one write" means.
+			var writes []tatarav1alpha1.TaskStatus
+			c := newMirrorClientIntercepted(t, interceptor.Funcs{
+				SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string,
+					obj client.Object, opts ...client.SubResourceUpdateOption) error {
+					if tk, ok := obj.(*tatarav1alpha1.Task); ok && tk.Name == "t-mint" {
+						writes = append(writes, *tk.Status.DeepCopy())
+					}
+					return cl.SubResource(sub).Update(ctx, obj, opts...)
+				},
+			}, task)
+
+			r := tsReconciler(c)
+			r.Metrics = wfMetrics()
+			if _, err := r.reconcileStage(context.Background(), tsProject(3), task, time.Now()); err != nil {
+				t.Fatalf("reconcileStage (mint): %v", err)
+			}
+
+			// THE INVARIANT, and it is stronger than the end state: no INTERMEDIATE
+			// status the API server ever held may be live-with-no-park-reason. An
+			// end-state-only assertion passes on the two-write version, because the
+			// second write does arrive when nothing interrupts it.
+			for i, st := range writes {
+				if st.State != "" && st.ParkReason == "" {
+					t.Fatalf("status write %d of %d left the Task LIVE at %q with NO park reason: "+
+						"a crash here mints an unparked Task that gets worked", i+1, len(writes), st.State)
+				}
+			}
+			if len(writes) != 1 {
+				t.Fatalf("the mint made %d status writes, want 1: the state and the park must land together",
+					len(writes))
+			}
+
+			got := mdGetTask(t, c, "t-mint")
+			if got.Status.State != tc.initState || got.Status.ParkReason != tc.initReason {
+				t.Fatalf("mint landed %s(%s), want %s(%s)",
+					got.Status.State, got.Status.ParkReason, tc.initState, tc.initReason)
+			}
+			if got.Status.ParkedFromState != tc.initState {
+				t.Fatalf("parkedFromState = %q, want %q: a Task parks WHERE IT IS",
+					got.Status.ParkedFromState, tc.initState)
+			}
+			if got.Status.ParkedAt == nil || got.Status.StateEnteredAt == nil {
+				t.Fatalf("the mint must stamp the whole tuple: %+v", got.Status)
+			}
+
+			// A MINT IS NOT AN OUTCOME (D1), and folding the two writes into one
+			// must not resurrect the park counter the split forced parkAtMint to
+			// suppress by hand.
+			if v := testutil.ToFloat64(
+				r.Metrics.TaskParkedCounter(tc.initState, tc.initReason)); v != 0 {
+				t.Fatalf("operator_task_parked_total{%s,%s} = %v after a mint, want 0",
+					tc.initState, tc.initReason, v)
 			}
 		})
 	}
@@ -75,15 +165,48 @@ func wfProject() *tatarav1alpha1.Project {
 	}
 }
 
+// wfParkedTask builds a Task parked for reason. The signature is kept at
+// (name, kind, reason) - not (name, kind, state, reason) - on purpose: it is
+// shared with unpark_test.go/unpark_decline_test.go outside this file's
+// ownership, so wfParkedStateFor infers the state this reason is actually
+// reachable from off (kind, reason) instead of taking it as a parameter. Park
+// does not move state, so the inferred state IS both the pre-park and the
+// (still-parked or successfully-re-entered) post-drive state.
 func wfParkedTask(name, kind, reason string) *tatarav1alpha1.Task {
+	state := wfParkedStateFor(kind, reason)
 	return &tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: mdNS, UID: types.UID("uid-" + name)},
 		Spec:       tatarav1alpha1.TaskSpec{Kind: kind, ProjectRef: "proj", Goal: "g"},
 		Status: tatarav1alpha1.TaskStatus{
-			Stage:          tatarav1alpha1.StageParked,
-			StageReason:    reason,
-			StageEnteredAt: &metav1.Time{Time: time.Now().Add(-time.Hour)},
+			State:           state,
+			ParkReason:      reason,
+			ParkedFromState: state,
+			StateEnteredAt:  &metav1.Time{Time: time.Now().Add(-time.Hour)},
 		},
+	}
+}
+
+// wfParkedStateFor infers the state a (kind, reason) park fixture is built
+// at. Some reasons name their own state regardless of kind (backlog-sweep is
+// always a fresh triage; merge/deploy-timeout are always the operator-driven
+// state they time out in); everything else falls back to the state its kind
+// normally runs in.
+func wfParkedStateFor(kind, reason string) string {
+	switch reason {
+	case stage.ReasonBacklogSweep:
+		return tatarav1alpha1.StateNew
+	case stage.ReasonMergeTimeout:
+		return tatarav1alpha1.StateMerged
+	case stage.ReasonDeployTimeout:
+		return tatarav1alpha1.StateDeployed
+	}
+	switch kind {
+	case "review":
+		return tatarav1alpha1.StateAwaitingReview
+	case "clarify", "brainstorm":
+		return tatarav1alpha1.StateRefined
+	default: // implement, incident, takeover, documentation, doc-batch
+		return tatarav1alpha1.StateUnderImplementation
 	}
 }
 
@@ -102,18 +225,17 @@ func TestDriveUnparks_TimeBasedReasonsReEnter(t *testing.T) {
 		name, reason, mrState, wantStage string
 		withMR                           bool
 	}{
-		{name: "merge-timeout", reason: stage.ReasonMergeTimeout, withMR: true, mrState: "open", wantStage: tatarav1alpha1.StageMerging},
-		{name: "deploy-timeout", reason: stage.ReasonDeployTimeout, withMR: true, mrState: "merged", wantStage: tatarav1alpha1.StageDeploying},
-		{name: "no-outcome", reason: stage.ReasonNoOutcome, withMR: false, wantStage: tatarav1alpha1.StageImplementing},
+		{name: "merge-timeout", reason: stage.ReasonMergeTimeout, withMR: true, mrState: "open", wantStage: tatarav1alpha1.StateMerged},
+		{name: "deploy-timeout", reason: stage.ReasonDeployTimeout, withMR: true, mrState: "merged", wantStage: tatarav1alpha1.StateDeployed},
+		{name: "no-outcome", reason: stage.ReasonNoOutcome, withMR: false, wantStage: tatarav1alpha1.StateUnderImplementation},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			// Unpark never moves state, so the pre-park state IS the
+			// post-re-entry wantStage (#406: no-outcome only re-drives when
+			// parked FROM implementing or reviewing - a real pod ran a turn -
+			// which under-implementation, wfParkedTask's state here, is).
 			task := wfParkedTask("t-"+tc.name, "implement", tc.reason)
-			if tc.reason == stage.ReasonNoOutcome {
-				// #406: no-outcome only re-drives when parked FROM implementing
-				// or reviewing (a real pod ran a turn). This is exactly that case.
-				task.Status.ParkedFromStage = tatarav1alpha1.StageImplementing
-			}
 			objs := []client.Object{task}
 			if tc.withMR {
 				mr := wfMR("mr-"+tc.name, tc.mrState, task)
@@ -126,8 +248,8 @@ func TestDriveUnparks_TimeBasedReasonsReEnter(t *testing.T) {
 				t.Fatalf("driveUnparks: %v", err)
 			}
 			got := mdGetTask(t, c, task.Name)
-			if got.Status.Stage != tc.wantStage {
-				t.Fatalf("park(%s) re-entered %s, want %s", tc.reason, got.Status.Stage, tc.wantStage)
+			if got.Status.State != tc.wantStage {
+				t.Fatalf("park(%s) re-entered %s, want %s", tc.reason, got.Status.State, tc.wantStage)
 			}
 		})
 	}
@@ -143,8 +265,8 @@ func TestDriveUnparks_BacklogSweepPromotesOnHumanComment(t *testing.T) {
 	if err := r.driveUnparks(context.Background(), wfProject(), time.Now()); err != nil {
 		t.Fatalf("driveUnparks: %v", err)
 	}
-	if got := mdGetTask(t, c, task.Name); got.Status.Stage != tatarav1alpha1.StageTriaging {
-		t.Fatalf("backlog-sweep + human comment re-entered %s, want triaging", got.Status.Stage)
+	if got := mdGetTask(t, c, task.Name); got.Status.State != tatarav1alpha1.StateNew {
+		t.Fatalf("backlog-sweep + human comment re-entered %s, want triaging", got.Status.State)
 	}
 }
 
@@ -155,8 +277,8 @@ func TestDriveUnparks_BacklogSweepStaysParkedWithoutComment(t *testing.T) {
 	if err := r.driveUnparks(context.Background(), wfProject(), time.Now()); err != nil {
 		t.Fatalf("driveUnparks: %v", err)
 	}
-	if got := mdGetTask(t, c, task.Name); got.Status.Stage != tatarav1alpha1.StageParked {
-		t.Fatalf("backlog-sweep with NO comment re-entered %s; must stay parked", got.Status.Stage)
+	if got := mdGetTask(t, c, task.Name); got.Status.State != tatarav1alpha1.StateNew || !tatarav1alpha1.Parked(got) {
+		t.Fatalf("backlog-sweep with NO comment re-entered %s/parked=%v; must stay parked", got.Status.State, tatarav1alpha1.Parked(got))
 	}
 }
 
@@ -180,11 +302,15 @@ func TestDriveUnparks_BacklogSweepStaysParkedWithoutComment(t *testing.T) {
 // more than 2 into conversing in a single pass.
 func TestDriveUnparks_ConversingRoomBudgetCapsBulkReEntry(t *testing.T) {
 	proj := wfProject()
-	proj.Spec.MaxConversingPods = 2
+	proj.Spec.MaxLivePods = 2
 
 	names := []string{"a", "b", "c", "d"}
 	var objs []client.Object
 	for _, n := range names {
+		// Parked FROM refined (the live, conversation-bearing state the old
+		// `conversing` pseudo-stage bucketed into, #521): unpark never moves
+		// state, so a successful re-entry leaves State exactly here and only
+		// clears the park flag.
 		task := wfParkedTask("t-bulk-"+n, "clarify", stage.ReasonAwaitingHuman)
 		task.Status.PendingEvents = []tatarav1alpha1.TaskEvent{{
 			At: metav1.Now(), Kind: "issue_comment", Author: "human", Body: "go ahead",
@@ -192,7 +318,7 @@ func TestDriveUnparks_ConversingRoomBudgetCapsBulkReEntry(t *testing.T) {
 		iss := &tatarav1alpha1.Issue{ObjectMeta: metav1.ObjectMeta{Name: "iss-bulk-" + n, Namespace: mdNS}}
 		iss.Status.State = "open"
 		iss.Status.Status = "new" // NOT approved: allApproved must stay false so this Task's
-		// re-entry consults ConversingHasRoom rather than jumping straight to implementing.
+		// re-entry consults LiveHasRoom rather than jumping straight to implementing.
 		task.Status.IssueRefs = []string{iss.Name}
 		objs = append(objs, task, iss)
 	}
@@ -205,12 +331,12 @@ func TestDriveUnparks_ConversingRoomBudgetCapsBulkReEntry(t *testing.T) {
 	conversing := 0
 	for _, n := range names {
 		got := mdGetTask(t, c, "t-bulk-"+n)
-		if got.Status.Stage == tatarav1alpha1.StageConversing {
+		if !tatarav1alpha1.Parked(got) {
 			conversing++
 		}
 	}
-	if conversing > proj.Spec.MaxConversingPods {
-		t.Fatalf("driveUnparks put %d Tasks into conversing in one pass against a ceiling of %d - the room budget was reused instead of spent", conversing, proj.Spec.MaxConversingPods)
+	if conversing > proj.Spec.MaxLivePods {
+		t.Fatalf("driveUnparks put %d Tasks into conversing in one pass against a ceiling of %d - the room budget was reused instead of spent", conversing, proj.Spec.MaxLivePods)
 	}
 	if conversing == 0 {
 		t.Fatalf("driveUnparks put 0 Tasks into conversing - the room budget computation itself is broken, not just the cap")
@@ -253,13 +379,13 @@ func TestGrammarVerifier_VerdictsPerIssue(t *testing.T) {
 	g := &GrammarVerifier{Client: c, Metrics: metrics}
 	ctx := context.Background()
 
-	if ev, ok := g.VerifyApproval(ctx, proj, approved, cites("c1", "go ahead")); !ok || ev == nil || ev.Login != "maint" {
+	if ev, ok, _ := g.VerifyApprovalDeclared(ctx, proj, approved, cites("c1", "go ahead"), ""); !ok || ev == nil || ev.Login != "maint" {
 		t.Fatalf("valid cited maintainer approval refused: ok=%v ev=%+v", ok, ev)
 	}
-	if _, ok := g.VerifyApproval(ctx, proj, fabricated, cites("c2", "go ahead")); ok {
+	if _, ok, _ := g.VerifyApprovalDeclared(ctx, proj, fabricated, cites("c2", "go ahead"), ""); ok {
 		t.Fatalf("a FABRICATED quote granted approval")
 	}
-	if _, ok := g.VerifyApproval(ctx, proj, nonMaint, cites("c3", "go ahead")); ok {
+	if _, ok, _ := g.VerifyApprovalDeclared(ctx, proj, nonMaint, cites("c3", "go ahead"), ""); ok {
 		t.Fatalf("a non-maintainer comment granted approval")
 	}
 	// Hard rule 13: every refusal path is queryable without log-scraping.
@@ -273,7 +399,7 @@ func TestGrammarVerifier_VerdictsPerIssue(t *testing.T) {
 	// A nil Metrics must not panic: the seam is wired with metrics in production
 	// but constructed bare in several tests.
 	bare := &GrammarVerifier{Client: c}
-	if _, ok := bare.VerifyApproval(ctx, proj, nonMaint, nil); ok {
+	if _, ok, _ := bare.VerifyApprovalDeclared(ctx, proj, nonMaint, nil, ""); ok {
 		t.Fatal("a nil-metrics verifier granted approval with no citation")
 	}
 }
@@ -288,7 +414,7 @@ func TestHandleTurnSubmitFailure_410RoutesToTTLStop(t *testing.T) {
 	task := &tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{Name: "t410", Namespace: mdNS, UID: types.UID("uid-t410")},
 		Spec:       tatarav1alpha1.TaskSpec{Kind: "implement", ProjectRef: "proj", Goal: "g"},
-		Status:     tatarav1alpha1.TaskStatus{Stage: tatarav1alpha1.StageImplementing},
+		Status:     tatarav1alpha1.TaskStatus{State: tatarav1alpha1.StateUnderImplementation},
 	}
 	c := newMirrorClient(t, task)
 	r := tsReconciler(c)

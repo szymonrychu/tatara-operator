@@ -40,8 +40,11 @@ func TestConversingIdleExitTakesAHandoffTurnBeforeParking(t *testing.T) {
 	if err := r.Get(context.Background(), objectKeyOf(task), fresh); err != nil {
 		t.Fatalf("get task: %v", err)
 	}
-	if fresh.Status.Stage != tatarav1alpha1.StageParked || fresh.Status.StageReason != stage.ReasonAwaitingHuman {
-		t.Fatalf("stage = %s(%s), want parked(awaiting-human)", fresh.Status.Stage, fresh.Status.StageReason)
+	if !tatarav1alpha1.Parked(fresh) || fresh.Status.ParkReason != stage.ReasonAwaitingHuman {
+		t.Fatalf("parked=%v reason=%s, want parked(awaiting-human)", tatarav1alpha1.Parked(fresh), fresh.Status.ParkReason)
+	}
+	if fresh.Status.State != tatarav1alpha1.StateRefined {
+		t.Fatalf("state = %s, want unchanged refined: park never moves state", fresh.Status.State)
 	}
 	if len(fresh.Status.Notes) == 0 {
 		t.Error("notes are empty after the handoff: the continuation state was lost")
@@ -103,7 +106,7 @@ func (s *exitSession) SubmitHandoffTurn(ctx context.Context, baseURL, text, call
 	}
 	fresh.Status.Notes = append(fresh.Status.Notes, tatarav1alpha1.Note{
 		At:    metav1.Now(),
-		Agent: "clarify",
+		Agent: "implement",
 		Kind:  agent.NoteKindHandoff,
 		Body:  "everything the next pod needs",
 	})
@@ -113,10 +116,11 @@ func (s *exitSession) SubmitHandoffTurn(ctx context.Context, baseURL, text, call
 	return id, nil
 }
 
-// newConversingExitFixture builds a conversing Task with a ready wrapper pod and
-// an idle-but-alive session, mirroring newConversingTurnFixture
-// (conversing_turn_test.go) but wired for the G.7 handoff-and-park exit rather
-// than the follow-up turn.
+// newConversingExitFixture builds a LIVE Task (refined - one of the three
+// states stage.Live now covers, #521's dissolution of the single `conversing`
+// stage) with a ready wrapper pod and an idle-but-alive session, mirroring
+// newLiveTurnFixture (livepods_turn_test.go) but wired for the G.7
+// handoff-and-park exit rather than the follow-up turn.
 func newConversingExitFixture(t *testing.T) (*tatarav1alpha1.Project, *tatarav1alpha1.Task, *TaskReconciler, *exitSession) {
 	t.Helper()
 
@@ -124,14 +128,14 @@ func newConversingExitFixture(t *testing.T) (*tatarav1alpha1.Project, *tatarav1a
 	proj := tsStablyReadyProject(3)
 	proj.Spec.Agent.TurnTimeoutSeconds = 600
 
-	task := tsTask("exit-1", "clarify", tatarav1alpha1.StageConversing, now.Add(-time.Hour))
+	task := tsTask("exit-1", "implement", tatarav1alpha1.StateRefined, now.Add(-time.Hour))
 	podAt := metav1.NewTime(now.Add(-10 * time.Minute))
 	workAt := metav1.NewTime(now.Add(-9 * time.Minute))
 	lastEvent := metav1.NewTime(now.Add(-time.Minute))
 	task.Status.PodStartedAt = &podAt
-	task.Status.StageWorkStartedAt = &workAt
+	task.Status.StateWorkStartedAt = &workAt
 	task.Status.ConversationLastEventAt = &lastEvent
-	task.Status.AgentKind = stage.AgentClarify
+	task.Status.AgentKind = stage.AgentKindFor(tatarav1alpha1.StateRefined, "implement")
 
 	c := newMirrorClient(t, proj, mdSecret(), task, tsReadyPod(task))
 	r := tsReconciler(c)

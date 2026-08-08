@@ -2,6 +2,51 @@
 
 Planned work not yet started. One line per item; link to plans for detail.
 
+- [x] **RESOLVED 2026-08-08 - the #521 migrator is withdrawn and the state reset is ACCEPTED.**
+  The finding stands: CRD structural pruning applies on the READ path, so once the narrowed CRD is
+  served no GET returns `status.stage` on any object and a one-shot migrator has nothing to read
+  (measured against envtest k8s 1.33.0). The maintainer ruled against every remedy that would have
+  made it readable - no `PreserveUnknownFields`, no `LegacyStage*` fields, no second release, no
+  v1alpha2. `internal/migrate`, its `cmd/manager` wiring and the refuse-to-start gate are DELETED.
+  **THE ACCEPTED CONSEQUENCE: all 129 live Tasks boot stateless and re-derive through the ordinary
+  create edge**, which is now intended behaviour rather than the H5 defect. The ONE guard is
+  `internal/controller/reset_guard.go:terminalResetTarget`, which keeps 8 delivered + 9 rejected
+  Tasks out of the live lifecycle on evidence that survived pruning (`status.deliveredAt`,
+  `status.documentedBy`, the owned Issue mirrors) and leaves anything ambiguous stateless.
+  Separately, the 61 Tasks still carrying `spec.kind=clarify` are no longer rewritten and each
+  parks once at `triage-stalled`. Blast radius and the post-deploy kubectl/PromQL are in
+  MEMORY.md 2026-08-08.
+
+- [x] **THE #521 LIFECYCLE AND AGENT MERGE. Shipped 2026-08-07, chart 2.0.0 (MAJOR, BREAKING).**
+  `docs/superpowers/plans/2026-08-07-521-lifecycle-and-agent-merge.md`, the tatara-operator half
+  (MR6). The 16-stage machine is replaced by THREE ORTHOGONAL properties: `status.state` (8 values,
+  26 edges), `status.parkReason` (a 28-value flag, empty means not parked) and `stage.Live(state)`
+  (liveness, which dissolved the `conversing` stage). `TaskDone` is now exactly `{done, rejected}` -
+  `TaskDone(parked)==true` was issue #521 itself. The `clarify` agent kind is DELETED and folded into
+  `implement` as the `approved`/`discuss`/`rejected` actions behind an extended server-side gate
+  (`approvingMaintainer` as a bound cross-check, plan-hash pinning, a 200 `granted:false` that does
+  not park). `internal/controller/resume.go` is deleted whole. `TATARA_CONTRACT_VERSION` is 4.
+  **CUTOVER: there is NO migrator - every live Task resets to stateless and re-derives, guarded
+  against resurrecting terminal work by `terminalResetTarget` (see the resolved item above).**
+  Rollback is FORWARD-ONLY. Apply chart and image together with
+  `helm upgrade --wait`; `kubeVersion: ">=1.33.0-0"` is enforced (CRD validation ratcheting).
+
+- [ ] **tatara-observability's alert rules key on the OLD stage vocabulary and are BROKEN by #521.**
+  `operator_task_terminal_total{stage=...}` is now `{state=...}` and narrowed to `done|rejected`;
+  `operator_conversing_*` is `operator_live_*`; `operator_task_stage*` is `operator_task_state*`.
+  A sixth repo, genuinely out of scope for the #521 landing, so the platform currently ships with
+  part of its own alerting blind. File and land before the next incident.
+
+- [ ] **THE SWEEP'S MINT-BUDGET THROUGHPUT CEILING. Measured, not raised.** MR1 made it visible
+  (`action=sweep_skip_issue reason=mint_budget_bound` plus `operator_sweep_orphan_stranded_seconds`)
+  and its first pass in v1.43.0 named it on 502, 503 and tatara-observability#93, with
+  `minted_triaging=1 + minted_parked=4 = 5 = maxNew` exactly. Crossed with `reposDueForScan`'s 4h
+  per-repo stagger, a backlog drains at ~5 issues per repo-window and anything under the cut line is
+  deferred indefinitely. Three candidates, none chosen: raise `maxNewTasksPerSweep`; order the budget
+  by OLDEST stranded orphan rather than forge-listing order (the cut is currently arbitrary); or
+  requeue immediately when a pass ends budget-bound with orphans outstanding. Let the stranded-seconds
+  gauge collect data first - the choice turns on whether the backlog is bursty or steady.
+
 - [x] **THE TASK-CENTRIC REDESIGN. Shipped 2026-07-13, chart 1.0.0 (MAJOR, BREAKING).** All 22 tasks
   of `docs/superpowers/plans/2026-07-12-task-centric-operator.md` (parent repo) against
   `2026-07-12-task-centric-CROSS-REPO-CONTRACT.md` v7. The phase/lifecycle/WorkItems machine is

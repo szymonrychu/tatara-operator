@@ -159,8 +159,8 @@ func TestRunScans_DocumentationDueCreatesDocTask(t *testing.T) {
 		t.Fatalf("want 1 documentation batch Task, got %d", len(batches))
 	}
 	b := batches[0]
-	if b.Spec.InitialStage != tatarav1alpha1.StageDocumenting {
-		t.Fatalf("initialStage = %q, want documenting", b.Spec.InitialStage)
+	if b.Spec.InitialState != tatarav1alpha1.StateUnderImplementation {
+		t.Fatalf("initialStage = %q, want documenting", b.Spec.InitialState)
 	}
 	found := false
 	for _, name := range b.Spec.DocumentsTasks {

@@ -34,8 +34,8 @@ func takenOverMR(review, takeover *tatarav1alpha1.Task, repo string, number int)
 // no-controller window, a still-owned MR, a dead controller, a non-review kind).
 func TestTaskTakenOver(t *testing.T) {
 	ctx := context.Background()
-	review := mdTask("rev-7", "review", tatarav1alpha1.StageReviewing)
-	takeover := mdTask("takeover-7", "takeover", tatarav1alpha1.StageImplementing)
+	review := mdTask("rev-7", "review", tatarav1alpha1.StateAwaitingReview)
+	takeover := mdTask("takeover-7", "takeover", tatarav1alpha1.StateUnderImplementation)
 	review.Status.MRRefs = []string{tatarav1alpha1.MergeRequestName("tatara-operator", 7)}
 
 	t.Run("taken over by a different live task", func(t *testing.T) {
@@ -85,7 +85,7 @@ func TestTaskTakenOver(t *testing.T) {
 		// refs [gone, takenOver]: the dangling ref is NOT proof of takeover -
 		// external deletion of an MR CR must never finalize the parent, even when
 		// another ref IS genuinely taken over.
-		mixed := mdTask("rev-mixed", "review", tatarav1alpha1.StageReviewing)
+		mixed := mdTask("rev-mixed", "review", tatarav1alpha1.StateAwaitingReview)
 		mixed.Status.MRRefs = []string{
 			tatarav1alpha1.MergeRequestName("tatara-operator", 41), // CR deleted externally
 			tatarav1alpha1.MergeRequestName("tatara-operator", 42),
@@ -110,7 +110,7 @@ func TestTaskTakenOver(t *testing.T) {
 	})
 
 	t.Run("non-review kind is never taken over", func(t *testing.T) {
-		impl := mdTask("impl-7", "implement", tatarav1alpha1.StageReviewing)
+		impl := mdTask("impl-7", "implement", tatarav1alpha1.StateAwaitingReview)
 		impl.Status.MRRefs = review.Status.MRRefs
 		mr := takenOverMR(impl, takeover, "tatara-operator", 7)
 		c := newMirrorClient(t, mdProject(), mdSecret(), impl, takeover, mr)
@@ -121,7 +121,7 @@ func TestTaskTakenOver(t *testing.T) {
 	})
 
 	t.Run("no mrRefs is never taken over", func(t *testing.T) {
-		bare := mdTask("rev-bare", "review", tatarav1alpha1.StageReviewing)
+		bare := mdTask("rev-bare", "review", tatarav1alpha1.StateAwaitingReview)
 		c := newMirrorClient(t, mdProject(), mdSecret(), bare)
 		over, err := TaskTakenOver(ctx, c, bare)
 		if err != nil || over {
@@ -138,8 +138,8 @@ func TestReconcileClocks_FinalizesTakenOverReviewParent(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
 	proj := tsProject(3)
-	review := tsTask("rev-7", "review", tatarav1alpha1.StageReviewing, now.Add(-time.Minute))
-	takeover := mdTask("takeover-7", "takeover", tatarav1alpha1.StageImplementing)
+	review := tsTask("rev-7", "review", tatarav1alpha1.StateAwaitingReview, now.Add(-time.Minute))
+	takeover := mdTask("takeover-7", "takeover", tatarav1alpha1.StateUnderImplementation)
 	review.Status.MRRefs = []string{tatarav1alpha1.MergeRequestName("tatara-operator", 7)}
 	mr := takenOverMR(review, takeover, "tatara-operator", 7)
 
@@ -154,8 +154,8 @@ func TestReconcileClocks_FinalizesTakenOverReviewParent(t *testing.T) {
 		t.Fatal("reconcileClocks must handle (finalize) the taken-over review parent")
 	}
 	got := mdGetTask(t, c, "rev-7")
-	if got.Status.Stage != tatarav1alpha1.StageRejected || got.Status.StageReason != stage.ReasonMRTakenOver {
-		t.Fatalf("stage/reason = %q/%q, want rejected/mr-taken-over", got.Status.Stage, got.Status.StageReason)
+	if got.Status.State != tatarav1alpha1.StateRejected || got.Status.StateReason != stage.ReasonMRTakenOver {
+		t.Fatalf("stage/reason = %q/%q, want rejected/mr-taken-over", got.Status.State, got.Status.StateReason)
 	}
 }
 
@@ -165,8 +165,8 @@ func TestReconcileClocks_FinalizesTakenOverReviewParent(t *testing.T) {
 func TestEnsureStagePod_FinalizesTakenOverReviewParent(t *testing.T) {
 	ctx := context.Background()
 	proj := tsProject(3)
-	review := tsTask("rev-8", "review", tatarav1alpha1.StageReviewing, time.Now())
-	takeover := mdTask("takeover-8", "takeover", tatarav1alpha1.StageImplementing)
+	review := tsTask("rev-8", "review", tatarav1alpha1.StateAwaitingReview, time.Now())
+	takeover := mdTask("takeover-8", "takeover", tatarav1alpha1.StateUnderImplementation)
 	review.Status.MRRefs = []string{tatarav1alpha1.MergeRequestName("tatara-operator", 8)}
 	mr := takenOverMR(review, takeover, "tatara-operator", 8)
 
@@ -189,8 +189,8 @@ func TestEnsureStagePod_FinalizesTakenOverReviewParent(t *testing.T) {
 		t.Fatalf("unexpected error checking for pod: %v", err)
 	}
 	got := mdGetTask(t, c, "rev-8")
-	if got.Status.Stage != tatarav1alpha1.StageRejected || got.Status.StageReason != stage.ReasonMRTakenOver {
-		t.Fatalf("stage/reason = %q/%q, want rejected/mr-taken-over", got.Status.Stage, got.Status.StageReason)
+	if got.Status.State != tatarav1alpha1.StateRejected || got.Status.StateReason != stage.ReasonMRTakenOver {
+		t.Fatalf("stage/reason = %q/%q, want rejected/mr-taken-over", got.Status.State, got.Status.StateReason)
 	}
 }
 
@@ -204,7 +204,7 @@ func TestTaskTakenOver_DoesNotMisfireOnFreshReviewOwner(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
 	proj := tsProject(3)
-	fresh := tsTask("rev-remint", "review", tatarav1alpha1.StageReviewing, now.Add(-time.Minute))
+	fresh := tsTask("rev-remint", "review", tatarav1alpha1.StateAwaitingReview, now.Add(-time.Minute))
 	fresh.Status.MRRefs = []string{tatarav1alpha1.MergeRequestName("tatara-operator", 9)}
 	mr := mdMR(fresh, "tatara-operator", 9) // fresh IS the controller owner
 
@@ -221,7 +221,7 @@ func TestTaskTakenOver_DoesNotMisfireOnFreshReviewOwner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reconcileClocks: %v", err)
 	}
-	if got := mdGetTask(t, c, "rev-remint"); got.Status.Stage != tatarav1alpha1.StageReviewing {
-		t.Fatalf("fresh review owner was finalized to %q; it must stay reviewing", got.Status.Stage)
+	if got := mdGetTask(t, c, "rev-remint"); got.Status.State != tatarav1alpha1.StateAwaitingReview {
+		t.Fatalf("fresh review owner was finalized to %q; it must stay reviewing", got.Status.State)
 	}
 }

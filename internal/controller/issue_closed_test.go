@@ -43,17 +43,17 @@ func issueGone(t *testing.T, c client.Client, name string) bool {
 // deletes the mirror CR, and clears IssueRefs.
 func TestIssueClosed_LiveStageStops(t *testing.T) {
 	for _, stg := range []string{
-		tatarav1alpha1.StageTriaging, tatarav1alpha1.StageClarifying,
-		tatarav1alpha1.StageImplementing, tatarav1alpha1.StageReviewing,
-		tatarav1alpha1.StageMerging,
+		tatarav1alpha1.StateNew, tatarav1alpha1.StateRefined,
+		tatarav1alpha1.StateUnderImplementation, tatarav1alpha1.StateAwaitingReview,
+		tatarav1alpha1.StateMerged,
 	} {
 		t.Run(stg, func(t *testing.T) {
 			r, c, task, issName := closedIssueSetup(t, stg, "", true)
 			reconcileIssue(t, r, issName)
 
 			got := getTaskCR(t, c, task.Name)
-			require.Equal(t, tatarav1alpha1.StageRejected, got.Status.Stage)
-			require.Equal(t, stage.ReasonIssueClosed, got.Status.StageReason)
+			require.Equal(t, tatarav1alpha1.StateRejected, got.Status.State)
+			require.Equal(t, stage.ReasonIssueClosed, got.Status.StateReason)
 			require.NotContains(t, got.Status.IssueRefs, issName)
 			require.True(t, issueGone(t, c, issName), "the closed mirror CR must be deleted, not leaked")
 		})
@@ -64,22 +64,23 @@ func TestIssueClosed_LiveStageStops(t *testing.T) {
 // deploying change is not rewound by a late issue close (this is also the
 // operator's own C.4 close, which must never be mistaken for a human stop).
 func TestIssueClosed_DeployingNoStop(t *testing.T) {
-	r, c, task, issName := closedIssueSetup(t, tatarav1alpha1.StageDeploying, "", true)
+	r, c, task, issName := closedIssueSetup(t, tatarav1alpha1.StateDeployed, "", true)
 	reconcileIssue(t, r, issName)
 
 	got := getTaskCR(t, c, task.Name)
-	require.Equal(t, tatarav1alpha1.StageDeploying, got.Status.Stage, "deploying is not stopped")
+	require.Equal(t, tatarav1alpha1.StateDeployed, got.Status.State, "deploying is not stopped")
 	require.False(t, issueGone(t, c, issName), "the mirror CR survives")
 }
 
 // TestIssueClosed_ParkedNoStop asserts a Task already parked when the close lands
 // is not stopped (the parked reaper handles its closed issues).
 func TestIssueClosed_ParkedNoStop(t *testing.T) {
-	r, c, task, issName := closedIssueSetup(t, tatarav1alpha1.StageParked, stage.ReasonBacklogSweep, true)
+	r, c, task, issName := closedIssueSetup(t, tatarav1alpha1.StateNew, stage.ReasonBacklogSweep, true)
 	reconcileIssue(t, r, issName)
 
 	got := getTaskCR(t, c, task.Name)
-	require.Equal(t, tatarav1alpha1.StageParked, got.Status.Stage)
+	require.Equal(t, tatarav1alpha1.StateNew, got.Status.State)
+	require.True(t, tatarav1alpha1.Parked(got), "still parked: the stop edge must have been refused")
 	require.False(t, issueGone(t, c, issName))
 }
 
@@ -101,7 +102,7 @@ func TestIssueClosed_FoldInFlightDefersTheStop(t *testing.T) {
 		{"adoption past its TTL", time.Now().Add(-2 * tatarav1alpha1.FoldInFlightTTL), true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r, c, task, issName := closedIssueSetup(t, tatarav1alpha1.StageRefining, "", true)
+			r, c, task, issName := closedIssueSetup(t, tatarav1alpha1.StateRefined, "", true)
 
 			live := getTaskCR(t, c, task.Name)
 			live.Status.FoldInFlight = []string{"member-task"}
@@ -113,11 +114,11 @@ func TestIssueClosed_FoldInFlightDefersTheStop(t *testing.T) {
 
 			got := getTaskCR(t, c, task.Name)
 			if tc.stopped {
-				require.Equal(t, tatarav1alpha1.StageRejected, got.Status.Stage)
-				require.Equal(t, stage.ReasonIssueClosed, got.Status.StageReason)
+				require.Equal(t, tatarav1alpha1.StateRejected, got.Status.State)
+				require.Equal(t, stage.ReasonIssueClosed, got.Status.StateReason)
 				return
 			}
-			require.Equal(t, tatarav1alpha1.StageRefining, got.Status.Stage,
+			require.Equal(t, tatarav1alpha1.StateRefined, got.Status.State,
 				"an umbrella mid-adoption must not be stopped by the close of an issue")
 			require.False(t, issueGone(t, c, issName), "nothing is severed while the stop is deferred")
 		})
@@ -131,7 +132,7 @@ func TestIssueClosed_FoldInFlightDefersTheStop(t *testing.T) {
 func TestIssueClosed_ReSeverCompletesAfterCrash(t *testing.T) {
 	// issRefs=false models the crash state: step 1 (IssueRefs clear) landed,
 	// step 2 (CR delete) did not.
-	r, c, _, issName := closedIssueSetup(t, tatarav1alpha1.StageRejected, stage.ReasonIssueClosed, false)
+	r, c, _, issName := closedIssueSetup(t, tatarav1alpha1.StateRejected, stage.ReasonIssueClosed, false)
 	reconcileIssue(t, r, issName)
 	require.True(t, issueGone(t, c, issName), "re-sever must finish the interrupted DeleteCR")
 }

@@ -18,7 +18,7 @@ import (
 // instead mark the mirror closed and stop, exactly like a real forge close.
 func TestReconcile_PermanentForge404MarksClosedInsteadOfLooping(t *testing.T) {
 	ctx := context.Background()
-	task := mdTask("t1", "implement", tatarav1alpha1.StageMerging)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateMerged)
 	mr := mdMR(task, "helmfile", 1311)
 	now := metav1.Now()
 	mr.Status.Ownership = tatarav1alpha1.OwnershipTatara

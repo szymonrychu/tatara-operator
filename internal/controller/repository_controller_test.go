@@ -86,7 +86,7 @@ func getRepo(t *testing.T, name string) *tataradevv1alpha1.Repository {
 func TestReconcileRepo_ComputesPerRepoCounts(t *testing.T) {
 	mkProject(t, "p-repo-counts", "p-repo-counts-scm")
 	mkRepo(t, "r-repo-counts", "p-repo-counts")
-	mkTaskWithKind(t, "t-issue-open-repo", "p-repo-counts", "r-repo-counts", "clarify")
+	mkTaskWithKind(t, "t-issue-open-repo", "p-repo-counts", "r-repo-counts", "implement")
 	mkTaskWithKind(t, "t-incident-open-repo", "p-repo-counts", "r-repo-counts", "incident")
 
 	if _, err := reconcileRepo(t, "r-repo-counts"); err != nil {
@@ -110,7 +110,7 @@ func TestReconcileRepo_ComputesPerRepoCounts_IngestDisabled(t *testing.T) {
 	if err := k8sClient.Update(context.Background(), repo); err != nil {
 		t.Fatalf("disable ingest: %v", err)
 	}
-	mkTaskWithKind(t, "t-issue-open-repo-off", "p-repo-counts-off", "r-repo-counts-off", "clarify")
+	mkTaskWithKind(t, "t-issue-open-repo-off", "p-repo-counts-off", "r-repo-counts-off", "implement")
 	mkTaskWithKind(t, "t-incident-open-repo-off", "p-repo-counts-off", "r-repo-counts-off", "incident")
 
 	if _, err := reconcileRepo(t, "r-repo-counts-off"); err != nil {

@@ -22,7 +22,7 @@ import (
 // four automatic resume triggers plus a manual annotation bound the cost of a
 // wrong call to "until the project next moves".
 func TestBrainstormExhaustedStampsThePause(t *testing.T) {
-	task := taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StageBrainstorming, "brainstorm")
+	task := taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StateRefined, "brainstorm")
 	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"), task)
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
@@ -39,7 +39,7 @@ func TestBrainstormExhaustedStampsThePause(t *testing.T) {
 // transient, counts toward nothing, and stamps no state: a skip no longer has
 // any scheduling consequence at all.
 func TestBrainstormSkipStampsNoPause(t *testing.T) {
-	task := taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StageBrainstorming, "brainstorm")
+	task := taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StateRefined, "brainstorm")
 	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"), task)
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
@@ -53,7 +53,7 @@ func TestBrainstormSkipStampsNoPause(t *testing.T) {
 
 // exhausted is validated exactly like skip: a non-empty reason is required.
 func TestBrainstormExhaustedRequiresAReason(t *testing.T) {
-	task := taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StageBrainstorming, "brainstorm")
+	task := taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StateRefined, "brainstorm")
 	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"), task)
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
@@ -78,7 +78,7 @@ func TestBrainstormExhaustedRequiresAReason(t *testing.T) {
 // event. taskV2 stamps StageEnteredAt to frozenNow-1h; a movement stamped
 // AFTER that (here, 30 minutes ago) must refuse the pause.
 func TestBrainstormExhaustedRefusesThePauseWhenTheProjectMovedDuringTheSession(t *testing.T) {
-	task := taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StageBrainstorming, "brainstorm")
+	task := taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StateRefined, "brainstorm")
 	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"), task)
 
 	p := e.project(t, "tatara")
@@ -96,7 +96,7 @@ func TestBrainstormExhaustedRefusesThePauseWhenTheProjectMovedDuringTheSession(t
 	require.Empty(t, proj.Status.BrainstormPauseReason)
 	// The Task itself must still complete normally: refusing the pause is not
 	// refusing the outcome.
-	require.Equal(t, tatarav1alpha1.StageDelivered, e.task(t, "t1").Status.Stage)
+	require.Equal(t, tatarav1alpha1.StateDone, e.task(t, "t1").Status.State)
 }
 
 // TestBrainstormExhaustedStillPausesWhenMovementPredatesTheSession proves the
@@ -105,7 +105,7 @@ func TestBrainstormExhaustedRefusesThePauseWhenTheProjectMovedDuringTheSession(t
 // the session already accounted for, and must not block a real exhausted
 // verdict forever.
 func TestBrainstormExhaustedStillPausesWhenMovementPredatesTheSession(t *testing.T) {
-	task := taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StageBrainstorming, "brainstorm")
+	task := taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StateRefined, "brainstorm")
 	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"), task)
 
 	p := e.project(t, "tatara")
@@ -123,7 +123,7 @@ func TestBrainstormExhaustedStillPausesWhenMovementPredatesTheSession(t *testing
 }
 
 func TestBrainstormRejectsAnUnknownAction(t *testing.T) {
-	task := taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StageBrainstorming, "brainstorm")
+	task := taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StateRefined, "brainstorm")
 	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"), task)
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
@@ -137,7 +137,7 @@ func TestBrainstormRejectsAnUnknownAction(t *testing.T) {
 // waiting for one of the five external triggers would be strictly worse.
 func TestBrainstormProposeClearsAnExistingPause(t *testing.T) {
 	proj := projectV2("tatara")
-	task := taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StageBrainstorming, "brainstorm")
+	task := taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StateRefined, "brainstorm")
 	task.Annotations = map[string]string{tatarav1alpha1.AnnBrainstormQuota: "1"}
 	e := buildV2(t, v2Opts{}, proj, scmSecretV2(), repoV2("tatara-operator", "tatara"), task)
 
@@ -175,7 +175,7 @@ func TestBrainstormExhaustedFailsClosedWhenThePauseStampFails(t *testing.T) {
 			return c.SubResource(subResourceName).Update(ctx, obj, opts...)
 		},
 	}
-	task := taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StageBrainstorming, "brainstorm")
+	task := taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StateRefined, "brainstorm")
 	e := buildV2WithCooldownAndInterceptor(t, metrics, 0, func() time.Time { return frozenNow }, funcs,
 		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"), task)
 
@@ -183,7 +183,7 @@ func TestBrainstormExhaustedFailsClosedWhenThePauseStampFails(t *testing.T) {
 		`{"kind":"brainstorm","payload":{"action":"exhausted","reason":"every open lane is blocked on a human decision"}}`)
 	require.Equal(t, http.StatusInternalServerError, w.Code, w.Body.String(),
 		"a failed pause stamp must fail the whole request, not just log-and-continue")
-	require.Equal(t, tatarav1alpha1.StageBrainstorming, e.task(t, "t1").Status.Stage,
+	require.Equal(t, tatarav1alpha1.StateRefined, e.task(t, "t1").Status.State,
 		"the Task must stay non-terminal so the agent's retry can land the pause; "+
 			"committing to Delivered first is exactly the fail-open bug this test pins")
 	require.Nil(t, e.project(t, "tatara").Status.BrainstormPausedAt,

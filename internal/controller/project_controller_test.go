@@ -10,6 +10,7 @@ import (
 	tataradevv1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/memory"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
+	"github.com/szymonrychu/tatara-operator/internal/stage"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/meta"
@@ -76,9 +77,9 @@ func TestReconcileProject_ComputesCounts(t *testing.T) {
 	mkTaskProject(t, "p-counts", 3)
 	mkTaskRepository(t, "r-counts-a", "p-counts")
 	mkTaskRepository(t, "r-counts-b", "p-counts")
-	mkTaskWithKind(t, "t-issue-open", "p-counts", "r-counts-a", "clarify")
+	mkTaskWithKind(t, "t-issue-open", "p-counts", "r-counts-a", "implement")
 	mkTaskWithKind(t, "t-incident-open", "p-counts", "r-counts-a", "incident")
-	mkTaskWithKindTerminal(t, "t-issue-closed", "p-counts", "r-counts-a", "clarify")
+	mkTaskWithKindTerminal(t, "t-issue-closed", "p-counts", "r-counts-a", "implement")
 
 	if _, err := reconcileProject(t, "p-counts"); err != nil {
 		t.Fatalf("reconcileProject: %v", err)
@@ -255,7 +256,7 @@ func TestUpdateIssueStateCounts_EmitsPerIssue(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "isc-task-1", Namespace: testNS},
 		Spec: tataradevv1alpha1.TaskSpec{
 			ProjectRef: "isc-proj",
-			Kind:       "clarify",
+			Kind:       "implement",
 			Goal:       "test",
 			Source: &tataradevv1alpha1.TaskSource{
 				Provider: "github", IssueRef: "acme/repo#42", Number: 42,
@@ -265,15 +266,15 @@ func TestUpdateIssueStateCounts_EmitsPerIssue(t *testing.T) {
 	if err := k8sClient.Create(ctx, task); err != nil {
 		t.Fatalf("create task: %v", err)
 	}
-	task.Status.Stage = tataradevv1alpha1.StageImplementing
+	task.Status.State = tataradevv1alpha1.StateUnderImplementation
 	if err := k8sClient.Status().Update(ctx, task); err != nil {
 		t.Fatalf("set stage: %v", err)
 	}
 
 	r.updateIssueStateCounts(ctx)
 
-	if got := gatherIssueState(t, reg, "acme/repo#42", "implementing", "false"); got != 1 {
-		t.Fatalf("tatara_issue_state{issue=acme/repo#42,state=implementing,incident=false} = %v, want 1", got)
+	if got := gatherIssueState(t, reg, "acme/repo#42", tataradevv1alpha1.StateUnderImplementation, "false"); got != 1 {
+		t.Fatalf("tatara_issue_state{issue=acme/repo#42,state=under-implementation,incident=false} = %v, want 1", got)
 	}
 }
 
@@ -289,7 +290,7 @@ func TestUpdateIssueStateCounts_SkipsFinished(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "iscd-task-1", Namespace: testNS},
 		Spec: tataradevv1alpha1.TaskSpec{
 			ProjectRef: "iscd-proj",
-			Kind:       "clarify",
+			Kind:       "implement",
 			Goal:       "test",
 			Source: &tataradevv1alpha1.TaskSource{
 				Provider: "github", IssueRef: "acme/repo#77", Number: 77,
@@ -299,7 +300,7 @@ func TestUpdateIssueStateCounts_SkipsFinished(t *testing.T) {
 	if err := k8sClient.Create(ctx, task); err != nil {
 		t.Fatalf("create task: %v", err)
 	}
-	task.Status.Stage = tataradevv1alpha1.StageDelivered
+	task.Status.State = tataradevv1alpha1.StateDone
 	if err := k8sClient.Status().Update(ctx, task); err != nil {
 		t.Fatalf("set stage: %v", err)
 	}
@@ -313,36 +314,41 @@ func TestUpdateIssueStateCounts_SkipsFinished(t *testing.T) {
 
 func TestIssueStateFor(t *testing.T) {
 	cases := []struct {
-		name  string
-		stage string
-		want  string
+		name       string
+		stage      string
+		parkReason string // "" means not parked
+		want       string
 	}{
-		{"triaging", tataradevv1alpha1.StageTriaging, "triaging"},
-		{"clarifying", tataradevv1alpha1.StageClarifying, "clarifying"},
-		{"implementing", tataradevv1alpha1.StageImplementing, "implementing"},
-		{"reviewing", tataradevv1alpha1.StageReviewing, "reviewing"},
-		{"merging", tataradevv1alpha1.StageMerging, "merging"},
-		{"deploying", tataradevv1alpha1.StageDeploying, "deploying"},
-		{"delivered is finished", tataradevv1alpha1.StageDelivered, ""},
-		{"parked is finished", tataradevv1alpha1.StageParked, ""},
-		{"failed is finished", tataradevv1alpha1.StageFailed, ""},
-		{"rejected is finished", tataradevv1alpha1.StageRejected, ""},
-		{"unstamped", "", ""},
+		{"triaging", tataradevv1alpha1.StateNew, "", tataradevv1alpha1.StateNew},
+		{"clarifying", tataradevv1alpha1.StateRefined, "", tataradevv1alpha1.StateRefined},
+		{"implementing", tataradevv1alpha1.StateUnderImplementation, "", tataradevv1alpha1.StateUnderImplementation},
+		{"reviewing", tataradevv1alpha1.StateAwaitingReview, "", tataradevv1alpha1.StateAwaitingReview},
+		{"merging", tataradevv1alpha1.StateMerged, "", tataradevv1alpha1.StateMerged},
+		{"deploying", tataradevv1alpha1.StateDeployed, "", tataradevv1alpha1.StateDeployed},
+		{"delivered is finished", tataradevv1alpha1.StateDone, "", ""},
+		{"rejected is finished", tataradevv1alpha1.StateRejected, "", ""},
+		// #521: parked/failed are gone as states; a park is a flag orthogonal
+		// to state, and a parked Task must still report as finished (not an
+		// active issue state) exactly like the old parked/failed stages did.
+		{"parked is finished", tataradevv1alpha1.StateUnderImplementation, stage.ReasonAwaitingHuman, ""},
+		{"a park from an exhaustion-style reason is finished too", tataradevv1alpha1.StateAwaitingReview, stage.ReasonPodRecreationExhausted, ""},
+		{"unstamped", "", "", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			task := &tataradevv1alpha1.Task{}
-			task.Status.Stage = tc.stage
+			task.Status.State = tc.stage
+			task.Status.ParkReason = tc.parkReason
 			if got := issueStateFor(task); got != tc.want {
-				t.Errorf("issueStateFor(stage=%q) = %q, want %q", tc.stage, got, tc.want)
+				t.Errorf("issueStateFor(stage=%q, parkReason=%q) = %q, want %q", tc.stage, tc.parkReason, got, tc.want)
 			}
 		})
 	}
 }
 
 // TestUpdateTaskStageGauges_CountAgeAndReset guards contract K.1's
-// operator_task_stage (a COUNT per stage,kind bucket, not per-task) and
-// operator_task_stage_age_seconds (per-task). A distinctive kind isolates the
+// operator_task_state (a COUNT per stage,kind bucket, not per-task) and
+// operator_task_state_age_seconds (per-task). A distinctive kind isolates the
 // count assertion from every other test's Tasks sharing this envtest
 // namespace. The Reset-then-recompute pass proves a removed Task's series is
 // gone (contract M22), not just left stale.
@@ -365,8 +371,8 @@ func TestUpdateTaskStageGauges_CountAgeAndReset(t *testing.T) {
 	if err := k8sClient.Create(ctx, t1); err != nil {
 		t.Fatalf("create t1: %v", err)
 	}
-	t1.Status.Stage = tataradevv1alpha1.StageImplementing
-	t1.Status.StageEnteredAt = &entered
+	t1.Status.State = tataradevv1alpha1.StateUnderImplementation
+	t1.Status.StateEnteredAt = &entered
 	if err := k8sClient.Status().Update(ctx, t1); err != nil {
 		t.Fatalf("set t1 status: %v", err)
 	}
@@ -378,25 +384,25 @@ func TestUpdateTaskStageGauges_CountAgeAndReset(t *testing.T) {
 	if err := k8sClient.Create(ctx, t2); err != nil {
 		t.Fatalf("create t2: %v", err)
 	}
-	t2.Status.Stage = tataradevv1alpha1.StageReviewing
-	t2.Status.StageEnteredAt = &entered
+	t2.Status.State = tataradevv1alpha1.StateAwaitingReview
+	t2.Status.StateEnteredAt = &entered
 	if err := k8sClient.Status().Update(ctx, t2); err != nil {
 		t.Fatalf("set t2 status: %v", err)
 	}
 
 	r.updateTaskStageGauges(ctx)
 
-	if got := testutil.ToFloat64(r.Metrics.TaskStageGauge(tataradevv1alpha1.StageImplementing, kind)); got != 1 {
-		t.Fatalf("operator_task_stage{implementing,%s} = %v, want 1", kind, got)
+	if got := testutil.ToFloat64(r.Metrics.TaskStageGauge(tataradevv1alpha1.StateUnderImplementation, kind)); got != 1 {
+		t.Fatalf("operator_task_state{implementing,%s} = %v, want 1", kind, got)
 	}
-	if got := testutil.ToFloat64(r.Metrics.TaskStageGauge(tataradevv1alpha1.StageReviewing, kind)); got != 1 {
-		t.Fatalf("operator_task_stage{reviewing,%s} = %v, want 1", kind, got)
+	if got := testutil.ToFloat64(r.Metrics.TaskStageGauge(tataradevv1alpha1.StateAwaitingReview, kind)); got != 1 {
+		t.Fatalf("operator_task_state{reviewing,%s} = %v, want 1", kind, got)
 	}
-	if got := testutil.ToFloat64(r.Metrics.TaskStageAgeGauge("tsg-task-1", tataradevv1alpha1.StageImplementing, kind)); got < 80 || got > 300 {
-		t.Fatalf("operator_task_stage_age_seconds{tsg-task-1} = %v, want ~90", got)
+	if got := testutil.ToFloat64(r.Metrics.TaskStageAgeGauge("tsg-task-1", tataradevv1alpha1.StateUnderImplementation, kind)); got < 80 || got > 300 {
+		t.Fatalf("operator_task_state_age_seconds{tsg-task-1} = %v, want ~90", got)
 	}
-	if got := testutil.ToFloat64(r.Metrics.TaskStageAgeGauge("tsg-task-2", tataradevv1alpha1.StageReviewing, kind)); got < 80 || got > 300 {
-		t.Fatalf("operator_task_stage_age_seconds{tsg-task-2} = %v, want ~90", got)
+	if got := testutil.ToFloat64(r.Metrics.TaskStageAgeGauge("tsg-task-2", tataradevv1alpha1.StateAwaitingReview, kind)); got < 80 || got > 300 {
+		t.Fatalf("operator_task_state_age_seconds{tsg-task-2} = %v, want ~90", got)
 	}
 
 	// Remove t2 and recompute: its stage bucket and its per-task age series
@@ -406,19 +412,19 @@ func TestUpdateTaskStageGauges_CountAgeAndReset(t *testing.T) {
 	}
 	r.updateTaskStageGauges(ctx)
 
-	if got := testutil.ToFloat64(r.Metrics.TaskStageGauge(tataradevv1alpha1.StageReviewing, kind)); got != 0 {
-		t.Fatalf("operator_task_stage{reviewing,%s} after delete = %v, want 0 (series gone)", kind, got)
+	if got := testutil.ToFloat64(r.Metrics.TaskStageGauge(tataradevv1alpha1.StateAwaitingReview, kind)); got != 0 {
+		t.Fatalf("operator_task_state{reviewing,%s} after delete = %v, want 0 (series gone)", kind, got)
 	}
-	if got := testutil.ToFloat64(r.Metrics.TaskStageAgeGauge("tsg-task-2", tataradevv1alpha1.StageReviewing, kind)); got != 0 {
-		t.Fatalf("operator_task_stage_age_seconds{tsg-task-2} after delete = %v, want 0 (series gone)", got)
+	if got := testutil.ToFloat64(r.Metrics.TaskStageAgeGauge("tsg-task-2", tataradevv1alpha1.StateAwaitingReview, kind)); got != 0 {
+		t.Fatalf("operator_task_state_age_seconds{tsg-task-2} after delete = %v, want 0 (series gone)", got)
 	}
-	if got := testutil.ToFloat64(r.Metrics.TaskStageGauge(tataradevv1alpha1.StageImplementing, kind)); got != 1 {
-		t.Fatalf("operator_task_stage{implementing,%s} after unrelated delete = %v, want 1 (unaffected)", kind, got)
+	if got := testutil.ToFloat64(r.Metrics.TaskStageGauge(tataradevv1alpha1.StateUnderImplementation, kind)); got != 1 {
+		t.Fatalf("operator_task_state{implementing,%s} after unrelated delete = %v, want 1 (unaffected)", kind, got)
 	}
 }
 
 // TestUpdateTaskStageGauges_HonorsElapsedCarry is issue #480's metrics-honesty
-// consequence: operator_task_stage_age_seconds must add
+// consequence: operator_task_state_age_seconds must add
 // Status.StageElapsedCarrySeconds, or it reads the time since the LATEST
 // merge-timeout/deploy-timeout re-entry rather than the whole stuck cycle -
 // exactly the "8404s for a Task merging 10h21m" under-report the issue
@@ -440,8 +446,8 @@ func TestUpdateTaskStageGauges_HonorsElapsedCarry(t *testing.T) {
 	if err := k8sClient.Create(ctx, tk); err != nil {
 		t.Fatalf("create task: %v", err)
 	}
-	tk.Status.Stage = tataradevv1alpha1.StageMerging
-	tk.Status.StageEnteredAt = &recentlyReentered
+	tk.Status.State = tataradevv1alpha1.StateMerged
+	tk.Status.StateEnteredAt = &recentlyReentered
 	tk.Status.StageElapsedCarrySeconds = carrySeconds
 	if err := k8sClient.Status().Update(ctx, tk); err != nil {
 		t.Fatalf("set task status: %v", err)
@@ -449,9 +455,9 @@ func TestUpdateTaskStageGauges_HonorsElapsedCarry(t *testing.T) {
 
 	r.updateTaskStageGauges(ctx)
 
-	got := testutil.ToFloat64(r.Metrics.TaskStageAgeGauge("tsg-carry-task", tataradevv1alpha1.StageMerging, kind))
+	got := testutil.ToFloat64(r.Metrics.TaskStageAgeGauge("tsg-carry-task", tataradevv1alpha1.StateMerged, kind))
 	if got < carrySeconds {
-		t.Fatalf("operator_task_stage_age_seconds{tsg-carry-task} = %v, want >= %d (carry not honored, under-reports the whole cycle)",
+		t.Fatalf("operator_task_state_age_seconds{tsg-carry-task} = %v, want >= %d (carry not honored, under-reports the whole cycle)",
 			got, carrySeconds)
 	}
 }

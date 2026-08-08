@@ -21,7 +21,7 @@ import (
 // path, ever.
 //
 // A golden that only ONE side checks is not a guard. tatara-cli asserts its
-// half; this asserts ours. Both must fail if the seven kinds drift.
+// half; this asserts ours. Both must fail if the six kinds drift.
 func TestKindProfilesMatchesAgentKindsGolden(t *testing.T) {
 	want := readAgentKindsGolden(t)
 
@@ -54,7 +54,7 @@ func TestKindProfilesValuesAreTheKindItself(t *testing.T) {
 }
 
 // TestEveryAgentKindResolvesATerminalProfile asserts the property the P0 broke:
-// every one of the seven agent kinds resolves to a NON-EMPTY profile. An empty
+// every one of the six agent kinds resolves to a NON-EMPTY profile. An empty
 // profile is not a nil-safe default - it is a pod that cannot terminate.
 func TestEveryAgentKindResolvesATerminalProfile(t *testing.T) {
 	for _, k := range readAgentKindsGolden(t) {
@@ -85,8 +85,8 @@ func readAgentKindsGolden(t *testing.T) []string {
 	if err := sc.Err(); err != nil {
 		t.Fatalf("read agent-kinds golden: %v", err)
 	}
-	if len(kinds) != 7 {
-		t.Fatalf("golden has %d agent kinds, want exactly 7 (contract G.9)", len(kinds))
+	if len(kinds) != 6 {
+		t.Fatalf("golden has %d agent kinds, want exactly 6 (contract G.9, post-#521)", len(kinds))
 	}
 	sort.Strings(kinds)
 	return kinds

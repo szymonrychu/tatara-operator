@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -53,11 +54,10 @@ func TestDeliverPendingEvent_UnownedMRStub_CommentDrivesUnpark(t *testing.T) {
 				Number: 88, IsPR: true,
 			},
 		},
-		Status: tatarav1.TaskStatus{
-			Stage:           tatarav1.StageParked,
-			StageReason:     stage.ReasonAwaitingHuman,
-			ParkedFromStage: tatarav1.StageReviewing,
-		},
+		Status: tatarav1.TaskStatus{State: tatarav1.StateAwaitingReview},
+	}
+	if err := stage.Park(task, stage.ReasonAwaitingHuman, time.Now()); err != nil {
+		t.Fatalf("park: %v", err)
 	}
 	c := peClient(t, proj, peRepo(), task, peMRStub(88))
 	s := peServer(c, &stubSpiller{}, nil)
@@ -72,13 +72,16 @@ func TestDeliverPendingEvent_UnownedMRStub_CommentDrivesUnpark(t *testing.T) {
 	if len(got.Status.PendingEvents) != 1 {
 		t.Fatalf("pendingEvents = %d, want 1 (event routed via the intake natural key)", len(got.Status.PendingEvents))
 	}
-	// conversing, not bare reviewing: the F.6 awaiting-human unpark prefers a
-	// live conversation over conversingHasRoom (reactive-agent-triggering,
-	// PR #475) whenever the project has room for one, which this project does
-	// by default. This assertion predates that feature landing.
-	if got.Status.Stage != tatarav1.StageConversing {
-		t.Fatalf("stage = %s(%s), want conversing: the human comment must drive the unpark",
-			got.Status.Stage, got.Status.StageReason)
+	// Un-parked and STILL in the same state (awaiting-review): un-park never
+	// moves state under #521 (there is no separate "conversing" stage to land
+	// in any more). This assertion used to check the Task moved to a
+	// conversing stage; what actually mattered - and still does - is that the
+	// human comment drove the F.6 unpark rather than being silently dropped.
+	if tatarav1.Parked(got) {
+		t.Fatalf("still parked(%s): the human comment must drive the unpark", got.Status.ParkReason)
+	}
+	if got.Status.State != tatarav1.StateAwaitingReview {
+		t.Fatalf("state = %q, want unchanged awaiting-review", got.Status.State)
 	}
 }
 
@@ -114,15 +117,32 @@ func TestDeliverPendingEvent_UnownedMRStub_NoMatchingTask(t *testing.T) {
 }
 
 // TestDeliverPendingEvent_UnownedMRStub_DoneTaskNotResurrected: the natural-key
-// twin exists but is FAILED - not live. The fallback must not deliver into it
-// (failed has no F.6 re-entry; appending events to a corpse is noise).
+// twin exists but is DONE - not live. The fallback must not deliver into it
+// (a done Task has no F.6 re-entry; appending events to a corpse is noise).
+//
+// #521 dissolved the separate `failed` terminal this fixture used to build:
+// TaskDone is now EXACTLY state in {done, rejected}, and that is precisely the
+// gate resolveOwningTask's fallback checks (tatarav1.TaskDone(task)) - a Task
+// merely PARKED (whatever the reason, "failed"'s closest new-model analogue)
+// is NOT TaskDone and is deliberately treated as live by that same gate
+// ("parked counts as live: delivering the event is precisely what can unpark
+// it"), so building this fixture parked would exercise a different property
+// than the one this test names. A matching Source is set (unlike the sibling
+// mismatch test below) so the TaskDone gate - not a source mismatch - is what
+// actually stops the delivery.
 func TestDeliverPendingEvent_UnownedMRStub_DoneTaskNotResurrected(t *testing.T) {
 	proj := peProject("tatara-bot", "maintainer")
 	name := tatarav1.IntakeTaskName("pe-proj", controller.SweepReviewKind, "pe-repo", 90)
 	task := &tatarav1.Task{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: peNS},
-		Spec:       tatarav1.TaskSpec{Kind: controller.SweepReviewKind, ProjectRef: "pe-proj", Goal: "g"},
-		Status:     tatarav1.TaskStatus{Stage: tatarav1.StageFailed, StageReason: stage.ReasonOperatorError},
+		Spec: tatarav1.TaskSpec{
+			Kind: controller.SweepReviewKind, ProjectRef: "pe-proj", Goal: "g",
+			Source: &tatarav1.TaskSource{
+				Provider: "github", IssueRef: "https://github.com/o/r/pull/90",
+				Number: 90, IsPR: true,
+			},
+		},
+		Status: tatarav1.TaskStatus{State: tatarav1.StateDone},
 	}
 	c := peClient(t, proj, peRepo(), task, peMRStub(90))
 	s := peServer(c, &stubSpiller{}, nil)
@@ -137,8 +157,8 @@ func TestDeliverPendingEvent_UnownedMRStub_DoneTaskNotResurrected(t *testing.T) 
 	if len(got.Status.PendingEvents) != 0 {
 		t.Fatalf("pendingEvents = %d, want 0: a done task never receives fallback deliveries", len(got.Status.PendingEvents))
 	}
-	if got.Status.Stage != tatarav1.StageFailed {
-		t.Fatalf("stage = %s, want untouched failed", got.Status.Stage)
+	if got.Status.State != tatarav1.StateDone {
+		t.Fatalf("state = %s, want untouched done", got.Status.State)
 	}
 }
 
@@ -167,11 +187,10 @@ func TestDeliverPendingEvent_UnownedMRStub_SourceMismatchNotDelivered(t *testing
 					Kind: controller.SweepReviewKind, ProjectRef: "pe-proj", Goal: "g",
 					Source: tt.source,
 				},
-				Status: tatarav1.TaskStatus{
-					Stage:           tatarav1.StageParked,
-					StageReason:     stage.ReasonAwaitingHuman,
-					ParkedFromStage: tatarav1.StageReviewing,
-				},
+				Status: tatarav1.TaskStatus{State: tatarav1.StateAwaitingReview},
+			}
+			if err := stage.Park(task, stage.ReasonAwaitingHuman, time.Now()); err != nil {
+				t.Fatalf("park: %v", err)
 			}
 			c := peClient(t, proj, peRepo(), task, peMRStub(91))
 			s := peServer(c, &stubSpiller{}, nil)
@@ -187,8 +206,8 @@ func TestDeliverPendingEvent_UnownedMRStub_SourceMismatchNotDelivered(t *testing
 				t.Fatalf("pendingEvents = %d, want 0: a source-mismatched task never receives fallback deliveries",
 					len(got.Status.PendingEvents))
 			}
-			if got.Status.Stage != tatarav1.StageParked {
-				t.Fatalf("stage = %s, want untouched parked", got.Status.Stage)
+			if !tatarav1.Parked(got) {
+				t.Fatalf("state = %s, want untouched (still parked)", got.Status.State)
 			}
 		})
 	}

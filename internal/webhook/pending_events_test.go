@@ -124,24 +124,46 @@ func peIssue(number int, task *tatarav1.Task, comments ...tatarav1.Comment) *tat
 	return iss
 }
 
-func peTask(name, stageName, stageReason string, issueRefs ...string) *tatarav1.Task {
+// peTask builds a live (non-parked) Task fixture at state, with stateReason -
+// meaningful only on the two terminals (done/rejected); every other caller
+// passes "". #521 replaced Spec.Kind's clarify with implement, so the default
+// kind here is implement, not the deleted clarify - AgentKindFor and
+// ReactingAgentKind resolve off originAgentKinds, which has no "clarify" entry
+// and fails closed on one.
+func peTask(name, state, stateReason string, issueRefs ...string) *tatarav1.Task {
+	now := metav1.Now()
 	return &tatarav1.Task{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: peNS},
-		Spec:       tatarav1.TaskSpec{Kind: "clarify", ProjectRef: "pe-proj", Goal: "g"},
+		Spec:       tatarav1.TaskSpec{Kind: "implement", ProjectRef: "pe-proj", Goal: "g"},
 		Status: tatarav1.TaskStatus{
-			Stage:       stageName,
-			StageReason: stageReason,
-			IssueRefs:   issueRefs,
+			State:          state,
+			StateReason:    stateReason,
+			StateEnteredAt: &now,
+			IssueRefs:      issueRefs,
 		},
 	}
 }
 
 // peTaskKind is peTask with an explicit Spec.Kind, for the tests (2026-07-28
 // security review NEW-2) that need a kind=review Task - peTask itself
-// hardcodes "clarify" and every other caller relies on that.
-func peTaskKind(name, kind, stageName, stageReason string) *tatarav1.Task {
-	task := peTask(name, stageName, stageReason)
+// hardcodes "implement" and every other caller relies on that.
+func peTaskKind(name, kind, state, stateReason string) *tatarav1.Task {
+	task := peTask(name, state, stateReason)
 	task.Spec.Kind = kind
+	return task
+}
+
+// peParkedTask builds a Task fixture already parked at reason, via stage.Park -
+// the ONE way #521 parks a Task (stamps ParkReason/ParkedAt/ParkedFromState
+// together). state is the state the Task parks WHERE IT IS: park never moves
+// state, so callers whose old fixture carried an implicit "conversing" or
+// "clarifying" precursor pass v1alpha1.StateRefined, matching the mapping
+// table those old stages folded into.
+func peParkedTask(name, state, parkReason string, issueRefs ...string) *tatarav1.Task {
+	task := peTask(name, state, "", issueRefs...)
+	if err := stage.Park(task, parkReason, time.Now()); err != nil {
+		panic(err)
+	}
 	return task
 }
 
@@ -181,7 +203,7 @@ func peServer(c client.Client, sp *stubSpiller, readerFor func(provider, token s
 // mirrors (the webhook drives the mirror unconditionally), but the enqueue
 // step is never reached for a bot actor.
 func TestDeliverPendingEvent_BotEvent_MirroredButNotEnqueued(t *testing.T) {
-	task := peTask("t-bot", tatarav1.StageClarifying, "")
+	task := peTask("t-bot", tatarav1.StateRefined, "")
 	iss := peIssue(7, task)
 	proj := peProject("tatara-bot", "maintainer")
 	c := peClient(t, proj, peRepo(), task, iss)
@@ -207,7 +229,7 @@ func TestDeliverPendingEvent_BotEvent_MirroredButNotEnqueued(t *testing.T) {
 // the webhook drives the mirror and the queue synchronously - no sweep
 // involved (there is none running in this test at all).
 func TestDeliverPendingEvent_NonBotEvent_MirroredAndEnqueuedImmediately(t *testing.T) {
-	task := peTask("t-live", tatarav1.StageClarifying, "")
+	task := peTask("t-live", tatarav1.StateRefined, "")
 	iss := peIssue(7, task)
 	proj := peProject("tatara-bot", "maintainer")
 	c := peClient(t, proj, peRepo(), task, iss)
@@ -268,7 +290,7 @@ func TestDeliverPendingEvent_NoOwningTask_MirrorsOnlyNoEnqueue(t *testing.T) {
 // and the wordlist itself is gone, so the same literal is now just a human
 // saying something - a conversation, not a decision.
 func TestDeliverPendingEvent_IdentityUnverifiedUsesCommentUnpark(t *testing.T) {
-	task := peTask("t-parked-shared", tatarav1.StageParked, stage.ReasonIdentityUnverified)
+	task := peParkedTask("t-parked-shared", tatarav1.StateRefined, stage.ReasonIdentityUnverified)
 	iss := peIssue(7, task)
 	task.Status.IssueRefs = []string{iss.Name}
 	proj := peProject("tatara-bot", "maintainer")
@@ -286,10 +308,17 @@ func TestDeliverPendingEvent_IdentityUnverifiedUsesCommentUnpark(t *testing.T) {
 	}
 	s.deliverPendingEvent(context.Background(), *proj, peRepo(), ev)
 
+	// Un-park never moves state any more (#521): the assertion that used to be
+	// "stage became conversing" is now "the park flag cleared and the Task is
+	// still exactly where it was" - which is what proves the comment reached
+	// the ONE shared unpark and that unpark computed live-pod room for
+	// identity-unverified, rather than declining or short-circuiting.
 	gotTask := getPETask(t, c, task.Name)
-	if gotTask.Status.Stage != tatarav1.StageConversing {
-		t.Fatalf("stage = (%q,%q), want conversing - the comment must reach an agent through the ONE shared unpark, and that unpark must have computed conversing room for identity-unverified",
-			gotTask.Status.Stage, gotTask.Status.StageReason)
+	if tatarav1.Parked(gotTask) {
+		t.Fatalf("still parked(%s) - the comment must reach an agent through the ONE shared unpark", gotTask.Status.ParkReason)
+	}
+	if gotTask.Status.State != tatarav1.StateRefined {
+		t.Fatalf("state = %q, want unchanged refined (un-park never moves state)", gotTask.Status.State)
 	}
 }
 
@@ -305,7 +334,7 @@ func TestDeliverPendingEvent_IdentityUnverifiedUsesCommentUnpark(t *testing.T) {
 // deleted limb bought this forge read for parked(identity-unverified) ONLY, so
 // the one stage that actually renders turn-0 bundles never got it.
 func TestDeliverPendingEvent_CommentSyncsIssueMirror(t *testing.T) {
-	task := peTask("t-live-sync", tatarav1.StageClarifying, "")
+	task := peTask("t-live-sync", tatarav1.StateRefined, "")
 	iss := peIssue(7, task) // mirror carries ZERO comments
 	task.Status.IssueRefs = []string{iss.Name}
 	proj := peProject("tatara-bot", "maintainer")
@@ -349,7 +378,7 @@ func TestDeliverPendingEvent_CommentSyncsIssueMirror(t *testing.T) {
 // there still requires a genuine decision=implement that passes restapi's LIVE
 // approval check - the conversing edge grants nothing on its own.
 func TestDeliverPendingEvent_ParkedIdentityUnverified_NotYet_OpensConversation(t *testing.T) {
-	task := peTask("t-parked-no", tatarav1.StageParked, stage.ReasonIdentityUnverified)
+	task := peParkedTask("t-parked-no", tatarav1.StateRefined, stage.ReasonIdentityUnverified)
 	iss := peIssue(7, task)
 	task.Status.IssueRefs = []string{iss.Name}
 	proj := peProject("tatara-bot", "maintainer")
@@ -367,16 +396,21 @@ func TestDeliverPendingEvent_ParkedIdentityUnverified_NotYet_OpensConversation(t
 	}
 	s.deliverPendingEvent(context.Background(), *proj, peRepo(), ev)
 
+	// "not yet" must not stay parked, but un-park never moves state (#521): the
+	// live conversation it opens is just the Task's own state (refined),
+	// un-parked with its idle clock armed - not a distinct "conversing" state.
 	gotTask := getPETask(t, c, task.Name)
-	if gotTask.Status.Stage != tatarav1.StageConversing {
-		t.Fatalf("stage = (%q,%q), want conversing - 'not yet' must not un-park to implementing, but it opens a conversation",
-			gotTask.Status.Stage, gotTask.Status.StageReason)
+	if tatarav1.Parked(gotTask) {
+		t.Fatalf("still parked(%s) - 'not yet' must not un-park to implementing, but it must un-park to a live conversation", gotTask.Status.ParkReason)
+	}
+	if gotTask.Status.State != tatarav1.StateRefined {
+		t.Fatalf("state = %q, want unchanged refined", gotTask.Status.State)
 	}
 	if gotTask.Status.ConversationLastEventAt == nil {
 		t.Fatal("ConversationLastEventAt is nil: the idle clock was never armed on entry")
 	}
 	if len(gotTask.Status.PendingEvents) != 1 {
-		t.Fatalf("pendingEvents = %d, want 1 RETAINED (the comment rides into the conversing pod's turn-0 bundle, not dropped here)", len(gotTask.Status.PendingEvents))
+		t.Fatalf("pendingEvents = %d, want 1 RETAINED (the comment rides into the live pod's turn-0 bundle, not dropped here)", len(gotTask.Status.PendingEvents))
 	}
 }
 
@@ -391,7 +425,10 @@ func TestDeliverPendingEvent_ParkedIdentityUnverified_NotYet_OpensConversation(t
 // from conversing), but exactly the "one pod per human comment" waste the guard
 // exists to prevent.
 func TestDeliverPendingEvent_ParkedIdentityUnverified_ReviewKindMergedMR_NoConversation(t *testing.T) {
-	task := peTaskKind("t-parked-review-merged", "review", tatarav1.StageParked, stage.ReasonIdentityUnverified)
+	task := peTaskKind("t-parked-review-merged", "review", tatarav1.StateAwaitingReview, "")
+	if err := stage.Park(task, stage.ReasonIdentityUnverified, time.Now()); err != nil {
+		t.Fatalf("park: %v", err)
+	}
 	mergedAt := metav1.Now()
 	mr := peMR(88, task, tatarav1.MergeRequestStatus{State: "merged", MergedAt: &mergedAt})
 	task.Status.MRRefs = []string{mr.Name}
@@ -411,9 +448,8 @@ func TestDeliverPendingEvent_ParkedIdentityUnverified_ReviewKindMergedMR_NoConve
 	s.deliverPendingEvent(context.Background(), *proj, peRepo(), ev)
 
 	gotTask := getPETask(t, c, task.Name)
-	if gotTask.Status.Stage != tatarav1.StageParked {
-		t.Fatalf("stage = (%q,%q), want still parked - a kind=review Task with a merged owned MR must never open a conversing pod",
-			gotTask.Status.Stage, gotTask.Status.StageReason)
+	if !tatarav1.Parked(gotTask) {
+		t.Fatalf("state = %q, want still parked - a kind=review Task with a merged owned MR must never open a live conversation", gotTask.Status.State)
 	}
 }
 
@@ -422,7 +458,7 @@ func TestDeliverPendingEvent_ParkedIdentityUnverified_ReviewKindMergedMR_NoConve
 // filter before the owning Task is even looked up, so neither the on-demand
 // issue sync (and its forge read) nor the comment unpark is reached at all.
 func TestDeliverPendingEvent_ParkedIdentityUnverified_BotComment_NeverSyncsOrUnparks(t *testing.T) {
-	task := peTask("t-parked-bot", tatarav1.StageParked, stage.ReasonIdentityUnverified)
+	task := peParkedTask("t-parked-bot", tatarav1.StateRefined, stage.ReasonIdentityUnverified)
 	iss := peIssue(7, task)
 	task.Status.IssueRefs = []string{iss.Name}
 	proj := peProject("tatara-bot", "maintainer")
@@ -442,7 +478,7 @@ func TestDeliverPendingEvent_ParkedIdentityUnverified_BotComment_NeverSyncsOrUnp
 		t.Fatalf("forge reads = %d, want 0 - a bot event must never even cost an on-demand forge read", rd.calls)
 	}
 	gotTask := getPETask(t, c, task.Name)
-	if gotTask.Status.Stage != tatarav1.StageParked || len(gotTask.Status.PendingEvents) != 0 {
-		t.Fatalf("bot event must change nothing: stage=%q pendingEvents=%d", gotTask.Status.Stage, len(gotTask.Status.PendingEvents))
+	if !tatarav1.Parked(gotTask) || len(gotTask.Status.PendingEvents) != 0 {
+		t.Fatalf("bot event must change nothing: parked=%v pendingEvents=%d", tatarav1.Parked(gotTask), len(gotTask.Status.PendingEvents))
 	}
 }

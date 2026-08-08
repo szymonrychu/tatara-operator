@@ -136,9 +136,19 @@ func TestAdmit_RetriesOnConflict_AdmitsDespiteStaleCache(t *testing.T) {
 }
 
 // TestAdmitTicket_RetriesOnConflict_StageEntersDespiteStaleCache covers the two
-// other raw writes admitTicket used to make (Task label Update, Task status
-// Update for the approved -> implementing stage.Enter): both must survive an
-// injected conflict the same way the QueuedEvent write does.
+// other raw writes admitTicket makes (Task label Update, Task status Update for
+// the agentKind self-heal): both must survive an injected conflict the same way
+// the QueuedEvent write does.
+//
+// #521 deleted the OLD approved -> implementing admission edge admitTicket used
+// to drive (refined is itself LIVE and runs the gate agent, so admission spawns
+// a pod where the Task already is; the ONLY thing that now moves a Task to
+// under-implementation is restapi's approval gate granting - see admitTicket's
+// own doc comment). What is left for admission to write is the agentKind
+// self-heal, and that write is SKIPPED ENTIRELY when status.agentKind already
+// agrees with the ticket - so the fixture must seed a genuine MISMATCH (a stale
+// agentKind, as a Task minted before an agentKind rename would carry) or the
+// conflict this test injects is never even attempted.
 func TestAdmitTicket_RetriesOnConflict_StageEntersDespiteStaleCache(t *testing.T) {
 	ctx := context.Background()
 	proj := &tatarav1alpha1.Project{
@@ -147,7 +157,12 @@ func TestAdmitTicket_RetriesOnConflict_StageEntersDespiteStaleCache(t *testing.T
 	}
 	mustCreate(t, ctx, proj)
 
-	task := stageTask(t, ctx, proj.Name, "p-conflict-ticket-t1", "clarify", tatarav1alpha1.StageApproved, 10*time.Minute, false)
+	task := stageTask(t, ctx, proj.Name, "p-conflict-ticket-t1", "implement", tatarav1alpha1.StateRefined, 10*time.Minute, false)
+	// Force the mismatch stageTask's own AgentKindFor stamp would not produce.
+	// status.agentKind is itself a closed CRD enum, so the stand-in must be a
+	// real (if wrong-for-this-Task) member of it, not an arbitrary string.
+	task.Status.AgentKind = "review"
+	mustStatusUpdate(t, ctx, task)
 	q := ticket(t, ctx, proj.Name, task.Name, stage.AgentImplement, 1, tatarav1alpha1.QueueStateQueued)
 
 	var updateCalls, statusCalls atomic.Int32
@@ -161,14 +176,13 @@ func TestAdmitTicket_RetriesOnConflict_StageEntersDespiteStaleCache(t *testing.T
 		t.Fatalf("Task Update (label) called %d times, want >= 2", updateCalls.Load())
 	}
 	if statusCalls.Load() < 2 {
-		t.Fatalf("Task Status().Update called %d times, want >= 2", statusCalls.Load())
+		t.Fatalf("Task Status().Update (agentKind self-heal) called %d times, want >= 2", statusCalls.Load())
 	}
-
-	gotTask := refreshTask(t, ctx, task.Name)
-	if gotTask.Status.Stage != tatarav1alpha1.StageImplementing {
-		t.Fatalf("approved -> implementing not applied despite the retry, stage=%q", gotTask.Status.Stage)
+	gotTask := getTask(t, task.Name)
+	if gotTask.Status.State != tatarav1alpha1.StateRefined {
+		t.Fatalf("admission must not move state (the approved -> implementing edge is gone, #521), got %q", gotTask.Status.State)
 	}
 	if gotTask.Status.AgentKind != stage.AgentImplement {
-		t.Fatalf("status.agentKind = %q, want implement", gotTask.Status.AgentKind)
+		t.Fatalf("agentKind self-heal did not land: got %q, want %q", gotTask.Status.AgentKind, stage.AgentImplement)
 	}
 }

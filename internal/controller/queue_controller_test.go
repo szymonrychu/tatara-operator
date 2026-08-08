@@ -33,7 +33,7 @@ func tk(name, stg, queuedEvent string) tatarav1alpha1.Task {
 	return tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "tatara", Labels: map[string]string{queue.LabelQueuedEvent: queuedEvent}},
 		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "p"},
-		Status:     tatarav1alpha1.TaskStatus{Stage: stg},
+		Status:     tatarav1alpha1.TaskStatus{State: stg},
 	}
 }
 
@@ -237,7 +237,7 @@ func TestDispatcherReconcile_AdmitsThenFreesOnTerminal(t *testing.T) {
 	}
 	// Drive q1's task terminal, reconcile -> q1 Done, q2 admitted.
 	task := taskForQE(t, ctx, refreshQE(t, ctx, q1))
-	task.Status.Stage = tatarav1alpha1.StageDelivered
+	task.Status.State = tatarav1alpha1.StateDone
 	mustStatusUpdate(t, ctx, task)
 	if _, err := r.Reconcile(ctx, reqFor(q1)); err != nil {
 		t.Fatal(err)
@@ -311,7 +311,7 @@ func TestAdmit_StaleTerminalTaskNameCollision(t *testing.T) {
 		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: proj.Name, Kind: "incident"},
 	}
 	mustCreate(t, ctx, staleTask)
-	staleTask.Status.Stage = tatarav1alpha1.StageDelivered
+	staleTask.Status.State = tatarav1alpha1.StateDone
 	mustStatusUpdate(t, ctx, staleTask)
 
 	q := &tatarav1alpha1.QueuedEvent{
@@ -337,7 +337,7 @@ func TestAdmit_StaleTerminalTaskNameCollision(t *testing.T) {
 	staleGot := &tatarav1alpha1.Task{}
 	err := k8sClient.Get(ctx, types.NamespacedName{Name: fixedName, Namespace: ns}, staleGot)
 	if !apierrors.IsNotFound(err) {
-		t.Fatalf("stale terminal Task should be deleted after first Reconcile, got err=%v phase=%q", err, staleGot.Status.Stage)
+		t.Fatalf("stale terminal Task should be deleted after first Reconcile, got err=%v phase=%q", err, staleGot.Status.State)
 	}
 	got := refreshQE(t, ctx, q)
 	if got.Status.State == tatarav1alpha1.QueueStateAdmitted {
@@ -360,7 +360,7 @@ func TestAdmit_StaleTerminalTaskNameCollision(t *testing.T) {
 		t.Fatalf("fresh Task %q not found: %v", fixedName, err)
 	}
 	if tatarav1alpha1.TaskDone(freshTask) {
-		t.Fatalf("fresh Task must be non-terminal, got phase=%q ls=%q", freshTask.Status.Stage, freshTask.Status.StageReason)
+		t.Fatalf("fresh Task must be non-terminal, got phase=%q ls=%q", freshTask.Status.State, freshTask.Status.ParkReason)
 	}
 }
 
@@ -383,7 +383,7 @@ func TestAdmit_StaleTerminalDelete_RequeuesAndContinuesPool(t *testing.T) {
 		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: proj.Name, Kind: "incident"},
 	}
 	mustCreate(t, ctx, staleTask)
-	staleTask.Status.Stage = tatarav1alpha1.StageDelivered
+	staleTask.Status.State = tatarav1alpha1.StateDone
 	mustStatusUpdate(t, ctx, staleTask)
 
 	q := &tatarav1alpha1.QueuedEvent{
@@ -440,7 +440,7 @@ func TestAdmit_StaleTerminalDelete_SecondReconcileAdmits(t *testing.T) {
 		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: proj.Name, Kind: "incident"},
 	}
 	mustCreate(t, ctx, staleTask)
-	staleTask.Status.Stage = tatarav1alpha1.StageDelivered
+	staleTask.Status.State = tatarav1alpha1.StateDone
 	mustStatusUpdate(t, ctx, staleTask)
 
 	q := &tatarav1alpha1.QueuedEvent{
@@ -527,7 +527,7 @@ func TestAdmit_PriorityOrdersAheadOfSeq(t *testing.T) {
 
 	sweep1 := mkQueuedPriority(t, ctx, name, 1, tatarav1alpha1.QueueClassNormal, "documentation", 2)
 	sweep2 := mkQueuedPriority(t, ctx, name, 2, tatarav1alpha1.QueueClassNormal, "documentation", 2)
-	webhook := mkQueuedPriority(t, ctx, name, 3, tatarav1alpha1.QueueClassNormal, "clarify", 1)
+	webhook := mkQueuedPriority(t, ctx, name, 3, tatarav1alpha1.QueueClassNormal, "implement", 1)
 
 	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
 	qes, tasks := listQEsTasks(t, ctx, proj.Name)
@@ -632,8 +632,8 @@ func TestAdmit_Priority2StarvationReservation(t *testing.T) {
 	mustCreate(t, ctx, proj)
 
 	// Two priority-1 (webhook) events crowd the whole 2-slot normal pool.
-	p1a := mkQueuedPriority(t, ctx, name, 1, tatarav1alpha1.QueueClassNormal, "clarify", 1)
-	p1b := mkQueuedPriority(t, ctx, name, 2, tatarav1alpha1.QueueClassNormal, "clarify", 1)
+	p1a := mkQueuedPriority(t, ctx, name, 1, tatarav1alpha1.QueueClassNormal, "implement", 1)
+	p1b := mkQueuedPriority(t, ctx, name, 2, tatarav1alpha1.QueueClassNormal, "implement", 1)
 	// The nightly doc batch: priority 2, queued long enough to starve.
 	docBatch := mkQueuedPriority(t, ctx, name, 3, tatarav1alpha1.QueueClassNormal, "documentation", 2)
 
@@ -669,8 +669,8 @@ func TestAdmit_Priority2NotStarving_NoReservation(t *testing.T) {
 	}
 	mustCreate(t, ctx, proj)
 
-	p1a := mkQueuedPriority(t, ctx, name, 1, tatarav1alpha1.QueueClassNormal, "clarify", 1)
-	p1b := mkQueuedPriority(t, ctx, name, 2, tatarav1alpha1.QueueClassNormal, "clarify", 1)
+	p1a := mkQueuedPriority(t, ctx, name, 1, tatarav1alpha1.QueueClassNormal, "implement", 1)
+	p1b := mkQueuedPriority(t, ctx, name, 2, tatarav1alpha1.QueueClassNormal, "implement", 1)
 	docBatch := mkQueuedPriority(t, ctx, name, 3, tatarav1alpha1.QueueClassNormal, "documentation", 2)
 	// docBatch is left at its real (fresh) CreationTimestamp: must not starve-reserve.
 
@@ -805,19 +805,19 @@ func TestPoolInflight_CountsAdmittedNonTerminal(t *testing.T) {
 	// no longer exercise "still holds a slot" - use the realistic shape.
 	ticketFor := func(name, class, taskRef, stg string) tatarav1alpha1.QueuedEvent {
 		q := qe(name, class, tatarav1alpha1.QueueStateAdmitted, taskRef)
-		q.Spec.Payload.AgentKind = stage.AgentKindFor(stg)
+		q.Spec.Payload.AgentKind = stage.AgentKindFor(stg, "implement")
 		return q
 	}
 	qes := []tatarav1alpha1.QueuedEvent{
-		ticketFor("a", tatarav1alpha1.QueueClassNormal, "t-a", tatarav1alpha1.StageReviewing), // running -> counts
-		ticketFor("b", tatarav1alpha1.QueueClassNormal, "t-b", tatarav1alpha1.StageDelivered), // terminal -> not
-		ticketFor("c", tatarav1alpha1.QueueClassAlert, "t-c", tatarav1alpha1.StageReviewing),  // alert running
-		qe("d", tatarav1alpha1.QueueClassNormal, tatarav1alpha1.QueueStateQueued, ""),         // queued -> not
+		ticketFor("a", tatarav1alpha1.QueueClassNormal, "t-a", tatarav1alpha1.StateAwaitingReview), // running -> counts
+		ticketFor("b", tatarav1alpha1.QueueClassNormal, "t-b", tatarav1alpha1.StateDone),           // terminal -> not
+		ticketFor("c", tatarav1alpha1.QueueClassAlert, "t-c", tatarav1alpha1.StateAwaitingReview),  // alert running
+		qe("d", tatarav1alpha1.QueueClassNormal, tatarav1alpha1.QueueStateQueued, ""),              // queued -> not
 	}
 	tasks := []tatarav1alpha1.Task{
-		tk("t-a", tatarav1alpha1.StageReviewing, "a"),
-		tk("t-b", tatarav1alpha1.StageDelivered, "b"),
-		tk("t-c", tatarav1alpha1.StageReviewing, "c"),
+		tk("t-a", tatarav1alpha1.StateAwaitingReview, "a"),
+		tk("t-b", tatarav1alpha1.StateDone, "b"),
+		tk("t-c", tatarav1alpha1.StateAwaitingReview, "c"),
 	}
 	if got := r.poolInflight(qes, tasks, tatarav1alpha1.QueueClassNormal); got != 1 {
 		t.Fatalf("normal inflight = %d, want 1", got)
@@ -845,9 +845,9 @@ func stageTask(t *testing.T, ctx context.Context, project, name, kind, stg strin
 	}
 	mustCreate(t, ctx, task)
 	entered := metav1.NewTime(time.Now().Add(-enteredAgo))
-	task.Status.Stage = stg
-	task.Status.StageEnteredAt = &entered
-	task.Status.AgentKind = stage.AgentKindFor(stg)
+	task.Status.State = stg
+	task.Status.StateEnteredAt = &entered
+	task.Status.AgentKind = stage.AgentKindFor(stg, kind)
 	if podStarted {
 		started := metav1.NewTime(time.Now().Add(-enteredAgo / 2))
 		task.Status.PodStartedAt = &started
@@ -901,7 +901,7 @@ func TestAdmit_Ticket_AdmitsExistingTaskAndMintsNothing(t *testing.T) {
 	}
 	mustCreate(t, ctx, proj)
 
-	task := stageTask(t, ctx, proj.Name, "p-ticket-impl", "clarify", tatarav1alpha1.StageImplementing, 5*time.Minute, false)
+	task := stageTask(t, ctx, proj.Name, "p-ticket-impl", "implement", tatarav1alpha1.StateUnderImplementation, 5*time.Minute, false)
 	q := ticket(t, ctx, proj.Name, task.Name, stage.AgentImplement, 1, tatarav1alpha1.QueueStateQueued)
 
 	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
@@ -920,19 +920,24 @@ func TestAdmit_Ticket_AdmitsExistingTaskAndMintsNothing(t *testing.T) {
 	if gotTask.Labels[queue.LabelQueuedEvent] != q.Name {
 		t.Fatalf("admitted Task must carry the queued-event label (pod-ensure gate + slot accounting): %v", gotTask.Labels)
 	}
-	if gotTask.Status.Stage != tatarav1alpha1.StageImplementing {
-		t.Fatalf("stage must be untouched, got %q", gotTask.Status.Stage)
+	if gotTask.Status.State != tatarav1alpha1.StateUnderImplementation {
+		t.Fatalf("stage must be untouched, got %q", gotTask.Status.State)
 	}
 	if got := r.poolInflight([]tatarav1alpha1.QueuedEvent{*got}, []tatarav1alpha1.Task{*gotTask}, tatarav1alpha1.QueueClassNormal); got != 1 {
 		t.Fatalf("an admitted ticket must hold exactly one slot, got %d", got)
 	}
 }
 
-// TestAdmit_Ticket_ApprovedEntersImplementing: contract F.3's
-// `approved -> implementing` edge - "a QueuedEvent for the implement pod is
-// ADMITTED". approved is POD-LESS: the Task waits there, and ADMISSION is the
-// trigger.
-func TestAdmit_Ticket_ApprovedEntersImplementing(t *testing.T) {
+// TestAdmit_Ticket_RefinedAdmissionSpawnsPodWithoutMovingState is the #521
+// replacement for the deleted contract F.3 `approved -> implementing` edge.
+// approved was a POD-LESS gate the Task waited in, and admitting its ticket
+// was what moved it into implementing; `refined` replaced it and is a LIVE
+// state that runs the gate agent ITSELF, so admission now just spawns a pod
+// where the Task already is (the agentKind self-heal, task_stage.go's
+// admitTicket) - it applies NO edge at all. The ONLY thing that moves a Task
+// into under-implementation is restapi's approval gate granting a
+// submit_outcome(action=approved), never admission.
+func TestAdmit_Ticket_RefinedAdmissionSpawnsPodWithoutMovingState(t *testing.T) {
 	ctx := context.Background()
 	proj := &tatarav1alpha1.Project{
 		ObjectMeta: metav1.ObjectMeta{Name: "p-approved", Namespace: testNS},
@@ -940,7 +945,7 @@ func TestAdmit_Ticket_ApprovedEntersImplementing(t *testing.T) {
 	}
 	mustCreate(t, ctx, proj)
 
-	task := stageTask(t, ctx, proj.Name, "p-approved-t1", "clarify", tatarav1alpha1.StageApproved, 10*time.Minute, false)
+	task := stageTask(t, ctx, proj.Name, "p-approved-t1", "implement", tatarav1alpha1.StateRefined, 10*time.Minute, false)
 	q := ticket(t, ctx, proj.Name, task.Name, stage.AgentImplement, 1, tatarav1alpha1.QueueStateQueued)
 
 	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
@@ -952,20 +957,14 @@ func TestAdmit_Ticket_ApprovedEntersImplementing(t *testing.T) {
 		t.Fatalf("ticket not admitted: %q", got.Status.State)
 	}
 	gotTask := refreshTask(t, ctx, task.Name)
-	if gotTask.Status.Stage != tatarav1alpha1.StageImplementing {
-		t.Fatalf("approved -> implementing not applied on admission, stage=%q", gotTask.Status.Stage)
+	if gotTask.Status.State != tatarav1alpha1.StateRefined {
+		t.Fatalf("admission moved state to %q; admission applies no edge at all (#521)", gotTask.Status.State)
 	}
 	if gotTask.Status.AgentKind != stage.AgentImplement {
 		t.Fatalf("status.agentKind = %q, want implement", gotTask.Status.AgentKind)
 	}
-	if gotTask.Status.PodStartedAt != nil || gotTask.Status.StageWorkStartedAt != nil {
-		t.Fatal("stage.Enter must clear podStartedAt / stageWorkStartedAt")
-	}
-	if gotTask.Status.StageEnteredAt == nil || time.Since(gotTask.Status.StageEnteredAt.Time) > time.Minute {
-		t.Fatalf("stageEnteredAt not re-stamped: %v", gotTask.Status.StageEnteredAt)
-	}
 	if n := countTasks(t, ctx, proj.Name); n != 1 {
-		t.Fatalf("minted a Task on the approved edge: %d", n)
+		t.Fatalf("minted a Task on admission: %d", n)
 	}
 }
 
@@ -979,8 +978,8 @@ func TestAdmit_Ticket_TwiceSpawnsOnePod(t *testing.T) {
 	}
 	mustCreate(t, ctx, proj)
 
-	task := stageTask(t, ctx, proj.Name, "p-ticket-idem-t", "clarify", tatarav1alpha1.StageClarifying, time.Minute, false)
-	q := ticket(t, ctx, proj.Name, task.Name, stage.AgentClarify, 1, tatarav1alpha1.QueueStateQueued)
+	task := stageTask(t, ctx, proj.Name, "p-ticket-idem-t", "implement", tatarav1alpha1.StateRefined, time.Minute, false)
+	q := ticket(t, ctx, proj.Name, task.Name, stage.AgentImplement, 1, tatarav1alpha1.QueueStateQueued)
 
 	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
 	if _, err := r.Reconcile(ctx, reqFor(q)); err != nil {
@@ -1007,8 +1006,17 @@ func TestAdmit_Ticket_TwiceSpawnsOnePod(t *testing.T) {
 }
 
 // TestAdmit_Ticket_DroppedWhenTaskGoneOrTerminal: a ticket whose Task has since
-// been deleted or has gone terminal is dropped CLEANLY - deleted, no slot burned,
-// no requeue loop, no panic - and the pool keeps draining behind it.
+// been deleted or reached a GENUINE terminal state (done/rejected) is dropped
+// CLEANLY - deleted, no slot burned, no requeue loop, no panic - and the pool
+// keeps draining behind it.
+//
+// #521 note: queueTaskDone is now EXACTLY TaskDone (state in {done,rejected}),
+// not "parked or failed" - a PARKED Task's ticket is deliberately KEPT, not
+// dropped (queueTaskDone's own doc comment: it re-acquires a slot when it
+// un-parks). The old "went terminal (failed)" case here modeled that with the
+// deleted `failed` stage; the accurate equivalent of "dropped" is a real
+// rejected transition, and the parked case now gets its OWN assertion in the
+// opposite direction (see TestAdmit_Ticket_KeptWhenTaskIsMerelyParked).
 func TestAdmit_Ticket_DroppedWhenTaskGoneOrTerminal(t *testing.T) {
 	ctx := context.Background()
 	proj := &tatarav1alpha1.Project{
@@ -1020,17 +1028,17 @@ func TestAdmit_Ticket_DroppedWhenTaskGoneOrTerminal(t *testing.T) {
 	// Ticket 1: the Task never existed (deleted mid-flight).
 	ghost := ticket(t, ctx, proj.Name, "p-ticket-drop-gone", stage.AgentImplement, 1, tatarav1alpha1.QueueStateQueued)
 
-	// Ticket 2: the Task went terminal (failed) while queueing.
-	dead := stageTask(t, ctx, proj.Name, "p-ticket-drop-dead", "clarify", tatarav1alpha1.StageImplementing, time.Minute, false)
-	dead.Status.Stage = tatarav1alpha1.StageFailed
-	dead.Status.StageReason = stage.ReasonTurnBudgetExhausted
+	// Ticket 2: the Task reached a genuine terminal state (rejected) while queueing.
+	dead := stageTask(t, ctx, proj.Name, "p-ticket-drop-dead", "implement", tatarav1alpha1.StateUnderImplementation, time.Minute, false)
+	dead.Status.State = tatarav1alpha1.StateRejected
+	dead.Status.StateReason = stage.ReasonDeclined
 	mustStatusUpdate(t, ctx, dead)
 	deadQE := ticket(t, ctx, proj.Name, dead.Name, stage.AgentImplement, 2, tatarav1alpha1.QueueStateQueued)
 
 	// Ticket 3: a live Task behind them. Capacity is 1: it must still be admitted,
 	// i.e. the two dropped tickets burned no slot.
-	live := stageTask(t, ctx, proj.Name, "p-ticket-drop-live", "clarify", tatarav1alpha1.StageClarifying, time.Minute, false)
-	liveQE := ticket(t, ctx, proj.Name, live.Name, stage.AgentClarify, 3, tatarav1alpha1.QueueStateQueued)
+	live := stageTask(t, ctx, proj.Name, "p-ticket-drop-live", "implement", tatarav1alpha1.StateRefined, time.Minute, false)
+	liveQE := ticket(t, ctx, proj.Name, live.Name, stage.AgentImplement, 3, tatarav1alpha1.QueueStateQueued)
 
 	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
 	if _, err := r.Reconcile(ctx, reqFor(ghost)); err != nil {
@@ -1048,6 +1056,37 @@ func TestAdmit_Ticket_DroppedWhenTaskGoneOrTerminal(t *testing.T) {
 	}
 }
 
+// TestAdmit_Ticket_KeptWhenTaskIsMerelyParked is the #521 counterpart:
+// queueTaskDone is exactly TaskDone (done|rejected) and admitTicket's only
+// drop check is queueTaskDone/DeletionTimestamp - NEITHER reads the park flag
+// - so a PARKED Task is not dropped, and its ticket is admitted exactly like
+// any other live Task's: it re-acquires the slot the instant it un-parks.
+// Dropping it would be the exact regression queueTaskDone's own doc comment
+// warns against.
+func TestAdmit_Ticket_KeptWhenTaskIsMerelyParked(t *testing.T) {
+	ctx := context.Background()
+	proj := &tatarav1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "p-ticket-parked-kept", Namespace: testNS},
+		Spec:       tatarav1alpha1.ProjectSpec{Queue: &tatarav1alpha1.QueueSpec{Capacity: 1, AlertCapacity: 1}},
+	}
+	mustCreate(t, ctx, proj)
+
+	parked := stageTask(t, ctx, proj.Name, "p-ticket-parked", "implement", tatarav1alpha1.StateUnderImplementation, time.Minute, false)
+	parked.Status.ParkReason = stage.ReasonTurnBudgetExhausted
+	mustStatusUpdate(t, ctx, parked)
+	parkedQE := ticket(t, ctx, proj.Name, parked.Name, stage.AgentImplement, 1, tatarav1alpha1.QueueStateQueued)
+
+	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+	if _, err := r.Reconcile(ctx, reqFor(parkedQE)); err != nil {
+		t.Fatalf("reconcile must not error on a parked Task's ticket: %v", err)
+	}
+
+	got := refreshQE(t, ctx, parkedQE)
+	if got.Status.State != tatarav1alpha1.QueueStateAdmitted {
+		t.Fatalf("a parked Task's ticket state = %q, want admitted: it must be KEPT and admitted so the Task re-acquires its slot on un-park", got.Status.State)
+	}
+}
+
 // TestAdmit_Ticket_StageBeatsPayloadAgentKind: the stage machine is the source of
 // truth; payload.agentKind is advisory. On disagreement the STAGE wins.
 func TestAdmit_Ticket_StageBeatsPayloadAgentKind(t *testing.T) {
@@ -1058,7 +1097,7 @@ func TestAdmit_Ticket_StageBeatsPayloadAgentKind(t *testing.T) {
 	}
 	mustCreate(t, ctx, proj)
 
-	task := stageTask(t, ctx, proj.Name, "p-ticket-kind-t", "clarify", tatarav1alpha1.StageReviewing, time.Minute, false)
+	task := stageTask(t, ctx, proj.Name, "p-ticket-kind-t", "implement", tatarav1alpha1.StateAwaitingReview, time.Minute, false)
 	// Stale ticket: it says implement, but the Task is REVIEWING.
 	q := ticket(t, ctx, proj.Name, task.Name, stage.AgentImplement, 1, tatarav1alpha1.QueueStateQueued)
 
@@ -1073,8 +1112,8 @@ func TestAdmit_Ticket_StageBeatsPayloadAgentKind(t *testing.T) {
 	if gotTask.Status.AgentKind != stage.AgentReview {
 		t.Fatalf("status.agentKind = %q, want review (the STAGE wins over payload.agentKind)", gotTask.Status.AgentKind)
 	}
-	if gotTask.Status.Stage != tatarav1alpha1.StageReviewing {
-		t.Fatalf("stage must not follow the payload, got %q", gotTask.Status.Stage)
+	if gotTask.Status.State != tatarav1alpha1.StateAwaitingReview {
+		t.Fatalf("stage must not follow the payload, got %q", gotTask.Status.State)
 	}
 }
 
@@ -1097,7 +1136,7 @@ func TestAdmit_SteadyState_QueuedFortyMinutesReachesImplementing(t *testing.T) {
 	// Three live agents: pods started, tickets Admitted.
 	for i := 1; i <= 3; i++ {
 		name := "p-steady-live-" + strconv.Itoa(i)
-		live := stageTask(t, ctx, proj.Name, name, "clarify", tatarav1alpha1.StageImplementing, 30*time.Minute, true)
+		live := stageTask(t, ctx, proj.Name, name, "implement", tatarav1alpha1.StateUnderImplementation, 30*time.Minute, true)
 		q := ticket(t, ctx, proj.Name, live.Name, stage.AgentImplement, int64(i), tatarav1alpha1.QueueStateAdmitted)
 		live.Labels = map[string]string{queue.LabelQueuedEvent: q.Name}
 		if err := k8sClient.Update(ctx, live); err != nil {
@@ -1106,7 +1145,7 @@ func TestAdmit_SteadyState_QueuedFortyMinutesReachesImplementing(t *testing.T) {
 	}
 
 	// The fourth Task: in a pod stage, no pod, queueing for 40 minutes.
-	waiter := stageTask(t, ctx, proj.Name, "p-steady-waiter", "clarify", tatarav1alpha1.StageImplementing, 40*time.Minute, false)
+	waiter := stageTask(t, ctx, proj.Name, "p-steady-waiter", "implement", tatarav1alpha1.StateUnderImplementation, 40*time.Minute, false)
 	waiterQE := ticket(t, ctx, proj.Name, waiter.Name, stage.AgentImplement, 4, tatarav1alpha1.QueueStateQueued)
 
 	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
@@ -1120,8 +1159,8 @@ func TestAdmit_SteadyState_QueuedFortyMinutesReachesImplementing(t *testing.T) {
 		t.Fatalf("waiter must stay Queued at capacity, state=%q", got.Status.State)
 	}
 	got := refreshTask(t, ctx, waiter.Name)
-	if tatarav1alpha1.StageTerminal(got) {
-		t.Fatalf("QUEUEING KILLED THE TASK: stage=%q reason=%q", got.Status.Stage, got.Status.StageReason)
+	if tatarav1alpha1.TaskDone(got) || tatarav1alpha1.Parked(got) {
+		t.Fatalf("QUEUEING KILLED THE TASK: stage=%q reason=%q", got.Status.State, got.Status.ParkReason)
 	}
 	clock, _, budget, _ := stage.ArmedClock(got, false)
 	if clock != stage.ClockAdmission || budget != tatarav1alpha1.AdmissionStarvedBudget {
@@ -1133,7 +1172,7 @@ func TestAdmit_SteadyState_QueuedFortyMinutesReachesImplementing(t *testing.T) {
 
 	// One agent finishes: the waiter is admitted, NORMALLY, still implementing.
 	done := refreshTask(t, ctx, "p-steady-live-1")
-	done.Status.Stage = tatarav1alpha1.StageDelivered
+	done.Status.State = tatarav1alpha1.StateDone
 	mustStatusUpdate(t, ctx, done)
 
 	if _, err := r.Reconcile(ctx, reqFor(waiterQE)); err != nil {
@@ -1144,8 +1183,8 @@ func TestAdmit_SteadyState_QueuedFortyMinutesReachesImplementing(t *testing.T) {
 		t.Fatalf("waiter not admitted once a slot freed: state=%q taskRef=%q", admitted.Status.State, admitted.Status.TaskRef)
 	}
 	final := refreshTask(t, ctx, waiter.Name)
-	if final.Status.Stage != tatarav1alpha1.StageImplementing || tatarav1alpha1.StageTerminal(final) {
-		t.Fatalf("waiter must reach implementing normally, stage=%q reason=%q", final.Status.Stage, final.Status.StageReason)
+	if final.Status.State != tatarav1alpha1.StateUnderImplementation || tatarav1alpha1.TaskDone(final) || tatarav1alpha1.Parked(final) {
+		t.Fatalf("waiter must reach implementing normally, stage=%q reason=%q", final.Status.State, final.Status.ParkReason)
 	}
 	if final.Labels[queue.LabelQueuedEvent] != waiterQE.Name {
 		t.Fatalf("admitted Task not labelled with its ticket: %v", final.Labels)
@@ -1178,17 +1217,17 @@ func TestTicketSpent_MintPayload(t *testing.T) {
 		want  bool
 	}{
 		{"unstamped, not yet touched by the stage machine", "", false},
-		{"triaging bootstrap", tatarav1alpha1.StageTriaging, false},
-		{"investigating: the Task's OWN pod stage, the deadlock trigger", tatarav1alpha1.StageInvestigating, true},
-		{"clarifying: any other pod stage", tatarav1alpha1.StageClarifying, true},
-		{"approved: pod-less admission gate, past bootstrap", tatarav1alpha1.StageApproved, true},
-		{"delivered: quasi-terminal", tatarav1alpha1.StageDelivered, true},
+		{"triaging bootstrap", tatarav1alpha1.StateNew, false},
+		{"refined: the Task's OWN pod state (investigating/clarifying/approved all collapsed here, #521), the deadlock trigger", tatarav1alpha1.StateRefined, true},
+		{"under-implementation: any other pod state", tatarav1alpha1.StateUnderImplementation, true},
+		{"awaiting-review: past bootstrap", tatarav1alpha1.StateAwaitingReview, true},
+		{"delivered: terminal", tatarav1alpha1.StateDone, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			task := &tatarav1alpha1.Task{Status: tatarav1alpha1.TaskStatus{Stage: tc.stage}}
+			task := &tatarav1alpha1.Task{Status: tatarav1alpha1.TaskStatus{State: tc.stage}}
 			if got := ticketSpent(mint, task); got != tc.want {
-				t.Fatalf("ticketSpent(mint, stage=%q) = %v, want %v", tc.stage, got, tc.want)
+				t.Fatalf("ticketSpent(mint, state=%q) = %v, want %v", tc.stage, got, tc.want)
 			}
 		})
 	}
@@ -1239,10 +1278,10 @@ func TestAdmit_IncidentMintReleasesAlertSlot_RegressionForDeadlock(t *testing.T)
 	// Drive the Task to its OWN investigating pod stage (as the triaging
 	// controller would for spec.kind=incident), same alert class.
 	task := refreshTask(t, ctx, taskName)
-	task.Status.Stage = tatarav1alpha1.StageInvestigating
+	task.Status.State = tatarav1alpha1.StateRefined
 	task.Status.AgentKind = stage.AgentIncident
 	entered := metav1.Now()
-	task.Status.StageEnteredAt = &entered
+	task.Status.StateEnteredAt = &entered
 	mustStatusUpdate(t, ctx, task)
 
 	// The investigating pod's OWN ticket: same alert class, same Task, the
@@ -1653,7 +1692,7 @@ func TestAdmit_MintGuard_StaleTerminalOwnMint(t *testing.T) {
 	}
 	admitted := refreshQE(t, ctx, q)
 	dead := taskForQE(t, ctx, admitted)
-	dead.Status.Stage = tatarav1alpha1.StageDelivered
+	dead.Status.State = tatarav1alpha1.StateDone
 	mustStatusUpdate(t, ctx, dead)
 
 	admitted.Status.State = tatarav1alpha1.QueueStateQueued
@@ -1685,6 +1724,6 @@ func TestAdmit_MintGuard_StaleTerminalOwnMint(t *testing.T) {
 	}
 	fresh := taskForQE(t, ctx, refreshQE(t, ctx, q))
 	if fresh.Name == dead.Name || tatarav1alpha1.TaskDone(fresh) {
-		t.Fatalf("want a fresh live Task, got name=%q stage=%q", fresh.Name, fresh.Status.Stage)
+		t.Fatalf("want a fresh live Task, got name=%q stage=%q", fresh.Name, fresh.Status.State)
 	}
 }

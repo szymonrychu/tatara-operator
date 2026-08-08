@@ -18,7 +18,7 @@ func TestToolProfileForKind(t *testing.T) {
 	}{
 		{"implement", "implement"},
 		{"review", "review"},
-		{"clarify", "clarify"},
+		{"clarify", ""}, // clarify folded into implement by #521; dormant kind maps to fail-closed
 		{"brainstorm", "brainstorm"},
 		{"incident", "incident"},
 		{"refine", "refine"},
@@ -39,18 +39,19 @@ func TestToolProfileForKind(t *testing.T) {
 // in the CRD enum maps to a non-empty profile, so a future new kind fails this
 // test until it is added to profileForKind. The enum is:
 //
-//	brainstorm;incident;clarify;refine;review;documentation
+//	brainstorm;incident;refine;review;documentation
 //
-// (from +kubebuilder:validation:Enum on TaskSpec.Kind)
+// (from +kubebuilder:validation:Enum on Status.AgentKind)
 //
 // "implement" is not in the TaskSpec.Kind enum but IS an active agent kind
-// (status.agentKind, contract G.9), so it is included here too.
+// (status.agentKind, contract G.9), so it is included here too. "clarify" is
+// EXCLUDED: #521 folded that kind into implement and its absence from
+// kindProfiles is now load-bearing (see profileForKind's doc comment).
 func TestToolProfileForKind_AllActiveCRDKinds(t *testing.T) {
 	// The CRD enum is the single source of truth; update here when it changes.
 	crdKinds := []string{
 		"implement",
 		"review",
-		"clarify",
 		"brainstorm",
 		"incident",
 		"refine",

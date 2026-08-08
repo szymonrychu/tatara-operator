@@ -103,10 +103,10 @@ func (d *StageDriver) DrainPendingReview(ctx context.Context, mr *tatarav1alpha1
 	// this same reviewing check; this gates the POST. The cached owning-task read is
 	// fresh by construction: the re-arm write that triggers this reconcile lands a
 	// full review-turn AFTER the transition it raced.
-	if task != nil && task.Status.Stage != tatarav1alpha1.StageReviewing {
+	if task != nil && task.Status.State != tatarav1alpha1.StateAwaitingReview {
 		l.Info("review: owning task left reviewing; dropping the stale pending review without posting",
 			"action", "review_drain_skipped_stale", "resource_id", mr.Name,
-			"repo", mr.Spec.RepositoryRef, "pr", mr.Spec.Number, "task_stage", task.Status.Stage)
+			"repo", mr.Spec.RepositoryRef, "pr", mr.Spec.Number, "task_stage", task.Status.State)
 		return d.clearPendingReview(ctx, proj, mr, pr, "refused")
 	}
 
@@ -162,7 +162,8 @@ func (d *StageDriver) DrainPendingReview(ctx context.Context, mr *tatarav1alpha1
 			if err != nil {
 				return err
 			}
-			return d.enterStage(ctx, proj, task, tatarav1alpha1.StageParked, stage.ReasonReviewPostRefused, mrs)
+			_ = mrs
+			return d.parkTask(ctx, proj, task, stage.ReasonReviewPostRefused)
 		default:
 			obs.ReviewPostTotal.WithLabelValues("error").Inc()
 			return fmt.Errorf("review: post review %s!%d: %w", repo.Name, mr.Spec.Number, perr)
@@ -315,7 +316,7 @@ func (d *StageDriver) advanceAfterReview(ctx context.Context, proj *tatarav1alph
 	if err := refreshTaskFromAPI(ctx, d.APIReader, task); err != nil {
 		return err
 	}
-	if task.Status.Stage != tatarav1alpha1.StageReviewing {
+	if task.Status.State != tatarav1alpha1.StateAwaitingReview {
 		return nil
 	}
 	mrs, err := ownedMergeRequests(ctx, d.mrReader(), task)
@@ -345,7 +346,7 @@ func (d *StageDriver) advanceAfterReview(ctx context.Context, proj *tatarav1alph
 	// merging gate re-reads the same status within 60s and leaves through this
 	// same edge, so a forge blip here costs one pointless promotion - whereas an
 	// error return costs the advance itself, and the advance is a ONE-SHOT.
-	if edge.To == tatarav1alpha1.StageMerging {
+	if edge.To == tatarav1alpha1.StateMerged {
 		red, cerr := ciRedAtReviewedHead(ctx, d.Client, d.SCMFor, d.Metrics, proj, mrs)
 		switch {
 		case cerr != nil:
@@ -355,9 +356,17 @@ func (d *StageDriver) advanceAfterReview(ctx context.Context, proj *tatarav1alph
 			return enterCIRed(ctx, d.Client, d.spiller(proj), d.Metrics, task, mrs, red, d.now())
 		}
 	}
-	log.FromContext(ctx).Info("review: task advancing off reviewing",
+	log.FromContext(ctx).Info("review: task advancing off awaiting-review",
 		"action", "review_advance", "resource_id", task.Name,
 		"to", edge.To, "reason", edge.Reason, "kind", task.Spec.Kind)
+	// EVERY kind=review verdict, and the exhausted/refused non-review ones, come
+	// back as a PARK, not a transition (#521 made park a flag). EnterStage
+	// correctly refuses stage.ParkTarget - it is not in the table and never will
+	// be - so an unbranched applier 500s on the platform's COMMONEST review
+	// outcome instead of parking it.
+	if edge.To == stage.ParkTarget {
+		return d.parkTask(ctx, proj, task, edge.Reason)
+	}
 	return d.enterStage(ctx, proj, task, edge.To, edge.Reason, mrs)
 }
 
@@ -400,9 +409,9 @@ func terminalMREdge(task *tatarav1alpha1.Task, mrs []tatarav1alpha1.MergeRequest
 		return stage.Edge{}, false
 	}
 	if stage.AllMRsMerged(mrs) {
-		return stage.Edge{To: tatarav1alpha1.StageDelivered, Reason: stage.ReasonMRMergedExternally}, true
+		return stage.Edge{To: tatarav1alpha1.StateDone, Reason: stage.ReasonMRMergedExternally}, true
 	}
-	return stage.Edge{To: tatarav1alpha1.StageRejected, Reason: stage.ReasonMRClosedExternally}, true
+	return stage.Edge{To: tatarav1alpha1.StateRejected, Reason: stage.ReasonMRClosedExternally}, true
 }
 
 // TaskTakenOver reports whether task is a kind=review Task in reviewing whose
@@ -487,12 +496,12 @@ func reviewAdvanceEdge(task *tatarav1alpha1.Task, mrs []tatarav1alpha1.MergeRequ
 		// A kind=review Task NEVER reaches implementing or merging - not on
 		// approve, not on request_changes, not from anywhere. Fixing and merging a
 		// human's PR is a HUMAN action.
-		return stage.Edge{To: tatarav1alpha1.StageParked, Reason: stage.ReasonAwaitingHuman}, true
+		return stage.Edge{To: stage.ParkTarget, Reason: stage.ReasonAwaitingHuman}, true
 	case needsChanges:
 		edge, _ := stage.RequestChanges(task, mrs, maxRounds)
 		return edge, true
 	default:
-		return stage.Edge{To: tatarav1alpha1.StageMerging}, true
+		return stage.Edge{To: tatarav1alpha1.StateMerged}, true
 	}
 }
 

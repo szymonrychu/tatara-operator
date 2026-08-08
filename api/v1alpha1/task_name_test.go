@@ -13,108 +13,6 @@ import (
 	"github.com/szymonrychu/tatara-operator/api/v1alpha1"
 )
 
-// TestStageConstants verifies each of the 16 stage constants exists and its
-// value is the exact contract string (F.1).
-func TestStageConstants(t *testing.T) {
-	cases := map[string]struct {
-		got  string
-		want string
-	}{
-		"StageTriaging":      {v1alpha1.StageTriaging, "triaging"},
-		"StageBrainstorming": {v1alpha1.StageBrainstorming, "brainstorming"},
-		"StageClarifying":    {v1alpha1.StageClarifying, "clarifying"},
-		"StageInvestigating": {v1alpha1.StageInvestigating, "investigating"},
-		"StageRefining":      {v1alpha1.StageRefining, "refining"},
-		"StageApproved":      {v1alpha1.StageApproved, "approved"},
-		"StageImplementing":  {v1alpha1.StageImplementing, "implementing"},
-		"StageReviewing":     {v1alpha1.StageReviewing, "reviewing"},
-		"StageConversing":    {v1alpha1.StageConversing, "conversing"},
-		"StageMerging":       {v1alpha1.StageMerging, "merging"},
-		"StageDeploying":     {v1alpha1.StageDeploying, "deploying"},
-		"StageDelivered":     {v1alpha1.StageDelivered, "delivered"},
-		"StageDocumenting":   {v1alpha1.StageDocumenting, "documenting"},
-		"StageRejected":      {v1alpha1.StageRejected, "rejected"},
-		"StageFailed":        {v1alpha1.StageFailed, "failed"},
-		"StageParked":        {v1alpha1.StageParked, "parked"},
-	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			if tc.got != tc.want {
-				t.Errorf("%s = %q, want %q", name, tc.got, tc.want)
-			}
-		})
-	}
-}
-
-// TestStageTerminal covers F.1: terminal is exactly rejected/failed/parked.
-// delivered is quasi-terminal (reaped separately at 48h) and must NOT be
-// terminal here.
-func TestStageTerminal(t *testing.T) {
-	want := map[string]bool{
-		v1alpha1.StageTriaging:      false,
-		v1alpha1.StageBrainstorming: false,
-		v1alpha1.StageClarifying:    false,
-		v1alpha1.StageInvestigating: false,
-		v1alpha1.StageRefining:      false,
-		v1alpha1.StageApproved:      false,
-		v1alpha1.StageImplementing:  false,
-		v1alpha1.StageReviewing:     false,
-		v1alpha1.StageConversing:    false,
-		v1alpha1.StageMerging:       false,
-		v1alpha1.StageDeploying:     false,
-		v1alpha1.StageDelivered:     false,
-		v1alpha1.StageDocumenting:   false,
-		v1alpha1.StageRejected:      true,
-		v1alpha1.StageFailed:        true,
-		v1alpha1.StageParked:        true,
-	}
-	if len(want) != 16 {
-		t.Fatalf("test table has %d stages, want 16", len(want))
-	}
-	for stage, wantTerminal := range want {
-		t.Run(stage, func(t *testing.T) {
-			task := &v1alpha1.Task{Status: v1alpha1.TaskStatus{Stage: stage}}
-			if got := v1alpha1.StageTerminal(task); got != wantTerminal {
-				t.Errorf("StageTerminal(stage=%q) = %v, want %v", stage, got, wantTerminal)
-			}
-		})
-	}
-}
-
-// TestStagePodless covers F.2's "pod: none" rows: triaging, approved, merging,
-// deploying, delivered, rejected, failed, parked run no agent pod. The other
-// eight stages spawn one.
-func TestStagePodless(t *testing.T) {
-	want := map[string]bool{
-		v1alpha1.StageTriaging:      true,
-		v1alpha1.StageApproved:      true,
-		v1alpha1.StageMerging:       true,
-		v1alpha1.StageDeploying:     true,
-		v1alpha1.StageDelivered:     true,
-		v1alpha1.StageRejected:      true,
-		v1alpha1.StageFailed:        true,
-		v1alpha1.StageParked:        true,
-		v1alpha1.StageBrainstorming: false,
-		v1alpha1.StageClarifying:    false,
-		v1alpha1.StageInvestigating: false,
-		v1alpha1.StageRefining:      false,
-		v1alpha1.StageImplementing:  false,
-		v1alpha1.StageReviewing:     false,
-		v1alpha1.StageConversing:    false,
-		v1alpha1.StageDocumenting:   false,
-	}
-	if len(want) != 16 {
-		t.Fatalf("test table has %d stages, want 16", len(want))
-	}
-	for stage, wantPodless := range want {
-		t.Run(stage, func(t *testing.T) {
-			if got := v1alpha1.StagePodless(stage); got != wantPodless {
-				t.Errorf("StagePodless(%q) = %v, want %v", stage, got, wantPodless)
-			}
-		})
-	}
-}
-
 // TestTaskName covers the 49-char name budget: TaskName truncates only the
 // PROJECT segment, never kind/date/uid, and always returns a valid RFC-1123
 // label.
@@ -122,14 +20,14 @@ func TestTaskName(t *testing.T) {
 	ts := time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)
 
 	t.Run("long project truncated to fit 49 chars", func(t *testing.T) {
-		name := v1alpha1.TaskName("a-very-long-project-name-that-keeps-going", "clarify", ts, "m4z8q")
+		name := v1alpha1.TaskName("a-very-long-project-name-that-keeps-going", "implement", ts, "m4z8q")
 		if len(name) > v1alpha1.MaxTaskNameLength {
 			t.Fatalf("len(name) = %d, want <= %d (name=%q)", len(name), v1alpha1.MaxTaskNameLength, name)
 		}
 		if errs := validation.IsDNS1123Label(name); len(errs) != 0 {
 			t.Fatalf("TaskName(%q) is not a valid RFC-1123 label: %v", name, errs)
 		}
-		if !strings.HasSuffix(name, "-clarify-2026-07-12-m4z8q") {
+		if !strings.HasSuffix(name, "-implement-2026-07-12-m4z8q") {
 			t.Fatalf("TaskName must truncate only the project segment, never kind/date/uid: got %q", name)
 		}
 	})
@@ -217,7 +115,7 @@ func TestMaxSizedTask(t *testing.T) {
 	}
 }
 
-// TestA4JSONTags round-trips every new contract-A.4 JSON tag on TaskSpec,
+// TestA4JSONTags round-trips every contract-A.4 JSON tag on TaskSpec,
 // TaskStatus, Note, TaskStats, and TaskEvent through marshal/unmarshal,
 // verifying the exact camelCase tag names the contract mandates.
 func TestA4JSONTags(t *testing.T) {
@@ -238,10 +136,10 @@ func TestA4JSONTags(t *testing.T) {
 			MaxTurnsPerTask: 300,
 		},
 		Status: v1alpha1.TaskStatus{
-			Stage:              v1alpha1.StageImplementing,
-			StageEnteredAt:     &now,
+			State:              v1alpha1.StateUnderImplementation,
+			StateEnteredAt:     &now,
 			PodStartedAt:       &now,
-			StageWorkStartedAt: &now,
+			StateWorkStartedAt: &now,
 			AgentKind:          "implement",
 			PodName:            "proj-implement-2026-07-12-abcde-implement",
 			Notes: []v1alpha1.Note{
@@ -269,8 +167,9 @@ func TestA4JSONTags(t *testing.T) {
 			DocumentedBy:      "proj-documentation-2026-07-12-xyz01",
 			IssueRefs:         []string{"iss-repo-a-5"},
 			MRRefs:            []string{"mr-repo-a-6"},
-			StageReason:       "stage-deadline",
-			ParkedFromStage:   v1alpha1.StageReviewing,
+			ParkReason:        "stage-deadline",
+			ParkedAt:          &now,
+			ParkedFromState:   v1alpha1.StateAwaitingReview,
 			MergeCursor:       1,
 			MergeReentries:    2,
 			DeployReentries:   3,
@@ -289,10 +188,10 @@ func TestA4JSONTags(t *testing.T) {
 	wantKeys := []string{
 		`"repositoryRef"`, `"goal"`, `"kind"`, `"mergeOrder"`, `"alertRules"`,
 		`"dedupKey"`, `"documentsTasks"`, `"maxTurnsPerTask"`,
-		`"stage"`, `"stageEnteredAt"`, `"podStartedAt"`, `"stageWorkStartedAt"`,
+		`"state"`, `"stateEnteredAt"`, `"podStartedAt"`, `"stateWorkStartedAt"`,
 		`"agentKind"`, `"podName"`, `"notes"`, `"pendingEvents"`, `"stats"`,
 		`"deliveredAt"`, `"documentedBy"`, `"issueRefs"`, `"mrRefs"`,
-		`"stageReason"`, `"parkedFromStage"`, `"mergeCursor"`, `"mergeReentries"`,
+		`"parkReason"`, `"parkedAt"`, `"parkedFromState"`, `"mergeCursor"`, `"mergeReentries"`,
 		`"deployReentries"`, `"headMoveReentries"`, `"humanReviewRounds"`,
 		`"foldInFlight"`,
 		// Note

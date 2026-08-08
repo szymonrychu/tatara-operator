@@ -321,8 +321,15 @@ func (r *IssueReconciler) handleIssueClosed(ctx context.Context, iss *tatarav1al
 		return false, fmt.Errorf("issue-closed: get owning task %s: %w", ownerName, err)
 	}
 
-	// Live, non-deploying source stage: stop the Task now.
-	if stage.AllowsIssueClosedStop(task.Status.Stage) {
+	// Live, non-deployed source state: stop the Task now.
+	//
+	// A PARKED Task is EXCLUDED, and that exclusion is what #521 made necessary.
+	// ApplyIssueClosedStop enters rejected(issue-closed), and stage.Enter refuses
+	// a parked Task by design - so for a parked owner this call silently no-ops
+	// and the unconditional `return` swallowed the parked-decline branch below
+	// with it. A parked brainstorm proposal whose issue a human closes is the
+	// commonest shape there is, and it must reach recordParkedProposalDecline.
+	if !tatarav1alpha1.Parked(&task) && stage.AllowsIssueClosedStop(task.Status.State) {
 		return ApplyIssueClosedStop(ctx, r.Client, &task, iss.Name, r.now())
 	}
 
@@ -335,7 +342,7 @@ func (r *IssueReconciler) handleIssueClosed(ctx context.Context, iss *tatarav1al
 	// re-sever would delete the mirror C3 exists to keep, on the very next
 	// reconcile. A retained mirror also reports handled=FALSE, so the reconcile
 	// continues and the rejected verdict still projects onto the declined label.
-	if task.Status.Stage == tatarav1alpha1.StageRejected && task.Status.StageReason == stage.ReasonIssueClosed {
+	if task.Status.State == tatarav1alpha1.StateRejected && task.Status.StateReason == stage.ReasonIssueClosed {
 		retained, err := recordProposalDecline(ctx, r.Client, &task, iss.Name, r.now())
 		if err != nil {
 			return false, err
@@ -358,10 +365,10 @@ func (r *IssueReconciler) handleIssueClosed(ctx context.Context, iss *tatarav1al
 	// decline and relabelled tatara-declined on the forge. The verdict guard alone
 	// cannot save it, because the sever runs first.
 	//
-	// Recording is NOT stopping: the Task's stage, stage reason and pod are
+	// Recording is NOT stopping: the Task's state, park reason and pod are
 	// untouched, and a non-proposal issue is left entirely alone. handled stays
 	// FALSE either way, so the reconcile still projects labels and requeues.
-	if task.Status.Stage != tatarav1alpha1.StageParked {
+	if !tatarav1alpha1.Parked(&task) {
 		return false, nil
 	}
 	return false, recordParkedProposalDecline(ctx, r.Client, &task, iss, r.now())

@@ -217,8 +217,12 @@ func (h *takeoverHarness) seedParkedTakeoverTask(t *testing.T, number int) {
 	if err := h.c.Create(ctx, task); err != nil {
 		t.Fatalf("create parked takeover task: %v", err)
 	}
-	task.Status.Stage = tatarav1alpha1.StageParked
-	task.Status.StageReason = stage.ReasonOwnershipLost
+	entered := metav1.NewTime(takeoverFrozenNow)
+	task.Status.State = tatarav1alpha1.StateRefined
+	task.Status.StateEnteredAt = &entered
+	if err := stage.Park(task, stage.ReasonOwnershipLost, takeoverFrozenNow); err != nil {
+		t.Fatalf("park takeover task: %v", err)
+	}
 	if err := h.c.Status().Update(ctx, task); err != nil {
 		t.Fatalf("park takeover task: %v", err)
 	}
@@ -452,7 +456,7 @@ func TestMRTakeover_SurvivesNextReconcileOwnership(t *testing.T) {
 	if err := h.c.Get(context.Background(), types.NamespacedName{Namespace: takeoverNS, Name: tkName}, &tk); err != nil {
 		t.Fatalf("get takeover task %s: %v", tkName, err)
 	}
-	tk.Status.Stage = tatarav1alpha1.StageApproved
+	tk.Status.State = tatarav1alpha1.StateRefined
 	if err := h.c.Status().Update(context.Background(), &tk); err != nil {
 		t.Fatalf("stamp takeover task stage: %v", err)
 	}
@@ -477,7 +481,7 @@ func TestMRTakeover_SurvivesNextReconcileOwnership(t *testing.T) {
 	if err := h.c.Get(context.Background(), types.NamespacedName{Namespace: takeoverNS, Name: tkName}, &tkAfter); err != nil {
 		t.Fatalf("get takeover task %s: %v", tkName, err)
 	}
-	if tkAfter.Status.Stage == tatarav1alpha1.StageParked {
+	if tatarav1alpha1.Parked(&tkAfter) {
 		t.Fatalf("takeover task must not be parked by the next reconcile")
 	}
 }
@@ -729,8 +733,9 @@ func TestTakeover_SingleMRUpdateNoDemoteWindow(t *testing.T) {
 		t.Fatalf("simulate stand-down ownership stamp: %v", err)
 	}
 	tk := h.task(t, takeoverName)
-	tk.Status.Stage = tatarav1alpha1.StageParked
-	tk.Status.StageReason = stage.ReasonOwnershipLost
+	if err := stage.Park(tk, stage.ReasonOwnershipLost, takeoverFrozenNow); err != nil {
+		t.Fatalf("simulate stand-down park: %v", err)
+	}
 	if err := h.c.Status().Update(context.Background(), tk); err != nil {
 		t.Fatalf("simulate stand-down park: %v", err)
 	}

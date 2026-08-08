@@ -73,6 +73,7 @@ func TestVerifyOneIssue_CitationFailClosedMatrix(t *testing.T) {
 		iss         *tatarav1alpha1.Issue
 		citations   []tatarav1alpha1.ApprovalCitation
 		maintainers []string // nil means the shared proj
+		declared    string   // the agent's declared approvingMaintainer; "" skips the two approver checks
 		wantReason  string   // "" means PASS
 		wantAuto    bool
 	}{
@@ -115,6 +116,22 @@ func TestVerifyOneIssue_CitationFailClosedMatrix(t *testing.T) {
 			),
 			citations:  cit("c-1", "go ahead"),
 			wantReason: "",
+		},
+		{
+			// The declared approver is checked case-insensitively against the
+			// cited comment's author. Both spellings must be maintainers in
+			// their own right (isMaintainerLogin/isMaintainerComment match
+			// logins exactly) - EqualFold is only the last comparison, the
+			// one between the two.
+			name: "declared approver matches the cited author case-insensitively",
+			iss: citIssue(
+				cmt("c-1", "randomer", "please do this", false, t0),
+				cmt("c-2", "maintainer-1", "sure, go ahead, I approve!", false, t0.Add(time.Minute)),
+			),
+			citations:   cit("c-2", "go ahead, I approve!"),
+			maintainers: []string{"maintainer-1", "MAINTAINER-1"},
+			declared:    "MAINTAINER-1",
+			wantReason:  "",
 		},
 		{
 			name: "issue already approved with evidence short-circuits regardless of citation",
@@ -236,6 +253,31 @@ func TestVerifyOneIssue_CitationFailClosedMatrix(t *testing.T) {
 			wantReason: ApprovalRefusedCitationNotMaintainer,
 		},
 		{
+			// The agent declared an approvingMaintainer that is not a
+			// maintainer of this project/repo at all.
+			name: "declared approver is not a maintainer",
+			iss: citIssue(
+				cmt("c-1", "randomer", "please do this", false, t0),
+				cmt("c-2", "maintainer-1", "sure, go ahead, I approve!", false, t0.Add(time.Minute)),
+			),
+			citations:  cit("c-2", "go ahead, I approve!"),
+			declared:   "randomer",
+			wantReason: ApprovalRefusedApproverNotMaintainer,
+		},
+		{
+			// The agent declared a REAL maintainer, but not the one who
+			// authored the cited comment.
+			name: "declared approver is a maintainer but not the cited comment's author",
+			iss: citIssue(
+				cmt("c-1", "randomer", "please do this", false, t0),
+				cmt("c-2", "maintainer-1", "sure, go ahead, I approve!", false, t0.Add(time.Minute)),
+			),
+			citations:   cit("c-2", "go ahead, I approve!"),
+			maintainers: []string{"maintainer-1", "maintainer-2"},
+			declared:    "maintainer-2",
+			wantReason:  ApprovalRefusedApproverMismatch,
+		},
+		{
 			name:       "quote is absent from the cited comment's body",
 			iss:        citIssue(cmt("c-2", "maintainer-1", "let me think about it", false, t0)),
 			citations:  cit("c-2", "go ahead, I approve!"),
@@ -283,7 +325,7 @@ func TestVerifyOneIssue_CitationFailClosedMatrix(t *testing.T) {
 			if tc.maintainers != nil {
 				p = citProject("bot-1", tc.maintainers...)
 			}
-			ev, reason := verifyOneIssue(tc.iss, p, repo, "bot-1", tc.citations)
+			ev, reason := verifyOneIssue(tc.iss, p, repo, "bot-1", tc.citations, tc.declared)
 			if reason != tc.wantReason {
 				t.Fatalf("reason = %q, want %q", reason, tc.wantReason)
 			}
@@ -327,7 +369,7 @@ func TestVerifyOneIssue_BotLoginDisjunctIsTheLastLayer(t *testing.T) {
 	)
 	proj := citProject("bot-1", "maintainer-1", "ci-runner")
 
-	ev, reason := verifyOneIssue(iss, proj, citRepo(), "ci-runner", cit("c-1", "go ahead"))
+	ev, reason := verifyOneIssue(iss, proj, citRepo(), "ci-runner", cit("c-1", "go ahead"), "")
 	if reason != ApprovalRefusedCitationNotMaintainer {
 		t.Fatalf("reason = %q, want %q: the botLogin disjunct is the only layer that can refuse this",
 			reason, ApprovalRefusedCitationNotMaintainer)
@@ -346,7 +388,7 @@ func TestVerifyOneIssue_EvidenceRecordsTheAgentsQuote(t *testing.T) {
 	iss := citIssue(cmt("c-7", "maintainer-1", "sure, go ahead, I approve!", false, t0))
 
 	ev, reason := verifyOneIssue(iss, citProject("bot-1", "maintainer-1"), citRepo(), "bot-1",
-		cit("c-7", " go ahead, I approve! "))
+		cit("c-7", " go ahead, I approve! "), "")
 	if reason != "" {
 		t.Fatalf("reason = %q, want a pass", reason)
 	}
@@ -358,6 +400,42 @@ func TestVerifyOneIssue_EvidenceRecordsTheAgentsQuote(t *testing.T) {
 	}
 	if ev.Auto {
 		t.Fatal("a human citation produced Auto evidence")
+	}
+}
+
+// TestVerifyOneIssue_DeclaredEmptySkipsApproverChecks pins that an empty
+// declared argument skips BOTH ApprovalRefusedApproverNotMaintainer and
+// ApprovalRefusedApproverMismatch entirely, rather than defaulting to a
+// refusal. This is what keeps the autoApproveTataraProposals carve-out
+// reachable: on that path there is no comment author to declare, so declared
+// is legitimately "" and must not itself become a third way to refuse.
+func TestVerifyOneIssue_DeclaredEmptySkipsApproverChecks(t *testing.T) {
+	t0 := time.Date(2026, 7, 28, 10, 0, 0, 0, time.UTC)
+
+	// The auto-approve carve-out itself: no maintainer comment at all, so the
+	// approver checks are never even reached, and the carve-out still grants
+	// with declared == "".
+	autoIss := citAutoApprovableIssue(t, "bot-1")
+	ev, reason := verifyOneIssue(autoIss, citProject("bot-1", "maintainer-1"), citRepo(), "bot-1", nil, "")
+	if reason != "" {
+		t.Fatalf("auto-approve carve-out: reason = %q, want a pass", reason)
+	}
+	if !ev.Auto {
+		t.Fatal("auto-approve carve-out: expected Auto evidence")
+	}
+
+	// A maintainer-cited approval with declared == "": the two approver
+	// checks are skipped even though a non-empty declared value here would
+	// have failed both (the cited author is maintainer-1, not "randomer",
+	// and "randomer" is not a maintainer at all).
+	iss := citIssue(cmt("c-1", "maintainer-1", "sure, go ahead, I approve!", false, t0))
+	ev, reason = verifyOneIssue(iss, citProject("bot-1", "maintainer-1"), citRepo(), "bot-1",
+		cit("c-1", "go ahead, I approve!"), "")
+	if reason != "" {
+		t.Fatalf("citation-based approval: reason = %q, want a pass with declared==\"\"", reason)
+	}
+	if ev.Login != "maintainer-1" {
+		t.Fatalf("evidence.Login = %q, want maintainer-1", ev.Login)
 	}
 }
 
@@ -376,7 +454,7 @@ func TestVerifyOneIssue_MultipleCitations(t *testing.T) {
 		{ID: "c-1", Quote: "go ahead"},
 		{ID: "c-2", Quote: "yes please, approved"},
 	}
-	ev, reason := verifyOneIssue(iss, citProject("bot-1", "maintainer-1"), citRepo(), "bot-1", citations)
+	ev, reason := verifyOneIssue(iss, citProject("bot-1", "maintainer-1"), citRepo(), "bot-1", citations, "")
 	if reason != "" {
 		t.Fatalf("reason = %q, want a pass on the maintainer-authored citation", reason)
 	}
@@ -474,7 +552,7 @@ func TestVerifyOneIssue_CitationSurvivesBundleEntityEscaping(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			iss := citIssue(cmt("c-1", "maintainer-1", tc.body, false, t0))
-			ev, reason := verifyOneIssue(iss, proj, repo, "bot-1", cit("c-1", tc.quote))
+			ev, reason := verifyOneIssue(iss, proj, repo, "bot-1", cit("c-1", tc.quote), "")
 			if reason != tc.wantReason {
 				t.Fatalf("reason = %q, want %q (body %q, quote %q)",
 					reason, tc.wantReason, tc.body, tc.quote)

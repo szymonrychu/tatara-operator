@@ -1058,14 +1058,16 @@ func TestTaskTerminal(t *testing.T) {
 }
 
 // TestTaskTerminalLabels asserts operator_task_terminal_total is registered
-// with exactly the label set {kind,stage,stageReason} (contract K.1 / D1):
-// the tatara-observability alert rules select on stage/stageReason by name,
+// with exactly the label set {kind,state,stateReason} (contract K.1 / D1):
+// the tatara-observability alert rules select on state/stateReason by name,
 // so a label rename here would silently break them without a build error.
+// #521 renamed the stage/stageReason labels to state/stateReason and narrowed
+// the state label's domain to {done, rejected} - see TaskTerminal's doc.
 func TestTaskTerminalLabels(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewOperatorMetrics(reg)
 
-	m.TaskTerminal("implement", "failed", "TurnTimeout")
+	m.TaskTerminal("implement", "rejected", "TurnTimeout")
 
 	mfs, err := reg.Gather()
 	if err != nil {
@@ -1085,7 +1087,7 @@ func TestTaskTerminalLabels(t *testing.T) {
 	for _, l := range found.GetMetric()[0].GetLabel() {
 		gotLabels[l.GetName()] = true
 	}
-	for _, want := range []string{"kind", "stage", "stageReason"} {
+	for _, want := range []string{"kind", "state", "stateReason"} {
 		if !gotLabels[want] {
 			t.Errorf("operator_task_terminal_total missing label %q, got %v", want, gotLabels)
 		}
@@ -1440,7 +1442,7 @@ func TestQualityMetrics_Emit(t *testing.T) {
 // Contract K.1: five metrics that were named but never emitted.
 // ---------------------------------------------------------------------------
 
-// operator_task_stage is a low-cardinality COUNT per (stage,kind) bucket, not
+// operator_task_state is a low-cardinality COUNT per (stage,kind) bucket, not
 // per-task. ResetTaskStageGauges clears both it and the per-task age gauge so a
 // Task that left its bucket does not linger (contract M22).
 func TestTaskStageGauge(t *testing.T) {
@@ -1449,12 +1451,12 @@ func TestTaskStageGauge(t *testing.T) {
 
 	m.SetTaskStage("implementing", "implement", 3)
 	if got := testutil.ToFloat64(m.TaskStageGauge("implementing", "implement")); got != 3 {
-		t.Fatalf("operator_task_stage{implementing,implement} = %v, want 3", got)
+		t.Fatalf("operator_task_state{implementing,implement} = %v, want 3", got)
 	}
 
 	m.ResetTaskStageGauges()
 	if got := testutil.ToFloat64(m.TaskStageGauge("implementing", "implement")); got != 0 {
-		t.Fatalf("operator_task_stage after Reset = %v, want 0 (series gone)", got)
+		t.Fatalf("operator_task_state after Reset = %v, want 0 (series gone)", got)
 	}
 }
 
@@ -1464,19 +1466,19 @@ func TestTaskStageGauge_NilSafe(t *testing.T) {
 	m.ResetTaskStageGauges()
 }
 
-// operator_task_stage_age_seconds is per-task.
+// operator_task_state_age_seconds is per-task.
 func TestTaskStageAgeGauge(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewOperatorMetrics(reg)
 
 	m.SetTaskStageAge("task-1", "implementing", "implement", 120)
 	if got := testutil.ToFloat64(m.TaskStageAgeGauge("task-1", "implementing", "implement")); got != 120 {
-		t.Fatalf("operator_task_stage_age_seconds = %v, want 120", got)
+		t.Fatalf("operator_task_state_age_seconds = %v, want 120", got)
 	}
 
 	m.ResetTaskStageGauges()
 	if got := testutil.ToFloat64(m.TaskStageAgeGauge("task-1", "implementing", "implement")); got != 0 {
-		t.Fatalf("operator_task_stage_age_seconds after Reset = %v, want 0 (series gone)", got)
+		t.Fatalf("operator_task_state_age_seconds after Reset = %v, want 0 (series gone)", got)
 	}
 }
 
@@ -1611,8 +1613,8 @@ func TestK1MetricsNamesRegistered(t *testing.T) {
 		t.Fatalf("gather: %v", err)
 	}
 	want := map[string]bool{
-		"operator_task_stage":             false,
-		"operator_task_stage_age_seconds": false,
+		"operator_task_state":             false,
+		"operator_task_state_age_seconds": false,
 		"operator_task_parked_total":      false,
 		"operator_orphan_adopted_total":   false,
 		"operator_queue_age_seconds":      false,

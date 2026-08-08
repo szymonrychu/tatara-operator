@@ -18,7 +18,7 @@ func TestSkillProfileForKind(t *testing.T) {
 	}{
 		{"implement", "implement"},
 		{"review", "review"},
-		{"clarify", "clarify"},
+		{"clarify", ""}, // clarify folded into implement by #521; dormant kind maps to fail-closed
 		{"brainstorm", "brainstorm"},
 		{"incident", "incident"},
 		{"refine", "refine"},
@@ -38,12 +38,12 @@ func TestSkillProfileForKind(t *testing.T) {
 // CRD enum maps to a non-empty skill profile, so a future new kind fails this test
 // until added. selfImprove is kept in the CRD enum (to avoid rejecting stored
 // terminal CRs) but is no longer an active code path - its profile is intentionally
-// removed (returns "").
+// removed (returns ""). clarify is likewise excluded: #521 folded it into
+// implement and its absent profile is now load-bearing fail-closed behavior.
 func TestSkillProfileForKind_AllActiveCRDKinds(t *testing.T) {
 	crdKinds := []string{
 		"implement",
 		"review",
-		"clarify",
 		"brainstorm",
 		"incident",
 		"refine",

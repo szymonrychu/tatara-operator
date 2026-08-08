@@ -30,8 +30,8 @@ func TestMintOrUnparkTakeoverTask_MintsBoundIntoApproved(t *testing.T) {
 	if task.Spec.Kind != "takeover" {
 		t.Fatalf("kind = %q", task.Spec.Kind)
 	}
-	if task.Spec.InitialStage != tatarav1alpha1.StageApproved {
-		t.Fatalf("initial stage = %q, want approved", task.Spec.InitialStage)
+	if task.Spec.InitialState != tatarav1alpha1.StateRefined {
+		t.Fatalf("initial stage = %q, want approved", task.Spec.InitialState)
 	}
 	if task.Annotations[tatarav1alpha1.AnnTakeoverHeadBranch] != "renovate/foo" {
 		t.Fatalf("push branch annotation = %q", task.Annotations[tatarav1alpha1.AnnTakeoverHeadBranch])
@@ -67,11 +67,11 @@ func TestMintOrUnparkTakeoverTask_UnparksExisting(t *testing.T) {
 		t.Fatalf("re-take must reuse the same Task: %q vs %q", first.Name, second.Name)
 	}
 	got := getTask(t, second.Name)
-	if got.Status.Stage != tatarav1alpha1.StageApproved {
-		t.Fatalf("re-take must re-enter approved, got %q", got.Status.Stage)
+	if got.Status.State != tatarav1alpha1.StateUnderImplementation {
+		t.Fatalf("re-take must re-enter under-implementation, got %q", got.Status.State)
 	}
-	if got.Status.StageReason != stage.ReasonOwnershipLost {
-		t.Fatalf("re-entry stage reason = %q, want %q", got.Status.StageReason, stage.ReasonOwnershipLost)
+	if tatarav1alpha1.Parked(got) {
+		t.Fatalf("re-take must clear the park flag, still parked: %q", got.Status.ParkReason)
 	}
 }
 
@@ -88,8 +88,8 @@ func TestMintOrUnparkTakeoverTask_ExistingNotOwnershipLostPark_ReturnedUnchanged
 		stg    string
 		reason string
 	}{
-		{"live approved task is returned unchanged", tatarav1alpha1.StageApproved, ""},
-		{"parked for a non-ownership-lost reason is returned unchanged", tatarav1alpha1.StageParked, stage.ReasonAwaitingHuman},
+		{"live approved task is returned unchanged", tatarav1alpha1.StateRefined, ""},
+		{"parked for a non-ownership-lost reason is returned unchanged", tatarav1alpha1.StateUnderImplementation, stage.ReasonAwaitingHuman},
 	}
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -114,11 +114,11 @@ func TestMintOrUnparkTakeoverTask_ExistingNotOwnershipLostPark_ReturnedUnchanged
 			}
 
 			got := getTask(t, second.Name)
-			if got.Status.Stage != tc.stg {
-				t.Fatalf("stage mutated: got %q, want unchanged %q", got.Status.Stage, tc.stg)
+			if got.Status.State != tc.stg {
+				t.Fatalf("stage mutated: got %q, want unchanged %q", got.Status.State, tc.stg)
 			}
-			if got.Status.StageReason != tc.reason {
-				t.Fatalf("stage reason mutated: got %q, want unchanged %q", got.Status.StageReason, tc.reason)
+			if got.Status.ParkReason != tc.reason {
+				t.Fatalf("stage reason mutated: got %q, want unchanged %q", got.Status.ParkReason, tc.reason)
 			}
 
 			// No second takeover Task was minted for this MR.
@@ -253,29 +253,37 @@ func ownerControllerName(obj client.Object) (string, bool) {
 // exercising the same edges a second time under a different test's name.
 func parkTaskOwnershipLost(t *testing.T, ctx context.Context, task *tatarav1alpha1.Task) {
 	t.Helper()
-	stampTaskStatus(t, ctx, task, tatarav1alpha1.StageParked, stage.ReasonOwnershipLost)
+	stampTaskStatus(t, ctx, task, tatarav1alpha1.StateUnderImplementation, stage.ReasonOwnershipLost)
 }
 
-// stampTaskStatus is parkTaskOwnershipLost's general form: it writes stg/reason
-// straight onto task's status, bypassing stage.Enter's legality checks, for
-// tests that need to PLACE a Task in some state without re-deriving how it got
-// there (that derivation is each state's own edge's coverage elsewhere).
-func stampTaskStatus(t *testing.T, ctx context.Context, task *tatarav1alpha1.Task, stg, reason string) {
+// stampTaskStatus writes state/reason straight onto task's status, bypassing
+// stage.Enter's legality checks, for tests that need to PLACE a Task in some
+// state (optionally parked) without re-deriving how it got there (that
+// derivation is each state's own edge's coverage elsewhere). reason lands on
+// status.parkReason (a park is a flag orthogonal to state, #521) unless state
+// is done/rejected, where it lands on status.stateReason instead.
+func stampTaskStatus(t *testing.T, ctx context.Context, task *tatarav1alpha1.Task, state, reason string) {
 	t.Helper()
 	var fresh tatarav1alpha1.Task
 	if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(task), &fresh); err != nil {
 		t.Fatalf("get task %s: %v", task.Name, err)
 	}
 	now := metav1.Now()
-	fresh.Status.Stage = stg
-	fresh.Status.StageReason = reason
-	if stg == tatarav1alpha1.StageParked {
-		fresh.Status.ParkedFromStage = tatarav1alpha1.StageImplementing
+	fresh.Status.State = state
+	fresh.Status.ParkReason = ""
+	fresh.Status.StateReason = ""
+	if reason != "" {
+		if state == tatarav1alpha1.StateDone || state == tatarav1alpha1.StateRejected {
+			fresh.Status.StateReason = reason
+		} else {
+			fresh.Status.ParkReason = reason
+			fresh.Status.ParkedFromState = state
+		}
 	}
-	fresh.Status.StageEnteredAt = &now
+	fresh.Status.StateEnteredAt = &now
 	fresh.Status.PodStartedAt = nil
 	if err := k8sClient.Status().Update(ctx, &fresh); err != nil {
-		t.Fatalf("stamp task %s stage=%s reason=%s: %v", task.Name, stg, reason, err)
+		t.Fatalf("stamp task %s state=%s reason=%s: %v", task.Name, state, reason, err)
 	}
 	*task = fresh
 }

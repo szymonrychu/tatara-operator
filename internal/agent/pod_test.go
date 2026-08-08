@@ -230,15 +230,15 @@ func TestBuildPodName(t *testing.T) {
 	}{
 		{
 			name:    "github issue",
-			project: "tatara", repoRef: "tatara-operator", kind: "clarify",
+			project: "tatara", repoRef: "tatara-operator", kind: "implement",
 			source: &tatarav1alpha1.TaskSource{Number: 23, IsPR: false},
-			want:   "clr-tatara-tatara-operator-i23",
+			want:   "imp-tatara-tatara-operator-i23",
 		},
 		{
 			name:    "gitlab mr folds into p",
-			project: "tatara", repoRef: "tatara-cli", kind: "clarify",
+			project: "tatara", repoRef: "tatara-cli", kind: "implement",
 			source: &tatarav1alpha1.TaskSource{Number: 7, IsPR: true},
-			want:   "clr-tatara-tatara-cli-p7",
+			want:   "imp-tatara-tatara-cli-p7",
 		},
 		{
 			name:    "implement with no source drops id segment",
@@ -254,9 +254,9 @@ func TestBuildPodName(t *testing.T) {
 		},
 		{
 			name:    "project board issue drops repo",
-			project: "tatara", repoRef: "", kind: "clarify",
+			project: "tatara", repoRef: "", kind: "implement",
 			source: &tatarav1alpha1.TaskSource{Number: 5, IsPR: false},
-			want:   "clr-tatara-i5",
+			want:   "imp-tatara-i5",
 		},
 		{
 			name:    "project board brainstorm drops repo",
@@ -297,10 +297,10 @@ func TestStampPodName_AndPodNameFallback(t *testing.T) {
 	// Stamped: PodName returns the descriptive name, and BuildPod/BuildService
 	// adopt it.
 	proj, repo, task, cfg := sampleInputs()
-	task.Spec.Kind = "clarify"
+	task.Spec.Kind = "implement"
 	task.Spec.Source = &tatarav1alpha1.TaskSource{Provider: "github", Number: 42, IsPR: false}
 	agent.StampPodName(task, "demo", "repo1")
-	require.Equal(t, "clr-demo-repo1-i42", agent.PodName(task))
+	require.Equal(t, "imp-demo-repo1-i42", agent.PodName(task))
 	require.Equal(t, agent.PodName(task), agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Name)
 	require.Equal(t, agent.PodName(task), agent.BuildService(proj, repo, task, cfg).Name)
 }

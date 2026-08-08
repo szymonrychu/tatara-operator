@@ -89,7 +89,7 @@ func verifyOne(t *testing.T, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.
 	t.Helper()
 	metrics := obs.NewOperatorMetrics(prometheus.NewRegistry())
 	g := &GrammarVerifier{Client: newMirrorClient(t, proj, repo, iss), Metrics: metrics}
-	ev, ok := g.VerifyApproval(context.Background(), proj, iss, citations)
+	ev, ok, _ := g.VerifyApprovalDeclared(context.Background(), proj, iss, citations, "")
 	return ev, ok, metrics
 }
 

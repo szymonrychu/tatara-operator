@@ -69,7 +69,7 @@ func TestIssueReopened_MirrorsOpenStateOntoARetainedProposal(t *testing.T) {
 	yes := true
 	task := &tatarav1.Task{
 		ObjectMeta: metav1.ObjectMeta{Name: "clarify-1", Namespace: ns},
-		Spec:       tatarav1.TaskSpec{ProjectRef: "rp", Kind: "clarify"},
+		Spec:       tatarav1.TaskSpec{ProjectRef: "rp", Kind: "brainstorm"},
 	}
 	// The exact shape recordProposalDecline leaves behind.
 	iss := &tatarav1.Issue{

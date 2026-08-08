@@ -72,7 +72,7 @@ func pendingReviewFixture(verdict string, round int, sha string) *tatarav1alpha1
 // dropped "refused": PendingReview cleared, zero forge posts, reviewedSHA
 // untouched.
 func TestDrainPendingReview_OwningTaskLeftReviewing_DropsStale(t *testing.T) {
-	task := mdTask("t-stale", "clarify", tatarav1alpha1.StageMerging)
+	task := mdTask("t-stale", "clarify", tatarav1alpha1.StateMerged)
 	mr := mdMR(task, "tatara-operator", 8)
 	mr.Status.PendingReview = pendingReviewFixture("approve", 1, "sha-rearmed")
 	mr.Status.ReviewedSHA = "sha-approved"
@@ -107,7 +107,7 @@ func TestDrainPendingReview_OwningTaskLeftReviewing_DropsStale(t *testing.T) {
 // The externalId set-union dedups the MIRROR. It can NEVER dedup the FORGE.
 // ==========================================================================
 func TestReviewPostSurvivesACrash(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageReviewing)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateAwaitingReview)
 	mr := mdMR(task, "tatara-operator", 7)
 	mr.Status.PendingReview = pendingReviewFixture("request_changes", 1, "sha-a")
 	mr.Status.ReviewedSHA = "sha-a"
@@ -188,7 +188,7 @@ func TestReviewPostSurvivesACrash(t *testing.T) {
 // and lands at stage=implementing - NOT parked(review-post-refused). The fake
 // forge FAILS THE TEST if it is ever handed APPROVE or REQUEST_CHANGES.
 func TestReviewPostRequestChangesGoesToImplementing(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageReviewing)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateAwaitingReview)
 	mr := mdMR(task, "tatara-operator", 7)
 	mr.Status.PendingReview = pendingReviewFixture("request_changes", 1, "sha-a")
 	mr.Status.ReviewedSHA = "sha-a"
@@ -208,8 +208,8 @@ func TestReviewPostRequestChangesGoesToImplementing(t *testing.T) {
 		t.Fatalf("the review body carries no round marker: %q", f.reviews[7][0].Body)
 	}
 	got := mdGetTask(t, c, "t1")
-	if got.Status.Stage != tatarav1alpha1.StageImplementing {
-		t.Fatalf("stage = %q/%q, want implementing (NOT parked)", got.Status.Stage, got.Status.StageReason)
+	if got.Status.State != tatarav1alpha1.StateUnderImplementation {
+		t.Fatalf("stage = %q/%q, want implementing (NOT parked)", got.Status.State, got.Status.ParkReason)
 	}
 	if gm := mdGetMR(t, c, mr.Name); gm.Status.PendingReview != nil || gm.Status.Status != "needs-changes" {
 		t.Fatalf("mr not settled: pendingReview=%v status=%q", gm.Status.PendingReview, gm.Status.Status)
@@ -219,7 +219,7 @@ func TestReviewPostRequestChangesGoesToImplementing(t *testing.T) {
 // An approve on a non-review Task advances to merging, and only AFTER
 // pendingReview is nil (the F.3 gate).
 func TestReviewPostApproveGoesToMerging(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageReviewing)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateAwaitingReview)
 	task.Spec.MergeOrder = []string{"tatara-operator"}
 	mr := mdMR(task, "tatara-operator", 7)
 	pr := pendingReviewFixture("approve", 1, "sha-a")
@@ -235,8 +235,8 @@ func TestReviewPostApproveGoesToMerging(t *testing.T) {
 		t.Fatalf("DrainPendingReview: %v", err)
 	}
 	got := mdGetTask(t, c, "t1")
-	if got.Status.Stage != tatarav1alpha1.StageMerging {
-		t.Fatalf("stage = %q, want merging", got.Status.Stage)
+	if got.Status.State != tatarav1alpha1.StateMerged {
+		t.Fatalf("stage = %q, want merging", got.Status.State)
 	}
 	if gm := mdGetMR(t, c, mr.Name); gm.Status.PendingReview != nil {
 		t.Fatalf("pendingReview must be cleared BEFORE the Task advances")
@@ -248,7 +248,7 @@ func TestReviewPostApproveGoesToMerging(t *testing.T) {
 // writeback_review.go:158-196 treats ANY Approve error as firstErr and requeues
 // FOREVER; that is the bug this closes.
 func TestReviewPostRefusedParksAndDoesNotRequeue(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageReviewing)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateAwaitingReview)
 	mr := mdMR(task, "tatara-operator", 7)
 	mr.Status.PendingReview = pendingReviewFixture("request_changes", 1, "sha-a")
 	c := newMirrorClient(t, mdProject(), mdSecret(), mdRepo("tatara-operator"), task, mr)
@@ -263,8 +263,9 @@ func TestReviewPostRefusedParksAndDoesNotRequeue(t *testing.T) {
 		t.Fatalf("a structural 4xx must NOT requeue, got err = %v", err)
 	}
 	got := mdGetTask(t, c, "t1")
-	if got.Status.Stage != tatarav1alpha1.StageParked || got.Status.StageReason != stage.ReasonReviewPostRefused {
-		t.Fatalf("stage = %q/%q, want parked/review-post-refused", got.Status.Stage, got.Status.StageReason)
+	if got.Status.State != tatarav1alpha1.StateAwaitingReview || !tatarav1alpha1.Parked(got) ||
+		got.Status.ParkReason != stage.ReasonReviewPostRefused {
+		t.Fatalf("state/park = %q/%q, want awaiting-review, parked(review-post-refused)", got.Status.State, got.Status.ParkReason)
 	}
 	if gm := mdGetMR(t, c, mr.Name); gm.Status.PendingReview != nil {
 		t.Fatalf("pendingReview must be cleared on a terminal refusal, else the reconciler hot-loops")
@@ -283,7 +284,7 @@ func TestReviewPostRefusedParksAndDoesNotRequeue(t *testing.T) {
 // TataraSCMWriteErrors / TataraSCMWriteFailureRatioHigh alerts select on
 // (#301 - the reap dropped every emitter without dropping the alerts).
 func TestReviewPostFailureIncrementsSCMWritesTotal(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageReviewing)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateAwaitingReview)
 	mr := mdMR(task, "tatara-operator", 7)
 	mr.Status.PendingReview = pendingReviewFixture("request_changes", 1, "sha-a")
 	c := newMirrorClient(t, mdProject(), mdSecret(), mdRepo("tatara-operator"), task, mr)
@@ -307,7 +308,7 @@ func TestReviewPostFailureIncrementsSCMWritesTotal(t *testing.T) {
 // comments array (which is what GitHub actually returns), so a reconciler that
 // expects them back from PostReview mirrors ZERO findings.
 func TestReviewPostCommentIDsComeFromASecondRead(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageReviewing)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateAwaitingReview)
 	mr := mdMR(task, "tatara-operator", 7)
 	mr.Status.PendingReview = pendingReviewFixture("request_changes", 2, "sha-b")
 	mr.Status.ReviewRounds = 2
@@ -345,7 +346,7 @@ func TestReviewPostCommentIDsComeFromASecondRead(t *testing.T) {
 // the review and lands in parked(awaiting-human). It NEVER reaches merging -
 // UNCONDITIONALLY. The fake forge's Merge PANICS.
 func TestReviewPostForkPRNeverMerges(t *testing.T) {
-	task := mdTask("t1", "review", tatarav1alpha1.StageReviewing)
+	task := mdTask("t1", "review", tatarav1alpha1.StateAwaitingReview)
 	mr := mdMR(task, "tatara-operator", 7)
 	pr := pendingReviewFixture("approve", 1, "sha-a")
 	pr.Findings = nil
@@ -366,14 +367,15 @@ func TestReviewPostForkPRNeverMerges(t *testing.T) {
 		t.Fatalf("the review IS posted on a human's PR: PostReview calls = %d", f.postReviewCalls)
 	}
 	got := mdGetTask(t, c, "t1")
-	if got.Status.Stage != tatarav1alpha1.StageParked || got.Status.StageReason != stage.ReasonAwaitingHuman {
-		t.Fatalf("stage = %q/%q, want parked/awaiting-human", got.Status.Stage, got.Status.StageReason)
+	if got.Status.State != tatarav1alpha1.StateAwaitingReview || !tatarav1alpha1.Parked(got) ||
+		got.Status.ParkReason != stage.ReasonAwaitingHuman {
+		t.Fatalf("state/park = %q/%q, want awaiting-review, parked(awaiting-human)", got.Status.State, got.Status.ParkReason)
 	}
 
 	// And even if something drove merging anyway, the merge would panic. Prove
 	// the stage machine refuses it.
 	got.Spec.MergeOrder = []string{"tatara-operator"}
-	got.Status.Stage = tatarav1alpha1.StageMerging
+	got.Status.State = tatarav1alpha1.StateMerged
 	if _, err := d.ReconcileMerging(context.Background(), mdProject(), got); err == nil {
 		t.Fatalf("a kind=review Task must never be merged")
 	}
@@ -384,7 +386,7 @@ func TestReviewPostForkPRNeverMerges(t *testing.T) {
 // re-submits, hits maxReviewRounds, and dies at parked(review-loop-exhausted) -
 // on EVERY changes-requested cycle, for the first hour after every review.
 func TestReviewPostFindingsReachTheNextPod(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageReviewing)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateAwaitingReview)
 	mr := mdMR(task, "tatara-operator", 7)
 	mr.Status.PendingReview = pendingReviewFixture("request_changes", 1, "sha-a")
 	mr.Status.ReviewedSHA = "sha-a"
@@ -470,7 +472,7 @@ func TestReviewBeltNote_RendersLineAndFileLevel(t *testing.T) {
 // mr_write(comment) / issue_write(comment) post ONCE: the requestId marker is
 // the forge-side dedup, and the mirror append is a set-union on externalId.
 func TestDrainPendingCommentsIsIdempotent(t *testing.T) {
-	task := mdTask("t1", "clarify", tatarav1alpha1.StageClarifying)
+	task := mdTask("t1", "clarify", tatarav1alpha1.StateRefined)
 	iss := mdIssue(task, "tatara-operator", 41)
 	iss.Status.PendingComments = []tatarav1alpha1.PendingComment{
 		{RequestID: "req-1", Action: "comment", Body: "what do you mean by fast?"},
@@ -520,7 +522,7 @@ func TestDrainPendingCommentsIsIdempotent(t *testing.T) {
 // intent carrying a marker (Task 12's encoding). The drain must READ THE MARKER
 // BACK and perform the edit/close, not post the marker as a comment body.
 func TestDrainPendingCommentsEditAndClose(t *testing.T) {
-	task := mdTask("t1", "clarify", tatarav1alpha1.StageClarifying)
+	task := mdTask("t1", "clarify", tatarav1alpha1.StateRefined)
 	iss := mdIssue(task, "tatara-operator", 41)
 	iss.Status.PendingComments = []tatarav1alpha1.PendingComment{
 		{RequestID: "req-edit", Action: "comment", Body: "<!-- tatara-edit -->\ntitle: a better title\nthe new body"},
@@ -569,7 +571,7 @@ func TestDrainPendingCommentsEditAndClose(t *testing.T) {
 // a re-drain must find it on the thread and NOT post it again - same shape
 // as postThreadComment, contract C.5.3.
 func TestDrainPendingCommentsCloseIsIdempotent(t *testing.T) {
-	task := mdTask("t1", "clarify", tatarav1alpha1.StageClarifying)
+	task := mdTask("t1", "clarify", tatarav1alpha1.StateRefined)
 	iss := mdIssue(task, "tatara-operator", 41)
 	iss.Status.PendingComments = []tatarav1alpha1.PendingComment{
 		{RequestID: "req-close", Action: "comment", Body: "<!-- tatara-close -->\nsuperseded by #99"},
@@ -615,7 +617,7 @@ func TestDrainPendingCommentsCloseIsIdempotent(t *testing.T) {
 // AUTO-MERGE IS NEVER ARMED. DisableAutoMerge is retained solely to disarm PRs
 // opened BEFORE the cutover; no arm call follows it, anywhere.
 func TestReviewPostAutoMergeNeverArmed(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageMerging)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateMerged)
 	task.Spec.MergeOrder = []string{"tatara-operator"}
 	mr := mdMR(task, "tatara-operator", 7)
 	mr.Status.ReviewedSHA = "sha-a"
@@ -666,7 +668,7 @@ func (s *staleListClient) List(ctx context.Context, list client.ObjectList, opts
 // level-triggered re-drive. The freshly-settled MR must overlay its stale
 // listed copy so the advance lands first try.
 func TestDrainPendingReview_StaleCachedSelfDoesNotBlockAdvance(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageReviewing)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateAwaitingReview)
 	task.Spec.MergeOrder = []string{"tatara-operator"}
 	mr := mdMR(task, "tatara-operator", 389)
 	pr := pendingReviewFixture("approve", 1, "sha-a")
@@ -680,8 +682,8 @@ func TestDrainPendingReview_StaleCachedSelfDoesNotBlockAdvance(t *testing.T) {
 	if err := d.DrainPendingReview(context.Background(), mdGetMR(t, base, mr.Name)); err != nil {
 		t.Fatalf("DrainPendingReview: %v", err)
 	}
-	if got := mdGetTask(t, base, "t1"); got.Status.Stage != tatarav1alpha1.StageMerging {
-		t.Fatalf("stage = %q, want merging: a stale cached copy of the just-settled MR must not veto the advance", got.Status.Stage)
+	if got := mdGetTask(t, base, "t1"); got.Status.State != tatarav1alpha1.StateMerged {
+		t.Fatalf("stage = %q, want merging: a stale cached copy of the just-settled MR must not veto the advance", got.Status.State)
 	}
 }
 
@@ -690,7 +692,7 @@ func TestDrainPendingReview_StaleCachedSelfDoesNotBlockAdvance(t *testing.T) {
 // the uncached APIReader when one is wired, so B's drain is not vetoed by A's
 // ghost pendingReview.
 func TestDrainPendingReview_AdvanceListsOwnedMRsUncached(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageReviewing)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateAwaitingReview)
 	task.Spec.MergeOrder = []string{"tatara-operator", "tatara-cli"}
 	mrA := mdMR(task, "tatara-operator", 7)
 	mrA.Status.Status = "approved"
@@ -715,14 +717,14 @@ func TestDrainPendingReview_AdvanceListsOwnedMRsUncached(t *testing.T) {
 	if err := d.DrainPendingReview(context.Background(), mdGetMR(t, base, mrB.Name)); err != nil {
 		t.Fatalf("DrainPendingReview: %v", err)
 	}
-	if got := mdGetTask(t, base, "t1"); got.Status.Stage != tatarav1alpha1.StageMerging {
-		t.Fatalf("stage = %q, want merging: the uncached read must see A's settled review", got.Status.Stage)
+	if got := mdGetTask(t, base, "t1"); got.Status.State != tatarav1alpha1.StateMerged {
+		t.Fatalf("stage = %q, want merging: the uncached read must see A's settled review", got.Status.State)
 	}
 }
 
 func TestTerminalMREdge(t *testing.T) {
-	review := mdTask("t1", "review", tatarav1alpha1.StageReviewing)
-	impl := mdTask("t2", "implement", tatarav1alpha1.StageReviewing)
+	review := mdTask("t1", "review", tatarav1alpha1.StateAwaitingReview)
+	impl := mdTask("t2", "implement", tatarav1alpha1.StateAwaitingReview)
 	merged := tatarav1alpha1.MergeRequest{Status: tatarav1alpha1.MergeRequestStatus{State: "merged"}}
 	closed := tatarav1alpha1.MergeRequest{Status: tatarav1alpha1.MergeRequestStatus{State: "closed"}}
 	open := tatarav1alpha1.MergeRequest{Status: tatarav1alpha1.MergeRequestStatus{State: "open"}}
@@ -730,13 +732,13 @@ func TestTerminalMREdge(t *testing.T) {
 	// All merged -> delivered(mr-merged-externally).
 	edge, ok := terminalMREdge(review, []tatarav1alpha1.MergeRequest{merged})
 	require.True(t, ok)
-	require.Equal(t, tatarav1alpha1.StageDelivered, edge.To)
+	require.Equal(t, tatarav1alpha1.StateDone, edge.To)
 	require.Equal(t, stage.ReasonMRMergedExternally, edge.Reason)
 
 	// All terminal, one closed-unmerged -> rejected(mr-closed-externally).
 	edge, ok = terminalMREdge(review, []tatarav1alpha1.MergeRequest{merged, closed})
 	require.True(t, ok)
-	require.Equal(t, tatarav1alpha1.StageRejected, edge.To)
+	require.Equal(t, tatarav1alpha1.StateRejected, edge.To)
 	require.Equal(t, stage.ReasonMRClosedExternally, edge.Reason)
 
 	// An open MR -> no finalize.
@@ -755,14 +757,14 @@ func TestTerminalMREdge(t *testing.T) {
 // A merged/closed MR carrying a STALE pendingReview must still finalize:
 // terminalMREdge runs BEFORE the pendingReview-owed gate in reviewAdvanceEdge.
 func TestReviewAdvanceEdge_TerminalMRBeatsStalePendingReview(t *testing.T) {
-	review := mdTask("t1", "review", tatarav1alpha1.StageReviewing)
+	review := mdTask("t1", "review", tatarav1alpha1.StateAwaitingReview)
 	merged := tatarav1alpha1.MergeRequest{Status: tatarav1alpha1.MergeRequestStatus{
 		State:         "merged",
 		PendingReview: &tatarav1alpha1.PendingReview{},
 	}}
 	edge, ok := reviewAdvanceEdge(review, []tatarav1alpha1.MergeRequest{merged}, 3)
 	require.True(t, ok, "a merged MR must finalize even with a stale pendingReview")
-	require.Equal(t, tatarav1alpha1.StageDelivered, edge.To)
+	require.Equal(t, tatarav1alpha1.StateDone, edge.To)
 	require.Equal(t, stage.ReasonMRMergedExternally, edge.Reason)
 }
 

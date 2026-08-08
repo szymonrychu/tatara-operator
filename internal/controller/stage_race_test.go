@@ -39,14 +39,24 @@ import (
 // only input the advance decision ever had.
 
 // TestEnterStage_LostRaceIsDroppedNotCountedAsIllegal is the choke-point half.
-// The caller pre-checked a stage the Task no longer has, so its edge is legal
+// The caller pre-checked a state the Task no longer has, so its edge is legal
 // from where it looked and illegal from where the Task actually is. That is a
 // lost race, not a table bug: no error, no illegal-transition count, and the
-// winner's stage stands untouched.
+// winner's state stands untouched.
+//
+// #521 retired the stage machine's `delivered`/`parked` targets the original
+// incident used, but the discrimination this pins - EnterStage's `ill.From !=
+// from` branch - is general over ANY live/stale divergence, not special-cased
+// to park. rejected is a real, legal edge FROM awaiting-review (the loser's
+// stale view) and illegal FROM done (the winner's live state, which only ever
+// exits via reap), so it exercises the exact same mechanism the
+// park-flavoured original did. under-implementation cannot be used here: a
+// kind=review Task is FOREVER barred from it (stage.LegalFor), which would
+// make the loser's own pre-check illegal too and prove nothing.
 func TestEnterStage_LostRaceIsDroppedNotCountedAsIllegal(t *testing.T) {
 	const (
-		liveFrom = tatarav1alpha1.StageDelivered
-		to       = tatarav1alpha1.StageParked
+		liveFrom = tatarav1alpha1.StateDone
+		to       = tatarav1alpha1.StateRejected
 	)
 	beforeIllegal := illegalCount(t, obs.IllegalStageTransitionCounter(liveFrom, to))
 	beforeRace := illegalCount(t, obs.StageRaceLostCounter(liveFrom, to))
@@ -55,32 +65,32 @@ func TestEnterStage_LostRaceIsDroppedNotCountedAsIllegal(t *testing.T) {
 	now := time.Unix(30000, 0)
 	entered := metav1.NewTime(now.Add(-10 * time.Minute))
 
-	// The mergerequest controller's IN-MEMORY copy: still reviewing. The edge it
-	// computes off this, reviewing -> parked(awaiting-human), IS in the F.3
+	// The mergerequest controller's IN-MEMORY copy: still awaiting-review. The
+	// edge it computes off this, awaiting-review -> rejected, IS in the F.3
 	// table - the pre-check inside EnterStage passes.
 	staleCopy := &tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{Name: "t-race", Namespace: mdNS, UID: types.UID("uid-t-race")},
 		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "proj", Kind: "review"},
 		Status: tatarav1alpha1.TaskStatus{
-			Stage:          tatarav1alpha1.StageReviewing,
+			State:          tatarav1alpha1.StateAwaitingReview,
 			AgentKind:      stage.AgentReview,
-			StageEnteredAt: &entered,
+			StateEnteredAt: &entered,
 		},
 	}
-	require.True(t, stage.Legal(tatarav1alpha1.StageReviewing, to),
-		"precondition: the loser's edge must be LEGAL from the stage it pre-checked, or this proves nothing")
+	require.True(t, stage.LegalFor(staleCopy, nil, tatarav1alpha1.StateAwaitingReview, to),
+		"precondition: the loser's edge must be LEGAL from the state it pre-checked, or this proves nothing")
 	require.False(t, stage.Legal(liveFrom, to),
-		"precondition: delivered -> parked must stay absent from F.3; the table is the detector, not the defect")
+		"precondition: done -> rejected must stay absent from F.3; the table is the detector, not the defect")
 
-	// THE API SERVER: the task controller already finalized it.
+	// THE API SERVER: the task controller already finalized it (every owned MR
+	// reached a terminal forge state, so the review Task is done, not parked).
 	live := staleCopy.DeepCopy()
-	live.Status.Stage = liveFrom
-	live.Status.StageReason = stage.ReasonMRMergedExternally
+	live.Status.State = liveFrom
 
 	c := newMirrorClient(t, proj, mdSecret(), live)
 
 	err := EnterStage(context.Background(), c, nil, obs.NewOperatorMetrics(prometheus.NewRegistry()),
-		staleCopy, nil, to, stage.ReasonAwaitingHuman, now, nil)
+		staleCopy, nil, to, stage.ReasonDeclined, now, nil)
 	require.NoError(t, err,
 		"losing a benign race to another controller must not fail the reconcile")
 
@@ -90,8 +100,7 @@ func TestEnterStage_LostRaceIsDroppedNotCountedAsIllegal(t *testing.T) {
 		"the lost race must still be VISIBLE, on its own counter - dropping it silently trades one blind spot for another")
 
 	got := mdGetTask(t, c, "t-race")
-	require.Equal(t, liveFrom, got.Status.Stage, "the winner's terminal stage was overwritten by the loser")
-	require.Equal(t, stage.ReasonMRMergedExternally, got.Status.StageReason)
+	require.Equal(t, liveFrom, got.Status.State, "the winner's terminal state was overwritten by the loser")
 }
 
 // The discrimination must not swallow the bug the counter exists for. When the
@@ -100,8 +109,8 @@ func TestEnterStage_LostRaceIsDroppedNotCountedAsIllegal(t *testing.T) {
 // counter, not the race one.
 func TestEnterStage_GenuineIllegalEdgeStillErrorsAndCounts(t *testing.T) {
 	const (
-		from = tatarav1alpha1.StageDelivered
-		to   = tatarav1alpha1.StageParked
+		from = tatarav1alpha1.StateDone
+		to   = tatarav1alpha1.StateUnderImplementation
 	)
 	beforeIllegal := illegalCount(t, obs.IllegalStageTransitionCounter(from, to))
 	beforeRace := illegalCount(t, obs.StageRaceLostCounter(from, to))
@@ -112,7 +121,7 @@ func TestEnterStage_GenuineIllegalEdgeStillErrorsAndCounts(t *testing.T) {
 	c := newMirrorClient(t, proj, mdSecret(), task)
 	r := tsReconciler(c)
 
-	err := r.enter(context.Background(), proj, task, nil, to, stage.ReasonAwaitingHuman, now)
+	err := r.enter(context.Background(), proj, task, nil, to, "", now)
 	require.Error(t, err, "an edge absent from F.3, computed off the LIVE stage, is a code bug and must fail loudly")
 	require.Equal(t, beforeIllegal+1, illegalCount(t, obs.IllegalStageTransitionCounter(from, to)))
 	require.Equal(t, beforeRace, illegalCount(t, obs.StageRaceLostCounter(from, to)),
@@ -125,20 +134,28 @@ func TestEnterStage_GenuineIllegalEdgeStillErrorsAndCounts(t *testing.T) {
 // reviewing two seconds earlier, then attempts a write the choke point has to
 // clean up after. The guard must test the same snapshot the write uses, so the
 // advance is never computed at all.
+//
+// advanceAfterReview's own guard (reviewpost.go) refreshes the Task live and
+// bails the instant State != awaiting-review, BEFORE it ever computes an edge
+// or reaches EnterStage/ParkTask - so no counter of any shape fires. That
+// guard does not care whether the live state is rejected, done, or (#521)
+// parked; rejected(mr-merged-externally) exercises it exactly like the
+// original delivered incident did.
 func TestAdvanceAfterReview_AdoptsTheLiveTaskBeforeGuarding(t *testing.T) {
 	const (
-		liveFrom = tatarav1alpha1.StageDelivered
-		to       = tatarav1alpha1.StageParked
+		liveFrom = tatarav1alpha1.StateRejected
+		to       = tatarav1alpha1.StateUnderImplementation
 	)
 	beforeIllegal := illegalCount(t, obs.IllegalStageTransitionCounter(liveFrom, to))
 	beforeRace := illegalCount(t, obs.StageRaceLostCounter(liveFrom, to))
 
-	// THE API SERVER: the task controller finalized this review Task already.
+	// THE API SERVER: the task controller finalized this review Task already
+	// (the MR was merged externally).
 	live := mdTask("t1", "review", liveFrom)
-	live.Status.StageReason = stage.ReasonMRMergedExternally
+	live.Status.StateReason = stage.ReasonMRMergedExternally
 	// An owned MR that is still open in the mirror, so reviewAdvanceEdge on a
-	// kind=review Task yields parked(awaiting-human) - the exact edge the
-	// incident tried to apply.
+	// kind=review Task would otherwise yield an edge - the exact shape the
+	// incident's stale-cache advance tried to apply.
 	mr := mdMR(live, "tatara-operator", 972)
 	base := newMirrorClient(t, mdProject(), mdSecret(), mdRepo("tatara-operator"), live, mr)
 
@@ -148,14 +165,14 @@ func TestAdvanceAfterReview_AdoptsTheLiveTaskBeforeGuarding(t *testing.T) {
 
 	// The mergerequest controller's own copy, off the informer cache.
 	stale := live.DeepCopy()
-	stale.Status.Stage = tatarav1alpha1.StageReviewing
-	stale.Status.StageReason = ""
+	stale.Status.State = tatarav1alpha1.StateAwaitingReview
+	stale.Status.StateReason = ""
 
 	err := d.advanceAfterReview(context.Background(), mdProject(), stale, mdGetMR(t, base, mr.Name))
 	require.NoError(t, err, "the advance must be skipped, not attempted and refused")
 
 	got := mdGetTask(t, base, "t1")
-	require.Equal(t, liveFrom, got.Status.Stage, "a terminal Task was dragged back to parked off a stale cached stage")
+	require.Equal(t, liveFrom, got.Status.State, "a terminal Task was dragged back off a stale cached state")
 	require.Equal(t, beforeIllegal, illegalCount(t, obs.IllegalStageTransitionCounter(liveFrom, to)))
 	require.Equal(t, beforeRace, illegalCount(t, obs.StageRaceLostCounter(liveFrom, to)),
 		"the guard must adopt the live stage and never reach the write, so not even the race counter fires")

@@ -30,14 +30,22 @@ func seedStagedTask(t *testing.T, name, stg, agentKind string, sess *fakeSession
 	task.Namespace = testNS
 	task.Spec.ProjectRef = name + "-proj"
 	task.Spec.Goal = "g"
-	task.Spec.Kind = "clarify"
+	task.Spec.Kind = "implement"
 	require.NoError(t, k8sClient.Create(ctx, task))
 
 	if stg != "" {
-		task.Status.Stage = stg
+		task.Status.State = stg
 		task.Status.AgentKind = agentKind
 		entered := metav1.NewTime(time.Now().Add(-30 * time.Minute))
-		task.Status.StageEnteredAt = &entered
+		task.Status.StateEnteredAt = &entered
+		if stage.Live(stg) {
+			// stampEnter stamps ConversationLastEventAt on every entry into a
+			// LIVE state (#521 folded `conversing`'s idle clock into every live
+			// state); a fixture built by direct struct assignment must carry
+			// the same shape or stage.ArmedClock sees no conversation event at
+			// all and arms nothing (ClockNone).
+			task.Status.ConversationLastEventAt = &entered
+		}
 		require.NoError(t, k8sClient.Status().Update(ctx, task))
 	}
 
@@ -91,7 +99,7 @@ func reconcilePod(t *testing.T, r *PodWatchReconciler, pod *corev1.Pod) ctrl.Res
 // is stamped - that is what arms CLOCK 2. Nothing else in the operator sets it,
 // and the entire three-clock model is load-bearing on it.
 func TestPodWatchStampsPodStartedAt(t *testing.T) {
-	r, task, pod := seedStagedTask(t, "podclock-create", tatarav1alpha1.StageImplementing, "implement", newFakeSession())
+	r, task, pod := seedStagedTask(t, "podclock-create", tatarav1alpha1.StateUnderImplementation, "implement", newFakeSession())
 	require.Nil(t, task.Status.PodStartedAt, "no pod-create stamp yet")
 
 	// Before the stamp the Task is on CLOCK 1: it is queued, not running.
@@ -103,7 +111,7 @@ func TestPodWatchStampsPodStartedAt(t *testing.T) {
 
 	got := getTask(t, "podclock-create")
 	require.NotNil(t, got.Status.PodStartedAt, "pod CREATE must stamp podStartedAt")
-	require.Nil(t, got.Status.StageWorkStartedAt, "the pod is not Ready: CLOCK 3 stays disarmed")
+	require.Nil(t, got.Status.StateWorkStartedAt, "the pod is not Ready: CLOCK 3 stays disarmed")
 	require.Equal(t, 1, got.Status.Stats.PodRuns)
 
 	clock, since, budget, _ := stage.ArmedClock(got, false)
@@ -117,19 +125,34 @@ func TestPodWatchStampsPodStartedAt(t *testing.T) {
 }
 
 // TestPodWatchStampsStageWorkStartedAtOnReady: on pod READY, status
-// .stageWorkStartedAt is stamped and CLOCK 3 (the stage work budget) takes over.
+// .stateWorkStartedAt is stamped and CLOCK 3 takes over from stateEnteredAt/
+// podStartedAt. #521 folded the old `conversing` stage's idle timer into every
+// LIVE state (stage.Live), so CLOCK 3 here is the IDLE clock, whose base is the
+// LATEST of the human's last word, this pod's readiness and the agent's last
+// turn end. At the instant the pod goes Ready that is the readiness stamp: the
+// Task may have queued for hours, and charging that queue to the idle budget
+// parks it before turn 0 is ever submitted.
 func TestPodWatchStampsStageWorkStartedAtOnReady(t *testing.T) {
-	r, _, pod := seedStagedTask(t, "podclock-ready", tatarav1alpha1.StageImplementing, "implement", newFakeSession())
+	r, _, pod := seedStagedTask(t, "podclock-ready", tatarav1alpha1.StateUnderImplementation, "implement", newFakeSession())
 	setPodStatus(t, pod, 20*time.Second, true)
 	reconcilePod(t, r, pod)
 
 	got := getTask(t, "podclock-ready")
 	require.NotNil(t, got.Status.PodStartedAt)
-	require.NotNil(t, got.Status.StageWorkStartedAt, "pod READY must stamp stageWorkStartedAt")
+	require.NotNil(t, got.Status.StateWorkStartedAt, "pod READY must stamp stateWorkStartedAt")
+	require.NotNil(t, got.Status.ConversationLastEventAt)
 
 	clock, since, _, _ := stage.ArmedClock(got, false)
-	require.Equal(t, stage.ClockWork, clock, "stageWorkStartedAt arms CLOCK 3")
-	require.Equal(t, got.Status.StageWorkStartedAt.Time, since)
+	require.Equal(t, stage.ClockWork, clock, "stateWorkStartedAt arms CLOCK 3")
+	require.Equal(t, got.Status.StateWorkStartedAt.Time, since,
+		"a freshly Ready pod starts its idle window now, not at whenever the Task entered the state")
+
+	// And a human comment landing later still owns the base: the idle clock is a
+	// SILENCE timer, so the newest thing that happened always wins.
+	spoke := metav1.NewTime(got.Status.StateWorkStartedAt.Add(10 * time.Minute))
+	got.Status.ConversationLastEventAt = &spoke
+	_, since, _, _ = stage.ArmedClock(got, false)
+	require.Equal(t, spoke.Time, since)
 }
 
 // TestPodWatchIgnoresLegacyTasks: the greenness rule. A phase-driven Task carries
@@ -141,7 +164,7 @@ func TestPodWatchIgnoresLegacyTasks(t *testing.T) {
 
 	got := getTask(t, "podclock-legacy")
 	require.Nil(t, got.Status.PodStartedAt)
-	require.Nil(t, got.Status.StageWorkStartedAt)
+	require.Nil(t, got.Status.StateWorkStartedAt)
 	require.Zero(t, got.Status.Stats.PodRuns)
 }
 
@@ -150,14 +173,14 @@ func TestPodWatchIgnoresLegacyTasks(t *testing.T) {
 // At PodReadyTimeout the pod RESPAWNS (+1 podRecreations). It does NOT fail the
 // Task, and there is no such reason as pod-not-ready.
 func TestPodWatchImagePullBackOffRespawns(t *testing.T) {
-	r, _, pod := seedStagedTask(t, "podclock-imagepull", tatarav1alpha1.StageImplementing, "implement", newFakeSession())
+	r, _, pod := seedStagedTask(t, "podclock-imagepull", tatarav1alpha1.StateUnderImplementation, "implement", newFakeSession())
 
 	// Under the deadline: still booting. No respawn.
 	setPodStatus(t, pod, 1*time.Minute, false)
 	res := reconcilePod(t, r, pod)
 	require.Equal(t, agentBootRequeue, res.RequeueAfter)
 	require.Zero(t, getTask(t, "podclock-imagepull").Status.Stats.PodRecreations)
-	require.Nil(t, getTask(t, "podclock-imagepull").Status.StageWorkStartedAt)
+	require.Nil(t, getTask(t, "podclock-imagepull").Status.StateWorkStartedAt)
 
 	// Past PodReadyTimeout (5m): CLOCK 2 breaches -> RESPAWN.
 	setPodStatus(t, pod, 6*time.Minute, false)
@@ -165,7 +188,7 @@ func TestPodWatchImagePullBackOffRespawns(t *testing.T) {
 
 	got := getTask(t, "podclock-imagepull")
 	require.Equal(t, 1, got.Status.Stats.PodRecreations, "a never-Ready pod RESPAWNS")
-	require.Equal(t, tatarav1alpha1.StageImplementing, got.Status.Stage, "a never-Ready pod does NOT fail the Task")
+	require.Equal(t, tatarav1alpha1.StateUnderImplementation, got.Status.State, "a never-Ready pod does NOT fail the Task")
 	require.Nil(t, got.Status.PodStartedAt, "the replaced pod's clock is cleared so the replacement re-stamps a FRESH one")
 
 	fresh := &corev1.Pod{}
@@ -174,10 +197,10 @@ func TestPodWatchImagePullBackOffRespawns(t *testing.T) {
 }
 
 // TestPodWatchRecreationBudgetExhaustedFailsTask: once maxPodRecreations is spent
-// the terminal is failed(pod-recreation-exhausted) - NEVER pod-not-ready, which
-// is not a member of the F.5 closed reason set.
+// the Task parks(pod-recreation-exhausted), state unchanged - NEVER
+// pod-not-ready, which is not a member of the F.5 closed reason set.
 func TestPodWatchRecreationBudgetExhaustedFailsTask(t *testing.T) {
-	r, task, pod := seedStagedTask(t, "podclock-exhausted", tatarav1alpha1.StageImplementing, "implement", newFakeSession())
+	r, task, pod := seedStagedTask(t, "podclock-exhausted", tatarav1alpha1.StateUnderImplementation, "implement", newFakeSession())
 	task.Status.Stats.PodRecreations = maxPodRecreations
 	require.NoError(t, k8sClient.Status().Update(context.Background(), task))
 
@@ -185,10 +208,11 @@ func TestPodWatchRecreationBudgetExhaustedFailsTask(t *testing.T) {
 	reconcilePod(t, r, pod)
 
 	got := getTask(t, "podclock-exhausted")
-	require.Equal(t, tatarav1alpha1.StageFailed, got.Status.Stage)
-	require.Equal(t, stage.ReasonPodRecreationExhausted, got.Status.StageReason)
-	require.True(t, stage.ValidReason(got.Status.StageReason))
-	require.NotEqual(t, "pod-not-ready", got.Status.StageReason)
+	require.Equal(t, tatarav1alpha1.StateUnderImplementation, got.Status.State, "a park never moves state")
+	require.True(t, tatarav1alpha1.Parked(got))
+	require.Equal(t, stage.ReasonPodRecreationExhausted, got.Status.ParkReason)
+	require.True(t, stage.ValidReason(got.Status.ParkReason))
+	require.NotEqual(t, "pod-not-ready", got.Status.ParkReason)
 }
 
 // TestPodWatchUnadmittedTaskSitsOnClock1: a Task that has not been admitted has
@@ -198,8 +222,8 @@ func TestPodWatchUnadmittedTaskSitsOnClock1(t *testing.T) {
 	entered := metav1.NewTime(time.Now().Add(-6 * time.Minute))
 	task := &tatarav1alpha1.Task{
 		Status: tatarav1alpha1.TaskStatus{
-			Stage:          tatarav1alpha1.StageImplementing,
-			StageEnteredAt: &entered,
+			State:          tatarav1alpha1.StateUnderImplementation,
+			StateEnteredAt: &entered,
 		},
 	}
 	clock, _, budget, edge := stage.ArmedClock(task, false)
@@ -215,13 +239,18 @@ func TestPodWatchUnadmittedTaskSitsOnClock1(t *testing.T) {
 // G.7's t0 = podStartedAt + agentPodTTLSeconds ALREADY PAST, so the operator
 // TTL-stops the next pod before its first turn.
 func TestPodWatchRestampsPodStartedAtOnRespawn(t *testing.T) {
-	r, task, pod := seedStagedTask(t, "podclock-restamp", tatarav1alpha1.StageImplementing, "implement", newFakeSession())
+	r, task, pod := seedStagedTask(t, "podclock-restamp", tatarav1alpha1.StateUnderImplementation, "implement", newFakeSession())
 
-	// A stale stamp from the pod this one replaced, an hour ago.
+	// A stale stamp from the pod this one replaced, an hour ago. TTLDeadline
+	// (agent/ttlstop.go) anchors on ConversationLastEventAt over PodStartedAt
+	// for a LIVE state when the former is later, so it must be backdated here
+	// too or the fixture's task-creation-time stamp (30m ago) wins and the
+	// precondition below no longer holds.
 	stale := metav1.NewTime(time.Now().Add(-1 * time.Hour))
 	staleWork := metav1.NewTime(time.Now().Add(-55 * time.Minute))
 	task.Status.PodStartedAt = &stale
-	task.Status.StageWorkStartedAt = &staleWork
+	task.Status.StateWorkStartedAt = &staleWork
+	task.Status.ConversationLastEventAt = &stale
 	require.NoError(t, k8sClient.Status().Update(context.Background(), task))
 
 	proj := &tatarav1alpha1.Project{Spec: tatarav1alpha1.ProjectSpec{AgentPodTTLSeconds: 1800}}
@@ -234,7 +263,7 @@ func TestPodWatchRestampsPodStartedAtOnRespawn(t *testing.T) {
 	got := getTask(t, "podclock-restamp")
 	require.NotNil(t, got.Status.PodStartedAt)
 	require.True(t, got.Status.PodStartedAt.After(stale.Time), "the fresh pod must RE-stamp podStartedAt")
-	require.Nil(t, got.Status.StageWorkStartedAt, "the replaced pod's work clock must not survive into the new pod")
+	require.Nil(t, got.Status.StateWorkStartedAt, "the replaced pod's work clock must not survive into the new pod")
 
 	t0, ok := agent.TTLDeadline(proj, got)
 	require.True(t, ok)
@@ -243,11 +272,12 @@ func TestPodWatchRestampsPodStartedAtOnRespawn(t *testing.T) {
 }
 
 // TestPodWatchContractMismatchFailsBeforeTurnZero is the G.10 handshake. A
-// wrapper reporting contractVersion 1 (or none at all) fails the Task INSTANTLY,
-// with ZERO turns submitted. The wrapper image is pinned in a DIFFERENT helm
-// release than the operator and helmfile applies releases concurrently, so this
-// state is reachable and WILL happen; without the instant fail every such pod
-// burns 40 Opus turns producing nothing, silently.
+// wrapper reporting contractVersion 1 (or none at all) parks the Task
+// (agent-contract-mismatch) INSTANTLY, state unchanged, with ZERO turns
+// submitted. The wrapper image is pinned in a DIFFERENT helm release than the
+// operator and helmfile applies releases concurrently, so this state is
+// reachable and WILL happen; without the instant park every such pod burns 40
+// Opus turns producing nothing, silently.
 func TestPodWatchContractMismatchFailsBeforeTurnZero(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -260,14 +290,15 @@ func TestPodWatchContractMismatchFailsBeforeTurnZero(t *testing.T) {
 			sess := newFakeSession()
 			sess.sessionInfo = tc.info
 			name := "podclock-mismatch-" + sanitizeName(tc.name)
-			r, _, pod := seedStagedTask(t, name, tatarav1alpha1.StageImplementing, "implement", sess)
+			r, _, pod := seedStagedTask(t, name, tatarav1alpha1.StateUnderImplementation, "implement", sess)
 			setPodStatus(t, pod, 20*time.Second, true)
 			reconcilePod(t, r, pod)
 
 			got := getTask(t, name)
-			require.Equal(t, tatarav1alpha1.StageFailed, got.Status.Stage)
-			require.Equal(t, stage.ReasonAgentContractMismatch, got.Status.StageReason)
-			require.Nil(t, got.Status.StageWorkStartedAt, "a mismatched pod never starts the work clock")
+			require.Equal(t, tatarav1alpha1.StateUnderImplementation, got.Status.State, "a park never moves state")
+			require.True(t, tatarav1alpha1.Parked(got))
+			require.Equal(t, stage.ReasonAgentContractMismatch, got.Status.ParkReason)
+			require.Nil(t, got.Status.StateWorkStartedAt, "a mismatched pod never starts the work clock")
 
 			// The property that makes this defence worth having: ZERO tokens burned.
 			require.Empty(t, sess.submits, "a contract-mismatched pod must submit ZERO turns")
@@ -281,14 +312,14 @@ func TestPodWatchContractMismatchFailsBeforeTurnZero(t *testing.T) {
 // is failed.
 func TestPodWatchContractMatchProceeds(t *testing.T) {
 	sess := newFakeSession()
-	r, _, pod := seedStagedTask(t, "podclock-contract-ok", tatarav1alpha1.StageReviewing, "review", sess)
+	r, _, pod := seedStagedTask(t, "podclock-contract-ok", tatarav1alpha1.StateAwaitingReview, "review", sess)
 	setPodStatus(t, pod, 20*time.Second, true)
 	reconcilePod(t, r, pod)
 
 	got := getTask(t, "podclock-contract-ok")
-	require.Equal(t, tatarav1alpha1.StageReviewing, got.Status.Stage)
-	require.Empty(t, got.Status.StageReason)
-	require.NotNil(t, got.Status.StageWorkStartedAt)
+	require.Equal(t, tatarav1alpha1.StateAwaitingReview, got.Status.State)
+	require.Empty(t, got.Status.ParkReason)
+	require.NotNil(t, got.Status.StateWorkStartedAt)
 }
 
 func ptrInt(v int) *int { return &v }

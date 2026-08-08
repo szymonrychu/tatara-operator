@@ -277,32 +277,32 @@ func TestMintStage(t *testing.T) {
 		"webhook-originated mints ACTIVE": {
 			iss:       scm.Issue{Number: 1, State: "open", Author: "alice"},
 			webhook:   true,
-			wantStage: tatarav1alpha1.StageTriaging,
+			wantStage: tatarav1alpha1.StateNew,
 		},
 		"a human has the last word: ACTIVE": {
 			iss: scm.Issue{Number: 1, State: "open", Author: "alice", Comments: []scm.IssueComment{
 				humanComment("1", "tatara-bot", "on it", t0),
 				humanComment("2", "alice", "any update?", t0.Add(time.Minute)),
 			}},
-			wantStage: tatarav1alpha1.StageTriaging,
+			wantStage: tatarav1alpha1.StateNew,
 		},
 		"the bot has the last word: PARKED": {
 			iss: scm.Issue{Number: 1, State: "open", Author: "alice", Comments: []scm.IssueComment{
 				humanComment("1", "alice", "please fix", t0),
 				humanComment("2", "tatara-bot", "parked", t0.Add(time.Minute)),
 			}},
-			wantStage:  tatarav1alpha1.StageParked,
+			wantStage:  tatarav1alpha1.StateNew,
 			wantReason: stage.ReasonBacklogSweep,
 		},
 		"an untouched backlog issue from an UNLISTED author: PARKED": {
 			iss:        scm.Issue{Number: 1, State: "open", Author: "alice"},
-			wantStage:  tatarav1alpha1.StageParked,
+			wantStage:  tatarav1alpha1.StateNew,
 			wantReason: stage.ReasonBacklogSweep,
 		},
 		"tatara-parked beats a human last word: PARKED": {
 			iss: scm.Issue{Number: 1, State: "open", Author: "alice", Labels: []string{TataraParkedLabel},
 				Comments: []scm.IssueComment{humanComment("1", "alice", "ping", t0)}},
-			wantStage:  tatarav1alpha1.StageParked,
+			wantStage:  tatarav1alpha1.StateNew,
 			wantReason: stage.ReasonBacklogSweep,
 		},
 		// THE ORDERING. The label is checked BEFORE the marker, and that ordering IS
@@ -316,56 +316,56 @@ func TestMintStage(t *testing.T) {
 		"tatara-parked beats a WEBHOOK MARKER: PARKED": {
 			iss:        scm.Issue{Number: 1, State: "open", Author: "alice", Labels: []string{TataraParkedLabel}},
 			webhook:    true,
-			wantStage:  tatarav1alpha1.StageParked,
+			wantStage:  tatarav1alpha1.StateNew,
 			wantReason: stage.ReasonBacklogSweep,
 		},
 		"an empty comment author is never the bot": {
 			iss: scm.Issue{Number: 1, State: "open", Author: "alice", Comments: []scm.IssueComment{
 				humanComment("1", "", "deleted account", t0),
 			}},
-			wantStage: tatarav1alpha1.StageParked, wantReason: stage.ReasonBacklogSweep,
+			wantStage: tatarav1alpha1.StateNew, wantReason: stage.ReasonBacklogSweep,
 		},
 
 		// --- the trusted-author clause ---
 		"a MAINTAINER's brand-new issue mints ACTIVE with no marker and no comments": {
 			proj:      trusted,
 			iss:       scm.Issue{Number: 1, State: "open", Author: "alice"},
-			wantStage: tatarav1alpha1.StageTriaging,
+			wantStage: tatarav1alpha1.StateNew,
 		},
 		"a listed REPORTER's brand-new issue mints ACTIVE": {
 			proj:      reporterOnly,
 			iss:       scm.Issue{Number: 1, State: "open", Author: "carol"},
-			wantStage: tatarav1alpha1.StageTriaging,
+			wantStage: tatarav1alpha1.StateNew,
 		},
 		"PRECEDENCE: tatara-parked BEATS a trusted author": {
 			proj:       trusted,
 			iss:        scm.Issue{Number: 1, State: "open", Author: "alice", Labels: []string{TataraParkedLabel}},
-			wantStage:  tatarav1alpha1.StageParked,
+			wantStage:  tatarav1alpha1.StateNew,
 			wantReason: stage.ReasonBacklogSweep,
 		},
 		"PRECEDENCE: a trusted author needs NO webhook marker": {
 			proj:      trusted,
 			iss:       scm.Issue{Number: 1, State: "open", Author: "alice"},
 			webhook:   false,
-			wantStage: tatarav1alpha1.StageTriaging,
+			wantStage: tatarav1alpha1.StateNew,
 		},
 		"an author outside the lists is NOT trusted: PARKED": {
 			proj:       trusted,
 			iss:        scm.Issue{Number: 1, State: "open", Author: "mallory"},
-			wantStage:  tatarav1alpha1.StageParked,
+			wantStage:  tatarav1alpha1.StateNew,
 			wantReason: stage.ReasonBacklogSweep,
 		},
 		"an empty author is never trusted: PARKED": {
 			proj:       trusted,
 			iss:        scm.Issue{Number: 1, State: "open", Author: ""},
-			wantStage:  tatarav1alpha1.StageParked,
+			wantStage:  tatarav1alpha1.StateNew,
 			wantReason: stage.ReasonBacklogSweep,
 		},
 		"a per-repo override that clears the maintainer list un-trusts the author": {
 			proj:       trusted,
 			repo:       noneHere,
 			iss:        scm.Issue{Number: 1, State: "open", Author: "alice"},
-			wantStage:  tatarav1alpha1.StageParked,
+			wantStage:  tatarav1alpha1.StateNew,
 			wantReason: stage.ReasonBacklogSweep,
 		},
 		// COORDINATOR-NARROWED, DELIBERATELY PINNED (see the doc comment above). The
@@ -377,7 +377,7 @@ func TestMintStage(t *testing.T) {
 		// before this change: no webhook, no comments -> PARKED.
 		"a BOT-authored orphan issue is NOT a trusted human and does not mint ACTIVE": {
 			iss:        scm.Issue{Number: 1, State: "open", Author: "tatara-bot"},
-			wantStage:  tatarav1alpha1.StageParked,
+			wantStage:  tatarav1alpha1.StateNew,
 			wantReason: stage.ReasonBacklogSweep,
 		},
 	}
@@ -417,11 +417,11 @@ func TestSweepBacklogIssueMintsParkedTaskWithNoPod(t *testing.T) {
 		t.Fatalf("tasks = %d, want 1", len(tasks))
 	}
 	tk := tasks[0]
-	// The mint sets the IMMUTABLE Spec.InitialStage (fix C5); Status.Stage is
+	// The mint sets the IMMUTABLE Spec.InitialState (fix C5); Status.Stage is
 	// applied later by the TaskReconciler create-edge, which this test does not
 	// run.
-	if tk.Spec.InitialStage != tatarav1alpha1.StageParked || tk.Spec.InitialStageReason != stage.ReasonBacklogSweep {
-		t.Fatalf("initialStage = %q/%q, want parked/backlog-sweep", tk.Spec.InitialStage, tk.Spec.InitialStageReason)
+	if tk.Spec.InitialState != tatarav1alpha1.StateNew || tk.Spec.InitialParkReason != stage.ReasonBacklogSweep {
+		t.Fatalf("initialStage = %q/%q, want parked/backlog-sweep", tk.Spec.InitialState, tk.Spec.InitialParkReason)
 	}
 	if tk.Status.PodName != "" {
 		t.Fatalf("parked(backlog-sweep) spawned a pod: %q", tk.Status.PodName)
@@ -516,11 +516,11 @@ func TestSweepHumanCommentMintsTriaging(t *testing.T) {
 	if len(tasks) != 1 {
 		t.Fatalf("tasks = %d, want 1", len(tasks))
 	}
-	if tasks[0].Spec.InitialStage != tatarav1alpha1.StageTriaging {
-		t.Fatalf("initialStage = %q, want triaging", tasks[0].Spec.InitialStage)
+	if tasks[0].Spec.InitialState != tatarav1alpha1.StateNew {
+		t.Fatalf("initialStage = %q, want triaging", tasks[0].Spec.InitialState)
 	}
-	if tasks[0].Spec.InitialStageReason != "" {
-		t.Fatalf("initialStageReason = %q, want empty on an ACTIVE mint", tasks[0].Spec.InitialStageReason)
+	if tasks[0].Spec.InitialParkReason != "" {
+		t.Fatalf("initialStageReason = %q, want empty on an ACTIVE mint", tasks[0].Spec.InitialParkReason)
 	}
 }
 
@@ -591,9 +591,9 @@ func TestSweepReapLoopNeverGoesActive(t *testing.T) {
 			t.Fatalf("pass %d: tasks = %d, want 1 (the sweep must not re-mint an owned issue)", pass, len(tasks))
 		}
 		tk := tasks[0]
-		if tk.Spec.InitialStage != tatarav1alpha1.StageParked || tk.Spec.InitialStageReason != stage.ReasonBacklogSweep {
+		if tk.Spec.InitialState != tatarav1alpha1.StateNew || tk.Spec.InitialParkReason != stage.ReasonBacklogSweep {
 			t.Fatalf("pass %d: initialStage = %q/%q, want parked/backlog-sweep (NEVER active)",
-				pass, tk.Spec.InitialStage, tk.Spec.InitialStageReason)
+				pass, tk.Spec.InitialState, tk.Spec.InitialParkReason)
 		}
 	}
 
@@ -764,7 +764,7 @@ func TestSweepAdoptsBotPRIntoOwningTask(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "pradopt-proj-clarify-x", Namespace: testNS},
 		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: proj.Name, Kind: "clarify", Goal: "g"},
 	}
-	owner.Status.Stage = tatarav1alpha1.StageImplementing
+	owner.Status.State = tatarav1alpha1.StateUnderImplementation
 	c := newMirrorClient(t, proj, repo, owner)
 	rd := &sweepReader{prs: []scm.PRRef{{
 		Repo: "szymonrychu/tatara-operator", HeadRepo: "szymonrychu/tatara-operator",
@@ -802,7 +802,7 @@ func TestSweepForkPROnTaskBranchIsNotAdopted(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "fork-proj-clarify-y", Namespace: testNS},
 		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: proj.Name, Kind: "clarify", Goal: "g"},
 	}
-	owner.Status.Stage = tatarav1alpha1.StageImplementing
+	owner.Status.State = tatarav1alpha1.StateUnderImplementation
 	c := newMirrorClient(t, proj, repo, owner)
 	rd := &sweepReader{prs: []scm.PRRef{{
 		Repo: "szymonrychu/tatara-operator", HeadRepo: "mallory/tatara-operator",
@@ -908,8 +908,8 @@ func TestSweepHumanPRReactionScope(t *testing.T) {
 				if tasks[0].Spec.Kind != SweepReviewKind {
 					t.Fatalf("kind = %q, want review", tasks[0].Spec.Kind)
 				}
-				if tasks[0].Spec.InitialStage != tatarav1alpha1.StageTriaging {
-					t.Fatalf("initialStage = %q, want triaging", tasks[0].Spec.InitialStage)
+				if tasks[0].Spec.InitialState != tatarav1alpha1.StateNew {
+					t.Fatalf("initialStage = %q, want triaging", tasks[0].Spec.InitialState)
 				}
 				if len(tasks[0].Status.MRRefs) != 1 {
 					t.Fatalf("mrRefs = %v, want the reviewed MR", tasks[0].Status.MRRefs)
@@ -943,20 +943,20 @@ func TestMintReviewStage(t *testing.T) {
 		wantReason string
 	}{
 		"no CR at all: a PR we have never seen mints ACTIVE": {
-			cr: nil, wantStage: tatarav1alpha1.StageTriaging,
+			cr: nil, wantStage: tatarav1alpha1.StateNew,
 		},
 		"a CR with no posted verdict: the review never landed, so RUN it": {
-			cr: withStatus(""), wantStage: tatarav1alpha1.StageTriaging,
+			cr: withStatus(""), wantStage: tatarav1alpha1.StateNew,
 		},
 		"status=new: the head MOVED and a FRESH review is owed": {
-			cr: withStatus("new"), wantStage: tatarav1alpha1.StageTriaging,
+			cr: withStatus("new"), wantStage: tatarav1alpha1.StateNew,
 		},
 		"status=needs-changes: the review WAS posted -> PARKED, no re-review": {
-			cr: withStatus("needs-changes"), wantStage: tatarav1alpha1.StageParked,
+			cr: withStatus("needs-changes"), wantStage: tatarav1alpha1.StateNew,
 			wantReason: stage.ReasonAwaitingHuman,
 		},
 		"status=approved: the review WAS posted -> PARKED, no re-review": {
-			cr: withStatus("approved"), wantStage: tatarav1alpha1.StageParked,
+			cr: withStatus("approved"), wantStage: tatarav1alpha1.StateNew,
 			wantReason: stage.ReasonAwaitingHuman,
 		},
 	}
@@ -1027,9 +1027,9 @@ func TestSweepAdoptsOwnerlessMergeRequestCR(t *testing.T) {
 	if tk.Spec.Kind != SweepReviewKind {
 		t.Fatalf("kind = %q, want review", tk.Spec.Kind)
 	}
-	if tk.Spec.InitialStage != tatarav1alpha1.StageParked || tk.Spec.InitialStageReason != stage.ReasonAwaitingHuman {
+	if tk.Spec.InitialState != tatarav1alpha1.StateNew || tk.Spec.InitialParkReason != stage.ReasonAwaitingHuman {
 		t.Fatalf("initialStage = %q/%q, want parked/awaiting-human (the review was ALREADY posted)",
-			tk.Spec.InitialStage, tk.Spec.InitialStageReason)
+			tk.Spec.InitialState, tk.Spec.InitialParkReason)
 	}
 	if tk.Status.PodName != "" {
 		t.Fatalf("the re-minted review Task spawned a pod: %q", tk.Status.PodName)
@@ -1097,15 +1097,19 @@ func TestSweepNeverReReviewsAHumanPR(t *testing.T) {
 			t.Fatalf("cycle %d: tasks = %d, want 1 (the sweep re-minted on top of an owned PR)", cycle, len(tasks))
 		}
 		tk := tasks[0]
-		if tk.Spec.InitialStage != tatarav1alpha1.StageParked || tk.Spec.InitialStageReason != stage.ReasonAwaitingHuman {
+		if tk.Spec.InitialState != tatarav1alpha1.StateNew || tk.Spec.InitialParkReason != stage.ReasonAwaitingHuman {
 			t.Fatalf("cycle %d: initialStage = %q/%q, want parked/awaiting-human: a re-minted review Task must NEVER be ACTIVE - it would re-post the review",
-				cycle, tk.Spec.InitialStage, tk.Spec.InitialStageReason)
+				cycle, tk.Spec.InitialState, tk.Spec.InitialParkReason)
 		}
-		// Project what the create-edge would apply from Spec.InitialStage (fix C5:
-		// the mint itself never stamps Status.Stage) and check THAT is not active -
-		// the exact question this assertion has always asked.
+		// Project what the create-edge would apply from Spec.InitialState /
+		// Spec.InitialParkReason (fix C5: the mint itself never stamps
+		// Status.State/ParkReason) and check THAT is not active - the exact
+		// question this assertion has always asked. #521 split the old single
+		// stage value into two independent fields, so the projection must copy
+		// BOTH: state alone no longer says whether a mint landed parked.
 		projected := tk.DeepCopy()
-		projected.Status.Stage = tk.Spec.InitialStage
+		projected.Status.State = tk.Spec.InitialState
+		projected.Status.ParkReason = tk.Spec.InitialParkReason
 		if StageActive(projected) {
 			t.Fatalf("cycle %d: the re-minted review Task is ACTIVE; it will spawn a review pod on a PR nobody touched", cycle)
 		}
@@ -1124,8 +1128,8 @@ func TestSweepNeverReReviewsAHumanPR(t *testing.T) {
 		}
 
 		// Drive the create-edge (fix C5) so the reaper - which reads Status.Stage,
-		// not Spec.InitialStage - sees this review Task as parked before it ages
-		// out. In production the reconciler applies Spec.InitialStage long before
+		// not Spec.InitialState - sees this review Task as parked before it ages
+		// out. In production the reconciler applies Spec.InitialState long before
 		// seven days pass; this mirrors that sequencing.
 		live := getSweepTask(t, c, tk.Name)
 		tr := &TaskReconciler{Client: c, Metrics: r.Metrics}
@@ -1133,12 +1137,17 @@ func TestSweepNeverReReviewsAHumanPR(t *testing.T) {
 			t.Fatalf("cycle %d: drive create-edge: %v", cycle, err)
 		}
 
-		// Seven days pass. B.6 reaps the park.
+		// Seven days pass. B.6 reaps the park. parkedAt() (reaper.go) prefers
+		// status.parkedAt over stateEnteredAt once it is set - and the create-edge
+		// drive above went through stage.Park, which stamps parkedAt to NOW - so
+		// both timestamps must be rewound, or the reap gate reads the fresh
+		// parkedAt and never ages out.
 		aged := getSweepTask(t, c, tk.Name)
 		rewound := metav1.NewTime(time.Now().Add(-8 * 24 * time.Hour))
-		aged.Status.StageEnteredAt = &rewound
+		aged.Status.StateEnteredAt = &rewound
+		aged.Status.ParkedAt = &rewound
 		if err := c.Status().Update(ctx, aged); err != nil {
-			t.Fatalf("cycle %d: rewind stageEnteredAt: %v", cycle, err)
+			t.Fatalf("cycle %d: rewind stateEnteredAt/parkedAt: %v", cycle, err)
 		}
 		if err := r.ReapTerminal(ctx, proj); err != nil {
 			t.Fatalf("cycle %d: ReapTerminal: %v", cycle, err)
@@ -1181,7 +1190,7 @@ func TestSweepDoesNotReMintOverAnOwnedHumanPR(t *testing.T) {
 	// Pass 1 mints the review Task and takes ownership of the MR CR.
 	runSweep(t, c, proj, repo, rd)
 	tasks := sweepTasks(t, c, proj.Name)
-	if len(tasks) != 1 || tasks[0].Spec.InitialStage != tatarav1alpha1.StageTriaging {
+	if len(tasks) != 1 || tasks[0].Spec.InitialState != tatarav1alpha1.StateNew {
 		t.Fatalf("pass 1: tasks = %+v, want one triaging review Task", tasks)
 	}
 
@@ -1254,7 +1263,7 @@ func TestSweepMintCapsBind(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{Name: "cap-open-proj-live", Namespace: testNS},
 			Spec:       tatarav1alpha1.TaskSpec{ProjectRef: proj.Name, Kind: "clarify", Goal: "g"},
 		}
-		live.Status.Stage = tatarav1alpha1.StageImplementing
+		live.Status.State = tatarav1alpha1.StateUnderImplementation
 		c := newMirrorClient(t, proj, repo, live)
 		now := time.Now()
 		rd := &sweepReader{
@@ -1279,8 +1288,8 @@ func TestSweepMintCapsBind(t *testing.T) {
 			if tasks[i].Name == live.Name {
 				continue
 			}
-			if tasks[i].Spec.InitialStage != tatarav1alpha1.StageParked {
-				t.Fatalf("minted initialStage = %q, want parked (maxOpenTasks is spent)", tasks[i].Spec.InitialStage)
+			if tasks[i].Spec.InitialState != tatarav1alpha1.StateNew {
+				t.Fatalf("minted initialStage = %q, want parked (maxOpenTasks is spent)", tasks[i].Spec.InitialState)
 			}
 		}
 		after := testutil.ToFloat64(obs.SweepMintCapHitTotal.WithLabelValues(proj.Name, obs.SweepCapMaxOpenTasks))
@@ -1462,12 +1471,12 @@ func TestSweepWebhookOriginatedIssueMintsTriaging(t *testing.T) {
 	if len(tasks) != 1 {
 		t.Fatalf("tasks = %d, want 1", len(tasks))
 	}
-	if tasks[0].Spec.InitialStage != tatarav1alpha1.StageTriaging {
+	if tasks[0].Spec.InitialState != tatarav1alpha1.StateNew {
 		t.Fatalf("initialStage = %q/%q, want triaging: a human OPENED this issue and the webhook said so",
-			tasks[0].Spec.InitialStage, tasks[0].Spec.InitialStageReason)
+			tasks[0].Spec.InitialState, tasks[0].Spec.InitialParkReason)
 	}
-	if tasks[0].Spec.InitialStageReason != "" {
-		t.Fatalf("initialStageReason = %q, want empty on an ACTIVE mint", tasks[0].Spec.InitialStageReason)
+	if tasks[0].Spec.InitialParkReason != "" {
+		t.Fatalf("initialStageReason = %q, want empty on an ACTIVE mint", tasks[0].Spec.InitialParkReason)
 	}
 
 	// CONSUMED. The marker is a one-shot: it must not survive to re-activate a
@@ -1509,10 +1518,10 @@ func TestSweepCutoverBacklogStillParksWithZeroPods(t *testing.T) {
 		t.Fatalf("tasks = %d, want %d", len(tasks), backlog)
 	}
 	for i := range tasks {
-		if tasks[i].Spec.InitialStage != tatarav1alpha1.StageParked ||
-			tasks[i].Spec.InitialStageReason != stage.ReasonBacklogSweep {
+		if tasks[i].Spec.InitialState != tatarav1alpha1.StateNew ||
+			tasks[i].Spec.InitialParkReason != stage.ReasonBacklogSweep {
 			t.Fatalf("task %s initialStage = %q/%q, want parked/backlog-sweep: the cutover backlog must NEVER re-triage",
-				tasks[i].Name, tasks[i].Spec.InitialStage, tasks[i].Spec.InitialStageReason)
+				tasks[i].Name, tasks[i].Spec.InitialState, tasks[i].Spec.InitialParkReason)
 		}
 	}
 
@@ -1577,9 +1586,9 @@ func TestSweepCutoverBacklogFromATrustedMaintainerMintsActiveInstead(t *testing.
 		t.Fatalf("tasks = %d, want %d", len(tasks), backlog)
 	}
 	for i := range tasks {
-		if tasks[i].Spec.InitialStage != tatarav1alpha1.StageTriaging || tasks[i].Spec.InitialStageReason != "" {
+		if tasks[i].Spec.InitialState != tatarav1alpha1.StateNew || tasks[i].Spec.InitialParkReason != "" {
 			t.Fatalf("task %s initialStage = %q/%q, want triaging/\"\": a trusted maintainer's backlog issue mints ACTIVE",
-				tasks[i].Name, tasks[i].Spec.InitialStage, tasks[i].Spec.InitialStageReason)
+				tasks[i].Name, tasks[i].Spec.InitialState, tasks[i].Spec.InitialParkReason)
 		}
 	}
 }
@@ -1603,8 +1612,8 @@ func TestWebhookMarkerIsConsumedExactlyOnce(t *testing.T) {
 
 	runSweep(t, c, proj, repo, rd)
 	first := sweepTasks(t, c, proj.Name)
-	if len(first) != 1 || first[0].Spec.InitialStage != tatarav1alpha1.StageTriaging {
-		t.Fatalf("pass 1: tasks = %d, initialStage = %q, want 1 triaging", len(first), first[0].Spec.InitialStage)
+	if len(first) != 1 || first[0].Spec.InitialState != tatarav1alpha1.StateNew {
+		t.Fatalf("pass 1: tasks = %d, initialStage = %q, want 1 triaging", len(first), first[0].Spec.InitialState)
 	}
 
 	// The Task parked and the reaper collected it: the Issue CR is RELEASED
@@ -1625,10 +1634,10 @@ func TestWebhookMarkerIsConsumedExactlyOnce(t *testing.T) {
 	if len(second) != 1 {
 		t.Fatalf("pass 2: tasks = %d, want 1", len(second))
 	}
-	if second[0].Spec.InitialStage != tatarav1alpha1.StageParked ||
-		second[0].Spec.InitialStageReason != stage.ReasonBacklogSweep {
+	if second[0].Spec.InitialState != tatarav1alpha1.StateNew ||
+		second[0].Spec.InitialParkReason != stage.ReasonBacklogSweep {
 		t.Fatalf("pass 2: initialStage = %q/%q, want parked/backlog-sweep: a SPENT marker must never re-activate a Task that has since parked",
-			second[0].Spec.InitialStage, second[0].Spec.InitialStageReason)
+			second[0].Spec.InitialState, second[0].Spec.InitialParkReason)
 	}
 }
 
@@ -1679,8 +1688,8 @@ func TestSweepBudgetsBindOnWebhookOriginatedMints(t *testing.T) {
 		if len(tasks) != 1 {
 			t.Fatalf("tasks = %d, want 1 (maxOpenTasks=1 binds: an ACTIVE mint counts against it)", len(tasks))
 		}
-		if tasks[0].Spec.InitialStage != tatarav1alpha1.StageTriaging {
-			t.Fatalf("initialStage = %q, want triaging", tasks[0].Spec.InitialStage)
+		if tasks[0].Spec.InitialState != tatarav1alpha1.StateNew {
+			t.Fatalf("initialStage = %q, want triaging", tasks[0].Spec.InitialState)
 		}
 	})
 }
@@ -1709,8 +1718,8 @@ func TestWebhookOpenedIssueTriagesAndSpawnsAPod(t *testing.T) {
 	runSweep(t, c, proj, repo, rd)
 
 	tasks := sweepTasks(t, c, proj.Name)
-	if len(tasks) != 1 || tasks[0].Spec.InitialStage != tatarav1alpha1.StageTriaging {
-		t.Fatalf("sweep minted %d tasks at initialStage %q, want 1 at triaging", len(tasks), tasks[0].Spec.InitialStage)
+	if len(tasks) != 1 || tasks[0].Spec.InitialState != tatarav1alpha1.StateNew {
+		t.Fatalf("sweep minted %d tasks at initialStage %q, want 1 at triaging", len(tasks), tasks[0].Spec.InitialState)
 	}
 
 	r := tsReconciler(c)
@@ -1720,19 +1729,19 @@ func TestWebhookOpenedIssueTriagesAndSpawnsAPod(t *testing.T) {
 	task := &tasks[0]
 	now := time.Now()
 
-	// PASS 0: the create-edge (fix C5). The mint only set Spec.InitialStage; this
+	// PASS 0: the create-edge (fix C5). The mint only set Spec.InitialState; this
 	// pass applies it to Status.Stage and requeues - it does not yet drive
 	// triaging's own routing.
 	task = tsReconcile(t, r, proj, task, now)
-	if task.Status.Stage != tatarav1alpha1.StageTriaging {
-		t.Fatalf("stage after the create-edge = %q, want triaging", task.Status.Stage)
+	if task.Status.State != tatarav1alpha1.StateNew {
+		t.Fatalf("stage after the create-edge = %q, want triaging", task.Status.State)
 	}
 
 	// PASS 1: triaging is POD-LESS. It mints the Issue CRs (F.2) and routes on
 	// spec.kind - clarify -> clarifying, where the C.6 approval gate lives.
 	task = tsReconcile(t, r, proj, task, now)
-	if task.Status.Stage != tatarav1alpha1.StageClarifying {
-		t.Fatalf("stage after triage = %q, want clarifying", task.Status.Stage)
+	if task.Status.State != tatarav1alpha1.StateRefined {
+		t.Fatalf("stage after triage = %q, want clarifying", task.Status.State)
 	}
 
 	// PASS 2: clarifying is a POD stage. The pod is created.
@@ -1742,7 +1751,7 @@ func TestWebhookOpenedIssueTriagesAndSpawnsAPod(t *testing.T) {
 		Namespace: testNS, Name: agent.PodName(task)}, &pod); err != nil {
 		t.Fatalf("THE AGENT POD WAS NEVER CREATED. A human opened an issue and the platform did nothing: %v", err)
 	}
-	if pod.Annotations[annPodStage] != tatarav1alpha1.StageClarifying {
+	if pod.Annotations[annPodStage] != tatarav1alpha1.StateRefined {
 		t.Fatalf("pod stage annotation = %q, want clarifying", pod.Annotations[annPodStage])
 	}
 }
@@ -2158,12 +2167,13 @@ func TestSweepBranchCollisionAdoptsIntoTheClaimingTask(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "collide-proj-clarify-2026-07-26-aaaaa", Namespace: testNS},
 		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: proj.Name, Kind: "clarify", Goal: "g", Source: collidingSource()},
 	}
-	decoy.Status.Stage = tatarav1alpha1.StageParked
+	decoy.Status.State = tatarav1alpha1.StateRefined
+	decoy.Status.ParkReason = stage.ReasonAwaitingHuman
 	claimant := &tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{Name: "collide-proj-clarify-2026-07-27-zzzzz", Namespace: testNS},
 		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: proj.Name, Kind: "clarify", Goal: "g", Source: collidingSource()},
 	}
-	claimant.Status.Stage = tatarav1alpha1.StageImplementing
+	claimant.Status.State = tatarav1alpha1.StateUnderImplementation
 	if agent.TaskBranch(decoy) != agent.TaskBranch(claimant) {
 		t.Fatalf("setup: branches must COLLIDE, got %q and %q", agent.TaskBranch(decoy), agent.TaskBranch(claimant))
 	}
@@ -2216,7 +2226,8 @@ func TestTaskForBranchPrefersTheClaimingTask(t *testing.T) {
 		},
 		Spec: tatarav1alpha1.TaskSpec{ProjectRef: proj.Name, Kind: "clarify", Goal: "g", Source: collidingSource()},
 	}
-	older.Status.Stage = tatarav1alpha1.StageParked
+	older.Status.State = tatarav1alpha1.StateRefined
+	older.Status.ParkReason = stage.ReasonAwaitingHuman
 	newer := &tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "prefer-proj-clarify-b", Namespace: testNS,
@@ -2224,7 +2235,7 @@ func TestTaskForBranchPrefersTheClaimingTask(t *testing.T) {
 		},
 		Spec: tatarav1alpha1.TaskSpec{ProjectRef: proj.Name, Kind: "clarify", Goal: "g", Source: collidingSource()},
 	}
-	newer.Status.Stage = tatarav1alpha1.StageImplementing
+	newer.Status.State = tatarav1alpha1.StateUnderImplementation
 	// Finished, and the NEWEST of the three: it must still lose to a Task that
 	// can still push, or the sweep would adopt a live PR into a dead Task.
 	dead := &tatarav1alpha1.Task{
@@ -2234,7 +2245,7 @@ func TestTaskForBranchPrefersTheClaimingTask(t *testing.T) {
 		},
 		Spec: tatarav1alpha1.TaskSpec{ProjectRef: proj.Name, Kind: "clarify", Goal: "g", Source: collidingSource()},
 	}
-	dead.Status.Stage = tatarav1alpha1.StageDelivered
+	dead.Status.State = tatarav1alpha1.StateDone
 
 	c := newMirrorClient(t, proj, older, newer, dead)
 	r := &ProjectReconciler{Client: c, Scheme: c.Scheme(), Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry())}
@@ -2304,12 +2315,13 @@ func TestSweepClaimedPRIsSkippedNotErrored(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "skip-proj-clarify-branch", Namespace: testNS},
 		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: proj.Name, Kind: "clarify", Goal: "g"},
 	}
-	branchTask.Status.Stage = tatarav1alpha1.StageParked
+	branchTask.Status.State = tatarav1alpha1.StateRefined
+	branchTask.Status.ParkReason = stage.ReasonAwaitingHuman
 	claimant := &tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{Name: "skip-proj-takeover-claimant", Namespace: testNS},
 		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: proj.Name, Kind: "takeover", Goal: "g"},
 	}
-	claimant.Status.Stage = tatarav1alpha1.StageMerging
+	claimant.Status.State = tatarav1alpha1.StateMerged
 	if agent.TaskBranch(branchTask) == agent.TaskBranch(claimant) {
 		t.Fatal("setup: the claimant must be on a DIFFERENT branch for clause 1b to be the net")
 	}

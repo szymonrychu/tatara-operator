@@ -1465,12 +1465,16 @@ func (in *TaskStatus) DeepCopyInto(out *TaskStatus) {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}
 	}
-	if in.StageEnteredAt != nil {
-		in, out := &in.StageEnteredAt, &out.StageEnteredAt
+	if in.StateEnteredAt != nil {
+		in, out := &in.StateEnteredAt, &out.StateEnteredAt
 		*out = (*in).DeepCopy()
 	}
-	if in.StageWorkStartedAt != nil {
-		in, out := &in.StageWorkStartedAt, &out.StageWorkStartedAt
+	if in.ParkedAt != nil {
+		in, out := &in.ParkedAt, &out.ParkedAt
+		*out = (*in).DeepCopy()
+	}
+	if in.StateWorkStartedAt != nil {
+		in, out := &in.StateWorkStartedAt, &out.StateWorkStartedAt
 		*out = (*in).DeepCopy()
 	}
 	if in.PodStartedAt != nil {
