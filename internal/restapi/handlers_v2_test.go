@@ -29,6 +29,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/restapi"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
+	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
 // --- fakes ----------------------------------------------------------------
@@ -157,21 +158,32 @@ type fakeApproval struct {
 	// clarify writer: ok=true with a nil evidence must never write an
 	// approver-less approval.
 	grantWithNilEvidence bool
-	gotCitations         [][]tatarav1alpha1.ApprovalCitation
+	// refusalReason overrides the reason returned on a plain !grant refusal
+	// (default controller.ApprovalRefusedNoMaintainer). needCitation's own
+	// refusal is always controller.ApprovalRefusedNoCitation, matching the
+	// real verifier's shape for that clause.
+	refusalReason string
+	gotCitations  [][]tatarav1alpha1.ApprovalCitation
+	gotDeclared   []string
 }
 
-func (f *fakeApproval) VerifyApproval(_ context.Context, _ *tatarav1alpha1.Project,
+// VerifyApprovalDeclared is the restapi.ApprovalVerifier seam post-#521: it
+// gains declared (the agent's approvingMaintainer, empty on the auto-approve
+// path) and a third return, the refusal REASON, so the gate's 200 body can
+// name which condition refused instead of a bare false.
+func (f *fakeApproval) VerifyApprovalDeclared(_ context.Context, _ *tatarav1alpha1.Project,
 	iss *tatarav1alpha1.Issue,
-	citations []tatarav1alpha1.ApprovalCitation) (*tatarav1alpha1.ApprovalEvidence, bool) {
+	citations []tatarav1alpha1.ApprovalCitation, declared string) (*tatarav1alpha1.ApprovalEvidence, bool, string) {
 	f.gotCitations = append(f.gotCitations, citations)
+	f.gotDeclared = append(f.gotDeclared, declared)
 	// MIRRORS THE PRODUCTION SEAM, and it is load-bearing that it does. The real
-	// verifier (controller.GrammarVerifier.VerifyApproval) returns the Issue's
-	// STORED approval with ok=TRUE for an out-of-scope Issue - it is not pending
-	// approval, so it must not block the scope check. That stored approval is
-	// routinely nil. A fake that refused instead would certify a gate production
-	// does not have.
+	// verifier (controller.GrammarVerifier.VerifyApprovalDeclared) returns the
+	// Issue's STORED approval with ok=TRUE for an out-of-scope Issue - it is not
+	// pending approval, so it must not block the scope check. That stored
+	// approval is routinely nil. A fake that refused instead would certify a
+	// gate production does not have.
 	if !controller.ApprovalInScope(iss) {
-		return iss.Status.Approval, true
+		return iss.Status.Approval, true, ""
 	}
 	// ALSO MIRRORS THE SEAM: verifyOneIssue's clause-2 idempotence returns an
 	// already-approved Issue's STORED evidence before any citation clause runs,
@@ -179,27 +191,31 @@ func (f *fakeApproval) VerifyApproval(_ context.Context, _ *tatarav1alpha1.Proje
 	// arm needCitation was STRICTER than production for exactly that Issue, and a
 	// test built on it would certify a refusal the real verifier never makes.
 	if iss.Status.Status == "approved" && iss.Status.Approval != nil {
-		return iss.Status.Approval, true
+		return iss.Status.Approval, true, ""
 	}
 	if !f.grant[iss.Name] {
-		return nil, false
+		reason := f.refusalReason
+		if reason == "" {
+			reason = controller.ApprovalRefusedNoMaintainer
+		}
+		return nil, false, reason
 	}
 	if f.needCitation && len(citations) == 0 {
-		return nil, false
+		return nil, false, controller.ApprovalRefusedNoCitation
 	}
 	if f.grantWithNilEvidence {
-		return nil, true
+		return nil, true, ""
 	}
 	if f.auto {
 		return &tatarav1alpha1.ApprovalEvidence{
 			Auto: true, Login: tatarav1alpha1.AutoApproveLogin,
 			CreatedAt: metav1.NewTime(time.Unix(0, 0)),
-		}, true
+		}, true, ""
 	}
 	return &tatarav1alpha1.ApprovalEvidence{
 		Login: "maintainer", CommentID: "1", Phrase: "go ahead",
 		CreatedAt: metav1.NewTime(time.Unix(0, 0)),
-	}, true
+	}, true, ""
 }
 
 type fakeCI struct {
@@ -395,8 +411,8 @@ func repoV2(name, projectRef string) *tatarav1alpha1.Repository {
 	}
 }
 
-// taskV2 builds a Task already in a stage, with its agentKind stamped.
-func taskV2(name, projectRef, kind, stg, agentKind string) *tatarav1alpha1.Task {
+// taskV2 builds a Task already in a state, with its agentKind stamped.
+func taskV2(name, projectRef, kind, state, agentKind string) *tatarav1alpha1.Task {
 	entered := metav1.NewTime(frozenNow.Add(-time.Hour))
 	return &tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
@@ -405,9 +421,22 @@ func taskV2(name, projectRef, kind, stg, agentKind string) *tatarav1alpha1.Task 
 			Goal: "Reaper phase race\n\nfix the reaper",
 		},
 		Status: tatarav1alpha1.TaskStatus{
-			Stage: stg, AgentKind: agentKind, StageEnteredAt: &entered,
+			State: state, AgentKind: agentKind, StateEnteredAt: &entered,
 		},
 	}
+}
+
+// parkedTaskV2 is taskV2 plus a park: the fixture shape for a Task that is
+// STALLED rather than merely resident in a state (#521: parked/failed are no
+// longer states, they are the orthogonal park flag). state is where the Task
+// was parked FROM and stays; it must be a live (non-terminal) state.
+func parkedTaskV2(t *testing.T, name, projectRef, kind, state, agentKind, parkReason string) *tatarav1alpha1.Task {
+	t.Helper()
+	tk := taskV2(name, projectRef, kind, state, agentKind)
+	if err := stage.Park(tk, parkReason, frozenNow); err != nil {
+		t.Fatalf("parkedTaskV2: %v", err)
+	}
+	return tk
 }
 
 // taskBranchV2 is the branch agent.TaskBranch(t) derives for a taskV2
@@ -480,7 +509,7 @@ func mrV2(repo string, number int, owner string, opts ...func(*tatarav1alpha1.Me
 func TestTaskContext_RendersBundle(t *testing.T) {
 	e := buildV2(t, v2Opts{},
 		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"),
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StateRefined, "clarify"),
 		issueV2("tatara-operator", 291, "t1"),
 	)
 	w := e.do(t, http.MethodGet, "/tasks/t1/context", "")
@@ -497,8 +526,8 @@ func TestTaskContext_RendersBundle(t *testing.T) {
 func TestTaskContext_Index(t *testing.T) {
 	e := buildV2(t, v2Opts{},
 		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "refine", tatarav1alpha1.StageRefining, "refine"),
-		taskV2("t2", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"),
+		taskV2("t1", "tatara", "refine", tatarav1alpha1.StateRefined, "refine"),
+		taskV2("t2", "tatara", "clarify", tatarav1alpha1.StateRefined, "clarify"),
 	)
 	w := e.do(t, http.MethodGet, "/tasks/t1/context?index=true", "")
 	require.Equal(t, http.StatusOK, w.Code)
@@ -514,7 +543,7 @@ func TestTaskContext_NotesAll_RehydratesSpilledNotes(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	task := taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageImplementing, "implement")
+	task := taskV2("t1", "tatara", "clarify", tatarav1alpha1.StateUnderImplementation, "implement")
 	task.Status.Notes = []tatarav1alpha1.Note{
 		{At: metav1.NewTime(frozenNow), Agent: "implement", Kind: "handoff", Body: "LIVE-NOTE"},
 	}
@@ -551,7 +580,7 @@ func TestTaskContext_NotesAll_ServesPartialOnRehydrateFailure(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	task := taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageImplementing, "implement")
+	task := taskV2("t1", "tatara", "clarify", tatarav1alpha1.StateUnderImplementation, "implement")
 	task.Status.Notes = []tatarav1alpha1.Note{
 		{At: metav1.NewTime(frozenNow), Agent: "implement", Kind: "handoff", Body: "LIVE-NOTE"},
 	}
@@ -584,7 +613,7 @@ func TestTaskContext_NotesAll_ServesPartialOnRehydrateFailure(t *testing.T) {
 // NoteFetcher is the same class of failure as an unreachable one. It must not
 // 502 either; every spilled ref counts as unavailable.
 func TestTaskContext_NotesAll_NoMemoryClientServesPartial(t *testing.T) {
-	task := taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageImplementing, "implement")
+	task := taskV2("t1", "tatara", "clarify", tatarav1alpha1.StateUnderImplementation, "implement")
 	task.Status.Notes = []tatarav1alpha1.Note{
 		{At: metav1.NewTime(frozenNow), Agent: "implement", Kind: "handoff", Body: "LIVE-NOTE"},
 	}
@@ -617,7 +646,7 @@ func TestTaskContext_NotesAll_CompleteHistoryIsNotFlaggedTruncated(t *testing.T)
 	})
 	require.NoError(t, err)
 
-	task := taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageImplementing, "implement")
+	task := taskV2("t1", "tatara", "clarify", tatarav1alpha1.StateUnderImplementation, "implement")
 	task.Status.Stats.NotesSpilled = 1
 	task.Status.Stats.NotesSpilledRefs = []string{"track-1"}
 
@@ -635,7 +664,7 @@ func TestTaskContext_NotesAll_CompleteHistoryIsNotFlaggedTruncated(t *testing.T)
 func TestPostNote_StampsAgentFromStatus(t *testing.T) {
 	e := buildV2(t, v2Opts{},
 		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageImplementing, "implement"),
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StateUnderImplementation, "implement"),
 	)
 	w := e.do(t, http.MethodPost, "/tasks/t1/notes", `{"kind":"handoff","body":"pass it on"}`)
 	require.Equal(t, http.StatusCreated, w.Code)
@@ -646,13 +675,31 @@ func TestPostNote_StampsAgentFromStatus(t *testing.T) {
 	require.Equal(t, "handoff", notes[0].Kind)
 }
 
+// TestPostNote_ReturnsTheNoteID: the response carries the id the write just
+// stamped (NewNoteID(at, kind, body)), because the approval gate requires a
+// planNoteId and an agent cannot quote back an id it was never given.
+func TestPostNote_ReturnsTheNoteID(t *testing.T) {
+	e := buildV2(t, v2Opts{},
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StateUnderImplementation, "implement"),
+	)
+	w := e.do(t, http.MethodPost, "/tasks/t1/notes", `{"kind":"plan","body":"the plan"}`)
+	require.Equal(t, http.StatusCreated, w.Code)
+
+	var resp struct {
+		NoteID string `json:"noteId"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Regexp(t, `^n-[0-9a-f]{16}$`, resp.NoteID)
+}
+
 // agent="operator" is UNREACHABLE from this endpoint: an `agent` body key is a
 // 400 under DisallowUnknownFields, and an empty status.agentKind is a 409 -
 // never a default (fix 19).
 func TestPostNote_AgentIsNotABodyKey(t *testing.T) {
 	e := buildV2(t, v2Opts{},
 		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageImplementing, "implement"),
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StateUnderImplementation, "implement"),
 	)
 	w := e.do(t, http.MethodPost, "/tasks/t1/notes", `{"kind":"note","body":"x","agent":"operator"}`)
 	require.Equal(t, http.StatusBadRequest, w.Code)
@@ -660,23 +707,25 @@ func TestPostNote_AgentIsNotABodyKey(t *testing.T) {
 }
 
 func TestPostNote_NoAgentKindIs409NeverDefaulted(t *testing.T) {
-	task := taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageTriaging, "")
+	task := taskV2("t1", "tatara", "clarify", tatarav1alpha1.StateNew, "")
 	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"), task)
 	w := e.do(t, http.MethodPost, "/tasks/t1/notes", `{"kind":"note","body":"x"}`)
 	require.Equal(t, http.StatusConflict, w.Code)
 	require.Empty(t, e.task(t, "t1").Status.Notes)
 }
 
+// A parked Task is terminal for this endpoint (#521 folded the old `failed`
+// stage into the park flag): TaskDone(t) || Parked(t) is the postNote gate.
 func TestPostNote_TerminalStageIs409(t *testing.T) {
 	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageFailed, "clarify"))
+		parkedTaskV2(t, "t1", "tatara", "clarify", tatarav1alpha1.StateRefined, "clarify", stage.ReasonOperatorError))
 	w := e.do(t, http.MethodPost, "/tasks/t1/notes", `{"kind":"note","body":"x"}`)
 	require.Equal(t, http.StatusConflict, w.Code)
 }
 
 func TestPostNote_BodyTruncatedOnARuneBoundary(t *testing.T) {
 	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageImplementing, "implement"))
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StateUnderImplementation, "implement"))
 
 	// 4095 bytes of ASCII plus a 3-byte rune straddles the 4096 cap.
 	body := strings.Repeat("a", 4095) + "世"
@@ -699,7 +748,7 @@ func strconvQuote(s string) string {
 // THERE IS NO 409-ON-CAP. At 50 notes the OLDEST is spilled and dropped: an
 // agent must ALWAYS be able to write its handoff.
 func TestPostNote_At50TheOldestIsSpilledNot409(t *testing.T) {
-	task := taskV2("t1", "tatara", "implement", tatarav1alpha1.StageImplementing, "implement")
+	task := taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement")
 	for i := 0; i < 50; i++ {
 		task.Status.Notes = append(task.Status.Notes, tatarav1alpha1.Note{
 			At:    metav1.NewTime(frozenNow.Add(time.Duration(i) * time.Minute)),
@@ -728,7 +777,7 @@ func TestPostNote_At50TheOldestIsSpilledNot409(t *testing.T) {
 // exactly what a tatara-memory outage is.
 func TestPostNote_AtCapWithBrokenSpillerIs503(t *testing.T) {
 	capped := func() *tatarav1alpha1.Task {
-		task := taskV2("t1", "tatara", "implement", tatarav1alpha1.StageImplementing, "implement")
+		task := taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement")
 		for i := 0; i < 50; i++ {
 			task.Status.Notes = append(task.Status.Notes, tatarav1alpha1.Note{
 				At:    metav1.NewTime(frozenNow.Add(time.Duration(i) * time.Minute)),
@@ -769,7 +818,7 @@ func TestPostNote_AtCapWithBrokenSpillerIs503(t *testing.T) {
 
 func TestPostNote_UnknownFieldIs400(t *testing.T) {
 	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageImplementing, "implement"))
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StateUnderImplementation, "implement"))
 	w := e.do(t, http.MethodPost, "/tasks/t1/notes", `{"kind":"note","body":"x","extra":1}`)
 	require.Equal(t, http.StatusBadRequest, w.Code)
 }
@@ -786,7 +835,7 @@ func TestScmRead_MRs_CarriesLastBotHeadSHAWhenSet(t *testing.T) {
 	})
 	e := buildV2(t, v2Opts{},
 		projectV2("tatara"), scmSecretV2(), repoV2("tatara-cli", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"),
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StateRefined, "clarify"),
 		mr,
 	)
 
@@ -799,7 +848,7 @@ func TestScmRead_MRs_OmitsLastBotHeadSHAWhenEmpty(t *testing.T) {
 	mr := mrV2("tatara-cli", 80, "t1")
 	e := buildV2(t, v2Opts{},
 		projectV2("tatara"), scmSecretV2(), repoV2("tatara-cli", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"),
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StateRefined, "clarify"),
 		mr,
 	)
 
@@ -823,7 +872,7 @@ func TestScmRead_Mirror_MakesZeroForgeRequests(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}, reader: panicReader{}},
 		projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"), repoV2("tatara-cli", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"),
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StateRefined, "clarify"),
 		iss, mr,
 	)
 
@@ -872,7 +921,7 @@ func TestScmRead_Comments_IsPRReadsTheMRThread(t *testing.T) {
 	})
 	e := buildV2(t, v2Opts{writer: panicForge{}},
 		projectV2("tatara"), scmSecretV2(), repoV2("tatara-cli", "tatara"),
-		taskV2("t1", "tatara", "implement", tatarav1alpha1.StageReviewing, "review"), mr)
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateAwaitingReview, "review"), mr)
 
 	// isPR is CAMELCASE on the wire. A snake_case param here is a 400 on every
 	// call from the cli.
@@ -889,7 +938,7 @@ func TestScmRead_Issues_StateAndLabelFilters(t *testing.T) {
 	})
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"), open, closed)
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StateRefined, "clarify"), open, closed)
 
 	w := e.do(t, http.MethodGet, "/projects/tatara/scm/issues?repo=tatara-operator", "")
 	require.Equal(t, http.StatusOK, w.Code)
@@ -984,7 +1033,7 @@ func TestScmRead_CI_LogTailOnlyForAFailingCheck(t *testing.T) {
 
 func TestIssueWrite_Create_IsSynchronousAndReturnsTheNumber(t *testing.T) {
 	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"))
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StateRefined, "clarify"))
 
 	w := e.do(t, http.MethodPost, "/projects/tatara/scm/issue-write",
 		`{"task":"t1","action":"create","repo":"tatara-operator","title":"T","body":"B"}`)
@@ -1017,7 +1066,7 @@ func TestIssueWrite_Create_IsSynchronousAndReturnsTheNumber(t *testing.T) {
 // none.
 func TestIssueWrite_Create_NeverClaimsProposalProvenanceFromTheBody(t *testing.T) {
 	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"))
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StateRefined, "clarify"))
 
 	body := tatarav1alpha1.StampProposalMarker("B", tatarav1alpha1.ProposalKindBrainstorm)
 	w := e.do(t, http.MethodPost, "/projects/tatara/scm/issue-write",
@@ -1045,8 +1094,8 @@ func TestIssueWrite_OwnershipGate(t *testing.T) {
 	})
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"),
-		taskV2("t2", "tatara", "refine", tatarav1alpha1.StageRefining, "refine"), iss)
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StateRefined, "clarify"),
+		taskV2("t2", "tatara", "refine", tatarav1alpha1.StateRefined, "refine"), iss)
 
 	for _, body := range []string{
 		`{"task":"t2","action":"comment","repo":"tatara-operator","number":291,"body":"hi"}`,
@@ -1066,7 +1115,7 @@ func TestIssueWrite_OwnershipGate(t *testing.T) {
 func TestIssueWrite_CommentIsDeferred(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"),
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StateRefined, "clarify"),
 		issueV2("tatara-operator", 291, "t1"))
 
 	w := e.do(t, http.MethodPost, "/projects/tatara/scm/issue-write",
@@ -1090,7 +1139,7 @@ func TestIssueWrite_CommentIsDeferred(t *testing.T) {
 func TestIssueWrite_NoStatusAndNoLabelsParam(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"),
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StateRefined, "clarify"),
 		issueV2("tatara-operator", 291, "t1"))
 	for _, body := range []string{
 		`{"task":"t1","action":"comment","repo":"tatara-operator","number":291,"body":"x","labels":["tatara"]}`,
@@ -1105,7 +1154,7 @@ func TestIssueWrite_NoStatusAndNoLabelsParam(t *testing.T) {
 
 func TestMRWrite_Open_Synchronous(t *testing.T) {
 	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-cli", "tatara"),
-		taskV2("t1", "tatara", "implement", tatarav1alpha1.StageImplementing, "implement"))
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"))
 
 	w := e.do(t, http.MethodPost, "/projects/tatara/scm/mr-write",
 		`{"task":"t1","action":"open","repo":"tatara-cli","title":"T","body":"B"}`)
@@ -1130,14 +1179,14 @@ func TestMRWrite_Open_Synchronous(t *testing.T) {
 // pod's TASK_BRANCH env and what the wrapper actually pushes to - not a
 // hand-rolled "task/"+name that never exists on the forge (issue #381 bug A).
 func TestMRWrite_Open_HeadBranchMatchesAgentTaskBranch(t *testing.T) {
-	numbered := taskV2("t-num", "tatara", "implement", tatarav1alpha1.StageImplementing, "implement")
+	numbered := taskV2("t-num", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement")
 	numbered.Spec.Source = &tatarav1alpha1.TaskSource{
 		Provider: "github", IssueRef: "https://github.com/acme/tatara-cli/issues/42",
 		Number: 42, Title: "Fix the thing",
 	}
-	docTask := taskV2("t-doc", "tatara", "documentation", tatarav1alpha1.StageDocumenting, "documentation")
+	docTask := taskV2("t-doc", "tatara", "documentation", tatarav1alpha1.StateUnderImplementation, "documentation")
 	docTask.Annotations = map[string]string{tatarav1alpha1.AnnSourceHeadSHA: "deadbeefcafefeed"}
-	fallback := taskV2("t-fb", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify")
+	fallback := taskV2("t-fb", "tatara", "clarify", tatarav1alpha1.StateRefined, "clarify")
 
 	for _, tc := range []struct {
 		name string
@@ -1177,7 +1226,7 @@ func TestMRWrite_Open_4xxPassesThrough(t *testing.T) {
 		Body:   "{\"message\":\"Validation Failed\",\"errors\":[{\"field\":\"head\",\"code\":\"invalid\"}]}",
 	}
 	e := buildV2(t, v2Opts{writer: forge}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-cli", "tatara"),
-		taskV2("t1", "tatara", "implement", tatarav1alpha1.StageImplementing, "implement"))
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"))
 
 	w := e.do(t, http.MethodPost, "/projects/tatara/scm/mr-write",
 		`{"task":"t1","action":"open","repo":"tatara-cli","title":"T","body":"B"}`)
@@ -1199,7 +1248,7 @@ func TestMRWrite_Open_TransportErrorStays502(t *testing.T) {
 	forge := newRecordingForge()
 	forge.openChangeErr = fmt.Errorf("dial tcp: connect: connection refused")
 	e := buildV2(t, v2Opts{writer: forge}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-cli", "tatara"),
-		taskV2("t1", "tatara", "implement", tatarav1alpha1.StageImplementing, "implement"))
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"))
 
 	w := e.do(t, http.MethodPost, "/projects/tatara/scm/mr-write",
 		`{"task":"t1","action":"open","repo":"tatara-cli","title":"T","body":"B"}`)
@@ -1214,7 +1263,7 @@ func TestMRWrite_Open_TransportErrorStays502(t *testing.T) {
 func TestMRWrite_Open_IsIdempotent(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-cli", "tatara"),
-		taskV2("t1", "tatara", "implement", tatarav1alpha1.StageImplementing, "implement"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
 		mrV2("tatara-cli", 80, "t1"))
 
 	w := e.do(t, http.MethodPost, "/projects/tatara/scm/mr-write",
@@ -1232,7 +1281,7 @@ func TestMRWrite_Open_RefusedAfterAMerge(t *testing.T) {
 	})
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-cli", "tatara"),
-		taskV2("t1", "tatara", "implement", tatarav1alpha1.StageImplementing, "implement"), merged)
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"), merged)
 
 	w := e.do(t, http.MethodPost, "/projects/tatara/scm/mr-write",
 		`{"task":"t1","action":"open","repo":"tatara-cli","title":"T","body":"B"}`)
@@ -1245,7 +1294,7 @@ func TestMRWrite_Open_RefusedAfterAMerge(t *testing.T) {
 func TestMRWrite_NoMergeNoApproveNoRequestChanges(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-cli", "tatara"),
-		taskV2("t1", "tatara", "implement", tatarav1alpha1.StageImplementing, "implement"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
 		mrV2("tatara-cli", 80, "t1"))
 	for _, action := range []string{"merge", "approve", "request_changes"} {
 		w := e.do(t, http.MethodPost, "/projects/tatara/scm/mr-write",
@@ -1258,8 +1307,8 @@ func TestMRWrite_NoMergeNoApproveNoRequestChanges(t *testing.T) {
 func TestMRWrite_OwnershipGate(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-cli", "tatara"),
-		taskV2("t1", "tatara", "implement", tatarav1alpha1.StageImplementing, "implement"),
-		taskV2("t2", "tatara", "review", tatarav1alpha1.StageReviewing, "review"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
+		taskV2("t2", "tatara", "review", tatarav1alpha1.StateAwaitingReview, "review"),
 		mrV2("tatara-cli", 80, "t1"))
 
 	w := e.do(t, http.MethodPost, "/projects/tatara/scm/mr-write",
@@ -1271,7 +1320,7 @@ func TestMRWrite_OwnershipGate(t *testing.T) {
 func TestMRWrite_ReplyIsDeferredAndCarriesInReplyTo(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-cli", "tatara"),
-		taskV2("t1", "tatara", "implement", tatarav1alpha1.StageImplementing, "implement"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
 		mrV2("tatara-cli", 80, "t1"))
 
 	w := e.do(t, http.MethodPost, "/projects/tatara/scm/mr-write",
@@ -1292,7 +1341,7 @@ func TestMRWrite_ReplyIsDeferredAndCarriesInReplyTo(t *testing.T) {
 func TestSynchronousWrites_AreVisibleInTheMirrorWithTheSweepNeverRun(t *testing.T) {
 	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"), repoV2("tatara-cli", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"))
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StateRefined, "clarify"))
 
 	require.Equal(t, http.StatusOK, e.do(t, http.MethodPost, "/projects/tatara/scm/issue-write",
 		`{"task":"t1","action":"create","repo":"tatara-operator","title":"just filed","body":"B"}`).Code)
@@ -1314,7 +1363,7 @@ func TestSynchronousWrites_AreVisibleInTheMirrorWithTheSweepNeverRun(t *testing.
 func TestEveryV2Body_RejectsAnUnknownKey(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-cli", "tatara"), repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "implement", tatarav1alpha1.StageImplementing, "implement"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
 		issueV2("tatara-operator", 291, "t1"), mrV2("tatara-cli", 80, "t1"))
 
 	cases := []struct{ path, body string }{
@@ -1335,7 +1384,7 @@ func TestEveryV2Body_RejectsAnUnknownKey(t *testing.T) {
 
 func TestV2Body_OversizeIs413(t *testing.T) {
 	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageImplementing, "implement"))
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StateUnderImplementation, "implement"))
 	big := strings.Repeat("a", (1<<20)+10)
 	w := e.do(t, http.MethodPost, "/tasks/t1/notes", `{"kind":"note","body":"`+big+`"}`)
 	require.Equal(t, http.StatusRequestEntityTooLarge, w.Code)

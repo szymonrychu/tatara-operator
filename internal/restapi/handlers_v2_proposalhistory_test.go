@@ -57,7 +57,7 @@ func declinedProposalV2(number int) *tatarav1alpha1.Issue {
 func TestTaskContext_BrainstormReReadCarriesTheProposalHistory(t *testing.T) {
 	e := buildV2(t, v2Opts{},
 		brainstormHistoryProject(20), scmSecretV2(), repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StageBrainstorming, "brainstorm"),
+		taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StateRefined, "brainstorm"),
 		declinedProposalV2(291),
 	)
 	w := e.do(t, http.MethodGet, "/tasks/t1/context", "")
@@ -77,7 +77,7 @@ func TestTaskContext_BrainstormReReadCarriesTheProposalHistory(t *testing.T) {
 func TestTaskContext_NonBrainstormReReadOmitsTheProposalHistory(t *testing.T) {
 	e := buildV2(t, v2Opts{},
 		brainstormHistoryProject(20), scmSecretV2(), repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"),
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StateRefined, "clarify"),
 		declinedProposalV2(291),
 	)
 	w := e.do(t, http.MethodGet, "/tasks/t1/context", "")

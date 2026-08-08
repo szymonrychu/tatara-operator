@@ -111,7 +111,7 @@ func setProjectMemory(t *testing.T, name string, mem *tatarav1alpha1.MemoryStatu
 func TestTaskSpawn_ProceedsWhenMemoryNotStablyReady(t *testing.T) {
 	mkTaskProject(t, "p-degraded", 3)
 	mkTaskRepository(t, "r-degraded", "p-degraded")
-	mkTaskWithKind(t, "t-degraded", "p-degraded", "r-degraded", "clarify")
+	mkTaskWithKind(t, "t-degraded", "p-degraded", "r-degraded", "implement")
 
 	// Ready, but ReadySince is NOW: inside the stabilization window, so the
 	// project is not stably ready. This is exactly what used to hold the spawn.
@@ -121,7 +121,7 @@ func TestTaskSpawn_ProceedsWhenMemoryNotStablyReady(t *testing.T) {
 		Endpoint:   "http://mem-p-degraded.tatara.svc:8080",
 		ReadySince: &now,
 	})
-	setTaskStage(t, "t-degraded", tatarav1alpha1.StageImplementing)
+	setTaskStage(t, "t-degraded", tatarav1alpha1.StateUnderImplementation)
 
 	r := newTaskReconciler(newFakeSession())
 	res, err := reconcileTask(t, r, "t-degraded")
@@ -135,7 +135,7 @@ func TestTaskSpawn_ProceedsWhenMemoryNotStablyReady(t *testing.T) {
 	if !podExists(t, agent.PodName(getTask(t, "t-degraded"))) {
 		t.Fatalf("no wrapper pod created: the memory gate is still holding the spawn")
 	}
-	if v := testutil.ToFloat64(r.Metrics.AgentPodDegradedCounter("p-degraded", "clarify", "memory")); v != 1 {
+	if v := testutil.ToFloat64(r.Metrics.AgentPodDegradedCounter("p-degraded", "implement", "memory")); v != 1 {
 		t.Fatalf("operator_agent_pod_degraded_total{project=p-degraded,kind=clarify,subsystem=memory} = %v, want 1", v)
 	}
 	cond := findCond(getTask(t, "t-degraded").Status.Conditions, tatarav1alpha1.ConditionMemoryDegraded)
@@ -151,10 +151,10 @@ func TestTaskSpawn_ProceedsWhenMemoryNotStablyReady(t *testing.T) {
 func TestTaskSpawn_NotDegradedWhenMemoryStablyReady(t *testing.T) {
 	mkTaskProject(t, "p-healthy", 3)
 	mkTaskRepository(t, "r-healthy", "p-healthy")
-	mkTaskWithKind(t, "t-healthy", "p-healthy", "r-healthy", "clarify")
+	mkTaskWithKind(t, "t-healthy", "p-healthy", "r-healthy", "implement")
 
 	setProjectMemory(t, "p-healthy", stableMemStatus("http://mem-p-healthy.tatara.svc:8080"))
-	setTaskStage(t, "t-healthy", tatarav1alpha1.StageImplementing)
+	setTaskStage(t, "t-healthy", tatarav1alpha1.StateUnderImplementation)
 
 	r := newTaskReconciler(newFakeSession())
 	if _, err := reconcileTask(t, r, "t-healthy"); err != nil {
@@ -163,7 +163,7 @@ func TestTaskSpawn_NotDegradedWhenMemoryStablyReady(t *testing.T) {
 	if !podExists(t, agent.PodName(getTask(t, "t-healthy"))) {
 		t.Fatalf("no wrapper pod created for a healthy project")
 	}
-	if v := testutil.ToFloat64(r.Metrics.AgentPodDegradedCounter("p-healthy", "clarify", "memory")); v != 0 {
+	if v := testutil.ToFloat64(r.Metrics.AgentPodDegradedCounter("p-healthy", "implement", "memory")); v != 0 {
 		t.Fatalf("operator_agent_pod_degraded_total = %v, want 0 for a stably-ready project", v)
 	}
 	if c := findCond(getTask(t, "t-healthy").Status.Conditions, tatarav1alpha1.ConditionMemoryDegraded); c != nil {

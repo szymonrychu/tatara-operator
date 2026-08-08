@@ -139,13 +139,23 @@ func enterCIRed(ctx context.Context, c client.Client, sp objbudget.Spiller, m *o
 	task *tatarav1alpha1.Task, mrs []tatarav1alpha1.MergeRequest,
 	red *tatarav1alpha1.MergeRequest, now time.Time) error {
 
-	from := task.Status.Stage
+	from := task.Status.State
 	edge, _ := stage.CIRed(task, mrs, tatarav1alpha1.MaxCIRedReentries)
 	reentries := task.Status.CIRedReentries
 	if err := appendOperatorNoteTo(ctx, c, sp, task, ciRedNote(red, reentries), now); err != nil {
 		return err
 	}
-	if err := EnterStage(ctx, c, sp, m, task, mrs, edge.To, edge.Reason, now,
+	// stage.CIRed returns a PARK for three of its four outcomes (kind=review,
+	// an already-merged sibling, and the spent re-entry budget) and a
+	// TRANSITION for the fourth. Parking is not an edge any more (#521), so
+	// EnterStage refuses stage.ParkTarget by design and an unbranched applier
+	// would 500 on the majority outcome.
+	if edge.To == stage.ParkTarget {
+		if err := ParkTask(ctx, c, sp, m, task, edge.Reason, now,
+			func(t *tatarav1alpha1.Task) { t.Status.CIRedReentries = reentries }); err != nil {
+			return err
+		}
+	} else if err := EnterStage(ctx, c, sp, m, task, mrs, edge.To, edge.Reason, now,
 		func(t *tatarav1alpha1.Task) { t.Status.CIRedReentries = reentries }); err != nil {
 		return err
 	}
@@ -153,7 +163,7 @@ func enterCIRed(ctx context.Context, c client.Client, sp objbudget.Spiller, m *o
 	obs.CIRedExitTotal.WithLabelValues(red.Spec.RepositoryRef, from, edge.To).Inc()
 	log.FromContext(ctx).Info("ci gate: the required checks are RED at the reviewed head; leaving the merge path",
 		"action", "ci_red_exit", "resource_id", task.Name, "from", from,
-		"to", edge.To, "stage_reason", edge.Reason, "repo", red.Spec.RepositoryRef,
+		"to", edge.To, "reason", edge.Reason, "repo", red.Spec.RepositoryRef,
 		"pr", red.Spec.Number, "sha", red.Status.ReviewedSHA, "ci_red_reentries", reentries)
 	return nil
 }

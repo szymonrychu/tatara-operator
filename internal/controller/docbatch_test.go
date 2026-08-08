@@ -23,7 +23,7 @@ const docsRepoURL = "https://github.com/szymonrychu/tatara-documentation.git"
 // the exact shape the nightly batch covers.
 func deliveredWithMergedMR(t *testing.T, proj, repo, name string, number int, at time.Time) (*tatarav1alpha1.Task, *tatarav1alpha1.MergeRequest) {
 	t.Helper()
-	tk := reapTask(proj, name, "clarify", tatarav1alpha1.StageDelivered, "", at)
+	tk := reapTask(proj, name, "implement", tatarav1alpha1.StateDone, "", at)
 	stamp := metav1.NewTime(at)
 	tk.Status.DeliveredAt = &stamp
 	tk.Status.MRRefs = []string{tatarav1alpha1.MergeRequestName(repo, number)}
@@ -70,11 +70,11 @@ func TestDocBatchMintsOneTaskForNDelivered(t *testing.T) {
 	t2, m2 := deliveredWithMergedMR(t, "docmint", src.Name, "task-b", 2, time.Now().Add(-2*time.Hour))
 	// NEVER covered: a brainstorm skip has zero MRs. A docs PR about nothing, a
 	// review, a merge and a release, every day, is exactly what fix 25 kills.
-	skip := reapTask("docmint", "task-skip", "brainstorm", tatarav1alpha1.StageDelivered, "", time.Now())
+	skip := reapTask("docmint", "task-skip", "brainstorm", tatarav1alpha1.StateDone, "", time.Now())
 	skipAt := metav1.NewTime(time.Now())
 	skip.Status.DeliveredAt = &skipAt
 	// NEVER covered: an incident false_positive is REJECTED, not delivered.
-	fp := reapTask("docmint", "task-fp", "incident", tatarav1alpha1.StageRejected, stage.ReasonFalsePositive, time.Now())
+	fp := reapTask("docmint", "task-fp", "incident", tatarav1alpha1.StateRejected, stage.ReasonFalsePositive, time.Now())
 
 	c := newMirrorClient(t, proj, src, docs, reapSecret(), t1, t2, skip, fp, m1, m2)
 	r := reapReconciler(c, &reapWriter{})
@@ -94,16 +94,16 @@ func TestDocBatchMintsOneTaskForNDelivered(t *testing.T) {
 	if b.Spec.RepositoryRef != docs.Name {
 		t.Fatalf("spec.repositoryRef = %q, want the docs repo %q", b.Spec.RepositoryRef, docs.Name)
 	}
-	// MintDocBatch sets the IMMUTABLE Spec.InitialStage (fix C5); Status.Stage is
+	// MintDocBatch sets the IMMUTABLE Spec.InitialState (fix C5); Status.Stage is
 	// applied later by the TaskReconciler create-edge, which this test does not
 	// run.
-	if b.Spec.InitialStage != tatarav1alpha1.StageDocumenting {
-		t.Fatalf("initialStage = %q, want documenting", b.Spec.InitialStage)
+	if b.Spec.InitialState != tatarav1alpha1.StateUnderImplementation {
+		t.Fatalf("initialStage = %q, want documenting", b.Spec.InitialState)
 	}
 
 	// Drive the create-edge (fix C5) so the in-flight guard - which reads
-	// Status.Stage, not Spec.InitialStage - sees this batch as live before the
-	// second pass. In production the reconciler applies Spec.InitialStage long
+	// Status.Stage, not Spec.InitialState - sees this batch as live before the
+	// second pass. In production the reconciler applies Spec.InitialState long
 	// before the next night's mint tick; this mirrors that sequencing.
 	live, _ := mustGetTask(t, c, b.Name)
 	tr := &TaskReconciler{Client: c, Metrics: r.Metrics}
@@ -132,7 +132,7 @@ func TestDocBatchStampsDocumentedByOnDelivered(t *testing.T) {
 	docs := reapRepo("docstamp", "tatara-documentation", docsRepoURL)
 
 	t1, m1 := deliveredWithMergedMR(t, "docstamp", src.Name, "task-a", 1, time.Now())
-	batch := reapTask("docstamp", "doc-batch", DocBatchKind, tatarav1alpha1.StageDelivered, "", time.Now())
+	batch := reapTask("docstamp", "doc-batch", DocBatchKind, tatarav1alpha1.StateDone, "", time.Now())
 	batch.Spec.DocumentsTasks = []string{"task-a"}
 	batch.Spec.RepositoryRef = docs.Name
 	batch.Status.Stats.PodRuns = 3
@@ -166,7 +166,7 @@ func TestReapTerminalStampsDocumentedByOnNormalDelivery(t *testing.T) {
 	// The batch reached delivered with reason="" - the normal merge.go path, NOT
 	// doc-timeout. It ran (podRuns > 0) and is fresh (well within its 48h TTL), so
 	// the ONLY thing left to verify is whether the reap pass resolves it at all.
-	batch := reapTask("docnormal", "doc-batch", DocBatchKind, tatarav1alpha1.StageDelivered, "", time.Now())
+	batch := reapTask("docnormal", "doc-batch", DocBatchKind, tatarav1alpha1.StateDone, "", time.Now())
 	batch.Spec.DocumentsTasks = []string{"task-a"}
 	batch.Spec.RepositoryRef = docs.Name
 	batch.Status.Stats.PodRuns = 3
@@ -195,7 +195,7 @@ func TestReapTerminalStampsDocumentedByOnParked(t *testing.T) {
 
 	t1, m1 := deliveredWithMergedMR(t, "docparked", src.Name, "task-a", 1, time.Now())
 	batch := reapTask("docparked", "doc-batch", DocBatchKind,
-		tatarav1alpha1.StageParked, stage.ReasonMergeTimeout, time.Now())
+		tatarav1alpha1.StateMerged, stage.ReasonMergeTimeout, time.Now())
 	batch.Spec.DocumentsTasks = []string{"task-a"}
 	batch.Spec.RepositoryRef = docs.Name
 	batch.Status.Stats.PodRuns = 2 // it ran
@@ -250,7 +250,7 @@ func TestDocBatchNeverRanIsPickedUpTheNextNight(t *testing.T) {
 	}
 
 	// Drive the create-edge (fix C5): MintDocBatch only sets the immutable
-	// Spec.InitialStage; the TaskReconciler create-edge applies it to
+	// Spec.InitialState; the TaskReconciler create-edge applies it to
 	// Status.Stage, which forceDocTimeout below switches on.
 	b1live, _ := mustGetTask(t, c, b1.Name)
 	tr := &TaskReconciler{Client: c, Metrics: r.Metrics}
@@ -260,11 +260,11 @@ func TestDocBatchNeverRanIsPickedUpTheNextNight(t *testing.T) {
 
 	// It STARVES: 2h+ in documenting, and stats.podRuns is ZERO. It NEVER RAN.
 	live, _ := mustGetTask(t, c, b1.Name)
-	if live.Status.Stage != tatarav1alpha1.StageDocumenting {
-		t.Fatalf("create-edge stamped %q, want documenting", live.Status.Stage)
+	if live.Status.State != tatarav1alpha1.StateUnderImplementation {
+		t.Fatalf("create-edge stamped %q, want documenting", live.Status.State)
 	}
 	entered := metav1.NewTime(time.Now().Add(-3 * time.Hour))
-	live.Status.StageEnteredAt = &entered
+	live.Status.StateEnteredAt = &entered
 	live.Status.Stats.PodRuns = 0
 	if err := c.Status().Update(ctx, live); err != nil {
 		t.Fatalf("age the batch: %v", err)
@@ -281,8 +281,8 @@ func TestDocBatchNeverRanIsPickedUpTheNextNight(t *testing.T) {
 	if !ok {
 		t.Fatal("the stuck batch vanished")
 	}
-	if forced.Status.Stage != tatarav1alpha1.StageDelivered || forced.Status.StageReason != stage.ReasonDocTimeout {
-		t.Fatalf("stuck batch is %s(%s), want delivered(doc-timeout)", forced.Status.Stage, forced.Status.StageReason)
+	if forced.Status.State != tatarav1alpha1.StateDone || forced.Status.StateReason != stage.ReasonDocTimeout {
+		t.Fatalf("stuck batch is %s(%s), want done(doc-timeout)", forced.Status.State, forced.Status.StateReason)
 	}
 	if got := testutil.ToFloat64(obs.DocTaskAbandonedTotal.WithLabelValues(obs.DocAbandonedNeverRan)); got <= before {
 		t.Fatalf("operator_doc_task_abandoned_total{reason=never_ran} = %v, want > %v", got, before)
@@ -326,7 +326,7 @@ func TestDocBatchTimeoutStampsWhenItRan(t *testing.T) {
 
 	t1, m1 := deliveredWithMergedMR(t, "docran", src.Name, "task-a", 1, time.Now())
 	batch := reapTask("docran", "doc-batch", DocBatchKind,
-		tatarav1alpha1.StageDocumenting, "", time.Now().Add(-3*time.Hour))
+		tatarav1alpha1.StateUnderImplementation, "", time.Now().Add(-3*time.Hour))
 	batch.Spec.DocumentsTasks = []string{"task-a"}
 	batch.Spec.RepositoryRef = docs.Name
 	batch.Status.Stats.PodRuns = 2 // IT RAN.
@@ -460,7 +460,7 @@ func TestNeedsDocumentingRequiresConfiguredCron(t *testing.T) {
 			var c client.Client
 			var tk *tatarav1alpha1.Task
 			if tc.noMR {
-				tk = reapTask(tc.proj.Name, "task-a", "brainstorm", tatarav1alpha1.StageDelivered, "", time.Now())
+				tk = reapTask(tc.proj.Name, "task-a", "brainstorm", tatarav1alpha1.StateDone, "", time.Now())
 				stamp := metav1.NewTime(time.Now())
 				tk.Status.DeliveredAt = &stamp
 				c = newMirrorClient(t, tc.proj, src, reapSecret(), tk)
@@ -575,7 +575,7 @@ func TestMintDocBatchRecordsOutcome(t *testing.T) {
 	src3 := reapRepo("mintdefer", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
 	docs3 := reapRepo("mintdefer", "tatara-documentation", docsRepoURL)
 	t3, m3 := deliveredWithMergedMR(t, "mintdefer", src3.Name, "task-a", 1, time.Now().Add(-3*time.Hour))
-	inflight := reapTask("mintdefer", "doc-inflight", DocBatchKind, tatarav1alpha1.StageDocumenting, "", time.Now())
+	inflight := reapTask("mintdefer", "doc-inflight", DocBatchKind, tatarav1alpha1.StateUnderImplementation, "", time.Now())
 	inflight.Spec.DocumentsTasks = []string{"task-a"}
 	inflight.Spec.RepositoryRef = "tatara-documentation"
 	c3 := newMirrorClient(t, proj3, src3, docs3, reapSecret(), t3, m3, inflight)

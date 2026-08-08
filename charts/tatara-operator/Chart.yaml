@@ -7,5 +7,36 @@ type: application
 # gone, and the Issue/MergeRequest mirrors are new. The Subtask CRD carries
 # helm.sh/resource-policy: keep, so `helm upgrade` does NOT remove it: the
 # cutover must run `kubectl delete crd subtasks.tatara.dev` explicitly.
-version: 1.0.0
-appVersion: "0.4.5"
+# 2.0.0: the #521 lifecycle and agent merge. BREAKING - Task.status.stage and
+# status.stageReason are GONE (status.state + status.parkReason replace them and
+# are ORTHOGONAL), the clarify agent kind is deleted and folded into implement,
+# Project.spec.maxConversingPods is renamed maxLivePods, and
+# TATARA_CONTRACT_VERSION is 4.
+#
+# THERE IS NO STATE MIGRATION, and that is a RULING rather than an omission.
+# CRD structural pruning is applied on the READ path: the moment this chart's
+# narrowed CRD is served, no GET returns status.stage on ANY object, so a
+# one-shot migrator has nothing to read. EVERY LIVE TASK IS THEREFORE RESET -
+# it comes back stateless and re-derives through the operator's create edge.
+# The one thing that reset must not do is resurrect finished work, and
+# controller.terminalResetTarget is the guard: a Task carrying proof it already
+# delivered or already stopped is stamped done/rejected instead of re-triaged.
+# See tatara-operator MEMORY.md 2026-08-08 for the measurement and the
+# post-deploy check.
+#
+# NOT SYMMETRICALLY REVERSIBLE. The CRD narrowing means a downgrade finds
+# status.state set and status.stage absent, i.e. every Task reads as stage-less
+# to the OLD operator too. The rollback is forward-only: fix and re-release.
+# Apply the chart and the image TOGETHER (`helm upgrade --wait`), never
+# `kubectl set image`.
+version: 2.0.0
+appVersion: "0.5.0"
+# The cutover relies on CRD validation RATCHETING during the window in which
+# Helm has applied the narrowed CRD but the OLD operator Deployment is still
+# running: it writes mirror-sync updates against a narrowed enum, and the 61
+# live Tasks still carrying the deleted spec.kind=clarify must survive their own
+# status writes afterwards. That was fixed for exactly this release by
+# kubernetes/kubernetes#129506. Helm refuses the upgrade below it rather than
+# letting the operator 422 mysteriously. Cluster measured at server v1.33.0 on
+# 2026-08-07.
+kubeVersion: ">=1.33.0-0"

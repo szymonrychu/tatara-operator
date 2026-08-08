@@ -65,7 +65,7 @@ func brainstormProposeFingerprint(t *testing.T) string {
 	t.Helper()
 	e := buildV2(t, v2Opts{writer: newRecordingForge()}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("fp", "tatara", "brainstorm", tatarav1alpha1.StageBrainstorming, "brainstorm"))
+		taskV2("fp", "tatara", "brainstorm", tatarav1alpha1.StateRefined, "brainstorm"))
 	w := e.do(t, http.MethodPost, "/tasks/fp/outcome", brainstormProposeBody)
 	require.Equal(t, http.StatusOK, w.Code)
 	cond := tatarav1alpha1.OutcomeCondition(e.task(t, "fp"))
@@ -95,7 +95,7 @@ func TestOutcome_ConcurrentIdenticalPOSTsClaimFingerprintOnce(t *testing.T) {
 	base := newRecordingForge()
 	forge := &blockingCreateIssueForge{recordingForge: base, entered: make(chan struct{}), release: make(chan struct{})}
 	e := buildV2(t, v2Opts{writer: forge}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StageBrainstorming, "brainstorm"))
+		taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StateRefined, "brainstorm"))
 
 	body := brainstormProposeBody
 
@@ -128,13 +128,13 @@ func TestOutcome_ConcurrentIdenticalPOSTsClaimFingerprintOnce(t *testing.T) {
 
 	var tasks tatarav1alpha1.TaskList
 	require.NoError(t, e.c.List(context.Background(), &tasks, client.InNamespace(ns)))
-	clarifies := 0
+	gateTasks := 0
 	for i := range tasks.Items {
-		if tasks.Items[i].Spec.Kind == "clarify" {
-			clarifies++
+		if tasks.Items[i].Spec.Kind == "implement" {
+			gateTasks++
 		}
 	}
-	require.Equal(t, 1, clarifies, "exactly one child clarify Task must be minted")
+	require.Equal(t, 1, gateTasks, "exactly one child gate (implement) Task must be minted")
 }
 
 // THE RE-CLAIM MUST REFRESH THE LEASE'S CLOCK, and that refresh is only
@@ -160,7 +160,7 @@ func TestOutcome_ReclaimOfAnOrphanedStubRefreshesTheLeaseClock(t *testing.T) {
 	base := newRecordingForge()
 	forge := &blockingCreateIssueForge{recordingForge: base, entered: make(chan struct{}), release: make(chan struct{})}
 	e := buildV2(t, v2Opts{writer: forge}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StageBrainstorming, "brainstorm"))
+		taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StateRefined, "brainstorm"))
 
 	// An ORPHANED STUB: a bare claim on our own fingerprint, older than the TTL.
 	stale := frozenNow.Add(-tatarav1alpha1.OutcomeClaimTTL - time.Second)

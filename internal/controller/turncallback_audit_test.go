@@ -78,7 +78,7 @@ func TestExpireTimedOutTurn_ClearsCurrentTurnAnnotation(t *testing.T) {
 	mkTaskProject(t, "p-exp1", 3)
 	mkTaskRepository(t, "r-exp1", "p-exp1")
 	mkTask(t, "t-exp1", "p-exp1", "r-exp1")
-	setTaskStage(t, "t-exp1", tatarav1alpha1.StageImplementing)
+	setTaskStage(t, "t-exp1", tatarav1alpha1.StateUnderImplementation)
 	annotate(t, "t-exp1", map[string]string{
 		annCurrentTurn:   "turn-expired",
 		annTurnStartedAt: "2000-01-01T00:00:00Z",
@@ -107,7 +107,7 @@ func TestExpireTimedOutTurn_LateCallbackIsNoop(t *testing.T) {
 	mkTaskProject(t, "p-exp2", 3)
 	mkTaskRepository(t, "r-exp2", "p-exp2")
 	mkTask(t, "t-exp2", "p-exp2", "r-exp2")
-	setTaskStage(t, "t-exp2", tatarav1alpha1.StageImplementing)
+	setTaskStage(t, "t-exp2", tatarav1alpha1.StateUnderImplementation)
 	annotate(t, "t-exp2", map[string]string{
 		annCurrentTurn:   "turn-late",
 		annTurnStartedAt: "2000-01-01T00:00:00Z",
@@ -135,7 +135,7 @@ func TestExpireTimedOutTurn_AlreadyTerminalIsNoop(t *testing.T) {
 	mkTaskProject(t, "p-term1", 3)
 	mkTaskRepository(t, "r-term1", "p-term1")
 	mkTask(t, "t-term1", "p-term1", "r-term1")
-	setTaskStage(t, "t-term1", tatarav1alpha1.StageFailed) // already finished
+	setTaskStage(t, "t-term1", tatarav1alpha1.StateRejected) // already finished
 	annotate(t, "t-term1", map[string]string{
 		annCurrentTurn:   "turn-term",
 		annTurnStartedAt: "2000-01-01T00:00:00Z",
@@ -182,7 +182,7 @@ func TestPollOnce_NilMetricsNoPanic(t *testing.T) {
 	mkTaskProject(t, "p-nilm2", 3)
 	mkTaskRepository(t, "r-nilm2", "p-nilm2")
 	mkTask(t, "t-nilm2", "p-nilm2", "r-nilm2")
-	setTaskStage(t, "t-nilm2", tatarav1alpha1.StageImplementing)
+	setTaskStage(t, "t-nilm2", tatarav1alpha1.StateUnderImplementation)
 	annotate(t, "t-nilm2", map[string]string{
 		annCurrentTurn:   "turn-nilm2",
 		annTurnStartedAt: "2000-01-01T00:00:00Z",

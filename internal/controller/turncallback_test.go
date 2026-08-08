@@ -310,7 +310,7 @@ func TestTurnComplete_EmitsTaskTokens(t *testing.T) {
 	mkTask(t, "t-tok", "p-tok", "r-tok")
 	// Set a Kind + issue source so the emitted series carries real labels.
 	tk := getTask(t, "t-tok")
-	tk.Spec.Kind = "clarify"
+	tk.Spec.Kind = "implement"
 	tk.Spec.Source = &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "szymonrychu/tatara-operator#7"}
 	if err := k8sClient.Update(context.Background(), tk); err != nil {
 		t.Fatalf("set kind/source: %v", err)
@@ -346,7 +346,7 @@ func TestTurnComplete_EmitsTaskTokens(t *testing.T) {
 			for _, lp := range mc.GetLabel() {
 				lbl[lp.GetName()] = lp.GetValue()
 			}
-			if lbl["kind"] == "clarify" && lbl["type"] == "input" && lbl["repo"] == "r-tok" {
+			if lbl["kind"] == "implement" && lbl["type"] == "input" && lbl["repo"] == "r-tok" {
 				input = mc.GetCounter().GetValue()
 				found = true
 			}

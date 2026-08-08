@@ -82,12 +82,16 @@ func TestConversingPodDoesNotSubmitWhileATurnIsInFlight(t *testing.T) {
 	}
 }
 
-// The follow-up turn is scoped to conversing ONLY. Every other pod stage keeps
-// exactly one turn per pod: widening it would change the turn model for
-// implementing and reviewing, which is not what this change is for.
+// The follow-up turn is scoped to LIVE states ONLY (#521 dissolved the single
+// `conversing` stage into stage.Live(state), which now covers all three of
+// refined/under-implementation/awaiting-review - so every state that runs a
+// pod at all is live, and this negative case can only be built against a
+// NON-live state). merged runs no agent pod - it is operator-driven - so even
+// with turn-0 already marked complete and an event pending, it must never
+// take a follow-up turn.
 func TestNonConversingPodTakesNoFollowUpTurn(t *testing.T) {
 	proj, task, r, sess := newConversingTurnFixture(t)
-	task.Status.Stage = v1alpha1.StageClarifying
+	task.Status.State = v1alpha1.StateMerged
 	task.Annotations = map[string]string{
 		annStageTurn0:   turn0Marker(task),
 		annCurrentTurn:  "turn-0",
@@ -101,7 +105,7 @@ func TestNonConversingPodTakesNoFollowUpTurn(t *testing.T) {
 		t.Fatalf("reconcilePodStage: %v", err)
 	}
 	if sess.submitted != 0 {
-		t.Fatalf("SubmitTurn called %d times on a clarifying pod, want 0", sess.submitted)
+		t.Fatalf("SubmitTurn called %d times on a non-live (merged) pod, want 0", sess.submitted)
 	}
 }
 
@@ -129,8 +133,8 @@ func TestConversingRenderCountsBundleElision(t *testing.T) {
 	if _, err := r.reconcilePodStage(context.Background(), proj, task, "clarify", time.Now()); err != nil {
 		t.Fatalf("reconcilePodStage: %v", err)
 	}
-	if got := bundleElidedFor(t, r, "clarify"); got == 0 {
-		t.Fatal("operator_bundle_elided_total{agent_kind=clarify} = 0: a long conversation is dropping history silently")
+	if got := bundleElidedFor(t, r, "implement"); got == 0 {
+		t.Fatal("operator_bundle_elided_total{agent_kind=implement} = 0: a long conversation is dropping history silently")
 	}
 }
 
@@ -342,14 +346,14 @@ func newConversingTurnFixture(t *testing.T) (*v1alpha1.Project, *v1alpha1.Task, 
 
 	now := time.Now()
 	proj := tsStablyReadyProject(3)
-	task := tsTask("conv-1", "clarify", v1alpha1.StageConversing, now.Add(-time.Hour))
+	task := tsTask("conv-1", "implement", v1alpha1.StateRefined, now.Add(-time.Hour))
 	podAt := metav1.NewTime(now.Add(-10 * time.Minute))
 	workAt := metav1.NewTime(now.Add(-9 * time.Minute))
 	lastEvent := metav1.NewTime(now.Add(-time.Minute))
 	task.Status.PodStartedAt = &podAt
-	task.Status.StageWorkStartedAt = &workAt
+	task.Status.StateWorkStartedAt = &workAt
 	task.Status.ConversationLastEventAt = &lastEvent
-	task.Status.AgentKind = stage.AgentClarify
+	task.Status.AgentKind = stage.AgentKindFor(v1alpha1.StateRefined, "implement")
 
 	c := newMirrorClient(t, proj, mdSecret(), task, tsReadyPod(task))
 	r := tsReconciler(&liveTaskClient{Client: c, task: task})

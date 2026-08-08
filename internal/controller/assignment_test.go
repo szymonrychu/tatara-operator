@@ -15,21 +15,28 @@ import (
 // is "clarify", the skills directive must use "clarify", not "incident".
 func TestAssignmentSkillsDirectiveUsesAgentKind(t *testing.T) {
 	tests := []struct {
+		name           string
 		agentKind      string
 		requiredSkill  string
 		forbiddenSkill string
 	}{
 		{
-			agentKind:      stage.AgentClarify,
-			requiredSkill:  "tatara-clarify-conversation",
+			// stage.AgentClarify is gone (#521): its job merged into
+			// stage.AgentImplement's arm, and tatara-clarify-conversation is
+			// superseded by tatara-implement-gate (see requiredSkillsForKind).
+			name:           "implement-gate",
+			agentKind:      stage.AgentImplement,
+			requiredSkill:  "tatara-implement-gate",
 			forbiddenSkill: "tatara-incident-investigation",
 		},
 		{
+			name:           "implement-workflow",
 			agentKind:      stage.AgentImplement,
 			requiredSkill:  "tatara-implement-workflow",
 			forbiddenSkill: "tatara-incident-investigation",
 		},
 		{
+			name:           "review",
 			agentKind:      stage.AgentReview,
 			requiredSkill:  "tatara-review-checklist",
 			forbiddenSkill: "tatara-incident-investigation",
@@ -37,7 +44,7 @@ func TestAssignmentSkillsDirectiveUsesAgentKind(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.agentKind, func(t *testing.T) {
+		t.Run(tt.name, func(t *testing.T) {
 			task := &tatarav1alpha1.Task{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "test-task",

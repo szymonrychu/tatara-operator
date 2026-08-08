@@ -60,9 +60,9 @@ func TestApplyUnpark_IdentityUnverifiedNeverReachesImplementing(t *testing.T) {
 	task.Name = "t-step-b-verdict-inert"
 	task.Spec.ProjectRef = "infrastructure"
 	task.Spec.Kind = "clarify"
-	task.Status.Stage = tatarav1alpha1.StageParked
-	task.Status.StageReason = stage.ReasonIdentityUnverified
-	task.Status.StageEnteredAt = &metav1.Time{Time: parkedAt}
+	task.Status.State = tatarav1alpha1.StateRefined
+	task.Status.ParkReason = stage.ReasonIdentityUnverified
+	task.Status.StateEnteredAt = &metav1.Time{Time: parkedAt}
 	task.Status.IssueRefs = []string{"iss-helmfile-26"}
 	task.Status.PendingEvents = []tatarav1alpha1.TaskEvent{{
 		At: metav1.Now(), Kind: "issue_comment", Repo: "helmfile", Number: 26,
@@ -72,7 +72,7 @@ func TestApplyUnpark_IdentityUnverifiedNeverReachesImplementing(t *testing.T) {
 	// NOT a live fault injection any more, and the docs on this file used to
 	// imply it was. Step C stopped ApplyUnpark reading in.Issues for the
 	// identity-unverified arm at all, so flipping "approved" to "new" here
-	// changes NOTHING - the arm asks only hasNonBotEvent and ConversingHasRoom.
+	// changes NOTHING - the arm asks only hasNonBotEvent and LiveHasRoom.
 	// It is kept as a CANARY: if this Task shape ever reaches implementing
 	// again, an approved owned Issue is what the old fast path needed, so the
 	// test would be sitting on the exact input that used to be dangerous.
@@ -84,16 +84,21 @@ func TestApplyUnpark_IdentityUnverifiedNeverReachesImplementing(t *testing.T) {
 
 	c := newMirrorClient(t, proj, task, iss)
 
-	target, decline, err := ApplyUnpark(context.Background(), c, c, proj, task, 1, 6, true, time.Now())
+	unparked, decline, err := ApplyUnpark(context.Background(), c, c, proj, task, 1, 6, true, time.Now())
 	if err != nil {
 		t.Fatalf("ApplyUnpark: %v", err)
 	}
-	if target == tatarav1alpha1.StageImplementing {
-		t.Fatal("target = implementing: a parked identity-unverified Task must NEVER reach implementing from unpark, " +
+	got := mdGetTask(t, c, task.Name)
+	if got.Status.State == tatarav1alpha1.StateUnderImplementation {
+		t.Fatal("state = implementing: a parked identity-unverified Task must NEVER reach implementing from unpark, " +
 			"whatever its owned Issues already say")
 	}
-	if target != tatarav1alpha1.StageConversing || decline != DeclineNone {
-		t.Fatalf("target = %q decline = %q, want conversing/none", target, decline)
+	// #521: Unpark NEVER moves state - it clears the flag and re-arms the clock
+	// IN PLACE. The old fast path's target ("conversing") is gone; what remains
+	// is that the Task un-parks, un-changed in state, with room to keep talking.
+	if got.Status.State != tatarav1alpha1.StateRefined || !unparked || decline != DeclineNone || tatarav1alpha1.Parked(got) {
+		t.Fatalf("state=%q unparked=%v decline=%q parked=%v, want refined/true/none/false",
+			got.Status.State, unparked, decline, tatarav1alpha1.Parked(got))
 	}
 }
 
@@ -125,9 +130,9 @@ func TestDriveUnparks_IdentityUnverifiedOpensConversationNeverImplementing(t *te
 	task.Name = "t"
 	task.Spec.ProjectRef = "infrastructure"
 	task.Spec.Kind = "clarify"
-	task.Status.Stage = tatarav1alpha1.StageParked
-	task.Status.StageReason = stage.ReasonIdentityUnverified
-	task.Status.StageEnteredAt = &metav1.Time{Time: time.Now()}
+	task.Status.State = tatarav1alpha1.StateRefined
+	task.Status.ParkReason = stage.ReasonIdentityUnverified
+	task.Status.StateEnteredAt = &metav1.Time{Time: time.Now()}
 	task.Status.IssueRefs = []string{"iss-helmfile-26"}
 	task.Status.PendingEvents = []tatarav1alpha1.TaskEvent{{
 		At: metav1.Now(), Kind: "issue_comment", Author: "szymonrychu", Body: "go ahead",
@@ -149,11 +154,14 @@ func TestDriveUnparks_IdentityUnverifiedOpensConversationNeverImplementing(t *te
 	if err := r.Get(context.Background(), objectKeyOf(task), fresh); err != nil {
 		t.Fatalf("get task: %v", err)
 	}
-	if fresh.Status.Stage == tatarav1alpha1.StageImplementing {
-		t.Fatal("stage = implementing: the reconcile driver must never re-enter implementing from parked(identity-unverified)")
+	if fresh.Status.State == tatarav1alpha1.StateUnderImplementation {
+		t.Fatal("state = implementing: the reconcile driver must never re-enter implementing from parked(identity-unverified)")
 	}
-	if fresh.Status.Stage != tatarav1alpha1.StageConversing {
-		t.Fatalf("stage = %s, want conversing: a human comment on a parked identity-unverified Task opens a conversation", fresh.Status.Stage)
+	// #521: un-park never moves state - the Task resumes talking IN PLACE,
+	// refined, un-parked.
+	if fresh.Status.State != tatarav1alpha1.StateRefined || tatarav1alpha1.Parked(fresh) {
+		t.Fatalf("state=%s parked=%v, want refined/un-parked: a human comment on a parked identity-unverified Task resumes it",
+			fresh.Status.State, tatarav1alpha1.Parked(fresh))
 	}
 	// Folded in from wiring_fixes_test.go's duplicate of this test (step C).
 	// The pre-Task-9 version there asserted the decline counter was 1 - "the
@@ -161,11 +169,11 @@ func TestDriveUnparks_IdentityUnverifiedOpensConversationNeverImplementing(t *te
 	// all, so the counter must be 0; asserted explicitly so a regression that
 	// made it decline again fails LOUDLY on the counter rather than silently
 	// passing the stage check by accident. The label it names is
-	// no-conversing-room, the ONLY decline this arm can still produce once a
+	// no-live-room, the ONLY decline this arm can still produce once a
 	// human comment is present (step C retired grammar-not-passed, which was a
 	// misnomer for a capacity refusal).
-	if n := testutil.ToFloat64(r.Metrics.UnparkDeclinedCounter(stage.ReasonIdentityUnverified, string(DeclineNoConversingRoom))); n != 0 {
-		t.Fatalf("operator_unpark_declined_total{identity-unverified,no-conversing-room} = %v, want 0: this pass entered conversing, it did not decline", n)
+	if n := testutil.ToFloat64(r.Metrics.UnparkDeclinedCounter(stage.ReasonIdentityUnverified, string(DeclineNoLiveRoom))); n != 0 {
+		t.Fatalf("operator_unpark_declined_total{identity-unverified,no-live-room} = %v, want 0: this pass resumed the conversation, it did not decline", n)
 	}
 }
 
@@ -186,24 +194,24 @@ func TestDriveUnparks_IdentityUnverifiedDeclinesNoConversingRoom(t *testing.T) {
 	proj.Namespace = "tatara"
 	proj.Name = "infrastructure"
 	proj.Spec.MaxOpenTasks = 6
-	proj.Spec.MaxConversingPods = 1
+	proj.Spec.MaxLivePods = 1
 
-	// One live conversing Task already occupies the whole ceiling.
+	// One live Task already occupies the whole ceiling.
 	busy := &tatarav1alpha1.Task{}
 	busy.Namespace = "tatara"
 	busy.Name = "t-busy"
 	busy.Spec.ProjectRef = "infrastructure"
 	busy.Spec.Kind = "clarify"
-	busy.Status.Stage = tatarav1alpha1.StageConversing
+	busy.Status.State = tatarav1alpha1.StateRefined
 
 	task := &tatarav1alpha1.Task{}
 	task.Namespace = "tatara"
 	task.Name = "t-ident-noroom"
 	task.Spec.ProjectRef = "infrastructure"
 	task.Spec.Kind = "clarify"
-	task.Status.Stage = tatarav1alpha1.StageParked
-	task.Status.StageReason = stage.ReasonIdentityUnverified
-	task.Status.StageEnteredAt = &metav1.Time{Time: time.Now()}
+	task.Status.State = tatarav1alpha1.StateRefined
+	task.Status.ParkReason = stage.ReasonIdentityUnverified
+	task.Status.StateEnteredAt = &metav1.Time{Time: time.Now()}
 	task.Status.PendingEvents = []tatarav1alpha1.TaskEvent{{
 		At: metav1.Now(), Kind: "issue_comment", Author: "szymonrychu", Body: "go ahead",
 	}}
@@ -219,28 +227,28 @@ func TestDriveUnparks_IdentityUnverifiedDeclinesNoConversingRoom(t *testing.T) {
 	if err := r.Get(context.Background(), objectKeyOf(task), fresh); err != nil {
 		t.Fatalf("get task: %v", err)
 	}
-	if fresh.Status.Stage != tatarav1alpha1.StageParked {
-		t.Fatalf("stage = %s(%s), want parked: a full conversing ceiling must decline, never fall through to another stage",
-			fresh.Status.Stage, fresh.Status.StageReason)
+	if !tatarav1alpha1.Parked(fresh) || fresh.Status.State != tatarav1alpha1.StateRefined {
+		t.Fatalf("state=%s parked=%v, want refined/parked: a full live-pod ceiling must decline, never fall through to another state",
+			fresh.Status.State, tatarav1alpha1.Parked(fresh))
 	}
 	if len(fresh.Status.PendingEvents) != 1 {
 		t.Fatalf("pendingEvents = %d, want 1: the event is RETAINED so the next pass retries", len(fresh.Status.PendingEvents))
 	}
-	if n := testutil.ToFloat64(r.Metrics.UnparkDeclinedCounter(stage.ReasonIdentityUnverified, string(DeclineNoConversingRoom))); n != 1 {
-		t.Fatalf("operator_unpark_declined_total{identity-unverified,no-conversing-room} = %v, want 1", n)
+	if n := testutil.ToFloat64(r.Metrics.UnparkDeclinedCounter(stage.ReasonIdentityUnverified, string(DeclineNoLiveRoom))); n != 1 {
+		t.Fatalf("operator_unpark_declined_total{identity-unverified,no-live-room} = %v, want 1", n)
 	}
 	// BOTH channels, per platform hard rule 13. This is the ONE rule decline
 	// driveUnparks logs: it means a human commented and the operator refused to
 	// answer them purely on capacity, which is operator-actionable, and the
 	// counter alone cannot say WHICH Task went unanswered.
-	if !containsLine(*lines, "unpark: declined (project is at its conversing ceiling; the pending event is retained and the next pass retries)") {
-		t.Fatalf("no-conversing-room declined without an INFO log; lines: %v", *lines)
+	if !containsLine(*lines, "unpark: declined (project is at its live-pod ceiling; the pending event is retained and the next pass retries)") {
+		t.Fatalf("no-live-room declined without an INFO log; lines: %v", *lines)
 	}
 }
 
 // 2026-07-28 security review CRITICAL 1: unparkFires is a THIRD UnparkInput
 // builder (after ApplyUnpark and stage.UnparkDetailed's own callers), and it
-// used to leave ConversingHasRoom at its zero value (false)
+// used to leave LiveHasRoom at its zero value (false)
 // unconditionally. The window: parked(identity-unverified), a non-bot event,
 // and the conversing ceiling has room. driveUnparks' ApplyUnpark, called with
 // room=true, sends the Task to conversing and saves it; unparkFires, called
@@ -256,7 +264,7 @@ func TestDriveUnparks_IdentityUnverifiedDeclinesNoConversingRoom(t *testing.T) {
 // the input where ApplyUnpark's own stage.UnparkDetailed call would enter
 // conversing (proven by TestUnpark_IdentityUnverifiedAlwaysConverses
 // directly against the pure function).
-func TestUnparkFires_AgreesWithApplyUnparkOnConversingHasRoom(t *testing.T) {
+func TestUnparkFires_AgreesWithApplyUnparkOnLiveHasRoom(t *testing.T) {
 	proj := &tatarav1alpha1.Project{}
 	proj.Namespace = "tatara"
 	proj.Name = "infrastructure"
@@ -267,9 +275,9 @@ func TestUnparkFires_AgreesWithApplyUnparkOnConversingHasRoom(t *testing.T) {
 	task.Name = "t-crit1-conversing-window"
 	task.Spec.ProjectRef = "infrastructure"
 	task.Spec.Kind = "clarify"
-	task.Status.Stage = tatarav1alpha1.StageParked
-	task.Status.StageReason = stage.ReasonIdentityUnverified
-	task.Status.StageEnteredAt = &metav1.Time{Time: time.Now().Add(-time.Hour)}
+	task.Status.State = tatarav1alpha1.StateRefined
+	task.Status.ParkReason = stage.ReasonIdentityUnverified
+	task.Status.StateEnteredAt = &metav1.Time{Time: time.Now().Add(-time.Hour)}
 	// There is no verdict field on UnparkInput any more, so room is the only variable.
 	task.Status.PendingEvents = []tatarav1alpha1.TaskEvent{{
 		At: metav1.Now(), Kind: "issue_comment", Author: "szymonrychu", Body: "any human comment at all",
@@ -303,7 +311,7 @@ func TestUnparkFires_AgreesWithApplyUnparkOnConversingHasRoom(t *testing.T) {
 // once past ParkRetention - deleted every parked(no-outcome) Task whether or
 // not driveUnparks' ApplyUnpark (which threads taskMaxTurns correctly) would
 // have re-entered it. Identical failure class to CRITICAL 1, on
-// MaxTurnsPerTask instead of ConversingHasRoom.
+// MaxTurnsPerTask instead of LiveHasRoom.
 //
 // This Task is parked(no-outcome) from implementing, with Turns(10) far below
 // the default cap (300, since neither the Task nor the Project overrides it) -
@@ -320,15 +328,21 @@ func TestUnparkFires_AgreesWithApplyUnparkOnMaxTurnsPerTask(t *testing.T) {
 	task.Name = "t-new1-no-outcome-under-cap"
 	task.Spec.ProjectRef = "infrastructure"
 	task.Spec.Kind = "clarify"
-	task.Status.Stage = tatarav1alpha1.StageParked
-	task.Status.StageReason = stage.ReasonNoOutcome
-	task.Status.ParkedFromStage = tatarav1alpha1.StageImplementing
-	task.Status.StageEnteredAt = &metav1.Time{Time: time.Now().Add(-time.Hour)}
+	task.Status.State = tatarav1alpha1.StateUnderImplementation
+	task.Status.ParkReason = stage.ReasonNoOutcome
+	task.Status.ParkedFromState = tatarav1alpha1.StateUnderImplementation
+	task.Status.StateEnteredAt = &metav1.Time{Time: time.Now().Add(-time.Hour)}
 	task.Status.Stats.Turns = 10 // far below the default cap of 300
 
 	r := newUnparkTestReconciler(t, proj, task)
 
-	fires, err := r.unparkFires(context.Background(), proj, task, time.Now(), false)
+	// room=true: this test isolates MaxTurnsPerTask threading specifically.
+	// #521 widened liveRoomDecline's ceiling check to every live state
+	// (under-implementation included), and ReasonNoOutcome's arm checks Turns
+	// BEFORE liveRoomDecline but still reaches it once Turns clears - room=false
+	// would decline no-live-room instead and mask the exact NEW-1 bug this test
+	// exists to catch.
+	fires, err := r.unparkFires(context.Background(), proj, task, time.Now(), true)
 	if err != nil {
 		t.Fatalf("unparkFires: %v", err)
 	}

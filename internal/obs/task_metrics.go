@@ -15,9 +15,11 @@ type taskMetrics struct {
 	taskParkedTotal         *prometheus.CounterVec
 	orphanAdoptedTotal      *prometheus.CounterVec
 	unparkDeclinedTotal     *prometheus.CounterVec
-	conversingPods          *prometheus.GaugeVec
-	conversingEntryDeclined *prometheus.CounterVec
-	conversingClosedTotal   *prometheus.CounterVec
+	livePods                *prometheus.GaugeVec
+	liveEntryDeclined       *prometheus.CounterVec
+	liveClosedTotal         *prometheus.CounterVec
+	residencyExceededTotal  *prometheus.CounterVec
+	parkedLivePodRepaired   *prometheus.CounterVec
 	botRounds               *prometheus.GaugeVec
 }
 
@@ -38,24 +40,24 @@ func newTaskMetrics(reg prometheus.Registerer) *taskMetrics {
 		}, []string{"project", "repo", "issue", "kind", "state", "incident"}),
 		taskTerminalTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_task_terminal_total",
-			Help: "Tasks reaching a terminal stage by kind, stage (delivered|failed|rejected|parked), and stage reason.",
-		}, []string{"kind", "stage", "stageReason"}),
+			Help: "Tasks reaching a TERMINAL STATE by kind, state (done|rejected), and state reason. #521 narrowed the state label from four values to two: `failed` and `parked` are gone as states - a failure now PARKS, and operator_task_parked_total is where a park is counted.",
+		}, []string{"kind", "state", "stateReason"}),
 		taskTerminalTokensTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_task_terminal_tokens_total",
 			Help: "Cumulative agent token usage of terminated Tasks by project, repo, terminal outcome (delivered|churned|abandoned), model, and type (input|output|cache_read|cache_creation). No issue label - churn is outcome-keyed, not issue-keyed.",
 		}, []string{"project", "repo", "outcome", "model", "type"}),
 		taskStage: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "operator_task_stage",
-			Help: "Live Tasks currently in a given stage, by stage and kind (contract K.1). Value is the COUNT of Tasks in that (stage,kind) bucket, not per-task.",
-		}, []string{"stage", "kind"}),
+			Name: "operator_task_state",
+			Help: "Live Tasks currently in a given state, by state and kind (contract K.1). Value is the COUNT of Tasks in that (state,kind) bucket, not per-task.",
+		}, []string{"state", "kind"}),
 		taskStageAge: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "operator_task_stage_age_seconds",
-			Help: "Seconds since a live Task entered its current stage (contract K.1), by task, stage, and kind.",
-		}, []string{"task", "stage", "kind"}),
+			Name: "operator_task_state_age_seconds",
+			Help: "Seconds since a live Task entered its current state (contract K.1), by task, state, and kind. It is CARRY-ADJUSTED (stage.StateElapsedSeconds), so a park/un-park round trip reads as continuous residency rather than a sawtooth.",
+		}, []string{"task", "state", "kind"}),
 		taskParkedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_task_parked_total",
-			Help: "Park transitions (contract K.1), by the stage the Task parked FROM (the stalling stage) and the park stageReason. Incremented once per park transition, never on a mint.",
-		}, []string{"stage", "stageReason"}),
+			Help: "Parks (contract K.1), by the STATE the Task was in when it parked and the parkReason. #521 made park a flag orthogonal to state, so this is the ONLY counter of a stall - operator_task_terminal_total no longer sees one. Incremented once per park, never on a mint.",
+		}, []string{"state", "parkReason"}),
 		// Legitimately reads 0 when webhook-primary reactivity is handling
 		// intake and the sweep finds no genuine orphan (verified via 7-day
 		// Prometheus history during the metric-wiring audit, issue #370:
@@ -70,22 +72,30 @@ func newTaskMetrics(reg prometheus.Registerer) *taskMetrics {
 		}, []string{"kind"}),
 		unparkDeclinedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_unpark_declined_total",
-			Help: "F.6 re-entry declines by ApplyUnpark, by the Task's park stageReason and decline kind: " +
+			Help: "Re-entry declines by ApplyUnpark, by the Task's parkReason and decline kind: " +
 				"guard (the live Task had already drifted from what the caller believed was parked - rare, " +
 				"anomalous) or rule (stage.Unpark's re-entry rule was not satisfied yet - normal steady state).",
-		}, []string{"stageReason", "kind"}),
-		conversingPods: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "operator_conversing_pods",
-			Help: "Tasks currently in the conversing stage, by project. It is the live reading of the per-project ceiling (Project.spec.maxConversingPods, default 2).",
+		}, []string{"parkReason", "kind"}),
+		livePods: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "operator_live_pods",
+			Help: "Tasks currently in a LIVE state and un-parked, by project. It is the live reading of the per-project ceiling (Project.spec.maxLivePods, default 2, clamped strictly below maxConcurrentAgents).",
 		}, []string{"project"}),
-		conversingEntryDeclined: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "operator_conversing_entry_declined_total",
-			Help: "Comments that did NOT open a conversation, by project and reason. There is no acknowledgement layer, so this counter is the only thing that makes a refused conversation visible to an operator.",
+		liveEntryDeclined: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_live_entry_declined_total",
+			Help: "Comments that did NOT reach a live agent pod, by project and reason. There is no acknowledgement layer, so this counter is the only thing that makes a refused turn visible to an operator. The reason is a CLOSED vocabulary (controller.LiveEntryDeclineReasons) and never the literal \"unresolved\", which is all the pre-#521 counter ever recorded.",
 		}, []string{"project", "reason"}),
-		conversingClosedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "operator_conversing_closed_total",
+		liveClosedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_live_closed_total",
 			Help: "Conversations ended, by project and cause (idle | evicted). A rising evicted rate means the ceiling is the binding constraint, not the idle window.",
 		}, []string{"project", "cause"}),
+		residencyExceededTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_task_residency_exceeded_total",
+			Help: "Tasks parked because a live state's ABSOLUTE residency cap was reached even though its idle clock had not. Generalising liveness replaced a live state's work clock with an idle clock, which a chatty reviewer resets forever; this counter is how often that backstop had to fire.",
+		}, []string{"state", "kind"}),
+		parkedLivePodRepaired: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_task_parked_with_live_pod_repaired_total",
+			Help: "Parked Tasks found still holding a live agent pod and repaired. parkReason != \"\" with a live pod is a TRANSIENT by design; a sustained non-zero rate means the park-then-stop sequence is not completing and slots are leaking.",
+		}, []string{"project", "park_reason"}),
 		botRounds: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "operator_bot_rounds",
 			Help: "Highest consecutive agent-authored comment rounds with no intervening human comment, by project. There is deliberately no ping-pong cap (decision D7); this gauge is the ONLY way a cycling agent pair becomes observable before a human finds it by reading duplicate comments.",
@@ -102,9 +112,11 @@ func newTaskMetrics(reg prometheus.Registerer) *taskMetrics {
 		m.taskParkedTotal,
 		m.orphanAdoptedTotal,
 		m.unparkDeclinedTotal,
-		m.conversingPods,
-		m.conversingEntryDeclined,
-		m.conversingClosedTotal,
+		m.livePods,
+		m.liveEntryDeclined,
+		m.liveClosedTotal,
+		m.residencyExceededTotal,
+		m.parkedLivePodRepaired,
 		m.botRounds,
 	)
 	return m
@@ -204,12 +216,12 @@ func (m *taskMetrics) DeleteTaskSeries(project, repo, kind, issue string) {
 // loop success/failure denominator: every terminal transition is metered here
 // exactly once, including failure paths (PodLost, TurnTimeout,
 // PlanningStalled, ...) that the per-reason fault counters do not all cover.
-func (m *taskMetrics) TaskTerminal(kind, stage, stageReason string) {
-	m.taskTerminalTotal.WithLabelValues(kind, stage, stageReason).Inc()
+func (m *taskMetrics) TaskTerminal(kind, state, stateReason string) {
+	m.taskTerminalTotal.WithLabelValues(kind, state, stateReason).Inc()
 }
 
-// ResetTaskStageGauges clears operator_task_stage and
-// operator_task_stage_age_seconds so a recompute pass leaves no stale series
+// ResetTaskStageGauges clears operator_task_state and
+// operator_task_state_age_seconds so a recompute pass leaves no stale series
 // for a Task that left its stage or was deleted (contract M22): a per-task
 // gauge that is never explicitly reaped grows /metrics without bound, so every
 // pass Resets first and re-Sets only live series.
@@ -221,33 +233,33 @@ func (m *OperatorMetrics) ResetTaskStageGauges() {
 	m.taskStageAge.Reset()
 }
 
-// SetTaskStage sets operator_task_stage{stage,kind} to the live COUNT of Tasks
+// SetTaskStage sets operator_task_state{stage,kind} to the live COUNT of Tasks
 // in that bucket.
-func (m *OperatorMetrics) SetTaskStage(stage, kind string, count float64) {
+func (m *OperatorMetrics) SetTaskStage(state, kind string, count float64) {
 	if m == nil || m.taskStage == nil {
 		return
 	}
-	m.taskStage.WithLabelValues(stage, kind).Set(count)
+	m.taskStage.WithLabelValues(state, kind).Set(count)
 }
 
-// SetTaskStageAge sets operator_task_stage_age_seconds{task,stage,kind} to
+// SetTaskStageAge sets operator_task_state_age_seconds{task,stage,kind} to
 // ageSeconds, the time since that Task entered its current stage.
-func (m *OperatorMetrics) SetTaskStageAge(task, stage, kind string, ageSeconds float64) {
+func (m *OperatorMetrics) SetTaskStageAge(task, state, kind string, ageSeconds float64) {
 	if m == nil || m.taskStageAge == nil {
 		return
 	}
-	m.taskStageAge.WithLabelValues(task, stage, kind).Set(ageSeconds)
+	m.taskStageAge.WithLabelValues(task, state, kind).Set(ageSeconds)
 }
 
-// TaskParked increments operator_task_parked_total for one park transition.
-// stage is the stage the Task parked FROM (the stalling stage); stageReason is
-// the park reason. Nil-safe: EnterStage calls it unconditionally, and a
-// reconciler wired without metrics is a test, not an outage.
-func (m *OperatorMetrics) TaskParked(stage, stageReason string) {
+// TaskParked increments operator_task_parked_total for one park. state is the
+// state the Task was in when it parked; parkReason is the flag it stamped.
+// Nil-safe: ParkTask calls it unconditionally, and a reconciler wired without
+// metrics is a test, not an outage.
+func (m *OperatorMetrics) TaskParked(state, parkReason string) {
 	if m == nil || m.taskParkedTotal == nil {
 		return
 	}
-	m.taskParkedTotal.WithLabelValues(stage, stageReason).Inc()
+	m.taskParkedTotal.WithLabelValues(state, parkReason).Inc()
 }
 
 // OrphanAdopted increments operator_orphan_adopted_total for one orphan work
@@ -259,22 +271,22 @@ func (m *OperatorMetrics) OrphanAdopted(kind string) {
 	m.orphanAdoptedTotal.WithLabelValues(kind).Inc()
 }
 
-// TaskStageGauge returns the operator_task_stage gauge for (stage,kind) for
+// TaskStageGauge returns the operator_task_state gauge for (stage,kind) for
 // test assertions.
-func (m *OperatorMetrics) TaskStageGauge(stage, kind string) prometheus.Gauge {
-	return m.taskStage.WithLabelValues(stage, kind)
+func (m *OperatorMetrics) TaskStageGauge(state, kind string) prometheus.Gauge {
+	return m.taskStage.WithLabelValues(state, kind)
 }
 
-// TaskStageAgeGauge returns the operator_task_stage_age_seconds gauge for
+// TaskStageAgeGauge returns the operator_task_state_age_seconds gauge for
 // (task,stage,kind) for test assertions.
-func (m *OperatorMetrics) TaskStageAgeGauge(task, stage, kind string) prometheus.Gauge {
-	return m.taskStageAge.WithLabelValues(task, stage, kind)
+func (m *OperatorMetrics) TaskStageAgeGauge(task, state, kind string) prometheus.Gauge {
+	return m.taskStageAge.WithLabelValues(task, state, kind)
 }
 
 // TaskParkedCounter returns the operator_task_parked_total counter for
 // (stage,stageReason) for test assertions.
-func (m *OperatorMetrics) TaskParkedCounter(stage, stageReason string) prometheus.Counter {
-	return m.taskParkedTotal.WithLabelValues(stage, stageReason)
+func (m *OperatorMetrics) TaskParkedCounter(state, parkReason string) prometheus.Counter {
+	return m.taskParkedTotal.WithLabelValues(state, parkReason)
 }
 
 // OrphanAdoptedCounter returns the operator_orphan_adopted_total counter for
@@ -295,48 +307,76 @@ func (m *OperatorMetrics) UnparkDeclined(stageReason, kind string) {
 }
 
 // UnparkDeclinedCounter returns the operator_unpark_declined_total counter for
-// (stageReason,kind) for test assertions.
-func (m *OperatorMetrics) UnparkDeclinedCounter(stageReason, kind string) prometheus.Counter {
-	return m.unparkDeclinedTotal.WithLabelValues(stageReason, kind)
+// (parkReason,kind) for test assertions.
+func (m *OperatorMetrics) UnparkDeclinedCounter(parkReason, kind string) prometheus.Counter {
+	return m.unparkDeclinedTotal.WithLabelValues(parkReason, kind)
 }
 
-// SetConversingPods sets operator_conversing_pods for one project.
-func (m *OperatorMetrics) SetConversingPods(project string, n float64) {
-	if m == nil || m.conversingPods == nil {
+// SetLivePods sets operator_live_pods for one project.
+func (m *OperatorMetrics) SetLivePods(project string, n float64) {
+	if m == nil || m.livePods == nil {
 		return
 	}
-	m.conversingPods.WithLabelValues(project).Set(n)
+	m.livePods.WithLabelValues(project).Set(n)
 }
 
-// ConversingPodsGauge returns the operator_conversing_pods gauge for a project.
-func (m *OperatorMetrics) ConversingPodsGauge(project string) prometheus.Gauge {
-	return m.conversingPods.WithLabelValues(project)
+// LivePodsGauge returns the operator_live_pods gauge for a project.
+func (m *OperatorMetrics) LivePodsGauge(project string) prometheus.Gauge {
+	return m.livePods.WithLabelValues(project)
 }
 
-// ConversingEntryDeclined counts a comment that did not open a conversation.
-func (m *OperatorMetrics) ConversingEntryDeclined(project, reason string) {
-	if m == nil || m.conversingEntryDeclined == nil {
+// LiveEntryDeclined counts a comment that did not reach a live agent pod. reason
+// MUST be a member of controller.LiveEntryDeclineReasons.
+func (m *OperatorMetrics) LiveEntryDeclined(project, reason string) {
+	if m == nil || m.liveEntryDeclined == nil {
 		return
 	}
-	m.conversingEntryDeclined.WithLabelValues(project, reason).Inc()
+	m.liveEntryDeclined.WithLabelValues(project, reason).Inc()
 }
 
-// ConversingEntryDeclinedCounter returns the operator_conversing_entry_declined_total counter.
-func (m *OperatorMetrics) ConversingEntryDeclinedCounter(project, reason string) prometheus.Counter {
-	return m.conversingEntryDeclined.WithLabelValues(project, reason)
+// LiveEntryDeclinedCounter returns the operator_live_entry_declined_total counter.
+func (m *OperatorMetrics) LiveEntryDeclinedCounter(project, reason string) prometheus.Counter {
+	return m.liveEntryDeclined.WithLabelValues(project, reason)
 }
 
-// ConversingClosed counts a conversation that ended, by cause.
-func (m *OperatorMetrics) ConversingClosed(project, cause string) {
-	if m == nil || m.conversingClosedTotal == nil {
+// LiveClosed counts a conversation that ended, by cause.
+func (m *OperatorMetrics) LiveClosed(project, cause string) {
+	if m == nil || m.liveClosedTotal == nil {
 		return
 	}
-	m.conversingClosedTotal.WithLabelValues(project, cause).Inc()
+	m.liveClosedTotal.WithLabelValues(project, cause).Inc()
 }
 
-// ConversingClosedCounter returns the operator_conversing_closed_total counter.
-func (m *OperatorMetrics) ConversingClosedCounter(project, cause string) prometheus.Counter {
-	return m.conversingClosedTotal.WithLabelValues(project, cause)
+// LiveClosedCounter returns the operator_live_closed_total counter.
+func (m *OperatorMetrics) LiveClosedCounter(project, cause string) prometheus.Counter {
+	return m.liveClosedTotal.WithLabelValues(project, cause)
+}
+
+// ResidencyExceeded counts a Task parked by the absolute residency backstop.
+func (m *OperatorMetrics) ResidencyExceeded(state, kind string) {
+	if m == nil || m.residencyExceededTotal == nil {
+		return
+	}
+	m.residencyExceededTotal.WithLabelValues(state, kind).Inc()
+}
+
+// ResidencyExceededCounter returns the operator_task_residency_exceeded_total counter.
+func (m *OperatorMetrics) ResidencyExceededCounter(state, kind string) prometheus.Counter {
+	return m.residencyExceededTotal.WithLabelValues(state, kind)
+}
+
+// ParkedWithLivePodRepaired counts one repair of the park/live invariant.
+func (m *OperatorMetrics) ParkedWithLivePodRepaired(project, parkReason string) {
+	if m == nil || m.parkedLivePodRepaired == nil {
+		return
+	}
+	m.parkedLivePodRepaired.WithLabelValues(project, parkReason).Inc()
+}
+
+// ParkedWithLivePodRepairedCounter returns the
+// operator_task_parked_with_live_pod_repaired_total counter.
+func (m *OperatorMetrics) ParkedWithLivePodRepairedCounter(project, parkReason string) prometheus.Counter {
+	return m.parkedLivePodRepaired.WithLabelValues(project, parkReason)
 }
 
 // SetBotRounds sets operator_bot_rounds for one project. The ONE caller is

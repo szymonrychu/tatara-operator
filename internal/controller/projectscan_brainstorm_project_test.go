@@ -60,7 +60,7 @@ func TestBrainstorm_ProjectLevel_InFlight_AnyRepo_Blocks(t *testing.T) {
 	if err := k8sClient.Create(context.Background(), pre); err != nil {
 		t.Fatalf("pre-create: %v", err)
 	}
-	pre.Status.Stage = tatarav1alpha1.StageBrainstorming
+	pre.Status.State = tatarav1alpha1.StateRefined
 	_ = k8sClient.Status().Update(context.Background(), pre)
 
 	reader := &perRepoFakeReader{

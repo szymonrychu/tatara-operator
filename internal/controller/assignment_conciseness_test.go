@@ -22,7 +22,7 @@ func TestAssignmentFor_ConcisenessGuidance(t *testing.T) {
 	}
 
 	for _, kind := range []string{
-		stage.AgentBrainstorm, stage.AgentClarify, stage.AgentIncident,
+		stage.AgentBrainstorm, stage.AgentIncident,
 		stage.AgentRefine, stage.AgentImplement, stage.AgentReview, stage.AgentDocumentation,
 	} {
 		got := assignmentFor(kind, task, &tatarav1alpha1.Project{})

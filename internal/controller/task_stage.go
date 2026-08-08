@@ -110,7 +110,7 @@ func (r *TaskReconciler) reconcileClocks(ctx context.Context, proj *tatarav1alph
 	// (so no handoffCondition is armed), which is exactly the #33 shape - and it
 	// reuses terminalMREdge so this path, the pre-dispatch guard and reviewAdvanceEdge
 	// can never disagree with each other.
-	if task.Status.Stage == tatarav1alpha1.StageReviewing && task.Spec.Kind == "review" {
+	if task.Status.State == tatarav1alpha1.StateAwaitingReview && task.Spec.Kind == "review" {
 		mrs, mrErr := ownedMergeRequests(ctx, r.mrReader(), task)
 		if mrErr != nil {
 			return ctrl.Result{}, true, mrErr
@@ -136,9 +136,9 @@ func (r *TaskReconciler) reconcileClocks(ctx context.Context, proj *tatarav1alph
 			if over {
 				l.Info("review task finalized: its review target was taken over by a maintainer; the takeover task now owns it",
 					"action", "review_finalize_taken_over", "resource_id", task.Name,
-					"to", tatarav1alpha1.StageRejected, "reason", stage.ReasonMRTakenOver)
+					"to", tatarav1alpha1.StateRejected, "reason", stage.ReasonMRTakenOver)
 				return ctrl.Result{}, true, r.enter(ctx, proj, task, mrs,
-					tatarav1alpha1.StageRejected, stage.ReasonMRTakenOver, now)
+					tatarav1alpha1.StateRejected, stage.ReasonMRTakenOver, now)
 			}
 		}
 	}
@@ -186,7 +186,7 @@ func (r *TaskReconciler) reconcileClocks(ctx context.Context, proj *tatarav1alph
 			// so returning an error from it is a Task that reaches neither - wedged in
 			// reviewing, holding its admitted concurrency ticket, in the one function
 			// whose whole job is that no stage lacks an exit deadline.
-			if edge.To == tatarav1alpha1.StageMerging {
+			if edge.To == tatarav1alpha1.StateMerged {
 				red, cerr := ciRedAtReviewedHead(ctx, r.Client, r.SCMFor, r.Metrics, proj, mrs)
 				switch {
 				case cerr != nil:
@@ -196,29 +196,75 @@ func (r *TaskReconciler) reconcileClocks(ctx context.Context, proj *tatarav1alph
 					return ctrl.Result{}, true, enterCIRed(ctx, r.Client, r.spiller(proj), r.Metrics, task, mrs, red, now)
 				}
 			}
-			l.Info("review handoff re-driven: the deferred advance had not fired; advancing off reviewing",
-				"action", "handoff_redriven", "resource_id", task.Name, "stage", task.Status.Stage,
+			l.Info("review handoff re-driven: the deferred advance had not fired; advancing off awaiting-review",
+				"action", "handoff_redriven", "resource_id", task.Name, "state", task.Status.State,
 				"to", edge.To, "reason", edge.Reason, "kind", task.Spec.Kind)
+			// The SAME park branch advanceAfterReview carries, and for the same
+			// reason: reviewAdvanceEdge returns stage.ParkTarget for every
+			// kind=review verdict and for the exhausted/refused non-review ones,
+			// and EnterStage refuses it by design.
+			if edge.To == stage.ParkTarget {
+				return ctrl.Result{}, true, r.park(ctx, proj, task, edge.Reason, now)
+			}
 			return ctrl.Result{}, true, r.enter(ctx, proj, task, mrs, edge.To, edge.Reason, now)
 		}
 		if elapsed := now.Sub(cond.LastTransitionTime.Time); elapsed > tatarav1alpha1.HandoffDeadline {
 			l.Info("review handoff stalled: the outcome committed but the drain never advanced the task",
-				"action", "handoff_stalled", "resource_id", task.Name, "stage", task.Status.Stage,
+				"action", "handoff_stalled", "resource_id", task.Name, "state", task.Status.State,
 				"outcome_reason", cond.Reason, "deadline", tatarav1alpha1.HandoffDeadline.String(),
 				"elapsed", elapsed.String())
-			return ctrl.Result{}, true, r.enter(ctx, proj, task, mrs,
-				tatarav1alpha1.StageParked, stage.ReasonHandoffStalled, now)
+			return ctrl.Result{}, true, r.park(ctx, proj, task, stage.ReasonHandoffStalled, now)
 		}
 	}
 
+	// THE ABSOLUTE RESIDENCY BOUND. It runs BEFORE ArmedClock and it is a
+	// SEPARATE check, not a second return value: ArmedClock returns exactly one
+	// clock by construction, and that single-clock property is what makes the
+	// model auditable. Whichever fires first wins, and residency is the one that
+	// fires when the idle clock never will.
+	//
+	// It exists because #521 generalised liveness: a LIVE state now arms the IDLE
+	// clock on conversationLastEventAt, which every human comment re-stamps, and
+	// which ArmedClock disarms outright while a turn is in flight - so
+	// under-implementation lost the 6h absolute bound the old `implementing`
+	// stage had. Without this an implement agent ping-ponging with a reviewer, or
+	// simply never finishing a turn, runs forever.
+	//
+	// Only the live states have a cap. It is measured with StateElapsedSeconds,
+	// so it is CUMULATIVE across a park/un-park round trip - a Task that has
+	// spent six hours in under-implementation across three re-entries has spent
+	// six hours there, and buying a fresh 6h per re-entry is the unbounded-loop
+	// shape #480 killed for merging.
+	//
+	// IT HONOURS THE PAUSE, for the same reason clock 1 does and with more at
+	// stake. `paused` (maxConcurrentAgents == 0) is the kill switch, and the
+	// contract's one deadline exception exists because "without it the pause kill
+	// switch is a backlog shredder" (constants.go). Residency is the WORST clock
+	// to leave unguarded: every live cap (24h/6h/4h) is at or below the 24h
+	// admission budget, so an unguarded residency check dominates the exemption
+	// and parks the entire queued backlog at stage-deadline - which is
+	// UnparkNever, so it ages out at ParkRetention and is reaped. A four-hour
+	// pause would have destroyed every awaiting-review Task on the project.
 	paused := projectPaused(proj)
+	if !paused && !tatarav1alpha1.Parked(task) && stage.ResidencyExceeded(task, now) {
+		l.Info("state residency budget exceeded",
+			"action", "residency_exceeded", "resource_id", task.Name,
+			"state", task.Status.State, "kind", task.Spec.Kind,
+			"elapsed_seconds", stage.StateElapsedSeconds(task, now))
+		r.Metrics.ResidencyExceeded(task.Status.State, task.Spec.Kind)
+		return ctrl.Result{}, true, r.park(ctx, proj, task, stage.ReasonStageDeadline, now)
+	}
+
 	clock, since, budget, edge := stage.ArmedClock(task, paused)
 	// The ONE per-project clock budget in the F.4 model. internal/stage is pure and
 	// holds no Project, so the table carries ConversationIdleDefault and the
 	// substitution happens here, at the single call site that has the Project in
-	// hand. Keeping the table row means TestEveryStageHasABudget still covers
-	// conversing and a future stage still cannot be added without a deadline.
-	if task.Status.Stage == tatarav1alpha1.StageConversing && clock == stage.ClockWork {
+	// hand. Keeping the table row means TestEveryStateHasABudget still covers the
+	// live states and a future state still cannot be added without a deadline.
+	//
+	// #521 widened the predicate from the single `conversing` stage to every LIVE
+	// state, and nothing else about this substitution changed.
+	if stage.Live(task.Status.State) && clock == stage.ClockWork && !tatarav1alpha1.Parked(task) {
 		budget = tatarav1alpha1.ConversationIdle(proj)
 	}
 	if clock == stage.ClockNone {
@@ -233,8 +279,8 @@ func (r *TaskReconciler) reconcileClocks(ctx context.Context, proj *tatarav1alph
 
 	switch edge.To {
 	case stage.Reap:
-		// delivered/rejected/failed/parked aged out. The REAPER deletes them
-		// (contract B.6); this reconciler never does.
+		// done/rejected aged out, or a park reached ParkRetention. The REAPER
+		// deletes them (contract B.6); this reconciler never does.
 		return ctrl.Result{}, true, nil
 
 	case stage.Respawn:
@@ -247,35 +293,48 @@ func (r *TaskReconciler) reconcileClocks(ctx context.Context, proj *tatarav1alph
 		return ctrl.Result{RequeueAfter: agentBootRequeue}, false, nil
 	}
 
-	// The conversing budget-elapsed edge is NOT a plain transition: the agent is
-	// owed one handoff turn before its pod dies, or the notes journal - which IS
-	// the continuation state - is left empty for whatever pod comes next.
-	if task.Status.Stage == tatarav1alpha1.StageConversing {
+	// A LIVE state's IDLE-budget elapse is NOT a plain park: the agent is owed one
+	// handoff turn before its pod dies, or the notes journal - which IS the
+	// continuation state - is left empty for whatever pod comes next.
+	//
+	// GATED ON THE EDGE, NOT ON Live(state) ALONE. A live state also runs the
+	// ADMISSION clock (clock 1) before its pod exists, and that elapse is
+	// park(admission-starved) with NO pod to hand off from and a DIFFERENT
+	// reason. Routing it through the handoff would re-label it awaiting-human -
+	// a park with a re-entry rule where the correct one has none - and block for
+	// the stopper's timers against a pod that was never admitted.
+	if stage.Live(task.Status.State) && !tatarav1alpha1.Parked(task) &&
+		edge.Reason == stage.ReasonAwaitingHuman {
 		mrs, mrErr := ownedMergeRequests(ctx, r.Client, task)
 		if mrErr != nil {
 			return ctrl.Result{}, true, mrErr
 		}
 		l.Info("conversation idle budget elapsed",
-			"action", "stage_deadline", "resource_id", task.Name, "stage", task.Status.Stage,
+			"action", "stage_deadline", "resource_id", task.Name, "state", task.Status.State,
 			"clock", clock, "budget", budget.String(), "elapsed", elapsed.String(),
-			"to", edge.To, "stage_reason", edge.Reason)
-		return ctrl.Result{}, true, r.conversingHandoffAndPark(ctx, proj, task, mrs, "idle", now)
+			"to", edge.To, "park_reason", edge.Reason)
+		return ctrl.Result{}, true, r.liveHandoffAndPark(ctx, proj, task, mrs, "idle", now)
 	}
 
 	mrs, mrErr := ownedMergeRequests(ctx, r.Client, task)
 	if mrErr != nil {
 		return ctrl.Result{}, true, mrErr
 	}
-	l.Info("stage budget elapsed",
-		"action", "stage_deadline", "resource_id", task.Name, "stage", task.Status.Stage,
+	l.Info("state budget elapsed",
+		"action", "stage_deadline", "resource_id", task.Name, "state", task.Status.State,
 		"clock", clock, "budget", budget.String(), "elapsed", elapsed.String(),
-		"to", edge.To, "stage_reason", edge.Reason)
-	if err := r.enter(ctx, proj, task, mrs, edge.To, edge.Reason, now); err != nil {
+		"to", edge.To, "park_reason", edge.Reason)
+	if edge.To != stage.ParkTarget {
+		// Only Reap and Respawn are handled above, and every other onElapse row
+		// parks. A non-park target here is a table bug.
+		return ctrl.Result{}, true, fmt.Errorf("clocks: onElapse for %s targets %q, which is not a park", task.Status.State, edge.To)
+	}
+	if err := r.park(ctx, proj, task, edge.Reason, now); err != nil {
 		return ctrl.Result{}, true, err
 	}
-	// WS3-I5: on the FIRST entry into parked(deploy-timeout), surface the stuck
-	// deploy to the human with ONE rate-limited operator comment per owned issue.
-	if edge.To == tatarav1alpha1.StageParked && edge.Reason == stage.ReasonDeployTimeout {
+	// WS3-I5: on the FIRST park at deploy-timeout, surface the stuck deploy to the
+	// human with ONE rate-limited operator comment per owned issue.
+	if edge.Reason == stage.ReasonDeployTimeout {
 		if err := r.enqueueDeployTimeoutComment(ctx, proj, task, mrs, now); err != nil {
 			return ctrl.Result{}, true, err
 		}
@@ -310,7 +369,7 @@ func (r *TaskReconciler) enqueueDeployTimeoutComment(ctx context.Context, proj *
 	if repos == "" {
 		repos = task.Spec.RepositoryRef
 	}
-	budget, _ := stage.Budget(tatarav1alpha1.StageDeploying)
+	budget, _ := stage.Budget(tatarav1alpha1.StateDeployed)
 	body := fmt.Sprintf("Deployment of `%s` has not completed after `%s`; retry `%d`/`%d`. tatara keeps retrying until it succeeds or the deploy budget is exhausted.",
 		repos, budget, task.Status.DeployReentries, tatarav1alpha1.MaxDeployReentries)
 
@@ -351,16 +410,13 @@ func (r *TaskReconciler) enqueueDeployTimeoutComment(ctx context.Context, proj *
 // the Task that already exists and has nothing left to re-mint against).
 // Live proof: mt-r-tatara-cli-87 (issue #381 investigation).
 //
-// Guarded to fire EXACTLY ONCE: task.Status.Stage == StageParked is excluded
-// up front, both because parked->parked is not a legal F.3 edge (EnterStage
-// would refuse it and fire operator_illegal_stage_transition_total every
-// reconcile) and because it is this function's OWN rate limit for the
-// metric and the comment in Task 9 - once parked, this predicate would
-// otherwise stay permanently true (a parked Task's refs do not un-empty
-// themselves) and re-fire forever without it. The ALREADY-parked case is
-// owned by reconcileParkedBindingRepair (repair-and-unpark: no re-park, no
-// metric, no comment), which reconcileStage runs before its terminal
-// early-return.
+// Guarded to fire EXACTLY ONCE: an ALREADY-PARKED Task is excluded up front,
+// because the park flag is this function's OWN rate limit for the metric and the
+// comment - once parked, this predicate would otherwise stay permanently true (a
+// parked Task's refs do not un-empty themselves) and re-fire forever without it.
+// The already-parked case is owned by reconcileParkedBindingRepair (repair only,
+// no re-park, no metric, no comment), which reconcileStage runs before its
+// terminal early-return.
 //
 // Runs BEFORE the three clocks (F.4): those would EVENTUALLY reach the same
 // outcome via turn-budget/pod-recreation exhaustion, but only after hours of
@@ -369,7 +425,7 @@ func (r *TaskReconciler) enqueueDeployTimeoutComment(ctx context.Context, proj *
 func (r *TaskReconciler) reconcileMRBindingBackstop(ctx context.Context, proj *tatarav1alpha1.Project,
 	task *tatarav1alpha1.Task, now time.Time) (bool, error) {
 
-	if task.Status.Stage == tatarav1alpha1.StageParked ||
+	if tatarav1alpha1.Parked(task) ||
 		task.Spec.Source == nil || task.Spec.Source.Number <= 0 ||
 		len(task.Status.MRRefs) != 0 || len(task.Status.IssueRefs) != 0 {
 		return false, nil
@@ -378,14 +434,12 @@ func (r *TaskReconciler) reconcileMRBindingBackstop(ctx context.Context, proj *t
 	if age <= mrBindingBackstopGrace {
 		return false, nil
 	}
-	// issue #381 review BLOCKER: not every stage has a legal ->parked edge in
-	// the F.3 table (triaging and delivered do not - stage.go's Transitions).
-	// Without this guard r.enter below returns *stage.IllegalTransitionError
-	// for those stages every reconcile, an infinite requeue crash-loop. Fall
-	// through to normal reconcile instead: triaging's own triage-stalled clock
-	// (5m budget) owns that case, and delivered is quasi-terminal and ages out
-	// via the reaper.
-	if !stage.Legal(task.Status.Stage, tatarav1alpha1.StageParked) {
+	// A DONE Task is never parked: park means "stalled, resumable", and issue
+	// #381's review BLOCKER (some stages had no legal ->parked edge, so the old
+	// code crash-looped on an illegal transition) survives as this one guard.
+	// Parking is no longer an edge, so the table cannot refuse it - this
+	// predicate has to.
+	if tatarav1alpha1.TaskDone(task) {
 		return false, nil
 	}
 
@@ -400,14 +454,14 @@ func (r *TaskReconciler) reconcileMRBindingBackstop(ctx context.Context, proj *t
 	if r.repairSourceBinding(ctx, proj, task) {
 		l.Info("mr-binding backstop: repaired the interrupted mint binding instead of parking",
 			"action", "mr_binding_backstop_repaired", "resource_id", task.Name, "kind", task.Spec.Kind,
-			"stage", task.Status.Stage, "age", age.String())
+			"state", task.Status.State, "age", age.String())
 		return true, nil
 	}
 
 	l.Error(nil, "task owns no merge-request or issue record past grace; likely an interrupted mint - parking awaiting human",
 		"action", "mr_binding_backstop_parked", "resource_id", task.Name, "kind", task.Spec.Kind,
-		"stage", task.Status.Stage, "age", age.String(), "grace", mrBindingBackstopGrace.String())
-	if err := r.enter(ctx, proj, task, nil, tatarav1alpha1.StageParked, stage.ReasonAwaitingHuman, now); err != nil {
+		"state", task.Status.State, "age", age.String(), "grace", mrBindingBackstopGrace.String())
+	if err := r.park(ctx, proj, task, stage.ReasonAwaitingHuman, now); err != nil {
 		return true, err
 	}
 	r.Metrics.MRBindingBackstopParked(proj.Name, task.Spec.Kind)
@@ -420,23 +474,23 @@ func (r *TaskReconciler) reconcileMRBindingBackstop(ctx context.Context, proj *t
 // mt-r-tatara-operator-388-6e7958617d9d0119): a Task the watchdog ALREADY
 // parked awaiting-human - by an operator version predating the PR 388 repair,
 // or because the repair failed transiently before the park - was excluded
-// forever by the backstop's own StageParked guard, and the pending-events
+// forever by the backstop's own already-parked guard, and the pending-events
 // comment path dead-ended too (the unowned mirror stub has no controller
 // owner to route by). Both recovery paths dead, the Task was parked for good.
 //
 // This runs BEFORE reconcileStage's terminal early-return hands parked Tasks
 // to the reaper. The predicate is the watchdog's park and ONLY the watchdog's
-// park: parked(awaiting-human) + parkedFromStage recorded + Source.Number>0 +
+// park: parked(awaiting-human) + parkedFromState recorded + Source.Number>0 +
 // ZERO owned refs. Any awaiting-human park with refs is a genuine human wait
-// (a review verdict on a human PR, a clarify discuss) and is never touched;
+// (a review verdict on a human PR, a gate discuss) and is never touched;
 // every other reason (identity-unverified above all) is never touched.
 //
-// On a successful repair the Task un-parks straight back to its
-// parkedFromStage via stage.UnparkTargetForBindingRepair (the narrow,
-// documented F.6-adjacent edge) applied through the EnterStage choke point.
-// On a failed repair (foreign-owned CR, unresolvable source, write error) it
-// stays parked exactly as before - a later human comment can still drive the
-// normal F.6 re-entry now that the webhook's owner fallback routes it.
+// IT NO LONGER UN-PARKS (#521). stage.UnparkTargetForBindingRepair existed
+// because un-parking used to mean CHOOSING A STAGE, and this park had no owned
+// state to derive one from. Un-park no longer moves state at all, so there is
+// nothing to derive and no exception to make: the repair stamps the refs, and
+// the ordinary awaiting-human rule resumes the Task on the next human comment -
+// which now routes, because the mirror stub it dead-ended on has an owner.
 func (r *TaskReconciler) reconcileParkedBindingRepair(ctx context.Context, proj *tatarav1alpha1.Project,
 	task *tatarav1alpha1.Task, now time.Time) (bool, error) {
 
@@ -459,34 +513,23 @@ func (r *TaskReconciler) reconcileParkedBindingRepair(ctx context.Context, proj 
 		// Task stays parked and the park notice stands.
 		l.Info("parked binding repair: repair failed, task stays parked",
 			"action", "parked_binding_repair_failed", "resource_id", task.Name,
-			"kind", task.Spec.Kind, "parked_from", task.Status.ParkedFromStage)
+			"kind", task.Spec.Kind, "parked_from", task.Status.ParkedFromState)
 		return false, nil
 	}
-	target, ok := stage.UnparkTargetForBindingRepair(task)
-	if !ok {
-		// Repaired but no legal re-entry edge back to the parked-from stage: the
-		// refs are stamped and the CR owned, so a human comment now drives the
-		// normal F.6 re-entry; nothing more to do here.
-		l.Info("parked binding repair: repaired the interrupted mint binding; no re-entry edge, staying parked",
-			"action", "mr_binding_backstop_repaired_parked", "resource_id", task.Name,
-			"kind", task.Spec.Kind, "parked_from", task.Status.ParkedFromStage)
-		return true, nil
-	}
-	if err := r.enter(ctx, proj, task, nil, target, "", now); err != nil {
-		return true, err
-	}
-	l.Info("parked binding repair: repaired the interrupted mint binding and unparked",
-		"action", "mr_binding_backstop_unparked", "resource_id", task.Name,
-		"kind", task.Spec.Kind, "stage", target)
+	// The refs are stamped and the CR owned, so a human comment now drives the
+	// ordinary awaiting-human re-entry, in place, in the state the Task never
+	// left.
+	l.Info("parked binding repair: repaired the interrupted mint binding; staying parked until a human replies",
+		"action", "mr_binding_backstop_repaired_parked", "resource_id", task.Name,
+		"kind", task.Spec.Kind, "state", task.Status.State)
 	return true, nil
 }
 
 // parkedBindingRepairEligible is reconcileParkedBindingRepair's predicate: the
 // MR-binding watchdog's park flavor, and nothing else.
 func parkedBindingRepairEligible(task *tatarav1alpha1.Task) bool {
-	return task.Status.Stage == tatarav1alpha1.StageParked &&
-		task.Status.StageReason == stage.ReasonAwaitingHuman &&
-		task.Status.ParkedFromStage != "" &&
+	return task.Status.ParkReason == stage.ReasonAwaitingHuman &&
+		task.Status.ParkedFromState != "" &&
 		task.Spec.Source != nil && task.Spec.Source.Number > 0 &&
 		len(task.Status.MRRefs) == 0 && len(task.Status.IssueRefs) == 0
 }
@@ -650,7 +693,7 @@ func (r *TaskReconciler) commentMRBindingBackstopParked(ctx context.Context, pro
 // deadline and the two B2 suppression guards - so the scoping holds identically
 // at each.
 func handoffCondition(task *tatarav1alpha1.Task) *metav1.Condition {
-	if !tatarav1alpha1.OutcomeCommittedFor(task, stage.AgentKindFor(task.Status.Stage)) {
+	if !tatarav1alpha1.OutcomeCommittedFor(task, stage.AgentKindFor(task.Status.State, task.Spec.Kind)) {
 		return nil
 	}
 	cond := tatarav1alpha1.OutcomeCondition(task)
@@ -664,8 +707,8 @@ func handoffCondition(task *tatarav1alpha1.Task) *metav1.Condition {
 	// either - ArmedClock disarms on the same condition (stage.go:572). Every
 	// path into a stage runs stage.Enter, which always stamps it, so a nil stamp
 	// is unreachable; failing closed just keeps it that way.
-	if task.Status.StageEnteredAt == nil ||
-		cond.LastTransitionTime.Time.Before(task.Status.StageEnteredAt.Time) {
+	if task.Status.StateEnteredAt == nil ||
+		cond.LastTransitionTime.Time.Before(task.Status.StateEnteredAt.Time) {
 		return nil
 	}
 	return cond
@@ -701,7 +744,7 @@ func (r *TaskReconciler) reconcileCaps(ctx context.Context, proj *tatarav1alpha1
 	// == nil and is never this (fix V6-1): the fix that killed every Task that ever
 	// queued in normal steady state got exactly this predicate wrong.
 	stopped := false
-	if task.Status.PodStartedAt != nil && task.Status.StageWorkStartedAt != nil {
+	if task.Status.PodStartedAt != nil && task.Status.StateWorkStartedAt != nil {
 		gone, gerr := r.podGone(ctx, task)
 		if gerr != nil {
 			return true, gerr
@@ -735,22 +778,20 @@ func (r *TaskReconciler) reconcileCaps(ctx context.Context, proj *tatarav1alpha1
 	// the suppression in the other direction.
 	if handoffCondition(task) != nil &&
 		(edge.Reason == stage.ReasonNoOutcome || edge.Reason == stage.ReasonPodRecreationExhausted) {
-		log.FromContext(ctx).Info("stage budget exit suppressed: the outcome is committed and the handoff is in flight",
+		log.FromContext(ctx).Info("state budget exit suppressed: the outcome is committed and the handoff is in flight",
 			"action", "cap_suppressed_committed_outcome", "resource_id", task.Name,
-			"stage", task.Status.Stage, "pod_recreations", task.Status.Stats.PodRecreations,
+			"state", task.Status.State, "pod_recreations", task.Status.Stats.PodRecreations,
 			"suppressed_reason", edge.Reason)
 		return false, nil
 	}
 
-	mrs, mrErr := ownedMergeRequests(ctx, r.Client, task)
-	if mrErr != nil {
-		return true, mrErr
-	}
-	log.FromContext(ctx).Info("stage budget exit",
-		"action", "stage_budget_exit", "resource_id", task.Name, "stage", task.Status.Stage,
+	log.FromContext(ctx).Info("state budget exit",
+		"action", "stage_budget_exit", "resource_id", task.Name, "state", task.Status.State,
 		"turns", task.Status.Stats.Turns, "pod_recreations", task.Status.Stats.PodRecreations,
-		"pod_stopped_no_outcome", stopped, "to", edge.To, "stage_reason", edge.Reason)
-	return true, r.enter(ctx, proj, task, mrs, edge.To, edge.Reason, now)
+		"pod_stopped_no_outcome", stopped, "to", edge.To, "park_reason", edge.Reason)
+	// Every BudgetExit edge parks: they are all exhaustion outcomes, and an
+	// exhaustion outcome stalls the Task where it is rather than moving it.
+	return true, r.park(ctx, proj, task, edge.Reason, now)
 }
 
 // reconcileTriaging is the pod-less TRIAGE stage: the operator classifies the
@@ -765,14 +806,12 @@ func (r *TaskReconciler) reconcileTriaging(ctx context.Context, proj *tatarav1al
 	// fire BEFORE a pod is spawned, because the pod name is the Task name plus a
 	// suffix and the kubelet's failure is opaque.
 	if len(task.Name) > tatarav1alpha1.MaxTaskNameLength {
-		return ctrl.Result{}, r.enter(ctx, proj, task, nil,
-			tatarav1alpha1.StageFailed, stage.ReasonNameTooLong, now)
+		return ctrl.Result{}, r.park(ctx, proj, task, stage.ReasonNameTooLong, now)
 	}
 	if verr := tatarav1alpha1.ValidateTaskSpec(task.Spec); verr != nil {
 		log.FromContext(ctx).Info("triage: invalid task spec",
 			"action", "triage_invalid_spec", "resource_id", task.Name, "err", verr.Error())
-		return ctrl.Result{}, r.enter(ctx, proj, task, nil,
-			tatarav1alpha1.StageFailed, stage.ReasonTriageStalled, now)
+		return ctrl.Result{}, r.park(ctx, proj, task, stage.ReasonTriageStalled, now)
 	}
 
 	if err := r.mintIssueCRs(ctx, proj, task); err != nil {
@@ -781,37 +820,45 @@ func (r *TaskReconciler) reconcileTriaging(ctx context.Context, proj *tatarav1al
 
 	next, ok := triageTarget(task.Spec.Kind)
 	if !ok {
-		log.FromContext(ctx).Info("triage: no stage for this task kind",
+		log.FromContext(ctx).Info("triage: no state for this task kind",
 			"action", "triage_unknown_kind", "resource_id", task.Name, "kind", task.Spec.Kind)
-		return ctrl.Result{}, r.enter(ctx, proj, task, nil,
-			tatarav1alpha1.StageFailed, stage.ReasonTriageStalled, now)
+		return ctrl.Result{}, r.park(ctx, proj, task, stage.ReasonTriageStalled, now)
 	}
 	return ctrl.Result{}, r.enter(ctx, proj, task, nil, next, "", now)
 }
 
-// triageTarget is F.3's triaging row, as data: the stage each agent kind starts
-// at. A kind with no row is a spec bug and fails triage rather than falling
-// through into some default that spawns the wrong agent.
+// triageTarget is the `new` row, as data: the state each ORIGIN kind starts at.
+// A kind with no row is a spec bug and stalls triage rather than falling through
+// into some default that spawns the wrong agent.
+//
+// EVERY code-bearing kind starts at `refined`, and `implement` is now one of
+// them (#521). That is not a hole in the approval gate: `refined` is where the
+// gate RUNS. The old machine reached code through clarifying -> approved ->
+// implementing and had to refuse kind=implement at triage because a Task minted
+// there would have skipped the gate; under the merged model the same agent
+// brainstorms, is approved and implements, and the ONLY edge out of refined into
+// under-implementation is the one restapi's gate grants. A Task minted
+// kind=implement therefore lands in front of the gate, not past it.
+//
+// THERE IS NO `documentation` ROW, and its absence is the point. It used to
+// return under-implementation, which is NOT in the table's `new` row - so a
+// documentation Task that ever reached triage would have failed
+// stage.LegalFor(new, under-implementation) and errored on every reconcile pass
+// forever. It never reaches triage: docbatch.go mints the nightly batch with
+// Spec.InitialState = StateUnderImplementation and the CREATE edge takes it
+// there directly (no driving issue to triage, no approval to gate). Falling
+// through to the no-row branch means a documentation Task that somehow does
+// arrive at `new` parks at triage-stalled, loudly and once, instead of grinding
+// against an edge that does not exist.
 func triageTarget(kind string) (string, bool) {
 	switch kind {
-	case stage.AgentBrainstorm:
-		return tatarav1alpha1.StageBrainstorming, true
-	case stage.AgentClarify:
-		return tatarav1alpha1.StageClarifying, true
-	case stage.AgentIncident:
-		return tatarav1alpha1.StageInvestigating, true
-	case stage.AgentRefine:
-		return tatarav1alpha1.StageRefining, true
+	case stage.AgentBrainstorm, stage.AgentIncident, stage.AgentRefine, stage.AgentImplement:
+		return tatarav1alpha1.StateRefined, true
+	case "takeover":
+		return tatarav1alpha1.StateRefined, true
 	case stage.AgentReview:
-		return tatarav1alpha1.StageReviewing, true
-	case stage.AgentDocumentation:
-		return tatarav1alpha1.StageDocumenting, true
+		return tatarav1alpha1.StateAwaitingReview, true
 	default:
-		// NOTE: `implement` is deliberately absent. F.3's triaging row has no
-		// implement edge, and there is no triaging -> implementing edge in the
-		// table: code execution is reached ONLY through clarifying -> approved ->
-		// implementing, i.e. only through the C.6 approval gate. A Task minted with
-		// kind=implement therefore fails triage rather than skipping the gate.
 		return "", false
 	}
 }
@@ -921,7 +968,7 @@ func (r *TaskReconciler) reconcilePodStage(ctx context.Context, proj *tatarav1al
 	if handoffCondition(task) != nil {
 		l.Info("stage pod work suppressed: the outcome is committed and the handoff is in flight",
 			"action", "pod_stage_suppressed_committed_outcome", "resource_id", task.Name,
-			"stage", task.Status.Stage, "agent_kind", agentKind)
+			"state", task.Status.State, "agent_kind", agentKind)
 		return ctrl.Result{RequeueAfter: stageRequeue}, nil
 	}
 
@@ -945,7 +992,7 @@ func (r *TaskReconciler) reconcilePodStage(ctx context.Context, proj *tatarav1al
 		if gone {
 			if r.liveStageDiffers(ctx, task) {
 				log.FromContext(ctx).Info("wrapper pod gone but the live stage has moved; not respawning",
-					"action", "pod_respawn_skipped_stage_moved", "resource_id", task.Name, "acting_stage", task.Status.Stage)
+					"action", "pod_respawn_skipped_stage_moved", "resource_id", task.Name, "acting_stage", task.Status.State)
 				return ctrl.Result{RequeueAfter: agentBootRequeue}, nil
 			}
 			return r.respawnLostPod(ctx, proj, task, now)
@@ -978,7 +1025,7 @@ func (r *TaskReconciler) reconcilePodStage(ctx context.Context, proj *tatarav1al
 	// the G.10 contract handshake first, so a wrapper speaking the wrong contract
 	// version fails the Task with agent-contract-mismatch BEFORE turn-0, with ZERO
 	// turns submitted. Until then there is nothing to do but wait; CLOCK 2 bounds it.
-	if task.Status.StageWorkStartedAt == nil {
+	if task.Status.StateWorkStartedAt == nil {
 		return ctrl.Result{RequeueAfter: agentBootRequeue}, nil
 	}
 
@@ -986,21 +1033,22 @@ func (r *TaskReconciler) reconcilePodStage(ctx context.Context, proj *tatarav1al
 	if task.Annotations[annStageTurn0] == marker {
 		// THE CONVERSATION FOLLOW-UP TURN, and the ONLY stage that gets one.
 		//
-		// Every other pod stage takes exactly one turn per pod: turn-0 renders the
-		// whole bundle, the agent works, it submits an outcome, the stage moves and
-		// the pod dies. conversing is different by construction - it is where a Task
-		// waits with a live agent for the human's NEXT comment - so the pod must be
-		// able to take that comment as a further turn or the warmth buys nothing.
+		// A pod's turn-0 renders the whole bundle, the agent works, it submits an
+		// outcome, the state moves and the pod dies. A LIVE state is different by
+		// construction - it is where a Task waits with a live agent for the human's
+		// NEXT comment - so the pod must be able to take that comment as a further
+		// turn or the warmth buys nothing. #521 widened this from the single
+		// `conversing` stage to every live state.
 		//
 		// Three guards, all load-bearing:
-		//   - stage == conversing, so the turn model of implementing/reviewing is
+		//   - the state is LIVE and un-parked, so a state that runs no pod is
 		//     untouched;
 		//   - pendingEvents non-empty, so this fires on a real delta and not on
 		//     every 30s requeue (and the drain below is what makes it terminate);
 		//   - no turn in flight, because POST /v1/messages 409s during a turn and a
 		//     racing second submit is exactly the 2026-06 redelivery defect that
 		//     double-injected text into a live session.
-		if task.Status.Stage == tatarav1alpha1.StageConversing &&
+		if stage.Live(task.Status.State) && !tatarav1alpha1.Parked(task) &&
 			len(task.Status.PendingEvents) > 0 && !taskHasInflightTurn(task) {
 			return r.submitStageTurn(ctx, proj, task, agentKind, "conversation", now)
 		}
@@ -1013,7 +1061,7 @@ func (r *TaskReconciler) reconcilePodStage(ctx context.Context, proj *tatarav1al
 // submitStageTurn renders the bundle and submits ONE turn to this Task's live
 // pod, then stamps the turn annotations and spends the pendingEvents delta that
 // was rendered into it. phase is "turn0" for a pod's first turn and
-// "conversation" for a conversing pod's follow-up; it names the submit site in
+// "conversation" for a live pod's follow-up; it names the submit site in
 // the failure path and in the log line, and is not otherwise behavioural.
 //
 // The annStageTurn0 marker is stamped for BOTH phases. For turn0 that is its
@@ -1050,7 +1098,7 @@ func (r *TaskReconciler) submitStageTurn(ctx context.Context, proj *tatarav1alph
 	r.Metrics.TurnSubmit(task.Spec.Kind, "ok", "ok", elapsed)
 	l.Info("turn submitted",
 		"action", "agent_turn_submit", "resource_id", task.Name, "turn_id", turnID,
-		"stage", task.Status.Stage, "agent_kind", agentKind, "phase", phase,
+		"state", task.Status.State, "agent_kind", agentKind, "phase", phase,
 		"events", len(rendered), "bytes", len(text),
 		"duration_ms", int64(elapsed*1000))
 
@@ -1133,7 +1181,7 @@ func (r *TaskReconciler) ttlStop(ctx context.Context, proj *tatarav1alpha1.Proje
 	}
 	if err := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 		fresh.Status.PodStartedAt = nil
-		fresh.Status.StageWorkStartedAt = nil
+		fresh.Status.StateWorkStartedAt = nil
 		return true
 	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("ttl stop re-arm %s: %w", task.Name, err)
@@ -1152,7 +1200,7 @@ func turn0Marker(task *tatarav1alpha1.Task) string {
 	if task.Status.PodStartedAt != nil {
 		at = task.Status.PodStartedAt.UTC().Format(time.RFC3339)
 	}
-	return task.Status.Stage + "|" + at
+	return task.Status.State + "|" + at
 }
 
 func (r *TaskReconciler) callbackURL() string {
@@ -1198,8 +1246,8 @@ func (r *TaskReconciler) renderBundle(ctx context.Context, proj *tatarav1alpha1.
 }
 
 // respawnLostPod handles a pod that RAN and is gone. It burns one podRecreations;
-// the terminal, once the budget is spent, is failed(pod-recreation-exhausted).
-// pod-not-ready is NOT a stage reason and appears nowhere.
+// the terminal, once the budget is spent, is park(pod-recreation-exhausted).
+// pod-not-ready is NOT a park reason and appears nowhere.
 func (r *TaskReconciler) respawnLostPod(ctx context.Context, proj *tatarav1alpha1.Project,
 	task *tatarav1alpha1.Task, now time.Time) (ctrl.Result, error) {
 
@@ -1209,12 +1257,17 @@ func (r *TaskReconciler) respawnLostPod(ctx context.Context, proj *tatarav1alpha
 		log.FromContext(ctx).Info("agent pod lost; recreation budget exhausted",
 			"action", "pod_recreation_exhausted", "resource_id", task.Name,
 			"pod_recreations", recreations)
-		return ctrl.Result{}, r.enter(ctx, proj, task, nil, edge.To, edge.Reason, now)
+		// Through the PARK CHOKE POINT, exactly as podwatch.go's handleNotReady
+		// does at the twin site: stage.RecordRespawn's terminal edge is a PARK
+		// (#521 deleted `failed`), and stage.Enter refuses stage.ParkTarget by
+		// design. Handing it the raw edge turns an exhausted budget into an
+		// IllegalTransitionError, and the exhaustion goes uncounted.
+		return ctrl.Result{}, r.park(ctx, proj, task, edge.Reason, now)
 	}
 	if err := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 		fresh.Status.Stats.PodRecreations = recreations
 		fresh.Status.PodStartedAt = nil
-		fresh.Status.StageWorkStartedAt = nil
+		fresh.Status.StateWorkStartedAt = nil
 		return true
 	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("record pod respawn: %w", err)
@@ -1243,7 +1296,7 @@ func (r *TaskReconciler) liveStageDiffers(ctx context.Context, task *tatarav1alp
 	if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(task), live); err != nil {
 		return false
 	}
-	return live.Status.Stage != task.Status.Stage
+	return live.Status.State != task.Status.State
 }
 
 // podGone reports whether the Task's wrapper Pod no longer exists.
@@ -1281,12 +1334,12 @@ func (r *TaskReconciler) ensureStagePod(ctx context.Context, proj *tatarav1alpha
 	getErr := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: agent.PodName(task)}, existing)
 	switch {
 	case getErr == nil:
-		if existing.Annotations[annPodStage] == task.Status.Stage {
+		if existing.Annotations[annPodStage] == task.Status.State {
 			return false, nil
 		}
 		log.FromContext(ctx).Info("wrapper pod belongs to a stage this task has left; deleting",
 			"action", "stale_stage_pod_delete", "resource_id", task.Name,
-			"pod_stage", existing.Annotations[annPodStage], "stage", task.Status.Stage)
+			"pod_stage", existing.Annotations[annPodStage], "state", task.Status.State)
 		return false, agent.DeleteWrapper(ctx, r.Client, task.Namespace, task)
 	case !apierrors.IsNotFound(getErr):
 		return false, fmt.Errorf("get wrapper pod: %w", getErr)
@@ -1305,7 +1358,7 @@ func (r *TaskReconciler) ensureStagePod(ctx context.Context, proj *tatarav1alpha
 	// backstop for any pod that slips through.
 	if r.liveStageDiffers(ctx, task) {
 		log.FromContext(ctx).Info("wrapper pod absent but the live stage has moved; skipping create",
-			"action", "pod_create_skipped_stage_moved", "resource_id", task.Name, "acting_stage", task.Status.Stage)
+			"action", "pod_create_skipped_stage_moved", "resource_id", task.Name, "acting_stage", task.Status.State)
 		return true, nil
 	}
 
@@ -1341,9 +1394,9 @@ func (r *TaskReconciler) ensureStagePod(ctx context.Context, proj *tatarav1alpha
 			if over {
 				log.FromContext(ctx).Info("review pod not spawned: the review target was taken over by a maintainer",
 					"action", "review_finalize_taken_over", "resource_id", task.Name,
-					"to", tatarav1alpha1.StageRejected, "reason", stage.ReasonMRTakenOver)
+					"to", tatarav1alpha1.StateRejected, "reason", stage.ReasonMRTakenOver)
 				if err := r.enter(ctx, proj, task, mrs,
-					tatarav1alpha1.StageRejected, stage.ReasonMRTakenOver, time.Now()); err != nil {
+					tatarav1alpha1.StateRejected, stage.ReasonMRTakenOver, time.Now()); err != nil {
 					return false, err
 				}
 				return true, nil
@@ -1366,7 +1419,7 @@ func (r *TaskReconciler) ensureStagePod(ctx context.Context, proj *tatarav1alpha
 	if pod.Annotations == nil {
 		pod.Annotations = map[string]string{}
 	}
-	pod.Annotations[annPodStage] = task.Status.Stage
+	pod.Annotations[annPodStage] = task.Status.State
 	if err := r.Create(ctx, pod); err != nil && !apierrors.IsAlreadyExists(err) {
 		return false, fmt.Errorf("create wrapper pod: %w", err)
 	}
@@ -1486,7 +1539,7 @@ func (r *TaskReconciler) ensureTicket(ctx context.Context, proj *tatarav1alpha1.
 	if created {
 		log.FromContext(ctx).Info("admission ticket enqueued",
 			"action", "queue_ticket_enqueue", "resource_id", task.Name,
-			"stage", task.Status.Stage, "agent_kind", agentKind, "class", class)
+			"state", task.Status.State, "agent_kind", agentKind, "class", class)
 	}
 	return false, nil
 }

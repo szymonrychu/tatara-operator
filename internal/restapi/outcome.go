@@ -75,13 +75,79 @@ type outcomeEnvelope struct {
 	Payload json.RawMessage `json:"payload"`
 }
 
+// implementPayload is the /outcome implement wire shape, and after #521 it
+// carries the folded gate as well as the code outcome. THE KEY SET IS FROZEN
+// against tatara-cli's post-outcomeArgMap output and must be diffed key for key
+// against it: a mismatch fails SILENTLY at runtime, because DisallowUnknownFields
+// only catches keys the operator does not know, never ones the cli stopped
+// sending.
+//
+//	action title body changeSignificance mergeOrder
+//	reason approvingMaintainer planNoteId approvalCitations
+//
+// THERE IS ONE `reason` KEY AND ITS LEGALITY IS DECIDED BY `action`. tatara-cli
+// maps the agent's snake_case `decline_reason` onto the wire key `reason` in its
+// outcomeArgMap, and implement's schema ALSO has a top-level `reason` for the
+// three gate actions - both wrote payload["reason"], and buildOutcomePayload
+// ranges over a Go map, so a call carrying both produced a NONDETERMINISTIC
+// payload. The cli closed that by making exactly one of the two agent-facing
+// arguments legal per action, which collapses on the wire to a SINGLE key.
+//
+// THERE IS NO `declineReason` KEY. An operator-side `declineReason` would be a
+// second contract tatara-cli does not implement: every real decline arrives as
+// {"action":"declined","reason":"..."} and would be refused twice over. This is
+// the operator's half of the one contract - the operator is the trust boundary
+// and an old or hand-rolled client can send anything, so the per-action
+// legality is enforced here too rather than assumed.
+//
+// APPROVINGMAINTAINER AND APPROVALCITATIONS TRAVEL AS A PAIR. Both present is a
+// human-cited approval; both absent is the autoApproveTataraProposals path,
+// where a bot-authored, anchor-verified proposal is released with NO human
+// comment at all - so there is no comment author to name and requiring the field
+// would make the carve-out unreachable on the two Projects that have it enabled.
+// One without the other is refused. planNoteId is required either way: the plan
+// pin is orthogonal to who approved.
 type implementPayload struct {
 	Action             string   `json:"action"`
 	Title              string   `json:"title,omitempty"`
 	Body               string   `json:"body,omitempty"`
 	ChangeSignificance string   `json:"changeSignificance,omitempty"`
 	MergeOrder         []string `json:"mergeOrder,omitempty"`
-	Reason             string   `json:"reason,omitempty"`
+	// Reason is REQUIRED on declined (why no code is coming) and on the three
+	// gate actions (approved / discuss / rejected), and REFUSED on submitted: a
+	// code outcome carries a title and a body, never a reason.
+	Reason string `json:"reason,omitempty"`
+	// The gate fields. Present only on action=approved; the handler refuses
+	// them on every other action so a code outcome cannot smuggle an approval.
+	ApprovingMaintainer string                            `json:"approvingMaintainer,omitempty"`
+	PlanNoteID          string                            `json:"planNoteId,omitempty"`
+	ApprovalCitations   []tatarav1alpha1.ApprovalCitation `json:"approvalCitations,omitempty"`
+}
+
+// gateGrantedResponse / gateResponse is the 200 body the folded gate returns.
+//
+// A REFUSAL IS A 200 AND IT DOES NOT PARK. Under the old model the clarify pod
+// was dead after its one turn, so parking at identity-unverified was the only
+// way to hold the work; under the merged model the agent is still alive and
+// should be told no and keep talking. `declared` echoes back the
+// approvingMaintainer the agent sent, and the KEY IS ALWAYS PRESENT: an empty
+// string means "the agent declared no approver" (the auto-approve path, where
+// it legitimately sent none), not "the field never showed up". That is why
+// this field carries NO `omitempty` - the field would otherwise be absent
+// from the JSON on the auto-approve refusal path, which is undefined rather
+// than the defined empty string - so the refusal is self-explaining in the
+// pod's transcript either way. The skills instruct agents to branch on
+// `reason` ONLY; `declared` is for the human reading the log.
+type gateResponse struct {
+	Granted bool `json:"granted"`
+	// Reason keeps its omitempty. Unlike Declared it was never DEFINED as
+	// present-and-empty on any path: this type is constructed only inside
+	// refuseGate, and every call site there passes a non-empty reason
+	// constant, so the omitempty is inert today rather than hiding a real
+	// undefined state - there is no path that needs "reason absent" to mean
+	// something distinct from "reason empty".
+	Reason   string `json:"reason,omitempty"`
+	Declared string `json:"declared"`
 }
 
 type reviewedSHA struct {
@@ -118,25 +184,6 @@ type headMovedResponse struct {
 	LiveSHA         string `json:"liveSHA"`
 	MirrorRefreshed bool   `json:"mirrorRefreshed"`
 	Message         string `json:"message"`
-}
-
-// clarifyPayload is the /outcome clarify wire shape.
-//
-// ApprovalCitations is the agent's EVIDENCE for decision=implement, and it is
-// NOT unconditionally required. The autoApproveTataraProposals carve-out fires
-// only when NO maintainer has commented, so there is literally no comment to
-// cite; requiring the field would kill that path. The operator decides, per
-// Issue, whether a citation was needed - see controller.verifyOneIssue.
-//
-// A missing or failing citation is a REFUSAL, not a 400: this handler returns
-// 200 + "implement-unverified" and parks at identity-unverified, exactly as a
-// failed grammar check did. Only malformed JSON and a missing decision / blank
-// reason stay 4xx. That matches existing behaviour AND means a mis-instructed
-// agent parks one Task instead of deadlocking the fleet.
-type clarifyPayload struct {
-	Decision          string                            `json:"decision"`
-	Reason            string                            `json:"reason"`
-	ApprovalCitations []tatarav1alpha1.ApprovalCitation `json:"approvalCitations,omitempty"`
 }
 
 type proposalPayload struct {
@@ -293,8 +340,15 @@ func (s *Server) postOutcome(w http.ResponseWriter, r *http.Request) {
 	// they run before any kind handler and stamp nothing, so they are class B.
 	// oc.proj is nil until the lookup below; neither gate reads it.
 	oc := &outcomeCtx{s: s, w: w, r: r, task: task, fp: fp, kind: env.Kind}
-	if tatarav1alpha1.StageTerminal(task) || task.Status.Stage == tatarav1alpha1.StageDelivered {
-		oc.conflict("task is in a terminal stage", "terminal-stage")
+	if tatarav1alpha1.TaskDone(task) {
+		oc.conflict("task is done", "terminal-stage")
+		return
+	}
+	// A PARKED Task runs no pod, so an outcome submitted against one is from a
+	// pod the park was supposed to have taken down. Refuse it: applying it would
+	// move a Task the operator has already stalled.
+	if tatarav1alpha1.Parked(task) {
+		oc.conflict("task is parked", "task-parked")
 		return
 	}
 	// The pod's claim is not trusted: kind MUST equal status.agentKind.
@@ -311,11 +365,29 @@ func (s *Server) postOutcome(w http.ResponseWriter, r *http.Request) {
 	oc.proj = proj
 
 	switch env.Kind {
-	case "implement", "documentation":
+	case "implement":
 		var p implementPayload
 		if !oc.decode(env.Payload, &p) {
 			return
 		}
+		// THE FOLD. `clarify` was its own kind with its own payload until #521;
+		// its three decisions are action values here now, and the routing is the
+		// only thing that tells the gate half from the code half apart.
+		switch p.Action {
+		case "approved", "discuss", "rejected":
+			oc.gate(p)
+		default:
+			oc.implement(p)
+		}
+	case "documentation":
+		var p implementPayload
+		if !oc.decode(env.Payload, &p) {
+			return
+		}
+		// A documentation agent has NO gate to drive - it writes docs and opens
+		// an MR - so it never reaches oc.gate, and tatara-cli gives it its own
+		// schema whose action enum is submitted|declined only. This arm is the
+		// operator-side half of that split.
 		oc.implement(p)
 	case "review":
 		var p reviewPayload
@@ -323,12 +395,6 @@ func (s *Server) postOutcome(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		oc.review(p)
-	case "clarify":
-		var p clarifyPayload
-		if !oc.decode(env.Payload, &p) {
-			return
-		}
-		oc.clarify(p)
 	case "brainstorm":
 		var p brainstormPayload
 		if !oc.decode(env.Payload, &p) {
@@ -546,8 +612,8 @@ func (o *outcomeCtx) commit(mutate func(*tatarav1alpha1.Task) error) bool {
 	s := o.s
 	key := types.NamespacedName{Namespace: s.ns, Name: o.task.Name}
 	var mutErr error
-	from := o.task.Status.Stage
-	var to, toReason string
+	from := o.task.Status.State
+	var to, toReason, toPark string
 	err := objbudget.FitTask(ctx, s.c, s.spillerForOrNil(o.proj), key, func(t *tatarav1alpha1.Task) {
 		if mutate != nil {
 			if err := mutate(t); err != nil {
@@ -555,7 +621,7 @@ func (o *outcomeCtx) commit(mutate func(*tatarav1alpha1.Task) error) bool {
 				return
 			}
 		}
-		to, toReason = t.Status.Stage, t.Status.StageReason
+		to, toReason, toPark = t.Status.State, t.Status.StateReason, t.Status.ParkReason
 		setCondition(t, metav1.Condition{
 			Type:               outcomeAcceptedCondition,
 			Status:             metav1.ConditionTrue,
@@ -606,19 +672,29 @@ func (o *outcomeCtx) commit(mutate func(*tatarav1alpha1.Task) error) bool {
 	}
 	s.metrics.TaskTerminalEntry(o.task.Spec.Kind, from, to, toReason)
 	// The same choke-point gap D1 closed for operator_task_terminal_total:
-	// this handler's stage.Enter calls (awaiting-human, identity-unverified,
-	// implement-declined, ...) never route through controller.EnterStage, the
+	// this handler's stage.Park calls (awaiting-human, identity-unverified,
+	// implement-declined, ...) never route through controller.ParkTask, the
 	// only other place TaskParked() is called - so an outcome-driven first
-	// park undercounted operator_task_parked_total. Mirrors transition.go's
-	// EnterStage condition exactly (metric-wiring audit, issue #370).
-	if to == tatarav1alpha1.StageParked && from != "" {
-		s.metrics.TaskParked(from, toReason)
+	// park undercounted operator_task_parked_total (metric-wiring audit, #370).
+	if toPark != "" && o.task.Status.ParkReason == "" {
+		s.metrics.TaskParked(from, toPark)
 	}
 	if to != from {
-		s.log.InfoContext(ctx, "stage transition",
+		s.log.InfoContext(ctx, "state transition",
 			append(reqLogFields(o.r), "action", "stage_transition", "task", o.task.Name,
-				"from", from, "to", to, "stage_reason", toReason)...)
+				"from", from, "to", to, "state_reason", toReason)...)
 	}
+	// THE PARK TAKES THE POD DOWN. controller.ParkTask does this for every
+	// operator-side park; an outcome-driven one has to do it here, because this
+	// handler never routes through that choke point. A parked Task holding a live
+	// pod burns an admission slot with no clock armed.
+	if toPark != "" && o.task.Status.ParkReason == "" {
+		if derr := agent.DeleteWrapper(ctx, s.c, s.ns, o.task); derr != nil {
+			s.log.ErrorContext(ctx, "restapi: park landed but the agent pod delete failed; the task reconciler repairs it",
+				append(reqLogFields(o.r), "task", o.task.Name, "error", derr)...)
+		}
+	}
+	o.task.Status.State, o.task.Status.StateReason, o.task.Status.ParkReason = to, toReason, toPark
 	return true
 }
 
@@ -709,7 +785,7 @@ func (o *outcomeCtx) ok(action string, fields ...any) {
 	obs.RestOutcomeAcceptedTotal.WithLabelValues(o.kind, action).Inc()
 	o.s.log.InfoContext(ctx, "restapi: outcome accepted",
 		append(append(reqLogFields(o.r), "action", "submit_outcome", "task", o.task.Name,
-			"kind", o.kind, "outcome", action, "stage", fresh.Status.Stage), fields...)...)
+			"kind", o.kind, "outcome", action, "state", fresh.Status.State), fields...)...)
 	writeJSON(o.w, http.StatusOK, toTaskDTO(*fresh))
 }
 
@@ -729,6 +805,19 @@ func (o *outcomeCtx) implement(p implementPayload) {
 	ctx := o.r.Context()
 	s := o.s
 
+	// THE SINGLE `reason` FIELD, WITH PER-ACTION LEGALITY. The frozen wire
+	// contract has ONE reason key: tatara-cli maps the agent's snake_case
+	// `decline_reason` onto it and the gate's own `reason` argument onto the same
+	// key, and made exactly one of the two legal per action. So the key's meaning
+	// is decided by `action`, and this is where the operator decides it too -
+	// tatara-cli is not the trust boundary and an old or hand-rolled client can
+	// send anything.
+	//
+	// `submitted` REFUSES it: a code outcome is a title, a body and a
+	// significance, and a reason riding one is a client that thinks it is
+	// declining. `declined` REQUIRES it: a decline with no reason terminates the
+	// Task with nothing on the thread explaining why. The three gate actions
+	// require it in o.gate.
 	switch p.Action {
 	case "submitted":
 		if strings.TrimSpace(p.Title) == "" || strings.TrimSpace(p.Body) == "" ||
@@ -736,12 +825,12 @@ func (o *outcomeCtx) implement(p implementPayload) {
 			o.bad("action=submitted requires title, body and changeSignificance", "missing-field")
 			return
 		}
-		if p.Reason != "" {
-			o.bad("reason is only for action=declined", "unexpected-field")
-			return
-		}
 		if !validChangeSignificance[p.ChangeSignificance] {
 			o.bad("changeSignificance must be one of major, minor, patch", "bad-significance")
+			return
+		}
+		if p.Reason != "" {
+			o.bad("reason is only for action=declined, approved, discuss or rejected", "unexpected-field")
 			return
 		}
 	case "declined":
@@ -753,6 +842,12 @@ func (o *outcomeCtx) implement(p implementPayload) {
 		o.bad("action must be one of submitted, declined", "bad-action")
 		return
 	}
+	// NO GATE FIELD MAY RIDE A CODE OUTCOME. Without this a submitted payload
+	// could carry an approval nobody evaluated.
+	if p.ApprovingMaintainer != "" || p.PlanNoteID != "" || len(p.ApprovalCitations) > 0 {
+		o.bad("approvingMaintainer, planNoteId and approvalCitations are only valid when action=approved", "unexpected-field")
+		return
+	}
 
 	mrs, err := s.ownedMRs(ctx, o.task)
 	if err != nil {
@@ -760,19 +855,42 @@ func (o *outcomeCtx) implement(p implementPayload) {
 		return
 	}
 
-	if p.Action == "declined" {
-		to, reason := tatarav1alpha1.StageParked, stage.ReasonImplementDeclined
-		if o.kind == "documentation" {
-			// A declined documentation batch is DELIVERED, not parked: there was
-			// nothing to document (F.3).
-			to, reason = tatarav1alpha1.StageDelivered, ""
+	// THE PLAN PIN, RE-CHECKED BEFORE CODE SHIPS. The gate hashed the plan note
+	// at grant; if the agent rewrote it afterwards, the change it is submitting
+	// is not the change that was approved.
+	//
+	// THE CHEAP PATH OUT IS `refined`, NEVER A PARK. An agent that finds the plan
+	// gate expensive will simply stop updating its plan note, which destroys the
+	// note's value as continuation state - so a mismatch sends it back to the
+	// gate to ask again, with its pod alive and its work intact.
+	if p.Action == "submitted" && o.kind == "implement" {
+		if refused := s.planPinRefusal(ctx, o.task); refused {
+			if !o.commit(func(t *tatarav1alpha1.Task) error {
+				return stage.Enter(t, mrs, tatarav1alpha1.StateRefined, "", s.now())
+			}) {
+				return
+			}
+			o.refuseGate(controller.ApprovalRefusedPlanHashMismatch, "")
+			return
 		}
+	}
+
+	if p.Action == "declined" {
+		docDecline := o.kind == "documentation"
 		if !o.commit(func(t *tatarav1alpha1.Task) error {
-			// stage.Enter FIRST: objbudget.FitTask persists whatever this
+			// The mutation FIRST: objbudget.FitTask persists whatever this
 			// closure mutated even when it returns an error, so a note appended
 			// before a REFUSED transition would land - and, now that a class-B
 			// rejection releases the claim, land AGAIN on every retry.
-			if err := stage.Enter(t, mrs, to, reason, s.now()); err != nil {
+			var err error
+			if docDecline {
+				// A declined documentation batch is DONE, not parked: there was
+				// nothing to document.
+				err = stage.Enter(t, mrs, tatarav1alpha1.StateDone, stage.ReasonDocTimeout, s.now())
+			} else {
+				err = stage.Park(t, stage.ReasonImplementDeclined, s.now())
+			}
+			if err != nil {
 				return err
 			}
 			agentNote(t, o.kind, "note", "declined: "+p.Reason, s.now())
@@ -856,7 +974,7 @@ func (o *outcomeCtx) implement(p implementPayload) {
 	}
 
 	if !o.commit(func(t *tatarav1alpha1.Task) error {
-		if err := stage.Enter(t, mrs, tatarav1alpha1.StageReviewing, "", s.now()); err != nil {
+		if err := stage.Enter(t, mrs, tatarav1alpha1.StateAwaitingReview, "", s.now()); err != nil {
 			return err
 		}
 		agentNote(t, o.kind, "note", "submitted: "+p.Title+"\n\n"+p.Body, s.now())
@@ -1217,20 +1335,34 @@ func findingsFor(in []reviewFindingPayload, repo string, number int) []tatarav1a
 	return out
 }
 
-// --- clarify --------------------------------------------------------------
+// --- the gate -------------------------------------------------------------
 
-func (o *outcomeCtx) clarify(p clarifyPayload) {
+// gate is the folded clarify handler: `o.clarify` renamed, its body kept, its
+// payload swapped for implementPayload's three gate actions.
+//
+// THE RENAME IS DELIBERATE AND THE BODY IS NOT NEW. This function IS the
+// approval gate and it is verifyApprovalScope's ONLY caller; deleting it and
+// re-deriving the same checks somewhere else is how a gate loses one of the
+// eight refusals nobody notices for a month.
+//
+// Legality vs authorisation stays separated verbatim: internal/stage owns the
+// transition table and park legality and does NO approval reasoning; this
+// function owns authorisation. Nothing in #521 moves that line.
+func (o *outcomeCtx) gate(p implementPayload) {
 	ctx := o.r.Context()
 	s := o.s
 
-	switch p.Decision {
-	case "implement", "close", "discuss":
-	default:
-		o.bad("decision must be one of implement, close, discuss", "bad-decision")
+	if strings.TrimSpace(p.Reason) == "" {
+		o.bad("reason is required on every gate action", "missing-field")
 		return
 	}
-	if strings.TrimSpace(p.Reason) == "" {
-		o.bad("reason is required on every clarify decision", "missing-field")
+	if p.Title != "" || p.Body != "" || p.ChangeSignificance != "" || len(p.MergeOrder) > 0 {
+		o.bad("title, body, changeSignificance and mergeOrder are only valid when action=submitted", "unexpected-field")
+		return
+	}
+	if p.Action != "approved" &&
+		(p.ApprovingMaintainer != "" || p.PlanNoteID != "" || len(p.ApprovalCitations) > 0) {
+		o.bad("approvingMaintainer, planNoteId and approvalCitations are only valid when action=approved", "unexpected-field")
 		return
 	}
 
@@ -1240,10 +1372,12 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 		return
 	}
 
-	switch p.Decision {
+	switch p.Action {
 	case "discuss":
+		// A PARK, not a transition (#521). The Task stays exactly where it is and
+		// resumes there on the next human comment.
 		if !o.commit(func(t *tatarav1alpha1.Task) error {
-			if err := stage.Enter(t, mrs, tatarav1alpha1.StageParked, stage.ReasonAwaitingHuman, s.now()); err != nil {
+			if err := stage.Park(t, stage.ReasonAwaitingHuman, s.now()); err != nil {
 				return err
 			}
 			agentNote(t, o.kind, "note", "discuss: "+p.Reason, s.now())
@@ -1253,7 +1387,7 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 		}
 		o.ok("discuss")
 		return
-	case "close":
+	case "rejected":
 		// The OPERATOR closes the issue; the agent never does it from here.
 		// The close is queued as a pending comment intent on every owned Issue,
 		// drained by the Issue reconciler.
@@ -1269,38 +1403,68 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 			}
 		}
 		if !o.commit(func(t *tatarav1alpha1.Task) error {
-			if err := stage.Enter(t, mrs, tatarav1alpha1.StageRejected, stage.ReasonDeclined, s.now()); err != nil {
+			if err := stage.Enter(t, mrs, tatarav1alpha1.StateRejected, stage.ReasonDeclined, s.now()); err != nil {
 				return err
 			}
-			agentNote(t, o.kind, "note", "close: "+p.Reason, s.now())
+			agentNote(t, o.kind, "note", "rejected: "+p.Reason, s.now())
 			return nil
 		}) {
 			return
 		}
-		o.ok("close")
+		o.ok("rejected")
 		return
 	}
 
-	// decision=implement. The agent reports its decision and CITES the comment
+	// action=approved. The agent reports its decision and CITES the comment
 	// it judged to approve; the operator INDEPENDENTLY re-derives the structural
-	// facts - WHO wrote the cited comment, whether the quote is really in it -
-	// and the SCOPE (EVERY owned Issue, not one: fix H9). It never reads intent.
+	// facts - WHO wrote the cited comment, whether the quote is really in it,
+	// and whether the DECLARED approver agrees with both - and the SCOPE (EVERY
+	// owned Issue, not one: fix H9). It never reads intent.
+
+	// THE PAIR RULE. approvingMaintainer and approvalCitations travel together:
+	// both present is a human-cited approval, both absent is the auto-approve
+	// path. One without the other is a client bug and is refused before any
+	// verification runs, because a citation with no declared approver skips the
+	// two new cross-checks and a declared approver with no citation has nothing
+	// to be checked against.
+	if (p.ApprovingMaintainer == "") != (len(p.ApprovalCitations) == 0) {
+		o.bad("approvingMaintainer and approvalCitations must both be present or both be absent", "gate-pair-mismatch")
+		return
+	}
+	// planNoteId is UNCONDITIONALLY required, including on the auto-approve
+	// path: the plan pin is orthogonal to who approved, and the agent writes a
+	// plan note either way.
+	if strings.TrimSpace(p.PlanNoteID) == "" {
+		o.bad("action=approved requires planNoteId", "missing-field")
+		return
+	}
+	// THE OPERATOR RESOLVES THE PLAN NOTE ITSELF, through the SAME call the
+	// submit-time re-check uses (planPinRefusal). Which note gets hashed IS the
+	// control: `planNoteId` is client-supplied and the wire constrains neither
+	// its kind nor its recency, so resolving it by id alone hashed whatever the
+	// agent named and called that the approved plan.
+	//
+	// The declared id is kept as a DECLARATION THAT MUST AGREE - the same shape
+	// as approvingMaintainer against the citation, and for the same reason: the
+	// agent still has to say which note it thinks it is being approved on, and a
+	// disagreement is a refusal rather than a silent substitution.
+	note := planNote(o.task)
+	if note == nil {
+		o.refuseGate(controller.ApprovalRefusedPlanNoteMissing, p.ApprovingMaintainer)
+		return
+	}
+	if note.ID != strings.TrimSpace(p.PlanNoteID) {
+		o.refuseGate(controller.ApprovalRefusedPlanNoteNotPlan, p.ApprovingMaintainer)
+		return
+	}
+
 	issues, err := s.ownedIssues(ctx, o.task)
 	if err != nil {
 		writeClientErr(o.w, err)
 		return
 	}
-	granted, evidence, refusal := s.verifyApprovalScope(ctx, o.proj, issues, p.ApprovalCitations)
+	granted, evidence, refusal := s.verifyApprovalScope(ctx, o.proj, issues, p.ApprovalCitations, p.ApprovingMaintainer)
 	if !granted {
-		if !o.commit(func(t *tatarav1alpha1.Task) error {
-			if err := stage.Enter(t, mrs, tatarav1alpha1.StageParked, stage.ReasonIdentityUnverified, s.now()); err != nil {
-				return err
-			}
-			agentNote(t, o.kind, "note", "implement: "+p.Reason, s.now())
-			return nil
-		}) {
-			return
-		}
 		// A SCOPE-LEVEL refusal has no per-Issue verifier call behind it, so this
 		// is the only place its reason can be counted and logged. The per-Issue
 		// path leaves refusal empty because VerifyApproval already did both.
@@ -1310,24 +1474,22 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 				append(reqLogFields(o.r), "action", "approval_refused",
 					"task", o.task.Name, "reason", refusal)...)
 		}
-		// The WARN names WHICH condition refused and counts LIVE Issues beside
-		// owned ones. It used to assert "the citation did not verify on every
-		// owned issue" with issues=len(issues) unconditionally: the WRONG cause
-		// for the no-live-issue shape, where no citation was evaluated at all,
-		// and a count that included the very Issues the refusal was about
-		// excluding. An operator reading it triaged the clarify agent and the
-		// skills pin instead of noticing that a human had closed the issue.
 		reason := refusal
 		if reason == "" {
 			reason = "citation-not-verified"
 		}
-		s.log.WarnContext(ctx, "restapi: clarify reported approval but the scope check refused",
+		s.log.WarnContext(ctx, "restapi: the implement gate reported approval but the scope check refused",
 			append(reqLogFields(o.r), "task", o.task.Name, "reason", reason,
 				"owned_issues", len(issues), "live_issues", liveIssueCount(issues))...)
-		o.ok("implement-unverified")
+		// IT DOES NOT PARK. The agent is still alive under the merged model and
+		// should be told no and keep talking; under the old model the clarify pod
+		// was dead after its one turn, so parking was the only way to hold the
+		// work. That is no longer true.
+		o.refuseGate(reason, p.ApprovingMaintainer)
 		return
 	}
 
+	planHash := notePlanHash(note.Body)
 	for i := range issues {
 		iss := &issues[i]
 		// The SAME filter verifyApprovalScope applied, and it must be the same:
@@ -1341,8 +1503,7 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 		ev := evidence[iss.Name]
 		// Count the auto-approval TRANSITION (an issue not already approved): the
 		// last human gate is being removed, so it must be queryable without
-		// log-scraping (hard rule 13). This is the primary auto-approve site - a
-		// brainstorm/incident proposal reaching implement via clarify submit.
+		// log-scraping (hard rule 13).
 		if ev != nil && ev.Auto && iss.Status.Status != "approved" {
 			if kind := tatarav1alpha1.ProposalKindFromBody(iss.Status.Body); kind != "" {
 				s.metrics.AutoApproveTotal(kind)
@@ -1352,26 +1513,23 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 			// UNREACHABLE AT HEAD, AND KEPT ANYWAY AS A DRIFT DETECTOR. It is
 			// unreachable because verifyApprovalScope refuses the whole request
 			// on !ok || ev == nil and this loop walks exactly the in-scope keys
-			// its map holds - so deleting this arm leaves the package green.
-			// That is not an argument for deleting it. It is reachable again the
-			// moment the scope skip five lines above drifts from the identical
-			// one inside verifyApprovalScope, which is a ONE-LINE regression that
-			// has already happened once: the two filters were out of step until
-			// fix L3-14, and this ERROR is what made it visible. Writing
-			// status=approved with a nil approval produces an approved Issue with
-			// NO approver - it defeats the idempotence short-circuit, defeats the
-			// single-use replay guard, and projects tatara-approved to the forge
-			// with nobody behind it.
-			//
-			// It is pinned in the NEGATIVE, not the positive: no test can reach
-			// this line through the handler, but
-			// TestOutcome_Clarify_ClosedIssueDoesNotBlockALiveOne asserts the
-			// ERROR is absent on the happy path and goes RED the instant the two
-			// filters drift (verified by deleting the skip).
+			// its map holds. It is reachable again the moment the scope skip five
+			// lines above drifts from the identical one inside
+			// verifyApprovalScope, which is a ONE-LINE regression that has already
+			// happened once (fix L3-14). Writing status=approved with a nil
+			// approval produces an approved Issue with NO approver.
 			s.log.ErrorContext(ctx, "restapi: approval granted with nil evidence; refusing to write an approver-less approval",
 				append(reqLogFields(o.r), "task", o.task.Name, "issue", iss.Name)...)
 			continue
 		}
+		// THE PLAN PIN. sha256 of the plan note's body AS IT STOOD AT GRANT,
+		// re-checked on the transition out of the gate into code. It is NEW in
+		// the merged model and it exists because the model created the gap:
+		// previously approval ended the clarify Task and a FRESH implement pod
+		// started, so no artifact sat between approval and execution. Now the
+		// same live agent brainstorms, is approved, and implements - so the plan
+		// it was approved on is an artifact it can edit afterwards.
+		ev.PlanHash = planHash
 		key := types.NamespacedName{Namespace: s.ns, Name: iss.Name}
 		if err := objbudget.FitIssue(ctx, s.c, s.spillerForOrNil(o.proj), key, func(is *tatarav1alpha1.Issue) {
 			is.Status.Status = "approved"
@@ -1380,35 +1538,169 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 			writeClientErr(o.w, err)
 			return
 		}
-		// THE GRANT NEEDS ITS OWN AUDIT LINE, and after step F this is the only
-		// place left that can emit one. Every REFUSAL is covered twice -
+		// THE CONFIRMATION COMMENT, and it is the SELECTIVE-QUOTING MITIGATION.
+		// "go ahead" really is a substring of "do not go ahead until CI is
+		// green", and no amount of quote checking closes that: the mitigation is
+		// DETECTION, not prevention. The operator posts one comment naming the
+		// approver and quoting exactly what was cited, so a bypass is visible on
+		// the thread within minutes. It rides the existing PendingComments drain
+		// and is BOT-AUTHORED, so the enqueue filter drops it and the operator's
+		// own confirmation can never wake the Task that produced it.
+		if err := s.queueApprovalConfirmation(ctx, o.proj, iss, o.task.Name, ev, p.PlanNoteID); err != nil {
+			writeClientErr(o.w, err)
+			return
+		}
+		// THE GRANT NEEDS ITS OWN AUDIT LINE. Every REFUSAL is covered twice -
 		// operator_approval_refused_total{reason} AND action=approval_refused -
-		// while the grant had only action=submit_outcome,outcome=implement,
-		// which names no approver and no comment. Issue.Status.Approval is ONE
-		// slot, overwritten by the next approval on that Issue, so the
+		// while the grant had only action=submit_outcome. Issue.Status.Approval
+		// is ONE slot, overwritten by the next approval on that Issue, so the
 		// durable record of WHO released a change into push-CD is destroyed by
-		// the next one; this line is the append-only trace. Field names are
-		// exactly those the deleted controller-side writer used, so a consumer
-		// built against either sees one shape.
+		// the next one; this line is the append-only trace.
 		s.log.InfoContext(ctx, "restapi: approval verified",
 			append(reqLogFields(o.r), "action", "approval_verified", "task", o.task.Name,
-				"issue", iss.Name, "maintainer_login", ev.Login,
-				"cited_comment_id", ev.CommentID, "auto", ev.Auto)...)
+				"issue", iss.Name, "maintainer_login", ev.Login, "declared", p.ApprovingMaintainer,
+				"cited_comment_id", ev.CommentID, "auto", ev.Auto, "plan_note_id", p.PlanNoteID)...)
 	}
 	if !o.commit(func(t *tatarav1alpha1.Task) error {
-		if err := stage.Enter(t, mrs, tatarav1alpha1.StageApproved, "", s.now()); err != nil {
+		if err := stage.Enter(t, mrs, tatarav1alpha1.StateUnderImplementation, "", s.now()); err != nil {
 			return err
 		}
-		agentNote(t, o.kind, "note", "implement: "+p.Reason, s.now())
+		agentNote(t, o.kind, "note", "approved: "+p.Reason, s.now())
 		return nil
 	}) {
 		return
 	}
 	// len(evidence), not len(issues): the map holds exactly the IN-SCOPE Issues
-	// that produced evidence, which is what this outcome actually approved. Owned
-	// but out-of-scope Issues are filtered out of both the scope check and the
-	// write loop above, so reporting every owned Issue overstated the grant.
-	o.ok("implement", "issues", len(evidence))
+	// that produced evidence, which is what this outcome actually approved.
+	o.ok("approved", "issues", len(evidence))
+}
+
+// planPinRefusal reports whether the plan note the gate pinned at grant no
+// longer hashes to the same value. It is FALSE - no refusal - when there is
+// nothing to compare: an auto-approved Task, an Issue whose evidence predates
+// the pin, or a Task whose plan note has been spilled and can no longer be
+// hashed. Those are all "the operator cannot prove drift", and refusing on a
+// thing you cannot prove would break every Task minted before this shipped.
+func (s *Server) planPinRefusal(ctx context.Context, task *tatarav1alpha1.Task) bool {
+	issues, err := s.ownedIssues(ctx, task)
+	if err != nil {
+		// A read failure is not evidence of drift. Fail OPEN here on purpose:
+		// the alternative bounces every submit during a transient apiserver
+		// blip, and the grant itself was already gated.
+		return false
+	}
+	for i := range issues {
+		ev := issues[i].Status.Approval
+		if ev == nil || ev.PlanHash == "" {
+			continue
+		}
+		note := planNote(task)
+		if note == nil {
+			// Spilled, or never written. Nothing to hash; see the doc comment.
+			continue
+		}
+		if notePlanHash(note.Body) != ev.PlanHash {
+			s.log.InfoContext(ctx, "restapi: the approved plan changed after the grant",
+				"action", "approval_refused", "task", task.Name, "issue", issues[i].Name,
+				"reason", controller.ApprovalRefusedPlanHashMismatch)
+			s.metrics.ApprovalRefused(controller.ApprovalRefusedPlanHashMismatch)
+			return true
+		}
+	}
+	return false
+}
+
+// refuseGate writes the 200 refusal body. IT DOES NOT PARK and it is NOT an
+// error: the agent is alive, it is told no, and it keeps talking.
+func (o *outcomeCtx) refuseGate(reason, declared string) {
+	obs.RestOutcomeAcceptedTotal.WithLabelValues(o.kind, "gate-refused").Inc()
+	o.s.log.InfoContext(o.r.Context(), "restapi: gate refused",
+		append(reqLogFields(o.r), "action", "submit_outcome", "task", o.task.Name,
+			"kind", o.kind, "outcome", "gate-refused", "reason", reason, "declared", declared)...)
+	writeJSON(o.w, http.StatusOK, gateResponse{Granted: false, Reason: reason, Declared: declared})
+}
+
+// planNote resolves THE plan note the pin applies to, and it is THE ONE
+// RESOLUTION: the grant calls it to decide what to hash, and planPinRefusal
+// calls it to decide what to re-hash. A pin whose two halves resolve
+// differently proves nothing whichever way it lands - it either compares
+// against a note that will never be re-read (no drift is ever detected) or
+// reports drift on a plan nobody touched - so the agreement is structural here
+// rather than a rule each side is asked to remember.
+//
+// It is the NEWEST note of kind `plan` (pinnedPlanNoteID), never an id the
+// agent chose, and it is nil when there is no plan note left to hash: never
+// written, or written and since spilled.
+func planNote(t *tatarav1alpha1.Task) *tatarav1alpha1.Note {
+	return findPlanNote(t, pinnedPlanNoteID(t))
+}
+
+// findPlanNote is findNote plus the KIND CHECK, and the kind check is the whole
+// point: findNote matches on id ALONE, and two different things then resolve to
+// a note that is not a plan.
+//
+// A CLIENT-SUPPLIED id naming a handoff or turn note - the plan pin hashes that
+// instead of the plan, and the anti-scope-drift control guards an artifact
+// nobody approved. And an EMPTY id: agentNote writes the operator's own notes
+// with no id at all, so findNote(t, "") matches the first of them and a Task
+// with no pinnedPlanNoteId re-hashes an operator note on every submit. Kind is
+// what separates the plan from everything else the journal holds.
+func findPlanNote(t *tatarav1alpha1.Task, id string) *tatarav1alpha1.Note {
+	if id == "" {
+		return nil
+	}
+	n := findNote(t, id)
+	if n == nil || n.Kind != planNoteKind {
+		return nil
+	}
+	return n
+}
+
+// findNote resolves a note id against the Task's journal. A spilled note is
+// GONE from status.notes, which is why the plan note is exempted from the spill
+// (see handlers_v2.go's postNote).
+func findNote(t *tatarav1alpha1.Task, id string) *tatarav1alpha1.Note {
+	for i := range t.Status.Notes {
+		if t.Status.Notes[i].ID == id {
+			return &t.Status.Notes[i]
+		}
+	}
+	return nil
+}
+
+// notePlanHash is the plan pin: sha256 of the note body, hex.
+func notePlanHash(body string) string { return fmt.Sprintf("%x", sha256.Sum256([]byte(body))) }
+
+// queueApprovalConfirmation enqueues the operator's one confirmation comment on
+// an approved Issue. Idempotent through the RequestID the PendingComments drain
+// already de-duplicates on: one per (task, issue, cited comment).
+func (s *Server) queueApprovalConfirmation(ctx context.Context, proj *tatarav1alpha1.Project,
+	iss *tatarav1alpha1.Issue, taskName string, ev *tatarav1alpha1.ApprovalEvidence, planNoteID string) error {
+
+	if ev == nil || ev.Auto {
+		// The auto-approve path has no maintainer to name and no quote to
+		// re-state; a confirmation comment there would be the operator telling
+		// the thread it approved itself.
+		return nil
+	}
+	requestID := newRequestID(taskName, "approval-confirm", iss.Name, ev.CommentID)
+	body := fmt.Sprintf(
+		"Approval accepted for `%s`.\n\n- approver: `%s`\n- cited comment: `%s`\n- quote: %q\n- plan note: `%s`\n\n"+
+			"If this is not what you meant, say so on this thread: the operator re-reads it every turn.",
+		taskName, ev.Login, ev.CommentID, ev.Phrase, planNoteID)
+	key := types.NamespacedName{Namespace: s.ns, Name: iss.Name}
+	return objbudget.FitIssue(ctx, s.c, s.spillerForOrNil(proj), key, func(i *tatarav1alpha1.Issue) {
+		for _, e := range i.Status.PendingComments {
+			if e.RequestID == requestID {
+				return
+			}
+		}
+		i.Status.PendingComments = append(i.Status.PendingComments, tatarav1alpha1.PendingComment{
+			RequestID: requestID,
+			Action:    "comment",
+			Body:      body,
+		})
+	})
 }
 
 // verifyApprovalScope re-derives the approval over every LIVE owned Issue,
@@ -1444,9 +1736,15 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 // re-reporting its refusal here would double-count one refusal into two series.
 // Only the two EMPTY-SET shapes have no per-Issue verifier call behind them, and
 // those are exactly the two that used to refuse with no telemetry at all.
+//
+// DECLARED is the agent's approvingMaintainer, threaded through to the verifier
+// as a BOUND CROSS-CHECK and never as a second authority. It is EMPTY on the
+// auto-approve path and both new refusals are gated on that emptiness - ungated
+// they would refuse every auto-approved proposal, because that path has no
+// comment author to name and ev.Login is the <tatara:auto> sentinel.
 func (s *Server) verifyApprovalScope(ctx context.Context, proj *tatarav1alpha1.Project,
 	issues []tatarav1alpha1.Issue,
-	citations []tatarav1alpha1.ApprovalCitation) (bool, map[string]*tatarav1alpha1.ApprovalEvidence, string) {
+	citations []tatarav1alpha1.ApprovalCitation, declared string) (bool, map[string]*tatarav1alpha1.ApprovalEvidence, string) {
 	// NOT production-reachable - cmd/manager/wire.go always sets Approval - so it
 	// gets no reason rather than a lie about the Task's Issues. Kept because a
 	// nil verifier must fail closed if the wiring ever regresses (fix W1).
@@ -1461,7 +1759,10 @@ func (s *Server) verifyApprovalScope(ctx context.Context, proj *tatarav1alpha1.P
 		if !controller.ApprovalInScope(&issues[i]) {
 			continue
 		}
-		ev, ok := s.approval.VerifyApproval(ctx, proj, &issues[i], citations)
+		ev, ok, refusal := s.approval.VerifyApprovalDeclared(ctx, proj, &issues[i], citations, declared)
+		if refusal != "" {
+			return false, nil, refusal
+		}
 		// A LIVE Issue that granted with NO evidence is a refusal, not a pass.
 		// The verifier is not supposed to answer that way for an in-scope Issue,
 		// which is exactly why it is caught here rather than trusted: the
@@ -1545,8 +1846,8 @@ func brainstormQuota(task *tatarav1alpha1.Task) int {
 // this handler's - except for the propose path below, where the session just
 // PROVED the idea space is not exhausted.
 //
-// sessionStart is this brainstorm session's own Task entering StageBrainstorming
-// (o.task.Status.StageEnteredAt, the "clock for the POD-LESS stages" per its
+// sessionStart is this brainstorm session's own Task entering `refined`
+// (o.task.Status.StateEnteredAt, the "clock for the POD-LESS stages" per its
 // own doc comment - the closest thing a Task has to "when this session
 // started"). It is compared against Project.Status.LastMovementAt inside
 // setBrainstormPause's retry loop (I3 fix round): see that function's comment
@@ -1616,14 +1917,14 @@ func (s *Server) setBrainstormPause(ctx context.Context, projName string, reason
 // for setBrainstormPause's movement comparison (I3 fix round). StageEnteredAt
 // is "the clock for the POD-LESS stages" (task_types.go's own doc comment) -
 // stamped on EVERY stage transition, including the entry into
-// StageBrainstorming that begins this session - so it is the closest thing a
+// entry into `refined` that begins this session - so it is the closest thing a
 // Task has to "when this session started". Falls back to the Task's own
 // CreationTimestamp on the (should-never-happen) chance StageEnteredAt is
 // unset, rather than the zero time: the zero time would make EVERY movement
 // ever recorded read as "after sessionStart" and refuse the pause forever.
 func brainstormSessionStart(task *tatarav1alpha1.Task) time.Time {
-	if task.Status.StageEnteredAt != nil {
-		return task.Status.StageEnteredAt.Time
+	if task.Status.StateEnteredAt != nil {
+		return task.Status.StateEnteredAt.Time
 	}
 	return task.CreationTimestamp.Time
 }
@@ -1688,7 +1989,7 @@ func (o *outcomeCtx) brainstorm(p brainstormPayload) {
 		// "nothing novel" must not spawn a docs pod, a docs PR about nothing, a
 		// review, a merge and a release.
 		if !o.commit(func(t *tatarav1alpha1.Task) error {
-			if err := stage.Enter(t, nil, tatarav1alpha1.StageDelivered, "", s.now()); err != nil {
+			if err := stage.Enter(t, nil, tatarav1alpha1.StateDone, "", s.now()); err != nil {
 				return err
 			}
 			agentNote(t, o.kind, "note", p.Action+": "+p.Reason, s.now())
@@ -1714,7 +2015,7 @@ func (o *outcomeCtx) brainstorm(p brainstormPayload) {
 		p.Proposals = p.Proposals[:quota]
 	}
 
-	// Each proposal becomes its OWN new clarify Task, owning its OWN Issue
+	// Each proposal becomes its OWN new implement Task, owning its OWN Issue
 	// (F.3). brainstorm files issues through submit_outcome, not issue_write,
 	// so the proposal cap and dedup still apply.
 	writer, token, ok := s.projectSCMWriterAndToken(o.w, o.r, o.proj)
@@ -1753,7 +2054,7 @@ func (o *outcomeCtx) brainstorm(p brainstormPayload) {
 			writeError(o.w, http.StatusBadGateway, "scm returned no issue number")
 			return
 		}
-		child, err := s.mintClarifyTask(ctx, o.proj, repo, pr, number, created.URL)
+		child, err := s.mintGateTask(ctx, o.proj, repo, pr, number, created.URL)
 		if err != nil {
 			writeClientErr(o.w, err)
 			return
@@ -1767,7 +2068,7 @@ func (o *outcomeCtx) brainstorm(p brainstormPayload) {
 	}
 
 	if !o.commit(func(t *tatarav1alpha1.Task) error {
-		if err := stage.Enter(t, nil, tatarav1alpha1.StageDelivered, "", s.now()); err != nil {
+		if err := stage.Enter(t, nil, tatarav1alpha1.StateDone, "", s.now()); err != nil {
 			return err
 		}
 		agentNote(t, o.kind, "note", "proposed: "+strings.Join(spawned, ", "), s.now())
@@ -1785,14 +2086,17 @@ func (o *outcomeCtx) brainstorm(p brainstormPayload) {
 	o.ok("propose", "spawned", strings.Join(spawned, ","))
 }
 
-// mintClarifyTask creates the clarify Task a brainstorm proposal becomes.
-func (s *Server) mintClarifyTask(ctx context.Context, proj *tatarav1alpha1.Project,
+// mintGateTask creates the Task a brainstorm proposal becomes: kind=implement,
+// which lands at `refined` where the approval gate runs. It was kind=clarify
+// until #521 folded that kind away; the CRD enum no longer accepts it, so this
+// mint would be REJECTED outright if the literal had been left behind.
+func (s *Server) mintGateTask(ctx context.Context, proj *tatarav1alpha1.Project,
 	repo *tatarav1alpha1.Repository, pr proposalPayload, number int, url string) (*tatarav1alpha1.Task, error) {
-	name := tatarav1alpha1.TaskName(proj.Name, "clarify", s.now(), rand.String(5))
+	name := tatarav1alpha1.TaskName(proj.Name, controller.SweepIssueKind, s.now(), rand.String(5))
 	t := &tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: s.ns},
 		Spec: tatarav1alpha1.TaskSpec{
-			ProjectRef: proj.Name, RepositoryRef: repo.Name, Kind: "clarify",
+			ProjectRef: proj.Name, RepositoryRef: repo.Name, Kind: controller.SweepIssueKind,
 			Goal: truncateValidUTF8(pr.Title+"\n\n"+pr.Body, tatarav1alpha1.GoalMaxBytes),
 			Source: &tatarav1alpha1.TaskSource{
 				Provider: providerOf(proj), IssueRef: issueRef(repo, number),
@@ -1804,7 +2108,7 @@ func (s *Server) mintClarifyTask(ctx context.Context, proj *tatarav1alpha1.Proje
 	// mint path; without it this Task falls back to the legacy wrapper-<name>.
 	agent.StampPodName(t, proj.Name, repo.Name)
 	if err := s.c.Create(ctx, t); err != nil {
-		return nil, fmt.Errorf("create clarify task %s: %w", name, err)
+		return nil, fmt.Errorf("create gate task %s: %w", name, err)
 	}
 	return t, nil
 }
@@ -1889,7 +2193,7 @@ func (o *outcomeCtx) incident(p incidentPayload) {
 
 	if p.Action == "false_positive" {
 		if !o.commit(func(t *tatarav1alpha1.Task) error {
-			if err := stage.Enter(t, nil, tatarav1alpha1.StageRejected, stage.ReasonFalsePositive, s.now()); err != nil {
+			if err := stage.Enter(t, nil, tatarav1alpha1.StateRejected, stage.ReasonFalsePositive, s.now()); err != nil {
 				return err
 			}
 			agentNote(t, o.kind, "note", "false_positive: "+p.Reason, s.now())
@@ -1906,8 +2210,16 @@ func (o *outcomeCtx) incident(p incidentPayload) {
 		return
 	}
 
-	// The tracker Issue is created under THIS Task (F.3), and the Task then
-	// goes to clarifying: the human decides whether it is worked.
+	// The tracker Issue is created under THIS Task (F.3), and filing it FINISHES
+	// the Task: it hands the incident to a tracker a human triages on its own
+	// thread, and it opens no MR, so `refined -> done` is its only path out.
+	//
+	// The pre-#521 handler moved to `clarifying`, a SEPARATE stage where the
+	// (now deleted) clarify agent ran the human gate. #521 collapsed
+	// investigating and clarifying onto one `refined`, so that same move became
+	// `refined -> refined` - a self-edge the table does not have and never had,
+	// which made every file_issue a 409 that RELEASED the claim and re-fired
+	// CreateIssue on the agent's retry.
 	repo, err := s.repoCR(ctx, o.proj.Name, p.Issue.Repo)
 	if err != nil {
 		writeClientErr(o.w, err)
@@ -1984,7 +2296,7 @@ func (o *outcomeCtx) incident(p incidentPayload) {
 	}
 
 	if !o.commit(func(t *tatarav1alpha1.Task) error {
-		if err := stage.Enter(t, nil, tatarav1alpha1.StageClarifying, "", s.now()); err != nil {
+		if err := stage.Enter(t, nil, tatarav1alpha1.StateDone, "", s.now()); err != nil {
 			return err
 		}
 		agentNote(t, o.kind, "note", "file_issue: "+p.Reason, s.now())
@@ -2089,7 +2401,7 @@ func (o *outcomeCtx) incidentComment(p incidentPayload) {
 	}
 
 	if !o.commit(func(t *tatarav1alpha1.Task) error {
-		if err := stage.Enter(t, nil, tatarav1alpha1.StageRejected, stage.ReasonTrackedElsewhere, s.now()); err != nil {
+		if err := stage.Enter(t, nil, tatarav1alpha1.StateRejected, stage.ReasonTrackedElsewhere, s.now()); err != nil {
 			return err
 		}
 		agentNote(t, o.kind, "note", "comment_issue "+ref+": "+p.Reason, s.now())
@@ -2265,14 +2577,13 @@ func (o *outcomeCtx) refine(p refinePayload) {
 		if err := s.foldMembers(ctx, o.proj, o.task, members); err != nil {
 			if errors.Is(err, errFoldUnverified) {
 				if !o.commit(func(t *tatarav1alpha1.Task) error {
-					if err := stage.Enter(t, nil, tatarav1alpha1.StageFailed,
-						stage.ReasonFoldAdoptionUnverified, s.now()); err != nil {
+					if err := stage.Park(t, stage.ReasonFoldAdoptionUnverified, s.now()); err != nil {
 						return err
 					}
 					// The step-3 contract says "foldInFlight cleared, members NOT
 					// deleted", and until #467 it cleared nothing: the members still
 					// existed, so the marker pinned every one of them off the reaper
-					// for the whole of FailedRetention.
+					// for the whole of the retention window.
 					t.Status.FoldInFlight = nil
 					t.Status.FoldInFlightSince = nil
 					return nil
@@ -2337,7 +2648,7 @@ func (o *outcomeCtx) refine(p refinePayload) {
 	}
 
 	if !o.commit(func(t *tatarav1alpha1.Task) error {
-		if err := stage.Enter(t, nil, tatarav1alpha1.StageDelivered, "", s.now()); err != nil {
+		if err := stage.Enter(t, nil, tatarav1alpha1.StateDone, "", s.now()); err != nil {
 			return err
 		}
 		t.Status.FoldInFlight = nil
@@ -2355,10 +2666,10 @@ func foldMemberBusy(m *tatarav1alpha1.Task) bool {
 	if m.Status.PodName != "" && m.Status.PodStartedAt != nil {
 		return true
 	}
-	switch m.Status.Stage {
-	case tatarav1alpha1.StageApproved, tatarav1alpha1.StageImplementing,
-		tatarav1alpha1.StageReviewing, tatarav1alpha1.StageMerging,
-		tatarav1alpha1.StageDeploying:
+	switch m.Status.State {
+	case tatarav1alpha1.StateRefined, tatarav1alpha1.StateUnderImplementation,
+		tatarav1alpha1.StateAwaitingReview, tatarav1alpha1.StateMerged,
+		tatarav1alpha1.StateDeployed:
 		return true
 	}
 	return false

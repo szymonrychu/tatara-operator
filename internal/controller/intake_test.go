@@ -5,6 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -69,8 +70,8 @@ func TestMintForItem_IssueWebhookOriginated_MintsTriagingClarify(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, MintCreated, outcome)
 	require.Equal(t, SweepIssueKind, task.Spec.Kind)
-	require.Equal(t, tatarav1alpha1.StageTriaging, task.Spec.InitialStage)
-	require.Equal(t, tatarav1alpha1.IntakeTaskName("p", "clarify", "tatara-operator", 353), task.Name)
+	require.Equal(t, tatarav1alpha1.StateNew, task.Spec.InitialState)
+	require.Equal(t, tatarav1alpha1.IntakeTaskName("p", SweepIssueKind, "tatara-operator", 353), task.Name)
 
 	// Issue CR is owned by the minted Task (the durable natural-key anchor).
 	var iss tatarav1alpha1.Issue
@@ -90,8 +91,8 @@ func TestMintForItem_ColdIssue_MintsParked(t *testing.T) {
 	task, outcome, err := m.MintForItem(context.Background(), proj, repo, item, false, nil)
 	require.NoError(t, err)
 	require.Equal(t, MintCreated, outcome)
-	require.Equal(t, tatarav1alpha1.StageParked, task.Spec.InitialStage)
-	require.Equal(t, stage.ReasonBacklogSweep, task.Spec.InitialStageReason)
+	require.Equal(t, tatarav1alpha1.StateNew, task.Spec.InitialState)
+	require.Equal(t, stage.ReasonBacklogSweep, task.Spec.InitialParkReason)
 }
 
 // An already-owned issue is not re-minted (the steady-state backstop dedup).
@@ -108,6 +109,58 @@ func TestMintForItem_OwnedIssue_NoOp(t *testing.T) {
 	require.Equal(t, MintNotOwed, outcome2, "an owned issue is not an orphan; the backstop no-ops")
 }
 
+// TestCreateTaskRaceSafe_TakesTheLiveTwinBranchForAParkedTask is the #521
+// regression test. createTaskRaceSafe's pre-check and its post-AlreadyExists
+// resolve both branch on tatarav1alpha1.TaskDone(existing): true takes the
+// delete-stale-tombstone-and-retry branch, false takes the live-twin branch
+// (MintExistingLive, twin returned, nothing deleted). Before #521, TaskDone
+// reported true for a PARKED Task too, so a parked Task hit by a concurrent
+// re-mint attempt was deleted out from under itself. TaskDone is now
+// state-only (done|rejected) and false for a parked Task regardless of
+// parkReason, so every one of these must take the live-twin branch instead.
+func TestCreateTaskRaceSafe_TakesTheLiveTwinBranchForAParkedTask(t *testing.T) {
+	reasons := []string{
+		stage.ReasonBacklogSweep,
+		stage.ReasonAwaitingHuman,
+		stage.ReasonNoOutcome,
+		stage.ReasonReviewLoopExhausted,
+		stage.ReasonStageDeadline,
+	}
+	now := time.Now()
+	for _, reason := range reasons {
+		t.Run(reason, func(t *testing.T) {
+			proj := sweepProject("p")
+			repo := sweepRepo("p")
+			name := tatarav1alpha1.IntakeTaskName("p", SweepIssueKind, "tatara-operator", 900)
+			existing := &tatarav1alpha1.Task{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS},
+				Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "p", Kind: SweepIssueKind, Goal: "g"},
+				Status:     tatarav1alpha1.TaskStatus{State: tatarav1alpha1.StateUnderImplementation},
+			}
+			require.NoError(t, stage.Park(existing, reason, now))
+			m, c := minterFor(t, proj, repo, existing)
+
+			// A fresh candidate Task on the SAME deterministic name, exactly what
+			// a concurrent webhook + sweep (or a backstop re-pass) would build.
+			candidate := &tatarav1alpha1.Task{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS},
+				Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "p", Kind: SweepIssueKind, Goal: "g"},
+			}
+			outcome, twin, err := m.createTaskRaceSafe(context.Background(), candidate)
+			require.NoError(t, err)
+			require.Equal(t, MintExistingLive, outcome,
+				"a parked Task must take the live-twin branch, not fall through to the delete branch")
+			require.NotNil(t, twin, "the live twin must be returned so the caller can repair the bind")
+			require.Equal(t, name, twin.Name)
+
+			var stored tatarav1alpha1.Task
+			require.NoError(t, c.Get(context.Background(), client.ObjectKeyFromObject(existing), &stored),
+				"the parked Task must still exist: this branch must never delete it")
+			require.Equal(t, reason, stored.Status.ParkReason, "the park must survive untouched")
+		})
+	}
+}
+
 // A human PR in reaction scope mints a review Task (triaging, no prior verdict).
 func TestMintForItem_HumanPR_MintsReview(t *testing.T) {
 	proj := sweepProject("p")
@@ -119,7 +172,7 @@ func TestMintForItem_HumanPR_MintsReview(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, MintCreated, outcome)
 	require.Equal(t, SweepReviewKind, task.Spec.Kind)
-	require.Equal(t, tatarav1alpha1.StageTriaging, task.Spec.InitialStage)
+	require.Equal(t, tatarav1alpha1.StateNew, task.Spec.InitialState)
 }
 
 // A bot-authored PR is ignored (ClassifyPR clause 2): no mint.
@@ -253,11 +306,11 @@ func TestMintIssueTask_StampsPodName(t *testing.T) {
 	task, outcome, err := m.MintForItem(context.Background(), proj, repo, item, true, nil)
 	require.NoError(t, err)
 	require.Equal(t, MintCreated, outcome)
-	require.Equal(t, "clr-p-tatara-operator-i353", task.Annotations[agent.PodNameAnnotation])
+	require.Equal(t, "imp-p-tatara-operator-i353", task.Annotations[agent.PodNameAnnotation])
 
 	var stored tatarav1alpha1.Task
 	require.NoError(t, c.Get(context.Background(), client.ObjectKeyFromObject(task), &stored))
-	require.Equal(t, "clr-p-tatara-operator-i353", agent.PodName(&stored),
+	require.Equal(t, "imp-p-tatara-operator-i353", agent.PodName(&stored),
 		"the stamp must land on the STORED Task, not just the local literal")
 }
 
@@ -341,7 +394,7 @@ func TestMintIssueTask_StampedPodNameStableAcrossStageChange(t *testing.T) {
 	var fresh tatarav1alpha1.Task
 	require.NoError(t, c.Get(context.Background(), client.ObjectKeyFromObject(task), &fresh))
 	fresh.Status.AgentKind = "implement"
-	fresh.Status.Stage = tatarav1alpha1.StageImplementing
+	fresh.Status.State = tatarav1alpha1.StateUnderImplementation
 	require.NoError(t, c.Status().Update(context.Background(), &fresh))
 
 	var after tatarav1alpha1.Task

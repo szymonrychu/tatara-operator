@@ -70,12 +70,14 @@ type taskStatusDTO struct {
 	PodName    string             `json:"podName,omitempty"`
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
-	Stage              string                   `json:"stage,omitempty"`
-	StageEnteredAt     string                   `json:"stageEnteredAt,omitempty"`
-	StageWorkStartedAt string                   `json:"stageWorkStartedAt,omitempty"`
+	State              string                   `json:"state,omitempty"`
+	StateEnteredAt     string                   `json:"stateEnteredAt,omitempty"`
+	StateWorkStartedAt string                   `json:"stateWorkStartedAt,omitempty"`
 	AgentKind          string                   `json:"agentKind,omitempty"`
-	StageReason        string                   `json:"stageReason,omitempty"`
-	ParkedFromStage    string                   `json:"parkedFromStage,omitempty"`
+	StateReason        string                   `json:"stateReason,omitempty"`
+	ParkReason         string                   `json:"parkReason,omitempty"`
+	ParkedAt           string                   `json:"parkedAt,omitempty"`
+	ParkedFromState    string                   `json:"parkedFromState,omitempty"`
 	Notes              []tatarav1alpha1.Note    `json:"notes,omitempty"`
 	Stats              tatarav1alpha1.TaskStats `json:"stats,omitempty"`
 	IssueRefs          []string                 `json:"issueRefs,omitempty"`
@@ -196,12 +198,14 @@ func toTaskDTO(task tatarav1alpha1.Task) TaskDTO {
 			PodName:    task.Status.PodName,
 			Conditions: task.Status.Conditions,
 
-			Stage:              task.Status.Stage,
-			StageEnteredAt:     rfc3339(task.Status.StageEnteredAt),
-			StageWorkStartedAt: rfc3339(task.Status.StageWorkStartedAt),
+			State:              task.Status.State,
+			StateEnteredAt:     rfc3339(task.Status.StateEnteredAt),
+			StateWorkStartedAt: rfc3339(task.Status.StateWorkStartedAt),
 			AgentKind:          task.Status.AgentKind,
-			StageReason:        task.Status.StageReason,
-			ParkedFromStage:    task.Status.ParkedFromStage,
+			StateReason:        task.Status.StateReason,
+			ParkReason:         task.Status.ParkReason,
+			ParkedAt:           rfc3339(task.Status.ParkedAt),
+			ParkedFromState:    task.Status.ParkedFromState,
 			Notes:              task.Status.Notes,
 			Stats:              task.Status.Stats,
 			IssueRefs:          task.Status.IssueRefs,

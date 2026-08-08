@@ -337,7 +337,7 @@ func TestMintOutcomeDistinguishesNothingOwedFromDestroyed(t *testing.T) {
 	t.Run("a fresh name is MintCreated", func(t *testing.T) {
 		c := newMirrorClient(t, proj, repo)
 		_, outcome, err := minterOn(c).MintIssueTask(context.Background(), proj, repo, ext,
-			tatarav1alpha1.StageTriaging, "", nil)
+			tatarav1alpha1.StateNew, "", nil)
 		if err != nil {
 			t.Fatalf("MintIssueTask: %v", err)
 		}
@@ -350,11 +350,11 @@ func TestMintOutcomeDistinguishesNothingOwedFromDestroyed(t *testing.T) {
 		c := newMirrorClient(t, proj, repo)
 		m := minterOn(c)
 		if _, _, err := m.MintIssueTask(context.Background(), proj, repo, ext,
-			tatarav1alpha1.StageTriaging, "", nil); err != nil {
+			tatarav1alpha1.StateNew, "", nil); err != nil {
 			t.Fatalf("first MintIssueTask: %v", err)
 		}
 		_, outcome, err := m.MintIssueTask(context.Background(), proj, repo, ext,
-			tatarav1alpha1.StageTriaging, "", nil)
+			tatarav1alpha1.StateNew, "", nil)
 		if err != nil {
 			t.Fatalf("second MintIssueTask: %v", err)
 		}
@@ -368,12 +368,12 @@ func TestMintOutcomeDistinguishesNothingOwedFromDestroyed(t *testing.T) {
 		dead := &tatarav1alpha1.Task{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS},
 			Spec:       tatarav1alpha1.TaskSpec{ProjectRef: proj.Name, Kind: SweepIssueKind},
-			Status:     tatarav1alpha1.TaskStatus{Stage: tatarav1alpha1.StageDelivered},
+			Status:     tatarav1alpha1.TaskStatus{State: tatarav1alpha1.StateDone},
 		}
 		c := newMirrorClient(t, proj, repo, dead)
 
 		_, outcome, err := minterOn(c).MintIssueTask(context.Background(), proj, repo, ext,
-			tatarav1alpha1.StageTriaging, "", nil)
+			tatarav1alpha1.StateNew, "", nil)
 		if err != nil {
 			t.Fatalf("MintIssueTask: %v", err)
 		}
@@ -412,7 +412,7 @@ func TestSweepRequeuesOnTombstoneDelete(t *testing.T) {
 	dead := &tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS},
 		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: proj.Name, Kind: SweepIssueKind},
-		Status:     tatarav1alpha1.TaskStatus{Stage: tatarav1alpha1.StageDelivered},
+		Status:     tatarav1alpha1.TaskStatus{State: tatarav1alpha1.StateDone},
 	}
 	c := newMirrorClient(t, proj, repo, dead)
 

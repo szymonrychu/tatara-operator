@@ -169,7 +169,7 @@ func (s *CallbackServer) orphanReason(pod *corev1.Pod, tasks map[string]*tatarav
 	// any, belongs to the stage it is about to enter; the idle backstop below is
 	// what bounds a wrapper the operator forgot to tear down.
 	if tatarav1alpha1.TaskDone(task) {
-		return fmt.Sprintf("task stage %s", task.Status.Stage), true
+		return fmt.Sprintf("task stage %s", task.Status.State), true
 	}
 	// Superseded-stage pod: the pod was built for an earlier stage (its stamped
 	// LabelAgentKind) but the Task has since advanced to a stage that wants a
@@ -181,8 +181,8 @@ func (s *CallbackServer) orphanReason(pod *corev1.Pod, tasks map[string]*tatarav
 	// different) - a pod-less current stage (AgentKindFor == "") is between
 	// stages and is left to the idle backstop instead, to stay conservative.
 	if podKind := pod.Labels[agent.LabelAgentKind]; podKind != "" {
-		if wantKind := stage.AgentKindFor(task.Status.Stage); wantKind != "" && wantKind != podKind {
-			return fmt.Sprintf("superseded: pod kind %s, stage wants %s", podKind, wantKind), true
+		if wantKind := stage.AgentKindFor(task.Status.State, task.Spec.Kind); wantKind != "" && wantKind != podKind {
+			return fmt.Sprintf("superseded: pod kind %s, state wants %s", podKind, wantKind), true
 		}
 	}
 	// Idle backstop (issue #237): a non-terminal Task whose pod holds no live turn
@@ -375,8 +375,8 @@ func (r *ProjectReconciler) ReapTerminal(ctx context.Context, proj *tatarav1alph
 				}
 				obs.FoldStrandedReleasedTotal.WithLabelValues(reason).Inc()
 				l.Info("reap: releasing a fold whose adoption can never complete",
-					"action", "reap_fold_released", "resource_id", t.Name, "stage", t.Status.Stage,
-					"stage_reason", t.Status.StageReason, "reason", reason,
+					"action", "reap_fold_released", "resource_id", t.Name, "state", t.Status.State,
+					"park_reason", t.Status.ParkReason, "reason", reason,
 					"members", len(t.Status.FoldInFlight))
 			}
 		}
@@ -390,22 +390,22 @@ func (r *ProjectReconciler) ReapTerminal(ctx context.Context, proj *tatarav1alph
 
 	// HOISTED, once per pass, not once per Task - the SAME reasoning as
 	// driveUnparks' identical hoist (unpark.go, 2026-07-28 security review
-	// IMPORTANT 4): ConversingHasRoom's countConversing is an unindexed
+	// IMPORTANT 4): LiveHasRoom's countLive is an unindexed
 	// namespace List, and reapOne -> reapParked -> unparkFires runs in a loop
 	// over every Task in the project on every ReapTerminal pass. Skipped
 	// entirely when nothing in this batch would ever consult it, and a
 	// transient error degrades to "no room" (the safe fallback) rather than
 	// failing the whole reap pass for every OTHER stage and reason.
-	conversingRoom := false
+	liveRoom := false
 	for i := range tl.Items {
 		t := &tl.Items[i]
-		if t.Spec.ProjectRef == proj.Name && t.Status.Stage == tatarav1alpha1.StageParked && NeedsConversingRoom(t.Status.StageReason) {
-			room, roomErr := ConversingHasRoom(ctx, r.Client, proj)
+		if t.Spec.ProjectRef == proj.Name && tatarav1alpha1.Parked(t) && NeedsLiveRoom(t.Status.ParkReason) {
+			room, roomErr := LiveHasRoom(ctx, r.Client, proj)
 			if roomErr != nil {
-				l.Error(roomErr, "reap: conversing capacity check failed; treating this pass as no room",
-					"action", "reap_conversing_room_error", "project", proj.Name)
+				l.Error(roomErr, "reap: live capacity check failed; treating this pass as no room",
+					"action", "reap_live_room_error", "project", proj.Name)
 			} else {
-				conversingRoom = room
+				liveRoom = room
 			}
 			break
 		}
@@ -418,7 +418,7 @@ func (r *ProjectReconciler) ReapTerminal(ctx context.Context, proj *tatarav1alph
 			return ctx.Err()
 		}
 		t := &tl.Items[i]
-		if t.Spec.ProjectRef != proj.Name || t.Status.Stage == "" {
+		if t.Spec.ProjectRef != proj.Name || t.Status.State == "" {
 			continue // the stage machine has not touched it yet
 		}
 		if since, held := foldHeldSince[t.Name]; held {
@@ -438,9 +438,9 @@ func (r *ProjectReconciler) ReapTerminal(ctx context.Context, proj *tatarav1alph
 			}
 			continue
 		}
-		if err := r.reapOne(ctx, proj, t, live, now, ds, conversingRoom); err != nil {
+		if err := r.reapOne(ctx, proj, t, live, now, ds, liveRoom); err != nil {
 			l.Error(err, "reap: terminal task", "action", "reap_error",
-				"resource_id", t.Name, "stage", t.Status.Stage, "stage_reason", t.Status.StageReason)
+				"resource_id", t.Name, "state", t.Status.State, "park_reason", t.Status.ParkReason)
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -493,7 +493,7 @@ func (r *ProjectReconciler) ReapTerminalPaced(ctx context.Context, proj *tatarav
 
 // reapOne is the B.6 table, row by row.
 func (r *ProjectReconciler) reapOne(ctx context.Context, proj *tatarav1alpha1.Project,
-	t *tatarav1alpha1.Task, live map[string]bool, now time.Time, ds *docReapState, conversingRoom bool) error {
+	t *tatarav1alpha1.Task, live map[string]bool, now time.Time, ds *docReapState, liveRoom bool) error {
 
 	// A documentation batch reaching delivered or parked THROUGH THE NORMAL
 	// review/merge/deploy path (reason "") never goes through forceDocTimeout, so
@@ -504,29 +504,23 @@ func (r *ProjectReconciler) reapOne(ctx context.Context, proj *tatarav1alpha1.Pr
 	// (guarded by AnnDocBatchResolved), so re-calling it from forceDocTimeout's
 	// delivered(doc-timeout) case too is a harmless no-op.
 	if t.Spec.Kind == DocBatchKind && len(t.Spec.DocumentsTasks) > 0 &&
-		(t.Status.Stage == tatarav1alpha1.StageDelivered || t.Status.Stage == tatarav1alpha1.StageParked) {
+		(t.Status.State == tatarav1alpha1.StateDone || tatarav1alpha1.Parked(t)) {
 		if err := r.ResolveDocBatch(ctx, proj, t); err != nil {
 			return err
 		}
 	}
 
-	switch t.Status.Stage {
+	// THE PARK BRANCH RUNS FIRST, whatever the state is. Park is orthogonal to
+	// state now (#521), so a parked Task is reaped by its park retention no
+	// matter where it stalled - which is exactly what the deleted `parked` and
+	// `failed` STAGES did, minus the fold that made TaskDone(parked) true.
+	if tatarav1alpha1.Parked(t) {
+		return r.reapParked(ctx, proj, t, live, now, liveRoom)
+	}
 
-	case tatarav1alpha1.StageFailed:
-		// FIX H13: a failed Task RELEASES ITS ISSUES IMMEDIATELY, not in 7 days.
-		// v3 let it hold them hostage for a week, SILENTLY: still controller-owner
-		// (so no re-mint), no bot comment (unlike parked), no re-entry. The cutover
-		// amplifier makes that fatal - an image-pin skew fails every Task INSTANTLY,
-		// which is correct, and would freeze every Issue for 7 days with no comment.
-		if err := r.releaseTerminal(ctx, proj, t, live); err != nil {
-			return err
-		}
-		if now.After(stageEnteredAt(t).Add(tatarav1alpha1.FailedRetention)) {
-			return r.deleteReapedTask(ctx, proj, t, live)
-		}
-		return nil
+	switch t.Status.State {
 
-	case tatarav1alpha1.StageRejected:
+	case tatarav1alpha1.StateRejected:
 		if err := r.releaseTerminal(ctx, proj, t, live); err != nil {
 			return err
 		}
@@ -535,16 +529,13 @@ func (r *ProjectReconciler) reapOne(ctx context.Context, proj *tatarav1alpha1.Pr
 		}
 		return nil
 
-	case tatarav1alpha1.StageParked:
-		return r.reapParked(ctx, proj, t, live, now, conversingRoom)
-
-	case tatarav1alpha1.StageDocumenting:
-		if now.After(stageEnteredAt(t).Add(tatarav1alpha1.DocStageBudget)) {
+	case tatarav1alpha1.StateUnderImplementation:
+		if t.Spec.Kind == DocBatchKind && now.After(stageEnteredAt(t).Add(tatarav1alpha1.DocStageBudget)) {
 			return r.forceDocTimeout(ctx, proj, t, now)
 		}
 		return nil
 
-	case tatarav1alpha1.StageDelivered:
+	case tatarav1alpha1.StateDone:
 		return r.reapDelivered(ctx, proj, t, live, now, ds)
 	}
 	return nil
@@ -630,7 +621,7 @@ func declinedAt(t *tatarav1alpha1.Task) time.Time {
 //	parked(anything else)  ages out at parkRetention, IF no F.6 re-entry rule
 //	                       fires AND the bot park comment has LANDED.
 func (r *ProjectReconciler) reapParked(ctx context.Context, proj *tatarav1alpha1.Project,
-	t *tatarav1alpha1.Task, live map[string]bool, now time.Time, conversingRoom bool) error {
+	t *tatarav1alpha1.Task, live map[string]bool, now time.Time, liveRoom bool) error {
 
 	// The SAME decline-retention exception the rejected branch carries. A parked
 	// owner is where most declines actually land (a maintainer who just closes the
@@ -645,7 +636,7 @@ func (r *ProjectReconciler) reapParked(ctx context.Context, proj *tatarav1alpha1
 	// Asked at each delete site instead, the terminal sequence still runs on
 	// schedule and only the collection waits. It is also why the List stays off
 	// the hot path: neither site is reached until the Task is otherwise due.
-	if t.Status.StageReason == stage.ReasonBacklogSweep {
+	if t.Status.ParkReason == stage.ReasonBacklogSweep {
 		issues, err := r.ownedIssues(ctx, t)
 		if err != nil {
 			return err
@@ -658,10 +649,10 @@ func (r *ProjectReconciler) reapParked(ctx context.Context, proj *tatarav1alpha1
 		return r.deleteUnlessHoldingADecline(ctx, proj, t, live, now)
 	}
 
-	if !now.After(stageEnteredAt(t).Add(tatarav1alpha1.ParkRetention)) {
+	if !now.After(parkedAt(t).Add(tatarav1alpha1.ParkRetention)) {
 		return nil
 	}
-	fires, err := r.unparkFires(ctx, proj, t, now, conversingRoom)
+	fires, err := r.unparkFires(ctx, proj, t, now, liveRoom)
 	if err != nil {
 		return err
 	}
@@ -834,8 +825,8 @@ func (r *ProjectReconciler) releaseTerminal(ctx context.Context, proj *tatarav1a
 			return err
 		}
 		l.Info("released a terminal task's in-flight fold",
-			"action", "reap_fold_released", "resource_id", t.Name, "stage", t.Status.Stage,
-			"stage_reason", t.Status.StageReason, "reason", obs.FoldStrandedUmbrellaDone)
+			"action", "reap_fold_released", "resource_id", t.Name, "state", t.Status.State,
+			"park_reason", t.Status.ParkReason, "reason", obs.FoldStrandedUmbrellaDone)
 	}
 
 	if t.Annotations[AnnTerminalReleased] == "true" {
@@ -887,8 +878,8 @@ func (r *ProjectReconciler) releaseTerminal(ctx context.Context, proj *tatarav1a
 		return err
 	}
 	l.Info("released a terminal task's artifacts",
-		"action", "reap_release", "resource_id", t.Name, "stage", t.Status.Stage,
-		"stage_reason", t.Status.StageReason, "issues", len(issues), "mrs", len(mrs))
+		"action", "reap_release", "resource_id", t.Name, "state", t.Status.State,
+		"park_reason", t.Status.ParkReason, "issues", len(issues), "mrs", len(mrs))
 	return nil
 }
 
@@ -933,7 +924,7 @@ func (r *ProjectReconciler) notifyTerminalIssue(ctx context.Context, proj *tatar
 		}
 		l.Info("posted the terminal notice on an owned issue",
 			"action", "reap_comment", "resource_id", t.Name, "issue_ref", issueRef,
-			"stage", t.Status.Stage, "stage_reason", t.Status.StageReason)
+			"state", t.Status.State, "park_reason", t.Status.ParkReason)
 	}
 
 	// Step 2. AddLabel IS idempotent on both forges, so it needs no marker - but
@@ -960,7 +951,7 @@ func terminalIssueComment(t *tatarav1alpha1.Task) string {
 		"tatara has stopped working this issue: task `%s` ended in `%s` (`%s`).\n\n"+
 			"The issue stays open and is labelled `%s`, so the platform will not spend "+
 			"another agent on it until a human replies here. Comment to pick it back up.",
-		t.Name, t.Status.Stage, t.Status.StageReason, TataraParkedLabel)
+		t.Name, t.Status.State, t.Status.ParkReason, TataraParkedLabel)
 }
 
 // ourMR is clauses (a) and (b) of B.6 step 4 - "this MR is ONE WE CREATED" - and
@@ -1168,7 +1159,7 @@ func (r *ProjectReconciler) closeOwnMRs(ctx context.Context, proj *tatarav1alpha
 		}
 		body := fmt.Sprintf(
 			"Closing: the tatara task that opened this PR ended in `%s` (`%s`). "+
-				"Its head branch is deleted with it.", t.Status.Stage, t.Status.StageReason)
+				"Its head branch is deleted with it.", t.Status.State, t.Status.ParkReason)
 		closeErr := writer.ClosePR(ctx, repo.Spec.URL, token, mr.Spec.Number, body)
 		RecordSCM(r.Metrics, provider, "close_pr", closeErr)
 		if closeErr != nil {
@@ -1264,7 +1255,7 @@ func (r *ProjectReconciler) deleteReapedTask(ctx context.Context, proj *tatarav1
 	}
 	log.FromContext(ctx).Info("reaped a terminal task",
 		"action", "reap_task", "resource_id", t.Name, "kind", t.Spec.Kind,
-		"stage", t.Status.Stage, "stage_reason", t.Status.StageReason)
+		"state", t.Status.State, "park_reason", t.Status.ParkReason)
 	return nil
 }
 
@@ -1281,10 +1272,10 @@ func (r *ProjectReconciler) deleteReapedTask(ctx context.Context, proj *tatarav1
 // B), then the UnparkInput field itself (step C). The divergence class is now
 // structurally impossible for this one field: there is nothing to thread.
 //
-// conversingRoom is the SAME reasoning applied to Task 9's ConversingHasRoom
+// conversingRoom is the SAME reasoning applied to Task 9's LiveHasRoom
 // field (2026-07-28 security review CRITICAL 1): unparkFires is a THIRD
 // UnparkInput builder (after ApplyUnpark and stage.UnparkDetailed itself), and
-// it used to leave ConversingHasRoom at its zero value (false).
+// it used to leave LiveHasRoom at its zero value (false).
 // The window this reopened: parked(identity-unverified), a non-bot event, and
 // the ceiling has room. driveUnparks' ApplyUnpark (room=true) would send the
 // Task to conversing and save it; this probe (room=false, before
@@ -1293,8 +1284,8 @@ func (r *ProjectReconciler) deleteReapedTask(ctx context.Context, proj *tatarav1
 // exactly the class of bug finding 3 already fixed once for GrammarPassed.
 // driveUnparksPaced and ReapTerminalPaced are paced INDEPENDENTLY, so a pass
 // where the driver is throttled and the reaper is not is a real production
-// window, not a theoretical one. The caller (ReapTerminal) hoists ConversingHasRoom
-// the same way driveUnparks does, off the SAME ConversingHasRoom helper - never
+// window, not a theoretical one. The caller (ReapTerminal) hoists LiveHasRoom
+// the same way driveUnparks does, off the SAME LiveHasRoom helper - never
 // reimplemented.
 //
 // MaxTurnsPerTask is threaded from the SAME taskMaxTurns(proj, t) ApplyUnpark
@@ -1304,7 +1295,7 @@ func (r *ProjectReconciler) deleteReapedTask(ctx context.Context, proj *tatarav1
 // always declined turns-exhausted and fires=false regardless of the Task's real
 // turn count, so reapParked deleted every parked(no-outcome) Task once
 // ParkRetention elapsed, whether or not driveUnparks would have re-entered it.
-// Identical failure class to the ConversingHasRoom fix above, on a different
+// Identical failure class to the LiveHasRoom fix above, on a different
 // field and reason).
 //
 // FIELD-BY-FIELD AUDIT (2026-07-28 security review NEW-1; refreshed for
@@ -1331,7 +1322,7 @@ func (r *ProjectReconciler) deleteReapedTask(ctx context.Context, proj *tatarav1
 //     anyMerged.
 //   - BotLogin: read by hasNonBotEvent in every comment-driven reason
 //     (backlog-sweep, awaiting-human, identity-unverified, handoff-stalled).
-//   - ConversingHasRoom: set by both as of the CRITICAL 1 fix above. Read by
+//   - LiveHasRoom: set by both as of the CRITICAL 1 fix above. Read by
 //     ReasonAwaitingHuman and ReasonIdentityUnverified. For a NON-REVIEW-kind
 //     identity-unverified Task it is now the ONLY thing that decides re-entry
 //     after hasNonBotEvent - false is DeclineNoConversingRoom and true is
@@ -1353,7 +1344,7 @@ func (r *ProjectReconciler) deleteReapedTask(ctx context.Context, proj *tatarav1
 // exists to hold - a new field cannot be added without a compile-visible
 // decision about both call sites.
 func (r *ProjectReconciler) unparkFires(ctx context.Context, proj *tatarav1alpha1.Project,
-	t *tatarav1alpha1.Task, now time.Time, conversingRoom bool) (bool, error) {
+	t *tatarav1alpha1.Task, now time.Time, liveRoom bool) (bool, error) {
 
 	issues, err := r.ownedIssues(ctx, t)
 	if err != nil {
@@ -1372,18 +1363,29 @@ func (r *ProjectReconciler) unparkFires(ctx context.Context, proj *tatarav1alpha
 		maxOpen = 6
 	}
 	probe := t.DeepCopy()
-	_, ok := stage.Unpark(stage.UnparkInput{
-		Task:              probe,
-		Issues:            issues,
-		MRs:               mrs,
-		ActiveTasks:       active,
-		MaxOpenTasks:      maxOpen,
-		BotLogin:          botLoginOf(proj),
-		MaxTurnsPerTask:   taskMaxTurns(proj, t),
-		ConversingHasRoom: conversingRoom,
-		Now:               now,
+	decline := stage.Unpark(stage.UnparkInput{
+		Task:            probe,
+		Issues:          issues,
+		MRs:             mrs,
+		ActiveTasks:     active,
+		MaxOpenTasks:    maxOpen,
+		BotLogin:        botLoginOf(proj),
+		MaxTurnsPerTask: taskMaxTurns(proj, t),
+		LiveHasRoom:     liveRoom,
+		Now:             now,
 	})
-	return ok, nil
+	return decline == stage.DeclineNone, nil
+}
+
+// parkedAt is the park clock's base: status.parkedAt, falling back to
+// stateEnteredAt for a Task parked by a build that predated the field. A Task
+// with neither reads as parked at the zero time, i.e. immediately reapable -
+// the same safe direction FoldStartedAt takes.
+func parkedAt(t *tatarav1alpha1.Task) time.Time {
+	if t.Status.ParkedAt != nil {
+		return t.Status.ParkedAt.Time
+	}
+	return stageEnteredAt(t)
 }
 
 // ownedIssues / ownedMRs resolve status.issueRefs / status.mrRefs. A ref whose CR
@@ -1446,8 +1448,8 @@ func dropOwnerRef(obj client.Object, taskName string) {
 // stamp is treated as having entered its stage at creation - it can then only age
 // OUT, never be kept alive by a missing timestamp.
 func stageEnteredAt(t *tatarav1alpha1.Task) time.Time {
-	if t.Status.StageEnteredAt != nil {
-		return t.Status.StageEnteredAt.Time
+	if t.Status.StateEnteredAt != nil {
+		return t.Status.StateEnteredAt.Time
 	}
 	return t.CreationTimestamp.Time
 }

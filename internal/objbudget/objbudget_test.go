@@ -398,8 +398,9 @@ func TestFitIssue_CommentsRetainedFromAdvances(t *testing.T) {
 // spec.goal alone exceeds the budget has nothing evictable, so FitTask must
 // return ErrObjectTooLarge without ever calling Spill, and the recovery
 // write (MinimalFailPatch) must be a merge patch whose BODY carries only
-// stage/stageReason - never the oversized goal - so recording the failure
-// cannot itself 413.
+// parkReason/parkedAt - never the oversized goal - so recording the failure
+// cannot itself 413. #521 made this a PARK, not a `failed` stage transition:
+// the state is left untouched and the Task stalls in place.
 func TestFitTask_ObjectTooLarge_MinimalFailPatch(t *testing.T) {
 	ctx := context.Background()
 	hugeGoal := strings.Repeat("g", 900_000)
@@ -443,23 +444,23 @@ func TestFitTask_ObjectTooLarge_MinimalFailPatch(t *testing.T) {
 		t.Fatalf("patch body carries the oversized goal: %d bytes", len(capturedPatch))
 	}
 	if len(capturedPatch) > 200 {
-		t.Fatalf("patch body is %d bytes, want a MINIMAL patch (stage+stageReason only)", len(capturedPatch))
+		t.Fatalf("patch body is %d bytes, want a MINIMAL patch (parkReason+parkedAt only)", len(capturedPatch))
 	}
 
 	var decoded struct {
 		Status struct {
-			Stage       string `json:"stage"`
-			StageReason string `json:"stageReason"`
+			ParkReason string `json:"parkReason"`
+			ParkedAt   string `json:"parkedAt"`
 		} `json:"status"`
 	}
 	if err := json.Unmarshal(capturedPatch, &decoded); err != nil {
 		t.Fatalf("patch body is not valid JSON: %v (%s)", err, capturedPatch)
 	}
-	if decoded.Status.Stage != tatarav1alpha1.StageFailed {
-		t.Fatalf("patch stage = %q, want %q", decoded.Status.Stage, tatarav1alpha1.StageFailed)
+	if decoded.Status.ParkReason != "object-too-large" {
+		t.Fatalf("patch parkReason = %q, want object-too-large", decoded.Status.ParkReason)
 	}
-	if decoded.Status.StageReason != "object-too-large" {
-		t.Fatalf("patch stageReason = %q, want object-too-large", decoded.Status.StageReason)
+	if decoded.Status.ParkedAt == "" {
+		t.Fatal("patch parkedAt is empty, want a stamped timestamp")
 	}
 
 	var raw map[string]json.RawMessage
@@ -474,7 +475,7 @@ func TestFitTask_ObjectTooLarge_MinimalFailPatch(t *testing.T) {
 		t.Fatalf("unmarshal status: %v", err)
 	}
 	if len(statusFields) != 2 {
-		t.Fatalf("patch .status has %d fields %v, want exactly 2 (stage, stageReason)", len(statusFields), statusFields)
+		t.Fatalf("patch .status has %d fields %v, want exactly 2 (parkReason, parkedAt)", len(statusFields), statusFields)
 	}
 }
 

@@ -42,7 +42,7 @@ func postPROpened(t *testing.T, h http.Handler, projName, secretVal string, body
 	require.Equal(t, http.StatusAccepted, w.Code)
 }
 
-// A human opens a NEW issue: the webhook mints an ACTIVE clarify Task NOW, and
+// A human opens a NEW issue: the webhook mints an ACTIVE implement Task NOW, and
 // the mirror Issue CR is owned by it. (Supersedes the old "mints nothing" test.)
 func TestIssueOpened_MintsClarifyTaskImmediately(t *testing.T) {
 	const secretVal = "whsec-mint1"
@@ -56,8 +56,8 @@ func TestIssueOpened_MintsClarifyTaskImmediately(t *testing.T) {
 
 	tasks := allTasks(t, c, "mp")
 	require.Len(t, tasks, 1)
-	require.Equal(t, "clarify", tasks[0].Spec.Kind)
-	require.Equal(t, tatarav1.StageTriaging, tasks[0].Spec.InitialStage)
+	require.Equal(t, "implement", tasks[0].Spec.Kind)
+	require.Equal(t, tatarav1.StateNew, tasks[0].Spec.InitialState)
 
 	var iss tatarav1.Issue
 	require.NoError(t, c.Get(context.Background(),
@@ -152,7 +152,7 @@ func postIssueComment(t *testing.T, h http.Handler, projName, secretVal string, 
 }
 
 // A comment lands on an issue with NO mirror CR yet: commentIsOrphan reads a
-// NotFound and the orphan-comment path mints a clarify Task immediately,
+// NotFound and the orphan-comment path mints a implement Task immediately,
 // same as issue-opened would have.
 func TestOrphanComment_NoMirror_MintsTask(t *testing.T) {
 	const secretVal = "whsec-oc1"
@@ -167,8 +167,8 @@ func TestOrphanComment_NoMirror_MintsTask(t *testing.T) {
 
 	tasks := allTasks(t, c, "ocp1")
 	require.Len(t, tasks, 1, "a comment on an orphan (no-mirror) issue must mint a Task")
-	require.Equal(t, "clarify", tasks[0].Spec.Kind)
-	require.Equal(t, tatarav1.StageTriaging, tasks[0].Spec.InitialStage,
+	require.Equal(t, "implement", tasks[0].Spec.Kind)
+	require.Equal(t, tatarav1.StateNew, tasks[0].Spec.InitialState,
 		"a live HMAC-verified human comment is a liveness signal like issues.opened; must mint ACTIVE, not parked")
 }
 
@@ -234,8 +234,8 @@ func TestOrphanComment_UnownedMirror_MintsTask(t *testing.T) {
 
 	tasks := allTasks(t, c, projName)
 	require.Len(t, tasks, 1, "a comment on an un-owned mirror must mint a Task")
-	require.Equal(t, "clarify", tasks[0].Spec.Kind)
-	require.Equal(t, tatarav1.StageTriaging, tasks[0].Spec.InitialStage,
+	require.Equal(t, "implement", tasks[0].Spec.Kind)
+	require.Equal(t, tatarav1.StateNew, tasks[0].Spec.InitialState,
 		"a live HMAC-verified human comment is a liveness signal like issues.opened; must mint ACTIVE, not parked")
 }
 
@@ -249,7 +249,7 @@ func TestOwnedMirrorComment_NoMint_PendingPathRuns(t *testing.T) {
 	const projName = "ocp3"
 	task := &tatarav1.Task{
 		ObjectMeta: metav1.ObjectMeta{Name: "existing-task-oc3", Namespace: ns},
-		Spec:       tatarav1.TaskSpec{Kind: "clarify", ProjectRef: projName, Goal: "g"},
+		Spec:       tatarav1.TaskSpec{Kind: "implement", ProjectRef: projName, Goal: "g"},
 	}
 	owned := &tatarav1.Issue{
 		ObjectMeta: metav1.ObjectMeta{Name: tatarav1.IssueName(repoName, 23), Namespace: ns},

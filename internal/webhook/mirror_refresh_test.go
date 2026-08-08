@@ -34,7 +34,7 @@ func peMR(number int, task *tatarav1.Task, status tatarav1.MergeRequestStatus) *
 // --- WS3-I2: issue edited ---------------------------------------------------
 
 func TestIssueEdited_BodyChange_MirrorsAndQueuesEvent(t *testing.T) {
-	task := peTask("t-edit", tatarav1.StageParked, "awaiting-human", tatarav1.IssueName("pe-repo", 7))
+	task := peParkedTask("t-edit", tatarav1.StateRefined, "awaiting-human", tatarav1.IssueName("pe-repo", 7))
 	iss := peIssue(7, task)
 	iss.Status.Body, iss.Status.Title = "old body", "old title"
 	proj := peProject("tatara-bot", "maintainer")
@@ -58,7 +58,7 @@ func TestIssueEdited_BodyChange_MirrorsAndQueuesEvent(t *testing.T) {
 }
 
 func TestIssueEdited_NoBodyChange_NoEvent(t *testing.T) {
-	task := peTask("t-noedit", tatarav1.StageParked, "awaiting-human", tatarav1.IssueName("pe-repo", 7))
+	task := peParkedTask("t-noedit", tatarav1.StateRefined, "awaiting-human", tatarav1.IssueName("pe-repo", 7))
 	iss := peIssue(7, task)
 	iss.Status.Body, iss.Status.Title = "same", "same"
 	proj := peProject("tatara-bot", "maintainer")
@@ -76,7 +76,7 @@ func TestIssueEdited_NoBodyChange_NoEvent(t *testing.T) {
 // TestIssueEdited_CombinedLabelEdit_ViaRouter proves the labeled path runs the
 // body diff (a combined body+label edit surfaces as GitLab labeled).
 func TestIssueEdited_CombinedLabelEdit_ViaRouter(t *testing.T) {
-	task := peTask("t-combined", tatarav1.StageParked, "awaiting-human", tatarav1.IssueName("pe-repo", 7))
+	task := peParkedTask("t-combined", tatarav1.StateRefined, "awaiting-human", tatarav1.IssueName("pe-repo", 7))
 	iss := peIssue(7, task)
 	iss.Status.Body = "old"
 	proj := peProject("tatara-bot", "maintainer") // no TriggerLabel -> no mint side effect
@@ -148,7 +148,7 @@ func TestTriggerLabelMint_BotActor_NoMint(t *testing.T) {
 
 func TestTriggerLabelMint_AlreadyOwned_NoMint(t *testing.T) {
 	proj := triggerProject()
-	task := peTask("t-own", tatarav1.StageClarifying, "", tatarav1.IssueName("pe-repo", 7))
+	task := peTask("t-own", tatarav1.StateRefined, "", tatarav1.IssueName("pe-repo", 7))
 	iss := peIssue(7, task) // owned -> not an orphan
 	c := peClient(t, proj, peRepo(), peSecret("pe-proj-scm", "tok"), task, iss)
 	s := peServer(c, &stubSpiller{}, nil)
@@ -161,7 +161,7 @@ func TestTriggerLabelMint_AlreadyOwned_NoMint(t *testing.T) {
 // --- WS3-M1: MR synchronize -------------------------------------------------
 
 func TestMRSynchronize_MirrorsHeadNoTransition(t *testing.T) {
-	task := peTask("t-rev", tatarav1.StageReviewing, "", tatarav1.IssueName("pe-repo", 7))
+	task := peTask("t-rev", tatarav1.StateAwaitingReview, "", tatarav1.IssueName("pe-repo", 7))
 	task.Status.MRRefs = []string{tatarav1.MergeRequestName("pe-repo", 34)}
 	mr := peMR(34, task, tatarav1.MergeRequestStatus{State: "open", HeadSHA: "oldhead"})
 	proj := peProject("tatara-bot", "maintainer")
@@ -175,7 +175,7 @@ func TestMRSynchronize_MirrorsHeadNoTransition(t *testing.T) {
 	var got tatarav1.MergeRequest
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Namespace: peNS, Name: mr.Name}, &got))
 	require.Equal(t, "newhead", got.Status.HeadSHA)
-	require.Equal(t, tatarav1.StageReviewing, getPETask(t, c, task.Name).Status.Stage, "no review restart on synchronize")
+	require.Equal(t, tatarav1.StateAwaitingReview, getPETask(t, c, task.Name).Status.State, "no review restart on synchronize")
 }
 
 // TestMRSynchronize_BotPushStampsLastBotHeadSHA proves a verified bot-push
@@ -183,7 +183,7 @@ func TestMRSynchronize_MirrorsHeadNoTransition(t *testing.T) {
 // must not read a push webhook that races ahead of the implement-outcome
 // record as an unattributable external push.
 func TestMRSynchronize_BotPushStampsLastBotHeadSHA(t *testing.T) {
-	task := peTask("t-rev", tatarav1.StageReviewing, "", tatarav1.IssueName("pe-repo", 7))
+	task := peTask("t-rev", tatarav1.StateAwaitingReview, "", tatarav1.IssueName("pe-repo", 7))
 	task.Status.MRRefs = []string{tatarav1.MergeRequestName("pe-repo", 34)}
 	mr := peMR(34, task, tatarav1.MergeRequestStatus{State: "open", HeadSHA: "oldhead"})
 	proj := peProject("tatara-bot", "maintainer")
@@ -205,7 +205,7 @@ func TestMRSynchronize_BotPushStampsLastBotHeadSHA(t *testing.T) {
 // pusher advances only the HeadSHA mirror, leaving LastBotHeadSHA stale so
 // ReconcileOwnership (OP8) sees the drift and flips.
 func TestMRSynchronize_HumanPushDoesNotStampLastBotHeadSHA(t *testing.T) {
-	task := peTask("t-rev2", tatarav1.StageReviewing, "", tatarav1.IssueName("pe-repo", 7))
+	task := peTask("t-rev2", tatarav1.StateAwaitingReview, "", tatarav1.IssueName("pe-repo", 7))
 	task.Status.MRRefs = []string{tatarav1.MergeRequestName("pe-repo", 35)}
 	mr := peMR(35, task, tatarav1.MergeRequestStatus{State: "open", HeadSHA: "oldhead", LastBotHeadSHA: "old-bot-head"})
 	proj := peProject("tatara-bot", "maintainer")
@@ -244,7 +244,7 @@ func TestMRClosed_Merged_MirrorsMergedState(t *testing.T) {
 // --- WS3-M4: review on an owned MR whose Task was reaped --------------------
 
 func TestReviewFoldsWhenOwningTaskReaped(t *testing.T) {
-	ghost := peTask("ghost-task", tatarav1.StageReviewing, "") // deliberately NOT added to the client
+	ghost := peTask("ghost-task", tatarav1.StateAwaitingReview, "") // deliberately NOT added to the client
 	mr := peMR(34, ghost, tatarav1.MergeRequestStatus{State: "open"})
 	proj := peProject("tatara-bot", "maintainer")
 	c := peClient(t, proj, peRepo(), peSecret("pe-proj-scm", "tok"), mr) // ghost absent

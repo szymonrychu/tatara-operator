@@ -156,7 +156,7 @@ func TestPollOnce_GetTurnContextDeadline(t *testing.T) {
 	mkTaskProject(t, "p-ctxdl1", 3)
 	mkTaskRepository(t, "r-ctxdl1", "p-ctxdl1")
 	mkTask(t, "t-ctxdl1", "p-ctxdl1", "r-ctxdl1")
-	setTaskStage(t, "t-ctxdl1", tatarav1alpha1.StageImplementing)
+	setTaskStage(t, "t-ctxdl1", tatarav1alpha1.StateUnderImplementation)
 	startedAt := time.Now().Add(-30 * time.Second) // not yet timed out
 	annotate(t, "t-ctxdl1", map[string]string{
 		annCurrentTurn:   "turn-ctxdl1",

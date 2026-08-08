@@ -24,15 +24,17 @@ func brainstormProposeBodyN(n int) string {
 	return `{"kind":"brainstorm","payload":{"action":"propose","proposals":[` + strings.Join(items, ",") + `]}}`
 }
 
-// clarifyTaskCount counts clarify Tasks in the namespace: one per KEPT
-// proposal is the invariant a truncating handler must preserve.
-func clarifyTaskCount(t *testing.T, e *v2Env) int {
+// gateTaskCount counts implement Tasks (the gate mint target: #521 folded
+// clarify's kind away, and the CRD enum no longer accepts it) in the
+// namespace: one per KEPT proposal is the invariant a truncating handler must
+// preserve.
+func gateTaskCount(t *testing.T, e *v2Env) int {
 	t.Helper()
 	var tasks tatarav1alpha1.TaskList
 	require.NoError(t, e.c.List(context.Background(), &tasks, client.InNamespace(ns)))
 	n := 0
 	for i := range tasks.Items {
-		if tasks.Items[i].Spec.Kind == "clarify" {
+		if tasks.Items[i].Spec.Kind == "implement" {
 			n++
 		}
 	}
@@ -42,7 +44,7 @@ func clarifyTaskCount(t *testing.T, e *v2Env) int {
 // The operator is the AUTHORITY on the quota: an agent that files more than K
 // gets exactly K issues opened, not a 400 and not K+n.
 func TestBrainstormProposeTruncatesToQuota(t *testing.T) {
-	task := taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StageBrainstorming, "brainstorm")
+	task := taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StateRefined, "brainstorm")
 	task.Annotations = map[string]string{tatarav1alpha1.AnnBrainstormQuota: "2"}
 	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"), task)
 
@@ -52,11 +54,11 @@ func TestBrainstormProposeTruncatesToQuota(t *testing.T) {
 	require.Len(t, e.forge.createdReqs, 2, "the operator truncates to the session quota")
 	require.Equal(t, "p0", e.forge.createdReqs[0].Title, "truncation keeps payload order")
 	require.Equal(t, "p1", e.forge.createdReqs[1].Title)
-	require.Equal(t, 2, clarifyTaskCount(t, e), "one clarify Task per KEPT proposal, never per submitted one")
+	require.Equal(t, 2, gateTaskCount(t, e), "one implement (gate) Task per KEPT proposal, never per submitted one")
 }
 
 func TestBrainstormProposeBelowQuotaIsUntouched(t *testing.T) {
-	task := taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StageBrainstorming, "brainstorm")
+	task := taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StateRefined, "brainstorm")
 	task.Annotations = map[string]string{tatarav1alpha1.AnnBrainstormQuota: "3"}
 	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"), task)
 
@@ -83,7 +85,7 @@ func TestBrainstormProposeAppliesTheBrainstormingLabel(t *testing.T) {
 			if tc.scmPatch != nil {
 				tc.scmPatch(proj.Spec.Scm)
 			}
-			task := taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StageBrainstorming, "brainstorm")
+			task := taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StateRefined, "brainstorm")
 			task.Annotations = map[string]string{tatarav1alpha1.AnnBrainstormQuota: "1"}
 			e := buildV2(t, v2Opts{}, proj, scmSecretV2(), repoV2("tatara-operator", "tatara"), task)
 

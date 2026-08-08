@@ -136,7 +136,7 @@ func newTTLHarness(t *testing.T, sess *stopSession) *ttlHarness {
 		ObjectMeta: metav1.ObjectMeta{Name: "task-ttl", Namespace: ttlNS, UID: "uid-1"},
 		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "demo", Kind: "implement"},
 		Status: tatarav1alpha1.TaskStatus{
-			Stage:        tatarav1alpha1.StageImplementing,
+			State:        tatarav1alpha1.StateUnderImplementation,
 			AgentKind:    "implement",
 			PodStartedAt: &podStart,
 		},

@@ -68,12 +68,15 @@ func (d *StageDriver) DrainStandDownMerge(ctx context.Context, proj *tatarav1alp
 		return fmt.Errorf("stand-down merge: hand control to owner task %s: %w", tk.Name, err)
 	}
 
-	// Reason is passed EXPLICITLY: the parked->merging edge collapses by
-	// (from, to) in the F.3 table, so the Reason carried here is not what makes
-	// the transition legal - it is the audit trail stamped onto
-	// status.stageReason, and it must read ownership-lost, not an empty string.
-	if err := d.enterStage(ctx, proj, tk, tatarav1alpha1.StageMerging, stage.ReasonOwnershipLost, nil); err != nil {
-		return fmt.Errorf("stand-down merge: re-drive %s to merging: %w", tk.Name, err)
+	// stage.UnparkTakeover is the ONE function permitted to clear the park flag
+	// AND move state in the same write, and this is one of its two call sites: a
+	// re-taken MR whose human head already carries an approved review resumes at
+	// the MERGE phase, from wherever the ownership flip happened to catch it. It
+	// refuses any park reason other than ownership-lost, any target outside its
+	// own allow-list, and a kind=review Task, so this call cannot become a hole
+	// in GUARD 1.
+	if err := d.unparkTakeover(ctx, proj, tk, tatarav1alpha1.StateMerged); err != nil {
+		return fmt.Errorf("stand-down merge: re-drive %s to merged: %w", tk.Name, err)
 	}
 	log.FromContext(ctx).Info("stand-down merge re-drive", "action", "standdown_merge",
 		"resource_id", mr.Name, "task", tk.Name, "kind", tk.Spec.Kind)
@@ -102,7 +105,7 @@ func (d *StageDriver) parkedOwnershipLostOwner(ctx context.Context, proj *tatara
 			}
 			return nil, fmt.Errorf("stand-down merge: get owner task %s: %w", ref.Name, err)
 		}
-		if tk.Status.Stage == tatarav1alpha1.StageParked && tk.Status.StageReason == stage.ReasonOwnershipLost {
+		if tk.Status.ParkReason == stage.ReasonOwnershipLost {
 			t := tk
 			found = &t
 		}

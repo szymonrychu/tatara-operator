@@ -41,13 +41,13 @@ const (
 // AGENT kind, Task.Status.AgentKind, and never a Task.Spec.Kind), and incident
 // is a fix landing. takeover is included for the SAME reason: a takeover Task
 // lands real code changes on behalf of real task work, so the project moved,
-// exactly as much as a clarify or incident merge does - do not "simplify" it
+// exactly as much as an implement or incident merge does - do not "simplify" it
 // back out. documentation, refine and review are not: they are housekeeping
 // kinds whose merges do not represent the project moving on its own idea
 // space, documentation above all (see the regression test).
 func brainstormResumeKind(kind string) bool {
 	switch kind {
-	case "clarify", "incident", "takeover":
+	case "implement", "incident", "takeover":
 		return true
 	}
 	return false

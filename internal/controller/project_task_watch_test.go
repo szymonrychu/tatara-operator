@@ -2,8 +2,10 @@ package controller
 
 import (
 	"testing"
+	"time"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/stage"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 )
@@ -17,7 +19,17 @@ func chainTask(activity, stg string) *tatarav1alpha1.Task {
 	if activity != "" {
 		t.Labels = map[string]string{labelActivity: activity}
 	}
-	t.Status.Stage = stg
+	t.Status.State = stg
+	return t
+}
+
+// chainParkedTask builds a Task at stg, then parks it for reason. State is
+// UNCHANGED by a park (stage.Park stamps the flag; it never moves State).
+func chainParkedTask(activity, stg, reason string) *tatarav1alpha1.Task {
+	t := chainTask(activity, stg)
+	if err := stage.Park(t, reason, time.Now()); err != nil {
+		panic(err)
+	}
 	return t
 }
 
@@ -39,26 +51,34 @@ func TestBrainstormCycleFinishedPredicate(t *testing.T) {
 			want     bool
 		}{
 			"THE SIGNAL: a skipped cycle lands on delivered": {
-				chainTask("brainstorm", tatarav1alpha1.StageBrainstorming),
-				chainTask("brainstorm", tatarav1alpha1.StageDelivered), true},
-			"a parked cycle frees its slot too": {
-				chainTask("brainstorm", tatarav1alpha1.StageBrainstorming),
-				chainTask("brainstorm", tatarav1alpha1.StageParked), true},
-			"a failed cycle frees its slot too": {
-				chainTask("brainstorm", tatarav1alpha1.StageBrainstorming),
-				chainTask("brainstorm", tatarav1alpha1.StageFailed), true},
+				chainTask("brainstorm", tatarav1alpha1.StateRefined),
+				chainTask("brainstorm", tatarav1alpha1.StateDone), true},
+			// #521: parked/failed are gone as stages; a park is now a FLAG
+			// orthogonal to State, and TaskDone is state-only (done|rejected).
+			// A park does not free the deficit slot - the Task may still
+			// resume (un-park) and finish the SAME cycle, so counting it as
+			// finished here would let a second cycle start under it. This
+			// mirrors brainstormInFlightProject/documentationInFlightProject,
+			// which count a parked Task as still in-flight for the same
+			// reason.
+			"a parked cycle does NOT free its slot: it may still resume": {
+				chainTask("brainstorm", tatarav1alpha1.StateRefined),
+				chainParkedTask("brainstorm", tatarav1alpha1.StateRefined, stage.ReasonAwaitingHuman), false},
+			"a cycle parked with no re-entry ALSO does not free its slot; the reaper's retention timer collects it eventually": {
+				chainTask("brainstorm", tatarav1alpha1.StateRefined),
+				chainParkedTask("brainstorm", tatarav1alpha1.StateRefined, stage.ReasonStageDeadline), false},
 			"mid-cycle movement is not the signal": {
-				chainTask("brainstorm", tatarav1alpha1.StageBrainstorming),
-				chainTask("brainstorm", tatarav1alpha1.StageReviewing), false},
+				chainTask("brainstorm", tatarav1alpha1.StateRefined),
+				chainTask("brainstorm", tatarav1alpha1.StateAwaitingReview), false},
 			"an already-done cycle re-written is not a second signal": {
-				chainTask("brainstorm", tatarav1alpha1.StageDelivered),
-				chainTask("brainstorm", tatarav1alpha1.StageDelivered), false},
+				chainTask("brainstorm", tatarav1alpha1.StateDone),
+				chainTask("brainstorm", tatarav1alpha1.StateDone), false},
 			"a NON-brainstorm Task finishing changes no brainstorm deficit": {
-				chainTask("documentation", tatarav1alpha1.StageImplementing),
-				chainTask("documentation", tatarav1alpha1.StageDelivered), false},
+				chainTask("documentation", tatarav1alpha1.StateUnderImplementation),
+				chainTask("documentation", tatarav1alpha1.StateDone), false},
 			"an unlabelled Task finishing changes no brainstorm deficit": {
-				chainTask("", tatarav1alpha1.StageImplementing),
-				chainTask("", tatarav1alpha1.StageDelivered), false},
+				chainTask("", tatarav1alpha1.StateUnderImplementation),
+				chainTask("", tatarav1alpha1.StateDone), false},
 		}
 		for name, tc := range cases {
 			t.Run(name, func(t *testing.T) {
@@ -74,7 +94,7 @@ func TestBrainstormCycleFinishedPredicate(t *testing.T) {
 	// every cycle it starts.
 	t.Run("create is never admitted", func(t *testing.T) {
 		for _, stg := range []string{
-			tatarav1alpha1.StageBrainstorming, tatarav1alpha1.StageDelivered, "",
+			tatarav1alpha1.StateRefined, tatarav1alpha1.StateDone, "",
 		} {
 			if pred.Create(event.CreateEvent{Object: chainTask("brainstorm", stg)}) {
 				t.Fatalf("Create at stage %q was admitted; the parent creates these Tasks", stg)
@@ -83,19 +103,19 @@ func TestBrainstormCycleFinishedPredicate(t *testing.T) {
 	})
 
 	t.Run("delete", func(t *testing.T) {
-		if !pred.Delete(event.DeleteEvent{Object: chainTask("brainstorm", tatarav1alpha1.StageBrainstorming)}) {
+		if !pred.Delete(event.DeleteEvent{Object: chainTask("brainstorm", tatarav1alpha1.StateRefined)}) {
 			t.Fatal("deleting an IN-FLIGHT cycle must be admitted: it frees the slot and raises the deficit")
 		}
-		if pred.Delete(event.DeleteEvent{Object: chainTask("brainstorm", tatarav1alpha1.StageDelivered)}) {
+		if pred.Delete(event.DeleteEvent{Object: chainTask("brainstorm", tatarav1alpha1.StateDone)}) {
 			t.Fatal("deleting an already-done cycle frees no slot; it must be dropped")
 		}
-		if pred.Delete(event.DeleteEvent{Object: chainTask("documentation", tatarav1alpha1.StageImplementing)}) {
+		if pred.Delete(event.DeleteEvent{Object: chainTask("documentation", tatarav1alpha1.StateUnderImplementation)}) {
 			t.Fatal("deleting a non-brainstorm Task must be dropped")
 		}
 	})
 
 	t.Run("generic is always dropped", func(t *testing.T) {
-		if pred.Generic(event.GenericEvent{Object: chainTask("brainstorm", tatarav1alpha1.StageDelivered)}) {
+		if pred.Generic(event.GenericEvent{Object: chainTask("brainstorm", tatarav1alpha1.StateDone)}) {
 			t.Fatal("GenericFunc must always return false")
 		}
 	})

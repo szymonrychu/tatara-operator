@@ -55,7 +55,7 @@ func TestProjectCronFieldsRoundTrip(t *testing.T) {
 
 func TestTaskKindEnum(t *testing.T) {
 	ctx := context.Background()
-	for _, kind := range []string{"brainstorm", "incident", "clarify", "refine", "review", "documentation"} {
+	for _, kind := range []string{"brainstorm", "incident", "implement", "refine", "review", "documentation"} {
 		tk := &tataradevv1alpha1.Task{}
 		tk.Name = "enum-" + kind
 		tk.Namespace = testNS
@@ -70,8 +70,9 @@ func TestTaskKindEnum(t *testing.T) {
 			t.Fatalf("create task kind=%s: %v", kind, err)
 		}
 	}
-	// The retired kinds are REJECTED by the CRD enum.
-	for _, kind := range []string{"implement", "issueLifecycle", "triageIssue", "selfImprove", "healthCheck"} {
+	// The retired kinds are REJECTED by the CRD enum. #521 retired "clarify"
+	// too, merging it into "implement".
+	for _, kind := range []string{"clarify", "issueLifecycle", "triageIssue", "selfImprove", "healthCheck"} {
 		tk := &tataradevv1alpha1.Task{}
 		tk.Name = "enum-bad-" + strings.ToLower(kind)
 		tk.Namespace = testNS

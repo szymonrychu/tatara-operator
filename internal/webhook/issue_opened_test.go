@@ -271,7 +271,7 @@ func TestIssueOpened_LaggingCacheStillMintsTriaging(t *testing.T) {
 	var tl tatarav1.TaskList
 	require.NoError(t, c.List(context.Background(), &tl))
 	require.Len(t, tl.Items, 1, "a brand-new maintainer issue must mint exactly one Task")
-	require.Equal(t, tatarav1.StageTriaging, tl.Items[0].Spec.InitialStage,
+	require.Equal(t, tatarav1.StateNew, tl.Items[0].Spec.InitialState,
 		"the mint must be ACTIVE: a human just opened this issue")
 }
 
@@ -322,12 +322,11 @@ func newServerWithReader(c client.Client, reader client.Reader) http.Handler {
 // (informer-backed, can lag a write it just made) against manager.GetAPIReader()
 // (direct to the API server, never lags) exactly as production wires
 // webhook.Config.APIReader. (issueCR - MintForItem's own orphan-classification
-// read - was ALSO tried on the uncached reader during this review round; it
-// broke TestResumeNoReentryPark_DirectMintCacheLagStillActive, whose own doc
-// comment documents that only the specific re-entrant read that needs
-// freshness goes through APIReader, not the general classification read, so
-// intake.go's issueCR deliberately stays on the cached Client - see its own
-// doc comment for the full reasoning.)
+// read - was ALSO tried on the uncached reader during this review round and
+// reverted: only the specific re-entrant read that needs freshness goes through
+// APIReader, not the general classification read, so intake.go's issueCR
+// deliberately stays on the cached Client - see its own doc comment for the
+// full reasoning.)
 func TestIssueOpened_BoundedCacheLagMintsOnceAndConsumesTheMarker(t *testing.T) {
 	const secretVal = "whsec-lag2"
 	scheme := newScheme(t)

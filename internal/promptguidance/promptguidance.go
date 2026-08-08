@@ -45,12 +45,17 @@ const ToolingNoteGuidance = "\n\n## Tooling you needed\n" +
 	"to the repo's .mise.toml. Do not file a separate issue for tooling; fold it into the issue " +
 	"you are proposing."
 
-// ConcisenessGuidance is appended to every agent turn-0 directive. Issue #506:
-// tatara's own forge-visible writing (issue/MR bodies, clarify/discuss
+// ConcisenessGuidance is appended to every agent turn-0 directive,
+// unconditionally, at internal/controller/assignment.go's single append site.
+// It lives here and NOT duplicated into seven skills free to drift.
+//
+// Issue #506: tatara's own forge-visible writing (issue/MR bodies, discussion
 // messages, comments) was too long for its actual audience.
 const ConcisenessGuidance = "\n\n## Writing style for your own output\n" +
-	"Audience is a senior dev/devops reader, not a beginner. For every issue " +
-	"comment, MR body, clarify/discuss message, and outcome body you write:\n" +
+	"You are writing for a matter expert in this system: the person who built it. " +
+	"Assume the architecture, the vocabulary and the failure modes are already known. " +
+	"Say what changed and why it is not obvious; skip what a reader could derive. " +
+	"For every issue comment, MR body, discussion message, and outcome body you write:\n" +
 	"  - Bullets and tables over prose. No restated context the reader already has " +
 	"(the diff, the thread, the goal).\n" +
 	"  - Skip explaining what is obvious from the diff or from standard terms in " +

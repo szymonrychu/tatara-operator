@@ -65,7 +65,7 @@ func TestAssignmentFor_NeverEmbedsGoalField(t *testing.T) {
 	}
 
 	for _, kind := range []string{
-		stage.AgentImplement, stage.AgentClarify, stage.AgentReview,
+		stage.AgentImplement, stage.AgentReview,
 		stage.AgentBrainstorm, stage.AgentIncident,
 	} {
 		t.Run(kind, func(t *testing.T) {

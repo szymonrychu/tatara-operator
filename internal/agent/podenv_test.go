@@ -32,9 +32,9 @@ func TestAgentEnv_G9Contract(t *testing.T) {
 	}
 	task := &tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{Name: "task-7", Namespace: "tatara"},
-		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "demo", RepositoryRef: "repo1", Kind: "clarify"},
+		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "demo", RepositoryRef: "repo1", Kind: "implement"},
 		Status: tatarav1alpha1.TaskStatus{
-			Stage:     tatarav1alpha1.StageImplementing,
+			State:     tatarav1alpha1.StateUnderImplementation,
 			AgentKind: "implement",
 		},
 	}
@@ -51,7 +51,7 @@ func TestAgentEnv_G9Contract(t *testing.T) {
 	require.Equal(t, "", env["TATARA_REPO"])
 	require.Equal(t, agent.TaskBranch(task), env["TASK_BRANCH"])
 	require.Equal(t, "3600", env["AGENT_POD_TTL_SECONDS"])
-	require.Equal(t, "3", env["TATARA_CONTRACT_VERSION"])
+	require.Equal(t, "4", env["TATARA_CONTRACT_VERSION"])
 }
 
 // TestAgentEnv_RepoOnlyForDocumentation: TATARA_REPO is the Repository CR name,
@@ -64,39 +64,41 @@ func TestAgentEnv_RepoOnlyForDocumentation(t *testing.T) {
 		stage     string
 		want      string
 	}{
-		{"documentation", tatarav1alpha1.StageDocumenting, "repo1"},
-		{"implement", tatarav1alpha1.StageImplementing, ""},
-		{"review", tatarav1alpha1.StageReviewing, ""},
-		{"clarify", tatarav1alpha1.StageClarifying, ""},
-		{"brainstorm", tatarav1alpha1.StageBrainstorming, ""},
-		{"incident", tatarav1alpha1.StageInvestigating, ""},
-		{"refine", tatarav1alpha1.StageRefining, ""},
+		{"documentation", tatarav1alpha1.StateUnderImplementation, "repo1"},
+		{"implement", tatarav1alpha1.StateUnderImplementation, ""},
+		{"review", tatarav1alpha1.StateAwaitingReview, ""},
+		{"clarify", tatarav1alpha1.StateRefined, ""},
+		{"brainstorm", tatarav1alpha1.StateRefined, ""},
+		{"incident", tatarav1alpha1.StateRefined, ""},
+		{"refine", tatarav1alpha1.StateRefined, ""},
 	} {
 		t.Run(tc.agentKind, func(t *testing.T) {
 			task := &tatarav1alpha1.Task{
 				ObjectMeta: metav1.ObjectMeta{Name: "t"},
 				Spec:       tatarav1alpha1.TaskSpec{RepositoryRef: "repo1"},
-				Status:     tatarav1alpha1.TaskStatus{Stage: tc.stage, AgentKind: tc.agentKind},
+				Status:     tatarav1alpha1.TaskStatus{State: tc.stage, AgentKind: tc.agentKind},
 			}
 			require.Equal(t, tc.want, g9EnvMap(agent.AgentEnv(proj, task))["TATARA_REPO"])
 		})
 	}
 }
 
-// TestAgentEnv_AllSevenAgentKindsResolveAProfile is the day-one wedge guard.
-// The seven agent kinds MUST each resolve to a non-empty profile - INCLUDING
-// clarify. resolveProfile fails CLOSED: an unknown key means the cli serves only
-// the always-on tool set and never registers submit_outcome, so the pod lists 74
-// tools, may call 4 of them, and has no terminal outcome tool at all.
-func TestAgentEnv_AllSevenAgentKindsResolveAProfile(t *testing.T) {
+// TestAgentEnv_AllSixAgentKindsResolveAProfile is the day-one wedge guard.
+// The six agent kinds MUST each resolve to a non-empty profile - clarify is
+// EXCLUDED since #521 folded it into implement (its absent profile is now
+// load-bearing fail-closed behavior, see profileForKind). resolveProfile
+// fails CLOSED: an unknown key means the cli serves only the always-on tool
+// set and never registers submit_outcome, so the pod lists 74 tools, may call
+// 4 of them, and has no terminal outcome tool at all.
+func TestAgentEnv_AllSixAgentKindsResolveAProfile(t *testing.T) {
 	proj := &tatarav1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "demo"}}
-	kinds := []string{"brainstorm", "incident", "clarify", "implement", "review", "refine", "documentation"}
-	require.Len(t, kinds, 7)
+	kinds := []string{"brainstorm", "incident", "implement", "review", "refine", "documentation"}
+	require.Len(t, kinds, 6)
 	for _, k := range kinds {
 		t.Run(k, func(t *testing.T) {
 			task := &tatarav1alpha1.Task{
 				ObjectMeta: metav1.ObjectMeta{Name: "t"},
-				Status:     tatarav1alpha1.TaskStatus{Stage: tatarav1alpha1.StageImplementing, AgentKind: k},
+				Status:     tatarav1alpha1.TaskStatus{State: tatarav1alpha1.StateUnderImplementation, AgentKind: k},
 			}
 			env := g9EnvMap(agent.AgentEnv(proj, task))
 			require.Equal(t, k, env["TATARA_TOOL_PROFILE"], "agent kind %q must resolve a tool profile", k)
@@ -120,11 +122,15 @@ func TestAgentEnv_LegacyTaskFallsBackToSpecKind(t *testing.T) {
 	require.Equal(t, "repo1", env["TATARA_REPO"], "legacy Tasks keep the un-narrowed TATARA_REPO")
 }
 
-// TestBuildPod_CarriesG9Block: BuildPod must actually emit the block.
+// TestBuildPod_CarriesG9Block: BuildPod must actually emit the block. The
+// state is deliberately NOT one of stage.Live's three (merged, an
+// operator-driven state), so AGENT_POD_TTL_SECONDS exercises the flat
+// project TTL pass-through rather than the live conversation idle window
+// (see pod_ttl_test.go for that).
 func TestBuildPod_CarriesG9Block(t *testing.T) {
 	proj, repo, task, cfg := sampleInputs()
 	proj.Spec.AgentPodTTLSeconds = 7200
-	task.Status.Stage = tatarav1alpha1.StageImplementing
+	task.Status.State = tatarav1alpha1.StateMerged
 	task.Status.AgentKind = "implement"
 
 	env := g9EnvMap(agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0].Env)
@@ -133,14 +139,14 @@ func TestBuildPod_CarriesG9Block(t *testing.T) {
 	require.Equal(t, "implement", env["TATARA_TOOL_PROFILE"])
 	require.Equal(t, "implement", env["TATARA_SKILL_PROFILE"])
 	require.Equal(t, "7200", env["AGENT_POD_TTL_SECONDS"])
-	require.Equal(t, "3", env["TATARA_CONTRACT_VERSION"])
+	require.Equal(t, "4", env["TATARA_CONTRACT_VERSION"])
 }
 
 // TestBuildPod_ProfileEnvBeatsExtraEnvs: the operator-set profile keys must win
 // over a stray ExtraEnvs duplicate. First occurrence wins in a Pod env list.
 func TestBuildPod_ProfileEnvBeatsExtraEnvs(t *testing.T) {
 	proj, repo, task, cfg := sampleInputs()
-	task.Status.Stage = tatarav1alpha1.StageReviewing
+	task.Status.State = tatarav1alpha1.StateAwaitingReview
 	task.Status.AgentKind = "review"
 	proj.Spec.Agent.ExtraEnvs = []corev1.EnvVar{
 		{Name: "TATARA_TOOL_PROFILE", Value: "hijacked"},
@@ -148,5 +154,5 @@ func TestBuildPod_ProfileEnvBeatsExtraEnvs(t *testing.T) {
 	}
 	env := g9EnvMap(agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0].Env)
 	require.Equal(t, "review", env["TATARA_TOOL_PROFILE"])
-	require.Equal(t, "3", env["TATARA_CONTRACT_VERSION"])
+	require.Equal(t, "4", env["TATARA_CONTRACT_VERSION"])
 }

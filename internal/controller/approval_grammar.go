@@ -88,7 +88,63 @@ const (
 	// clarify Task, which is the strongest veto they have and the exact gate hole
 	// fix L3-14 closed, was therefore the one refusal with no attribution at all.
 	ApprovalRefusedNoLiveIssue = "no-live-issue"
+	// ApprovalRefusedApproverNotMaintainer: the agent DECLARED an approving
+	// maintainer who is not one. Before #521 this collapsed into the generic
+	// citation-not-maintainer, which reports the wrong thing: the citation may
+	// be fine and the declared login is what is wrong. This is the
+	// reporter-self-approval case, made legible.
+	//
+	// IT IS GATED ON declared != "". On the autoApproveTataraProposals path the
+	// field is legitimately absent and ev.Login is the <tatara:auto> sentinel;
+	// ungated, this refusal would kill every auto-approved proposal on the two
+	// Projects that have the flag on.
+	ApprovalRefusedApproverNotMaintainer = "approver-not-maintainer"
+	// ApprovalRefusedApproverMismatch: the declared approver is not the author
+	// of the comment that was cited. This is what stops the username becoming a
+	// second, weaker authority - the citation stays the SOLE authority and the
+	// username is a declaration that must AGREE with it. Gated on
+	// declared != "" for the same reason as the constant above.
+	ApprovalRefusedApproverMismatch = "approver-mismatch"
+	// ApprovalRefusedPlanNoteMissing: this Task has NO plan note to pin - it
+	// never wrote one, or the one it wrote has been spilled out of status.notes
+	// and its body can no longer be hashed.
+	ApprovalRefusedPlanNoteMissing = "plan-note-missing"
+	// ApprovalRefusedPlanNoteNotPlan: planNoteId does not name THE plan note.
+	//
+	// planNoteId is CLIENT-SUPPLIED and the wire says nothing about the note's
+	// kind, so an agent may send the id of any note it has written. The gate
+	// resolves the plan note ITSELF - the newest note of kind `plan`, which is
+	// the same note the submit-time re-check re-hashes - and the declared id is
+	// a DECLARATION THAT MUST AGREE with it, exactly as approvingMaintainer is a
+	// declaration that must agree with the citation.
+	//
+	// It fires on a note of another kind (a handoff note, a turn note) and on a
+	// SUPERSEDED plan note, because both are the same defect: a hash taken over
+	// a note the re-check will never read. The first defeats the pin outright -
+	// nothing to compare, so no drift is ever detected - and the second fires it
+	// spuriously, bouncing the next untouched submit back to the gate.
+	ApprovalRefusedPlanNoteNotPlan = "plan-note-not-plan"
+	// ApprovalRefusedPlanHashMismatch: the plan note's body changed between the
+	// grant and the attempt to write code against it.
+	ApprovalRefusedPlanHashMismatch = "plan-hash-mismatch"
 )
+
+// ApprovalRefusals is the CLOSED vocabulary. It is the `reason` label on
+// operator_approval_refused_total and the `reason` field in the 200 refusal
+// body, so it must stay small, stable, total, and Prometheus-label-safe.
+var ApprovalRefusals = []string{
+	ApprovalRefusedNoMaintainer,
+	ApprovalRefusedNoCitation,
+	ApprovalRefusedCitationNotMaintainer,
+	ApprovalRefusedQuoteAbsent,
+	ApprovalRefusedEvidenceReplayed,
+	ApprovalRefusedNoLiveIssue,
+	ApprovalRefusedApproverNotMaintainer,
+	ApprovalRefusedApproverMismatch,
+	ApprovalRefusedPlanNoteMissing,
+	ApprovalRefusedPlanNoteNotPlan,
+	ApprovalRefusedPlanHashMismatch,
+}
 
 // ApprovalInScope is C.6 clause (2), narrowed to LIVE issues (fix L3-14): a
 // human closing one issue of a multi-issue Task must not make approval require a
@@ -226,7 +282,7 @@ func quoteOccursIn(body, quoted string) (string, bool) {
 // later "thanks!" from REVOKING an approval already given.
 func verifyOneIssue(iss *tatarav1alpha1.Issue, proj *tatarav1alpha1.Project,
 	repo *tatarav1alpha1.Repository, botLogin string,
-	citations []tatarav1alpha1.ApprovalCitation) (*tatarav1alpha1.ApprovalEvidence, string) {
+	citations []tatarav1alpha1.ApprovalCitation, declared string) (*tatarav1alpha1.ApprovalEvidence, string) {
 
 	if iss.Status.Status == "approved" && iss.Status.Approval != nil {
 		return iss.Status.Approval, ""
@@ -289,6 +345,30 @@ func verifyOneIssue(iss *tatarav1alpha1.Issue, proj *tatarav1alpha1.Project,
 	}
 	if cited == nil {
 		return nil, ApprovalRefusedCitationNotMaintainer
+	}
+
+	// THE DECLARED APPROVER, checked against the CITED comment's author, in this
+	// order: not-a-maintainer first (the more specific, more actionable failure),
+	// then mismatch. It lives HERE and not in verifyApprovalScope because both
+	// checks need the cited comment in hand.
+	//
+	// BOTH ARE SKIPPED ENTIRELY WHEN declared == "". That is not laxity, it is
+	// the autoApproveTataraProposals carve-out: on that path there is no comment
+	// author to name, the field is legitimately absent, and refusing here would
+	// make the carve-out unreachable on the two Projects that have it live. The
+	// PAIR RULE in restapi's gate is what stops an agent simply omitting the
+	// field to dodge these two - a citation with no declared approver is a 400
+	// before this function is ever reached.
+	//
+	// The declaration is a CROSS-CHECK, never a second authority: the citation
+	// stays the sole authority and this only ever REFUSES.
+	if declared != "" {
+		if !isMaintainerLogin(proj, repo, declared, botLogin) {
+			return nil, ApprovalRefusedApproverNotMaintainer
+		}
+		if !strings.EqualFold(declared, cited.Author) {
+			return nil, ApprovalRefusedApproverMismatch
+		}
 	}
 
 	// Clause (c). TrimSpace first: an empty or whitespace-only quote is a
@@ -396,25 +476,40 @@ type GrammarVerifier struct {
 // and refuses both an empty remainder and any in-scope Issue that grants nil
 // evidence. Relying on this arm alone is precisely the hole that let a Task
 // whose only Issue a human had CLOSED reach approved with no evidence at all.
-func (g *GrammarVerifier) VerifyApproval(ctx context.Context, proj *tatarav1alpha1.Project,
+func (g *GrammarVerifier) VerifyApprovalDeclared(ctx context.Context, proj *tatarav1alpha1.Project,
 	iss *tatarav1alpha1.Issue,
-	citations []tatarav1alpha1.ApprovalCitation) (*tatarav1alpha1.ApprovalEvidence, bool) {
+	citations []tatarav1alpha1.ApprovalCitation, declared string) (*tatarav1alpha1.ApprovalEvidence, bool, string) {
 	if !ApprovalInScope(iss) {
-		return iss.Status.Approval, true
+		return iss.Status.Approval, true, ""
 	}
 	botLogin := ""
 	if proj.Spec.Scm != nil {
 		botLogin = proj.Spec.Scm.BotLogin
 	}
 	repo := approvalRepo(ctx, g.Client, iss)
-	ev, reason := verifyOneIssue(iss, proj, repo, botLogin, citations)
+	ev, reason := verifyOneIssue(iss, proj, repo, botLogin, citations, declared)
 	if reason != "" {
 		log.FromContext(ctx).Info("approval refused",
-			"action", "approval_refused", "issue", iss.Name, "reason", reason)
+			"action", "approval_refused", "issue", iss.Name, "reason", reason, "declared", declared)
 		g.Metrics.ApprovalRefused(reason)
-		return nil, false
+		return nil, false, reason
 	}
-	return ev, true
+	return ev, true, ""
+}
+
+// isMaintainerLogin reports whether login is a verified, non-bot maintainer of
+// this project/repo. It is the DECLARED-approver half of the gate and it is
+// deliberately the same list isMaintainerComment consults, so a login that
+// could never have authored a citable comment can never be declared either.
+func isMaintainerLogin(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository,
+	login, botLogin string) bool {
+	if login == "" {
+		return false
+	}
+	if botLogin != "" && strings.EqualFold(login, botLogin) {
+		return false
+	}
+	return tatarav1alpha1.IsMaintainer(proj, repo, login)
 }
 
 // approvalRepo resolves the Issue's Repository for the per-repository

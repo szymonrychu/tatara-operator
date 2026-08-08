@@ -44,8 +44,17 @@ func ApplyIssueClosedStop(ctx context.Context, c client.Client, task *tatarav1al
 		if err := c.Get(ctx, key, fresh); err != nil {
 			return err
 		}
-		if !stage.AllowsIssueClosedStop(fresh.Status.Stage) {
-			return nil // raced off a live source stage (approval/park/deploying); fold
+		// The park half of this gate USED to be free: pre-#521 `parked` was itself
+		// a stage, so AllowsIssueClosedStop excluded it. Splitting state from
+		// parkReason made a parked Task read as its underlying state and this
+		// re-check stopped seeing the park at all - it has to be spelled out, the
+		// same way the caller in issue_controller.go spells it out. stage.Enter
+		// still refuses the write below, so what the missing conjunct actually
+		// cost was truth in the fold barrier: a parked Task with a live fold got
+		// logged as a DEFERRED stop, on the very log line an operator reads to
+		// diagnose a wedged adoption.
+		if tatarav1alpha1.Parked(fresh) || !stage.AllowsIssueClosedStop(fresh.Status.State) {
+			return nil // raced into a park, or off a live source stage (approval/deploying); fold
 		}
 		// THE FOLD BARRIER (issue #467). This edge exists for a HUMAN closing the
 		// driving issue; firing it on a refine umbrella mid-adoption terminates the
@@ -57,8 +66,8 @@ func ApplyIssueClosedStop(ctx context.Context, c client.Client, task *tatarav1al
 			deferred = true
 			return nil
 		}
-		prevStage = fresh.Status.Stage
-		if err := stage.Enter(fresh, nil, tatarav1alpha1.StageRejected, stage.ReasonIssueClosed, now); err != nil {
+		prevStage = fresh.Status.State
+		if err := stage.Enter(fresh, nil, tatarav1alpha1.StateRejected, stage.ReasonIssueClosed, now); err != nil {
 			return nil // guard refused; leave untouched
 		}
 		if err := c.Status().Update(ctx, fresh); err != nil {
@@ -73,7 +82,7 @@ func ApplyIssueClosedStop(ctx context.Context, c client.Client, task *tatarav1al
 	if deferred {
 		log.FromContext(ctx).Info("issue closed while a fold adoption is in flight: deferring the stop",
 			"action", "issue_closed_stop_deferred", "resource_id", task.Name,
-			"stage", task.Status.Stage, "issue", issueName)
+			"state", task.Status.State, "issue", issueName)
 	}
 	if !stopped {
 		return false, nil
@@ -90,7 +99,7 @@ func ApplyIssueClosedStop(ctx context.Context, c client.Client, task *tatarav1al
 	// leaks a LIVE interactive agent pod against a stopped Task until the Task is
 	// reaped - up to DeclinedProposalRetention now that the decline hold exists.
 	// Keep it first; do not add fallible work above it.
-	if stage.AgentKindFor(prevStage) != "" {
+	if stage.AgentKindFor(prevStage, task.Spec.Kind) != "" {
 		if err := agent.DeleteWrapper(ctx, c, task.Namespace, task); err != nil {
 			return true, fmt.Errorf("issue-closed: delete wrapper pod for %s: %w", task.Name, err)
 		}
@@ -325,7 +334,7 @@ func retainProposalDecline(ctx context.Context, c client.Client,
 	}
 	log.FromContext(ctx).Info("retained a discarded brainstorm proposal's mirror",
 		"action", "proposal_declined", "resource_id", iss.Name, "task", task.Name,
-		"owner_stage", task.Status.Stage, "owner_stage_reason", task.Status.StageReason,
+		"owner_stage", task.Status.State, "owner_stage_reason", task.Status.ParkReason,
 		"proposal_kind", tatarav1alpha1.ProposalKindBrainstorm, "comments", len(iss.Status.Comments))
 	return nil
 }

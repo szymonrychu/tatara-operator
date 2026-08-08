@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -18,6 +19,7 @@ import (
 
 	tatarav1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/own"
+	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
 // reviewProject builds a Project with a GitHub bot login and a maintainer
@@ -35,16 +37,16 @@ func reviewProject(name, secretRef, bot string, maintainers []string) *tatarav1.
 	}
 }
 
-// reviewTask builds a Task in reviewing, of the given kind, for the
+// reviewTask builds a Task in awaiting-review, of the given kind, for the
 // review-routing tests.
 func reviewTask(name, projName, kind string) *tatarav1.Task {
 	task := &tatarav1.Task{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 		Spec:       tatarav1.TaskSpec{ProjectRef: projName, Kind: kind, Goal: "g"},
 	}
-	task.Status.Stage = tatarav1.StageReviewing
+	task.Status.State = tatarav1.StateAwaitingReview
 	ent := metav1.Now()
-	task.Status.StageEnteredAt = &ent
+	task.Status.StateEnteredAt = &ent
 	return task
 }
 
@@ -108,7 +110,7 @@ func TestReview_ChangesRequested_ReentersImplementing(t *testing.T) {
 	const secretVal = "whsec-rv1"
 	proj := reviewProject("rv1", "rv1-scm", "tatara-bot", []string{"maint"})
 	repo := repository("repo-rv1", "rv1", "https://github.com/o/r.git", "main")
-	task := reviewTask("rv1-task", "rv1", "clarify")
+	task := reviewTask("rv1-task", "rv1", "implement")
 	mr := reviewMR(tatarav1.MergeRequestName(repo.Name, 42), "rv1", repo.Name, 42, task)
 	c := seedClient(t, proj, secret("rv1-scm", secretVal), repo, task, mr)
 	h, _ := newServer(t, c)
@@ -116,7 +118,7 @@ func TestReview_ChangesRequested_ReentersImplementing(t *testing.T) {
 	postReview(t, h, "rv1", secretVal, reviewBody("submitted", "changes_requested", 900, "maint", 42))
 
 	got := getTask(t, c, task.Name)
-	require.Equal(t, tatarav1.StageImplementing, got.Status.Stage)
+	require.Equal(t, tatarav1.StateUnderImplementation, got.Status.State)
 }
 
 // A non-maintainer review is ignored.
@@ -124,7 +126,7 @@ func TestReview_NonMaintainer_Ignored(t *testing.T) {
 	const secretVal = "whsec-rv2"
 	proj := reviewProject("rv2", "rv2-scm", "tatara-bot", []string{"maint"})
 	repo := repository("repo-rv2", "rv2", "https://github.com/o/r.git", "main")
-	task := reviewTask("rv2-task", "rv2", "clarify")
+	task := reviewTask("rv2-task", "rv2", "implement")
 	mr := reviewMR(tatarav1.MergeRequestName(repo.Name, 43), "rv2", repo.Name, 43, task)
 	c := seedClient(t, proj, secret("rv2-scm", secretVal), repo, task, mr)
 	h, _ := newServer(t, c)
@@ -132,7 +134,7 @@ func TestReview_NonMaintainer_Ignored(t *testing.T) {
 	postReview(t, h, "rv2", secretVal, reviewBody("submitted", "changes_requested", 901, "rando", 43))
 
 	got := getTask(t, c, task.Name)
-	require.Equal(t, tatarav1.StageReviewing, got.Status.Stage, "a non-maintainer's review must have no effect")
+	require.Equal(t, tatarav1.StateAwaitingReview, got.Status.State, "a non-maintainer's review must have no effect")
 }
 
 // A maintainer approval enters merging.
@@ -140,7 +142,7 @@ func TestReview_Approved_EntersMerging(t *testing.T) {
 	const secretVal = "whsec-rv3"
 	proj := reviewProject("rv3", "rv3-scm", "tatara-bot", []string{"maint"})
 	repo := repository("repo-rv3", "rv3", "https://github.com/o/r.git", "main")
-	task := reviewTask("rv3-task", "rv3", "clarify")
+	task := reviewTask("rv3-task", "rv3", "implement")
 	mr := reviewMR(tatarav1.MergeRequestName(repo.Name, 44), "rv3", repo.Name, 44, task)
 	mr.Status.PendingReview = &tatarav1.PendingReview{Round: 1} // bot review still owed
 	c := seedClient(t, proj, secret("rv3-scm", secretVal), repo, task, mr)
@@ -149,7 +151,7 @@ func TestReview_Approved_EntersMerging(t *testing.T) {
 	postReview(t, h, "rv3", secretVal, reviewBody("submitted", "approved", 902, "maint", 44))
 
 	got := getTask(t, c, task.Name)
-	require.Equal(t, tatarav1.StageMerging, got.Status.Stage)
+	require.Equal(t, tatarav1.StateMerged, got.Status.State)
 
 	var gotMR tatarav1.MergeRequest
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: mr.Name}, &gotMR))
@@ -159,12 +161,14 @@ func TestReview_Approved_EntersMerging(t *testing.T) {
 
 // changes_requested on an adopted human PR (owning Task Kind=review) does NOT
 // drive implementing. ApplyReviewChangesRequested refuses the kind=review edge
-// and folds to the pending-event path (deliverPendingEvent), which now (Task 9)
-// also opens a live conversation on a qualifying reviewing-stage event: the
-// human's feedback reaches a clarify agent instead of only queueing silently.
-// conversing is NOT implementing/merging - the F.3 kind guard still refuses
-// those for kind=review, by any path - so this is a widening of
-// responsiveness, never of the approval gate.
+// and folds to the pending-event path (deliverPendingEvent), which delivers a
+// live turn to a qualifying already-live Task instead of only queueing
+// silently - but under #521 awaiting-review IS a live state by itself (there
+// is no separate "conversing" state to move into, and DeliverLiveTurn is not a
+// transition), so the Task's state never moves and HumanReviewRounds - which
+// only Unpark's PARKED re-entry increments - stays at 0. The F.3 kind guard
+// still refuses under-implementation/merged for kind=review, by any path, so
+// this is a widening of responsiveness, never of the approval gate.
 func TestReview_ChangesRequested_ReviewKind_NotDriven(t *testing.T) {
 	const secretVal = "whsec-rv4"
 	proj := reviewProject("rv4", "rv4-scm", "tatara-bot", []string{"maint"})
@@ -177,9 +181,10 @@ func TestReview_ChangesRequested_ReviewKind_NotDriven(t *testing.T) {
 	postReview(t, h, "rv4", secretVal, reviewBody("submitted", "changes_requested", 903, "maint", 45))
 
 	got := getTask(t, c, task.Name)
-	require.Equal(t, tatarav1.StageConversing, got.Status.Stage,
-		"a kind=review Task is never driven to implementing, but a qualifying review now opens a conversation")
-	require.Equal(t, 1, got.Status.HumanReviewRounds, "entry from reviewing bumps the round counter, exactly like the awaiting-human re-entry")
+	require.Equal(t, tatarav1.StateAwaitingReview, got.Status.State,
+		"a kind=review Task is never driven to under-implementation/merged, and un-park/live-turn delivery never moves state")
+	require.Len(t, got.Status.PendingEvents, 1, "the review folds to the pending-event path rather than being lost")
+	require.Equal(t, 0, got.Status.HumanReviewRounds, "DeliverLiveTurn only checks the round cap on an already-live Task; only Unpark's parked re-entry increments it")
 }
 
 // The SAME (review.id, state) delivered twice fires the transition once. A
@@ -192,24 +197,24 @@ func TestReview_DedupOnReviewIDState(t *testing.T) {
 	const secretVal = "whsec-rv5"
 	proj := reviewProject("rv5", "rv5-scm", "tatara-bot", []string{"maint"})
 	repo := repository("repo-rv5", "rv5", "https://github.com/o/r.git", "main")
-	task := reviewTask("rv5-task", "rv5", "clarify")
-	task.Status.Stage = tatarav1.StageMerging
+	task := reviewTask("rv5-task", "rv5", "implement")
+	task.Status.State = tatarav1.StateMerged
 	mr := reviewMR(tatarav1.MergeRequestName(repo.Name, 46), "rv5", repo.Name, 46, task)
 	c := seedClient(t, proj, secret("rv5-scm", secretVal), repo, task, mr)
 	h, _ := newServer(t, c)
 
 	postReview(t, h, "rv5", secretVal, reviewBody("submitted", "changes_requested", 904, "maint", 46))
 	got := getTask(t, c, task.Name)
-	require.Equal(t, tatarav1.StageImplementing, got.Status.Stage, "first delivery re-enters implementing")
+	require.Equal(t, tatarav1.StateUnderImplementation, got.Status.State, "first delivery re-enters implementing")
 
-	// Simulate independent progress back to merging - the same edge that just
+	// Simulate independent progress back to merged - the same edge that just
 	// fired is legal again, so only the dedup marker can stop a re-fire.
-	got.Status.Stage = tatarav1.StageMerging
+	got.Status.State = tatarav1.StateMerged
 	require.NoError(t, c.Status().Update(context.Background(), got))
 
 	postReview(t, h, "rv5", secretVal, reviewBody("submitted", "changes_requested", 904, "maint", 46))
 	got2 := getTask(t, c, task.Name)
-	require.Equal(t, tatarav1.StageMerging, got2.Status.Stage, "the second identical (review.id,state) delivery must not re-fire")
+	require.Equal(t, tatarav1.StateMerged, got2.Status.State, "the second identical (review.id,state) delivery must not re-fire")
 }
 
 // A maintainer's commented review folds to the pending-event path (contract
@@ -220,7 +225,7 @@ func TestReview_Commented_CarriesBodyToPendingEvent(t *testing.T) {
 	const secretVal = "whsec-rv7"
 	proj := reviewProject("rv7", "rv7-scm", "tatara-bot", []string{"maint"})
 	repo := repository("repo-rv7", "rv7", "https://github.com/o/r.git", "main")
-	task := reviewTask("rv7-task", "rv7", "clarify")
+	task := reviewTask("rv7-task", "rv7", "implement")
 	mr := reviewMR(tatarav1.MergeRequestName(repo.Name, 48), "rv7", repo.Name, 48, task)
 	c := seedClient(t, proj, secret("rv7-scm", secretVal), repo, task, mr)
 	h, _ := newServer(t, c)
@@ -244,7 +249,7 @@ func TestReview_Redelivered_Deduped(t *testing.T) {
 	const secretVal = "whsec-rvdd"
 	proj := reviewProject("rvdd", "rvdd-scm", "tatara-bot", []string{"maint"})
 	repo := repository("repo-rvdd", "rvdd", "https://github.com/o/r.git", "main")
-	task := reviewTask("rvdd-task", "rvdd", "clarify")
+	task := reviewTask("rvdd-task", "rvdd", "implement")
 	mr := reviewMR(tatarav1.MergeRequestName(repo.Name, 60), "rvdd", repo.Name, 60, task)
 	c := seedClient(t, proj, secret("rvdd-scm", secretVal), repo, task, mr)
 	h, _ := newServer(t, c)
@@ -252,24 +257,31 @@ func TestReview_Redelivered_Deduped(t *testing.T) {
 	body := reviewBody("submitted", "changes_requested", 4242, "maint", 60)
 	postReview(t, h, "rvdd", secretVal, body)
 	first := getTask(t, c, task.Name)
-	require.Equal(t, tatarav1.StageImplementing, first.Status.Stage)
+	require.Equal(t, tatarav1.StateUnderImplementation, first.Status.State)
 	require.NotEmpty(t, first.Annotations["tatara.dev/reviewed"], "the dedup marker must persist")
 
 	// Redeliver the identical review: deduped, no second transition.
 	postReview(t, h, "rvdd", secretVal, body)
 	second := getTask(t, c, task.Name)
-	require.Equal(t, tatarav1.StageImplementing, second.Status.Stage, "a redelivery must not re-fire the verdict")
+	require.Equal(t, tatarav1.StateUnderImplementation, second.Status.State, "a redelivery must not re-fire the verdict")
 }
 
-// A terminal (failed) owning Task is never resurrected: changes_requested on it
-// is ignored, the stage is untouched (server.go TaskDone guard).
+// A genuinely terminal (rejected) owning Task is never resurrected:
+// changes_requested on it is ignored, the state is untouched (server.go
+// TaskDone guard). #521 folded the old separate `failed` terminal into the
+// park flag, and TaskDone is now EXACTLY state in {done, rejected} - a merely
+// PARKED Task (whatever the reason) is NOT TaskDone and IS routed by
+// ApplyReviewChangesRequested's park-reason rules (see
+// TestReview_ChangesRequested_ParkedMergeTimeout_ResumesMerging and
+// TestReview_ChangesRequested_ParkedReviewLoopExhausted_Folds below), so this
+// fixture must be an ACTUAL terminal state to still exercise the TaskDone
+// guard this test names.
 func TestReview_TerminalTask_Ignored(t *testing.T) {
 	const secretVal = "whsec-rv8"
 	proj := reviewProject("rv8", "rv8-scm", "tatara-bot", []string{"maint"})
 	repo := repository("repo-rv8", "rv8", "https://github.com/o/r.git", "main")
-	task := reviewTask("rv8-task", "rv8", "clarify")
-	task.Status.Stage = tatarav1.StageFailed
-	task.Status.StageReason = "turn-budget-exhausted"
+	task := reviewTask("rv8-task", "rv8", "implement")
+	task.Status.State = tatarav1.StateRejected
 	mr := reviewMR(tatarav1.MergeRequestName(repo.Name, 49), "rv8", repo.Name, 49, task)
 	c := seedClient(t, proj, secret("rv8-scm", secretVal), repo, task, mr)
 	h, _ := newServer(t, c)
@@ -277,18 +289,24 @@ func TestReview_TerminalTask_Ignored(t *testing.T) {
 	postReview(t, h, "rv8", secretVal, reviewBody("submitted", "changes_requested", 907, "maint", 49))
 
 	got := getTask(t, c, task.Name)
-	require.Equal(t, tatarav1.StageFailed, got.Status.Stage, "a terminal Task is never resurrected")
+	require.Equal(t, tatarav1.StateRejected, got.Status.State, "a terminal Task is never resurrected")
 }
 
-// changes_requested on a parked(merge-timeout) Task resumes MERGING (F1), routed
-// by the park reason - not implementing.
+// changes_requested on a parked(merge-timeout) Task resumes MERGED (F1), routed
+// by the park reason - not implementing. merge-timeout only ever parks a Task
+// FROM merged (park.go's onElapse table), so the pre-park state here is
+// StateMerged; stage.Park never changes it, and reenterParkedOnReview's
+// merge-timeout arm re-arms in place, so the Task stays exactly there -
+// un-parked.
 func TestReview_ChangesRequested_ParkedMergeTimeout_ResumesMerging(t *testing.T) {
 	const secretVal = "whsec-rv9"
 	proj := reviewProject("rv9", "rv9-scm", "tatara-bot", []string{"maint"})
 	repo := repository("repo-rv9", "rv9", "https://github.com/o/r.git", "main")
-	task := reviewTask("rv9-task", "rv9", "clarify")
-	task.Status.Stage = tatarav1.StageParked
-	task.Status.StageReason = "merge-timeout"
+	task := reviewTask("rv9-task", "rv9", "implement")
+	task.Status.State = tatarav1.StateMerged
+	if err := stage.Park(task, stage.ReasonMergeTimeout, time.Now()); err != nil {
+		t.Fatalf("park: %v", err)
+	}
 	mr := reviewMR(tatarav1.MergeRequestName(repo.Name, 50), "rv9", repo.Name, 50, task)
 	c := seedClient(t, proj, secret("rv9-scm", secretVal), repo, task, mr)
 	h, _ := newServer(t, c)
@@ -296,19 +314,24 @@ func TestReview_ChangesRequested_ParkedMergeTimeout_ResumesMerging(t *testing.T)
 	postReview(t, h, "rv9", secretVal, reviewBody("submitted", "changes_requested", 908, "maint", 50))
 
 	got := getTask(t, c, task.Name)
-	require.Equal(t, tatarav1.StageMerging, got.Status.Stage, "merge-timeout re-enters merging, never implementing")
+	require.False(t, tatarav1.Parked(got), "merge-timeout re-entry un-parks in place")
+	require.Equal(t, tatarav1.StateMerged, got.Status.State, "merge-timeout re-enters merged, never implementing")
 	require.Equal(t, 1, got.Status.MergeReentries)
 }
 
 // changes_requested on a parked(review-loop-exhausted) Task folds to the
-// pending-event path (the review is not lost) and does NOT re-enter (F1).
+// pending-event path (the review is not lost) and does NOT re-enter (F1):
+// review-loop-exhausted is UnparkNever, so ReenterOnReviewChangesRequested's
+// parked branch declines and the Task stays parked exactly as it was.
 func TestReview_ChangesRequested_ParkedReviewLoopExhausted_Folds(t *testing.T) {
 	const secretVal = "whsec-rv10"
 	proj := reviewProject("rv10", "rv10-scm", "tatara-bot", []string{"maint"})
 	repo := repository("repo-rv10", "rv10", "https://github.com/o/r.git", "main")
-	task := reviewTask("rv10-task", "rv10", "clarify")
-	task.Status.Stage = tatarav1.StageParked
-	task.Status.StageReason = "review-loop-exhausted"
+	task := reviewTask("rv10-task", "rv10", "implement")
+	task.Status.State = tatarav1.StateAwaitingReview
+	if err := stage.Park(task, stage.ReasonReviewLoopExhausted, time.Now()); err != nil {
+		t.Fatalf("park: %v", err)
+	}
 	mr := reviewMR(tatarav1.MergeRequestName(repo.Name, 51), "rv10", repo.Name, 51, task)
 	c := seedClient(t, proj, secret("rv10-scm", secretVal), repo, task, mr)
 	h, _ := newServer(t, c)
@@ -316,7 +339,7 @@ func TestReview_ChangesRequested_ParkedReviewLoopExhausted_Folds(t *testing.T) {
 	postReview(t, h, "rv10", secretVal, reviewBody("submitted", "changes_requested", 909, "maint", 51))
 
 	got := getTask(t, c, task.Name)
-	require.Equal(t, tatarav1.StageParked, got.Status.Stage, "review-loop-exhausted must not re-enter on a human review")
+	require.True(t, tatarav1.Parked(got), "review-loop-exhausted must not re-enter on a human review")
 	require.Len(t, got.Status.PendingEvents, 1, "the review folds to the pending-event path, not lost")
 }
 
@@ -325,7 +348,7 @@ func TestReview_Dismissed_Ignored(t *testing.T) {
 	const secretVal = "whsec-rv6"
 	proj := reviewProject("rv6", "rv6-scm", "tatara-bot", []string{"maint"})
 	repo := repository("repo-rv6", "rv6", "https://github.com/o/r.git", "main")
-	task := reviewTask("rv6-task", "rv6", "clarify")
+	task := reviewTask("rv6-task", "rv6", "implement")
 	mr := reviewMR(tatarav1.MergeRequestName(repo.Name, 47), "rv6", repo.Name, 47, task)
 	c := seedClient(t, proj, secret("rv6-scm", secretVal), repo, task, mr)
 	h, _ := newServer(t, c)
@@ -333,5 +356,5 @@ func TestReview_Dismissed_Ignored(t *testing.T) {
 	postReview(t, h, "rv6", secretVal, reviewBody("dismissed", "dismissed", 905, "maint", 47))
 
 	got := getTask(t, c, task.Name)
-	require.Equal(t, tatarav1.StageReviewing, got.Status.Stage, "a dismissed review must have no effect")
+	require.Equal(t, tatarav1.StateAwaitingReview, got.Status.State, "a dismissed review must have no effect")
 }

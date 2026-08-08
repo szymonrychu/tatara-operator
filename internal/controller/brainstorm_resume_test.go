@@ -25,28 +25,29 @@ import (
 //
 // The name still says only what it has always said - documentation and
 // pin-bump Tasks are excluded - because that half of the table is the one
-// that must never silently regress. clarify, incident and takeover are
+// that must never silently regress. implement, incident and takeover are
 // asserted TRUE in the same table (a merged MR for any of them lands real
 // code, so the project moved), so an eighth kind added later still fails
 // this test instead of picking a silent default, on either side of the line.
 func TestBrainstormResumeKindExcludesDocumentationAndPinBumpTasks(t *testing.T) {
 	// Task.Spec.Kind is a CLOSED CRD enum (task_types.go): brainstorm, incident,
-	// clarify, refine, review, documentation, takeover. Every value is listed
+	// implement, refine, review, documentation, takeover. #521 merged clarify
+	// into implement (the full proposal-to-implementation lifecycle kind);
+	// clarify is no longer a member of the enum at all. Every value is listed
 	// here on purpose, so adding an eighth kind fails this test rather than
 	// silently picking a default.
 	tests := []struct {
 		kind string
 		want bool
 	}{
-		{"clarify", true},  // the full proposal-to-implementation lifecycle
-		{"incident", true}, // an incident fix landing IS the project moving
-		{"takeover", true}, // a takeover MR lands real code - the project moved
+		{"implement", true}, // the full proposal-to-implementation lifecycle
+		{"incident", true},  // an incident fix landing IS the project moving
+		{"takeover", true},  // a takeover MR lands real code - the project moved
 		{"documentation", false},
 		{"refine", false},
 		{"review", false},
 		{"brainstorm", false},
 		{"", false},
-		{"implement", false}, // an AGENT kind, never a Task.Spec.Kind
 	}
 	for _, tc := range tests {
 		t.Run(tc.kind, func(t *testing.T) {

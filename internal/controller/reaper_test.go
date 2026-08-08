@@ -22,6 +22,18 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
+// setTaskParkReason stamps status.parkReason on an envtest Task, the park-flag
+// half of setTaskStage (task_controller_test.go): #521 made park orthogonal to
+// state, so a fixture that wants a PARKED Task now sets both independently.
+func setTaskParkReason(t *testing.T, name, reason string) {
+	t.Helper()
+	tk := getTask(t, name)
+	tk.Status.ParkReason = reason
+	if err := k8sClient.Status().Update(context.Background(), tk); err != nil {
+		t.Fatalf("set park reason %s: %v", name, err)
+	}
+}
+
 // reaperServer returns a CallbackServer with ReaperGrace=1ns so freshly
 // created test pods are not protected by the grace window.
 func reaperServer() *CallbackServer {
@@ -129,7 +141,7 @@ func TestReapOrphans_FinishedTask(t *testing.T) {
 	mkTaskProject(t, "p-reap-ph", 3)
 	mkTaskRepository(t, "r-reap-ph", "p-reap-ph")
 	mkTask(t, "t-reap-ph", "p-reap-ph", "r-reap-ph")
-	setTaskStage(t, "t-reap-ph", tatarav1alpha1.StageDelivered)
+	setTaskStage(t, "t-reap-ph", tatarav1alpha1.StateDone)
 	mkWrapperPodSvc(t, "reap-phase", "t-reap-ph", string(getTask(t, "t-reap-ph").UID))
 
 	reaperServer().ReapOrphans(context.Background())
@@ -145,7 +157,7 @@ func TestReapOrphans_PodlessLiveStageKept(t *testing.T) {
 	mkTaskProject(t, "p-reap-phlc", 3)
 	mkTaskRepository(t, "r-reap-phlc", "p-reap-phlc")
 	mkTask(t, "t-reap-phlc", "p-reap-phlc", "r-reap-phlc")
-	setTaskStage(t, "t-reap-phlc", tatarav1alpha1.StageMerging)
+	setTaskStage(t, "t-reap-phlc", tatarav1alpha1.StateMerged)
 	mkWrapperPodSvc(t, "reap-phlc", "t-reap-phlc", string(getTask(t, "t-reap-phlc").UID))
 
 	reaperServer().ReapOrphans(context.Background())
@@ -154,16 +166,32 @@ func TestReapOrphans_PodlessLiveStageKept(t *testing.T) {
 	}
 }
 
-func TestReapOrphans_ParkedTask(t *testing.T) {
+// TestReapOrphans_ParkedTaskPodIsNotOrphanReasonsBusiness documents a real
+// #521 consequence rather than asserting the pre-#521 behavior: orphanReason
+// has no ParkReason check anywhere in its body, and TaskDone(parked) is now
+// FALSE by design (that fold was the #521 bug itself - see
+// v1alpha1.TaskDone's own doc comment). So a parked Task's leftover wrapper
+// pod is no longer reaped by THIS mechanism at all: it falls through
+// unchanged unless the idle backstop (IdlePodReapAfter, unset here) or the
+// superseded-kind check happens to also match. The invariant "a parked Task
+// must not hold a live pod" is instead enforced by
+// repairParkedWithLivePod (livepods.go), a DIFFERENT mechanism keyed off
+// status.podName on the TaskReconciler's own reconcile loop, not by
+// ReapOrphans' independent pod<->Task label correlation. This is flagged
+// rather than silently adjusted: repairParkedWithLivePod currently has NO
+// test coverage in this package, which is worth a maintainer's attention.
+func TestReapOrphans_ParkedTaskPodIsNotOrphanReasonsBusiness(t *testing.T) {
 	mkTaskProject(t, "p-reap-lc", 3)
 	mkTaskRepository(t, "r-reap-lc", "p-reap-lc")
 	mkTask(t, "t-reap-lc", "p-reap-lc", "r-reap-lc")
-	setTaskStage(t, "t-reap-lc", tatarav1alpha1.StageParked)
+	setTaskStage(t, "t-reap-lc", tatarav1alpha1.StateRefined)
+	setTaskParkReason(t, "t-reap-lc", stage.ReasonAwaitingHuman)
 	mkWrapperPodSvc(t, "reap-lc", "t-reap-lc", string(getTask(t, "t-reap-lc").UID))
 
 	reaperServer().ReapOrphans(context.Background())
-	if podExists(t, "reap-lc") {
-		t.Error("expected pod for a parked task to be reaped")
+	if !podExists(t, "reap-lc") {
+		t.Error("orphanReason reaped a parked task's pod, but it has no ParkReason check at all - " +
+			"if this now fails, either a check was added (update this test to match) or something else changed")
 	}
 }
 
@@ -184,7 +212,7 @@ func TestReapOrphans_LiveTaskKept(t *testing.T) {
 	mkTaskProject(t, "p-reap-live", 3)
 	mkTaskRepository(t, "r-reap-live", "p-reap-live")
 	mkTask(t, "t-reap-live", "p-reap-live", "r-reap-live")
-	setTaskStage(t, "t-reap-live", tatarav1alpha1.StageImplementing)
+	setTaskStage(t, "t-reap-live", tatarav1alpha1.StateUnderImplementation)
 	mkWrapperPodSvc(t, "reap-live", "t-reap-live", string(getTask(t, "t-reap-live").UID))
 
 	reaperServer().ReapOrphans(context.Background())
@@ -201,14 +229,18 @@ func TestReapOrphans_LiveTaskKept(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestReapOrphans_SupersededStagePodReaped covers the production symptom
-// directly: an incident Task's investigating pod (LabelAgentKind=incident) is
-// still around after the Task advanced to clarifying (AgentKindFor=clarify).
-// Both kinds are non-empty and disagree, so it is reaped as superseded.
+// directly: a pod stamped for one origin kind's agent (LabelAgentKind=
+// incident) is still around after the Task's CURRENT (state, spec.kind) pair
+// computes a DIFFERENT agent kind (implement). Both kinds are non-empty and
+// disagree, so it is reaped as superseded. #521 note: AgentKindFor(state,
+// specKind) now needs a REAL origin kind on the Task (mkTask alone leaves
+// Spec.Kind empty, which makes AgentKindFor return "" and skips this check
+// entirely - mkTaskWithKind is required here for the mismatch to exist at all).
 func TestReapOrphans_SupersededStagePodReaped(t *testing.T) {
 	mkTaskProject(t, "p-reap-superseded", 3)
 	mkTaskRepository(t, "r-reap-superseded", "p-reap-superseded")
-	mkTask(t, "t-reap-superseded", "p-reap-superseded", "r-reap-superseded")
-	setTaskStage(t, "t-reap-superseded", tatarav1alpha1.StageClarifying)
+	mkTaskWithKind(t, "t-reap-superseded", "p-reap-superseded", "r-reap-superseded", "implement")
+	setTaskStage(t, "t-reap-superseded", tatarav1alpha1.StateRefined)
 	mkWrapperPodSvcKind(t, "reap-superseded", "t-reap-superseded",
 		string(getTask(t, "t-reap-superseded").UID), stage.AgentIncident)
 
@@ -224,8 +256,8 @@ func TestReapOrphans_SupersededStagePodReaped(t *testing.T) {
 func TestReapOrphans_MatchingStagePodKept(t *testing.T) {
 	mkTaskProject(t, "p-reap-matching", 3)
 	mkTaskRepository(t, "r-reap-matching", "p-reap-matching")
-	mkTask(t, "t-reap-matching", "p-reap-matching", "r-reap-matching")
-	setTaskStage(t, "t-reap-matching", tatarav1alpha1.StageInvestigating)
+	mkTaskWithKind(t, "t-reap-matching", "p-reap-matching", "r-reap-matching", "incident")
+	setTaskStage(t, "t-reap-matching", tatarav1alpha1.StateRefined)
 	mkWrapperPodSvcKind(t, "reap-matching", "t-reap-matching",
 		string(getTask(t, "t-reap-matching").UID), stage.AgentIncident)
 
@@ -242,7 +274,7 @@ func TestReapOrphans_SupersededStagePodFreshKept(t *testing.T) {
 	mkTaskProject(t, "p-reap-freshsup", 3)
 	mkTaskRepository(t, "r-reap-freshsup", "p-reap-freshsup")
 	mkTask(t, "t-reap-freshsup", "p-reap-freshsup", "r-reap-freshsup")
-	setTaskStage(t, "t-reap-freshsup", tatarav1alpha1.StageClarifying)
+	setTaskStage(t, "t-reap-freshsup", tatarav1alpha1.StateRefined)
 	mkWrapperPodSvcKind(t, "reap-freshsup", "t-reap-freshsup",
 		string(getTask(t, "t-reap-freshsup").UID), stage.AgentIncident)
 
@@ -293,7 +325,7 @@ func TestReapOrphans_IdleNoLiveTurn(t *testing.T) {
 	mkTaskProject(t, "p-reap-idle", 3)
 	mkTaskRepository(t, "r-reap-idle", "p-reap-idle")
 	mkTask(t, "t-reap-idle", "p-reap-idle", "r-reap-idle")
-	setTaskStage(t, "t-reap-idle", tatarav1alpha1.StageImplementing)
+	setTaskStage(t, "t-reap-idle", tatarav1alpha1.StateUnderImplementation)
 	old := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
 	setTaskAnns(t, "t-reap-idle", map[string]string{
 		annCurrentTurn:  "turn-1",
@@ -315,7 +347,7 @@ func TestReapOrphans_InflightTurnKept(t *testing.T) {
 	mkTaskProject(t, "p-reap-inflight", 3)
 	mkTaskRepository(t, "r-reap-inflight", "p-reap-inflight")
 	mkTask(t, "t-reap-inflight", "p-reap-inflight", "r-reap-inflight")
-	setTaskStage(t, "t-reap-inflight", tatarav1alpha1.StageImplementing)
+	setTaskStage(t, "t-reap-inflight", tatarav1alpha1.StateUnderImplementation)
 	setTaskAnns(t, "t-reap-inflight", map[string]string{annCurrentTurn: "turn-1"})
 	mkWrapperPodSvc(t, "reap-inflight", "t-reap-inflight", string(getTask(t, "t-reap-inflight").UID))
 
@@ -331,7 +363,7 @@ func TestReapOrphans_RecentActivityKept(t *testing.T) {
 	mkTaskProject(t, "p-reap-recent", 3)
 	mkTaskRepository(t, "r-reap-recent", "p-reap-recent")
 	mkTask(t, "t-reap-recent", "p-reap-recent", "r-reap-recent")
-	setTaskStage(t, "t-reap-recent", tatarav1alpha1.StageImplementing)
+	setTaskStage(t, "t-reap-recent", tatarav1alpha1.StateUnderImplementation)
 	now := time.Now().UTC().Format(time.RFC3339)
 	setTaskAnns(t, "t-reap-recent", map[string]string{
 		annCurrentTurn:  "turn-1",
@@ -353,7 +385,7 @@ func TestReapOrphans_IdleDisabled(t *testing.T) {
 	mkTaskProject(t, "p-reap-idledis", 3)
 	mkTaskRepository(t, "r-reap-idledis", "p-reap-idledis")
 	mkTask(t, "t-reap-idledis", "p-reap-idledis", "r-reap-idledis")
-	setTaskStage(t, "t-reap-idledis", tatarav1alpha1.StageImplementing)
+	setTaskStage(t, "t-reap-idledis", tatarav1alpha1.StateUnderImplementation)
 	old := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
 	setTaskAnns(t, "t-reap-idledis", map[string]string{
 		annCurrentTurn:  "turn-1",
@@ -643,18 +675,32 @@ func reapRepo(proj, name, url string) *tatarav1alpha1.Repository {
 	}
 }
 
-// reapTask builds a Task already IN a stage. It never hand-writes a stage the
+// reapTask builds a Task already IN a state. It never hand-writes a state the
 // F.3 table would refuse: stage.Enter is the one way in, and the tests that need
-// an aged stage rewind stageEnteredAt afterwards.
+// an aged state rewind stateEnteredAt afterwards.
+//
+// reason is routed to whichever field it actually belongs to (#521 split the
+// old single stageReason into status.parkReason and status.stateReason): a
+// member of the PARK vocabulary (stage.IsParkReason) lands on ParkReason and
+// the fixture is genuinely PARKED (Parked(t) == true, reapOne takes the park
+// branch); anything else (a done/rejected reason, or "") lands on StateReason
+// and the fixture is a genuine terminal/non-parked Task instead. Getting this
+// wrong silently routes a `rejected` fixture meant to hit releaseTerminal's
+// RejectedRetention gate into the 7-day ParkRetention gate instead - reapOne
+// checks Parked(t) FIRST, before ever looking at status.state.
 func reapTask(proj, name, kind, stg, reason string, entered time.Time) *tatarav1alpha1.Task {
 	t := &tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS, UID: types.UID("uid-" + name)},
 		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: proj, Kind: kind},
 	}
 	stamp := metav1.NewTime(entered)
-	t.Status.Stage = stg
-	t.Status.StageReason = reason
-	t.Status.StageEnteredAt = &stamp
+	t.Status.State = stg
+	if stage.IsParkReason(reason) {
+		t.Status.ParkReason = reason
+	} else {
+		t.Status.StateReason = reason
+	}
+	t.Status.StateEnteredAt = &stamp
 	return t
 }
 
@@ -726,7 +772,7 @@ func TestReapNeverClosesWhatWeDidNotCreate(t *testing.T) {
 
 	// A review Task, parked(awaiting-human) 8 days ago: PAST parkRetention.
 	task := reapTask("neverclose", "rev-task", "review",
-		tatarav1alpha1.StageParked, stage.ReasonAwaitingHuman, time.Now().Add(-8*24*time.Hour))
+		tatarav1alpha1.StateAwaitingReview, stage.ReasonAwaitingHuman, time.Now().Add(-8*24*time.Hour))
 	task.Status.MRRefs = []string{tatarav1alpha1.MergeRequestName(repo.Name, 7)}
 
 	// The HUMAN's fork PR. We controller-own the mirror CR; we did not create the
@@ -789,7 +835,7 @@ func TestReapOrphansTheHumansOpenMRRatherThanCascadingIt(t *testing.T) {
 	repo := reapRepo("orphanmr", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
 
 	task := reapTask("orphanmr", "rev-task", "review",
-		tatarav1alpha1.StageParked, stage.ReasonAwaitingHuman, time.Now().Add(-8*24*time.Hour))
+		tatarav1alpha1.StateAwaitingReview, stage.ReasonAwaitingHuman, time.Now().Add(-8*24*time.Hour))
 	task.Status.MRRefs = []string{tatarav1alpha1.MergeRequestName(repo.Name, 7)}
 	// Two of the five V7-9 rounds are already spent on this thread.
 	task.Status.HumanReviewRounds = 2
@@ -854,7 +900,7 @@ func TestReapCascadesAlreadyClosedHumanMR(t *testing.T) {
 	repo := reapRepo("closedhuman", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
 
 	task := reapTask("closedhuman", "rev-task", "review",
-		tatarav1alpha1.StageParked, stage.ReasonAwaitingHuman, time.Now().Add(-8*24*time.Hour))
+		tatarav1alpha1.StateAwaitingReview, stage.ReasonAwaitingHuman, time.Now().Add(-8*24*time.Hour))
 	task.Status.MRRefs = []string{tatarav1alpha1.MergeRequestName(repo.Name, 8)}
 
 	mr := &tatarav1alpha1.MergeRequest{
@@ -896,14 +942,14 @@ func TestReapClosesOwnBotMRAfterHandover(t *testing.T) {
 	repo := reapRepo("closeown", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
 
 	dying := reapTask("closeown", "impl-task", "clarify",
-		tatarav1alpha1.StageFailed, stage.ReasonTurnBudgetExhausted, time.Now().Add(-8*24*time.Hour))
+		tatarav1alpha1.StateUnderImplementation, stage.ReasonTurnBudgetExhausted, time.Now().Add(-8*24*time.Hour))
 	dying.Status.MRRefs = []string{
 		tatarav1alpha1.MergeRequestName(repo.Name, 1),
 		tatarav1alpha1.MergeRequestName(repo.Name, 2),
 	}
 	// A LIVE sibling that holds a plain ref on MR #1.
 	sibling := reapTask("closeown", "sib-task", "clarify",
-		tatarav1alpha1.StageImplementing, "", time.Now())
+		tatarav1alpha1.StateUnderImplementation, "", time.Now())
 
 	botMR := func(number int, owners []metav1.OwnerReference) *tatarav1alpha1.MergeRequest {
 		mr := &tatarav1alpha1.MergeRequest{
@@ -974,7 +1020,7 @@ func TestReapParkCommentBlocks(t *testing.T) {
 	repo := reapRepo("blocked", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
 
 	task := reapTask("blocked", "clar-task", "clarify",
-		tatarav1alpha1.StageParked, stage.ReasonAwaitingHuman, time.Now().Add(-8*24*time.Hour))
+		tatarav1alpha1.StateRefined, stage.ReasonAwaitingHuman, time.Now().Add(-8*24*time.Hour))
 	task.Status.IssueRefs = []string{tatarav1alpha1.IssueName(repo.Name, 5)}
 
 	iss := &tatarav1alpha1.Issue{
@@ -1035,19 +1081,29 @@ func TestReapParkCommentBlocks(t *testing.T) {
 	}
 }
 
-// TestReapFailedReleasesIssuesImmediately (fix H13). v3 let a failed Task hold
-// its Issues hostage for SEVEN DAYS, silently. The cutover amplifier makes that
-// fatal: an image-pin skew fails every Task INSTANTLY and would freeze every
-// Issue for a week with no comment. The Task CR still survives 7d as a DEBUGGING
-// ARTIFACT - owning nothing, blocking nothing.
-func TestReapFailedReleasesIssuesImmediately(t *testing.T) {
+// TestReapParkedTaskDoesNotReleaseIssuesImmediately is fix H13's SUBJECT
+// UNDER #521, inverted on purpose. v3 let a failed Task hold its Issues
+// hostage for SEVEN DAYS, silently, and H13's fix was to release them the
+// instant the Task stopped, not wait out its retention. `failed` is GONE now
+// - it folded into the PARK FLAG, which is REVERSIBLE (an ordinary park has
+// an F.6 re-entry rule), so releasing ownership out from under a Task that
+// might still resume would itself be a bug. reapParked (reaper.go) reflects
+// that: it does NOTHING - no release, no comment, no label - until the FULL
+// ParkRetention (7d) elapses AND no re-entry rule fires. The H13 guarantee
+// (immediate release, no week-long hostage) now lives at the genuine
+// terminal state that replaced unconditional failure: rejected - see
+// TestReapRejectedReleasesIssuesImmediately. This test pins the parked side
+// of that split so a future change cannot silently reintroduce immediate
+// release for a park and break re-entry.
+func TestReapParkedTaskDoesNotReleaseIssuesImmediately(t *testing.T) {
 	ctx := context.Background()
 	proj := reapProject("failfast")
 	repo := reapRepo("failfast", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
 
-	// Entered `failed` ONE MINUTE ago: nowhere near failedRetention.
+	// Parked ONE MINUTE ago: nowhere near ParkRetention (7d).
 	task := reapTask("failfast", "fail-task", "clarify",
-		tatarav1alpha1.StageFailed, stage.ReasonAgentContractMismatch, time.Now().Add(-time.Minute))
+		tatarav1alpha1.StateUnderImplementation, stage.ReasonAgentContractMismatch, time.Now().Add(-time.Minute))
+	task.Status.ParkedAt = &metav1.Time{Time: time.Now().Add(-time.Minute)}
 	task.Status.IssueRefs = []string{tatarav1alpha1.IssueName(repo.Name, 9)}
 
 	iss := &tatarav1alpha1.Issue{
@@ -1070,26 +1126,81 @@ func TestReapFailedReleasesIssuesImmediately(t *testing.T) {
 		t.Fatalf("ReapTerminal: %v", err)
 	}
 
-	// The Task is NOT deleted (it is 1 minute old, not 7 days).
+	// The Task survives untouched: 1 minute into a 7-day park retention, with
+	// an F.6 re-entry rule (agent-contract-mismatch is UnparkNever, so it will
+	// eventually age out - but not yet, and not by having its issue stripped
+	// out from under it while there is still a chance a human intervenes).
 	tk, ok := mustGetTask(t, c, "fail-task")
 	if !ok {
-		t.Fatal("a fresh failed task was deleted; it must survive as a debugging artifact")
+		t.Fatal("a freshly parked task was deleted; it must survive the full ParkRetention window")
+	}
+	if tk.Annotations[AnnTerminalReleased] == "true" {
+		t.Fatal("a parked task's terminal release fired before ParkRetention elapsed: this is the H13 regression, reintroduced for parks")
+	}
+	if len(w.comments) != 0 || len(w.labels) != 0 {
+		t.Fatalf("comments=%v labels=%v: a park within its retention must touch nothing on the forge", w.comments, w.labels)
+	}
+	got := mustGetIssue(t, c, iss.Name)
+	if len(got.OwnerReferences) == 0 {
+		t.Fatal("the parked task's issue ownership was released before its retention elapsed")
+	}
+}
+
+// TestReapRejectedReleasesIssuesImmediately is where fix H13's guarantee
+// actually lives now: releaseTerminal runs UNCONDITIONALLY on entering the
+// StateRejected branch of reapOne, UNGATED by RejectedRetention - only the
+// Task CR's own delete waits for that window. A Task rejected ONE MINUTE ago
+// still releases its Issues right now; it survives as a debugging artifact.
+func TestReapRejectedReleasesIssuesImmediately(t *testing.T) {
+	ctx := context.Background()
+	proj := reapProject("rejfast")
+	repo := reapRepo("rejfast", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
+
+	// Entered `rejected` ONE MINUTE ago: nowhere near RejectedRetention (24h).
+	task := reapTask("rejfast", "rej-task", "clarify",
+		tatarav1alpha1.StateRejected, stage.ReasonDeclined, time.Now().Add(-time.Minute))
+	task.Status.IssueRefs = []string{tatarav1alpha1.IssueName(repo.Name, 9)}
+
+	iss := &tatarav1alpha1.Issue{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: tatarav1alpha1.IssueName(repo.Name, 9), Namespace: testNS,
+			OwnerReferences: []metav1.OwnerReference{reapOwnerRef("rej-task", true)},
+		},
+		Spec: tatarav1alpha1.IssueSpec{RepositoryRef: repo.Name, Number: 9, ProjectRef: "rejfast"},
+	}
+	iss.Status.State = "open"
+
+	c := newMirrorClient(t, proj, repo, reapSecret(), task, iss)
+	w := &reapWriter{
+		comment:  func(string, string) error { return nil },
+		addLabel: func(string, string) error { return nil },
+	}
+	r := reapReconciler(c, w)
+
+	if err := r.ReapTerminal(ctx, proj); err != nil {
+		t.Fatalf("ReapTerminal: %v", err)
+	}
+
+	// The Task is NOT deleted (it is 1 minute old, not 24h).
+	tk, ok := mustGetTask(t, c, "rej-task")
+	if !ok {
+		t.Fatal("a fresh rejected task was deleted; it must survive as a debugging artifact")
 	}
 	if tk.Annotations[AnnTerminalReleased] != "true" {
-		t.Fatal("the failed task did not record its terminal release")
+		t.Fatal("the rejected task did not record its terminal release")
 	}
 	// But the Issue is RELEASED RIGHT NOW: commented, labelled, ownerRef dropped.
 	if len(w.comments) != 1 {
-		t.Fatalf("comments = %v, want exactly one naming the stageReason", w.comments)
+		t.Fatalf("comments = %v, want exactly one naming the stateReason", w.comments)
 	}
 	if len(w.labels) != 1 {
 		t.Fatalf("labels = %v, want the tatara-parked stamp", w.labels)
 	}
 	got := mustGetIssue(t, c, iss.Name)
 	if len(got.OwnerReferences) != 0 {
-		t.Fatalf("the failed task still owns its issue: %v", got.OwnerReferences)
+		t.Fatalf("the rejected task still owns its issue: %v", got.OwnerReferences)
 	}
-	if got.Annotations[AnnTerminalCommented] != "fail-task" {
+	if got.Annotations[AnnTerminalCommented] != "rej-task" {
 		t.Fatal("the issue does not record which task commented; a requeue would double-post")
 	}
 
@@ -1114,7 +1225,7 @@ func TestReapRejectedDeletesTaskAndClearsTokenSeries(t *testing.T) {
 
 	// Entered `rejected` well past RejectedRetention (24h): eligible for delete.
 	task := reapTask("tokgc", "rej-task", "clarify",
-		tatarav1alpha1.StageRejected, stage.ReasonDeclined, time.Now().Add(-25*time.Hour))
+		tatarav1alpha1.StateRejected, stage.ReasonDeclined, time.Now().Add(-25*time.Hour))
 	task.Spec.RepositoryRef = repo.Name
 	task.Spec.Source = &tatarav1alpha1.TaskSource{IssueRef: "tatara-operator#9"}
 	task.Status.ResolvedModel = "claude-opus-5"
@@ -1168,7 +1279,7 @@ func TestReapBacklogSweepNeverAgesOut(t *testing.T) {
 
 	seed := func(state string) (client.Client, *reapWriter, *ProjectReconciler) {
 		task := reapTask("backlog", "bl-task", "clarify",
-			tatarav1alpha1.StageParked, stage.ReasonBacklogSweep, time.Now().Add(-90*24*time.Hour))
+			tatarav1alpha1.StateRefined, stage.ReasonBacklogSweep, time.Now().Add(-90*24*time.Hour))
 		task.Status.IssueRefs = []string{tatarav1alpha1.IssueName(repo.Name, 3)}
 		iss := &tatarav1alpha1.Issue{
 			ObjectMeta: metav1.ObjectMeta{
@@ -1227,11 +1338,11 @@ func TestReapDeliveredWaitsForDocumentation(t *testing.T) {
 	}
 
 	// (a) undocumented, has a merged MR: BLOCKED.
-	undoc := reapTask("delivered", "undoc-task", "clarify", tatarav1alpha1.StageDelivered, "", deliveredAt.Time)
+	undoc := reapTask("delivered", "undoc-task", "clarify", tatarav1alpha1.StateDone, "", deliveredAt.Time)
 	undoc.Status.DeliveredAt = &deliveredAt
 	undoc.Status.MRRefs = []string{tatarav1alpha1.MergeRequestName(repo.Name, 11)}
 	// (b) zero merged MRs (a brainstorm skip): reaped on the TTL alone.
-	noMR := reapTask("delivered", "nomr-task", "brainstorm", tatarav1alpha1.StageDelivered, "", deliveredAt.Time)
+	noMR := reapTask("delivered", "nomr-task", "brainstorm", tatarav1alpha1.StateDone, "", deliveredAt.Time)
 	noMR.Status.DeliveredAt = &deliveredAt
 
 	c := newMirrorClient(t, proj, repo, reapSecret(), undoc, noMR, mergedMR(11, "undoc-task"))
@@ -1341,7 +1452,7 @@ func TestReapDeliveredNotCountedWhileLiveBatchCovers(t *testing.T) {
 	tk, mr := deliveredWithMergedMR(t, "coveredhold", repo.Name, "covered-task", 11, time.Now().Add(-30*time.Hour))
 	// A live batch, minted 30 min ago (well within DocStageBudget so it stays in
 	// documenting through this pass), covering the task.
-	batch := reapTask("coveredhold", "doc-batch-live", DocBatchKind, tatarav1alpha1.StageDocumenting, "", time.Now().Add(-30*time.Minute))
+	batch := reapTask("coveredhold", "doc-batch-live", DocBatchKind, tatarav1alpha1.StateUnderImplementation, "", time.Now().Add(-30*time.Minute))
 	batch.Spec.DocumentsTasks = []string{"covered-task"}
 	batch.Spec.RepositoryRef = "tatara-documentation"
 
@@ -1393,7 +1504,7 @@ func TestReapDeliveredDocReferenceLogFetchFailureIsNonBlocking(t *testing.T) {
 	repo := reapRepo("delivered-logfail", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
 	deliveredAt := metav1.NewTime(time.Now().Add(-72 * time.Hour)) // past the 48h TTL
 
-	undoc := reapTask("delivered-logfail", "undoc-task", "clarify", tatarav1alpha1.StageDelivered, "", deliveredAt.Time)
+	undoc := reapTask("delivered-logfail", "undoc-task", "clarify", tatarav1alpha1.StateDone, "", deliveredAt.Time)
 	undoc.Status.DeliveredAt = &deliveredAt
 	undoc.Status.MRRefs = []string{tatarav1alpha1.MergeRequestName(repo.Name, 11)}
 	mr := &tatarav1alpha1.MergeRequest{
@@ -1446,7 +1557,7 @@ func TestReapFoldInFlightGate(t *testing.T) {
 			name: "live umbrella, fresh adoption: held, not counted",
 			umbrella: func() *tatarav1alpha1.Task {
 				u := reapTask("foldskip", "umbrella-task", "refine",
-					tatarav1alpha1.StageRefining, "", time.Now())
+					tatarav1alpha1.StateRefined, "", time.Now())
 				since := metav1.NewTime(time.Now())
 				u.Status.FoldInFlightSince = &since
 				return u
@@ -1460,7 +1571,7 @@ func TestReapFoldInFlightGate(t *testing.T) {
 			name: "live umbrella, adoption past its grace: held and counted",
 			umbrella: func() *tatarav1alpha1.Task {
 				u := reapTask("foldskip", "umbrella-task", "refine",
-					tatarav1alpha1.StageRefining, "", time.Now())
+					tatarav1alpha1.StateRefined, "", time.Now())
 				since := metav1.NewTime(time.Now().Add(-10 * time.Minute))
 				u.Status.FoldInFlightSince = &since
 				return u
@@ -1475,7 +1586,7 @@ func TestReapFoldInFlightGate(t *testing.T) {
 			name: "terminal umbrella: released",
 			umbrella: func() *tatarav1alpha1.Task {
 				u := reapTask("foldskip", "umbrella-task", "refine",
-					tatarav1alpha1.StageRejected, stage.ReasonIssueClosed, time.Now())
+					tatarav1alpha1.StateRejected, stage.ReasonIssueClosed, time.Now())
 				since := metav1.NewTime(time.Now())
 				u.Status.FoldInFlightSince = &since
 				return u
@@ -1483,18 +1594,30 @@ func TestReapFoldInFlightGate(t *testing.T) {
 			held: false, counted: false,
 		},
 		{
-			// A PARKED umbrella is the worst shape of the same bug: parked
-			// (backlog-sweep) is never aged out at all, so its marker outlives
-			// every retention the reaper has.
-			name: "parked umbrella: released",
+			// A PARKED umbrella with a FRESH marker: v1alpha1.FoldInFlightActive
+			// (api/v1alpha1/task_types.go) is exactly TaskDone(t) == false AND
+			// within FoldInFlightTTL of FoldStartedAt - it carries NO check of
+			// the park flag at all. #521 folded the old always-terminal `failed`
+			// stage into the (reversible) park flag, and parked(backlog-sweep) in
+			// particular "is never aged out at all, so its marker outlives every
+			// retention the reaper has" (the ORIGINAL worry this case names) -
+			// but that worry is not actually answered here: a parked umbrella
+			// with a fresh marker is HELD exactly like a live one, because
+			// nothing in FoldInFlightActive treats Parked as done. This is a
+			// discovered gap worth a maintainer's look (report, not a fix - it
+			// sits in api/v1alpha1, out of this task's scope), and this case now
+			// pins the ACTUAL current behavior rather than the pre-#521
+			// assumption, so a real fix later shows up here as an intentional
+			// test change instead of a silent regression.
+			name: "parked umbrella, fresh marker: held (FoldInFlightActive has no park check - see comment)",
 			umbrella: func() *tatarav1alpha1.Task {
 				u := reapTask("foldskip", "umbrella-task", "refine",
-					tatarav1alpha1.StageParked, stage.ReasonBacklogSweep, time.Now())
+					tatarav1alpha1.StateRefined, stage.ReasonBacklogSweep, time.Now())
 				since := metav1.NewTime(time.Now())
 				u.Status.FoldInFlightSince = &since
 				return u
 			},
-			held: false, counted: false,
+			held: true, counted: false,
 		},
 		{
 			// The backstop for every way an adoption can die that leaves the
@@ -1502,7 +1625,7 @@ func TestReapFoldInFlightGate(t *testing.T) {
 			name: "live umbrella, adoption past its TTL: released",
 			umbrella: func() *tatarav1alpha1.Task {
 				u := reapTask("foldskip", "umbrella-task", "refine",
-					tatarav1alpha1.StageRefining, "", time.Now())
+					tatarav1alpha1.StateRefined, "", time.Now())
 				since := metav1.NewTime(time.Now().Add(-2 * tatarav1alpha1.FoldInFlightTTL))
 				u.Status.FoldInFlightSince = &since
 				return u
@@ -1517,7 +1640,7 @@ func TestReapFoldInFlightGate(t *testing.T) {
 			name: "no anchor, stage clock past the TTL: released",
 			umbrella: func() *tatarav1alpha1.Task {
 				return reapTask("foldskip", "umbrella-task", "refine",
-					tatarav1alpha1.StageRefining, "", time.Now().Add(-2*tatarav1alpha1.FoldInFlightTTL))
+					tatarav1alpha1.StateRefined, "", time.Now().Add(-2*tatarav1alpha1.FoldInFlightTTL))
 			},
 			held: false, counted: false,
 		},
@@ -1527,7 +1650,7 @@ func TestReapFoldInFlightGate(t *testing.T) {
 			proj := reapProject("foldskip")
 
 			member := reapTask("foldskip", "member-task", "clarify",
-				tatarav1alpha1.StageFailed, stage.ReasonOperatorError, time.Now().Add(-30*24*time.Hour))
+				tatarav1alpha1.StateRefined, stage.ReasonOperatorError, time.Now().Add(-30*24*time.Hour))
 			umbrella := tc.umbrella()
 			umbrella.Status.FoldInFlight = []string{"member-task"}
 
@@ -1567,7 +1690,7 @@ func TestReapTerminalUmbrellaClearsItsFoldMarker(t *testing.T) {
 	proj := reapProject("foldclear")
 
 	umbrella := reapTask("foldclear", "umbrella-task", "refine",
-		tatarav1alpha1.StageRejected, stage.ReasonIssueClosed, time.Now())
+		tatarav1alpha1.StateRejected, stage.ReasonIssueClosed, time.Now())
 	umbrella.Status.FoldInFlight = []string{"member-task"}
 	since := metav1.NewTime(time.Now())
 	umbrella.Status.FoldInFlightSince = &since
@@ -1623,7 +1746,7 @@ func TestReapRefusesBranchDeleteWhenALiveTaskPushesToIt(t *testing.T) {
 	repo := reapRepo("takeoverguard", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
 
 	dying := reapTask("takeoverguard", "abandoned-task", "clarify",
-		tatarav1alpha1.StageFailed, stage.ReasonTurnBudgetExhausted, time.Now().Add(-8*24*time.Hour))
+		tatarav1alpha1.StateUnderImplementation, stage.ReasonTurnBudgetExhausted, time.Now().Add(-8*24*time.Hour))
 	branch := agent.TaskBranch(&tatarav1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: "abandoned-task"}})
 	dying.Status.MRRefs = []string{tatarav1alpha1.MergeRequestName(repo.Name, 4)}
 
@@ -1631,7 +1754,7 @@ func TestReapRefusesBranchDeleteWhenALiveTaskPushesToIt(t *testing.T) {
 	// agent.TaskBranch is tatara/task-takeover-task, so a TaskBranch-based scan
 	// would answer "nobody pushes here" - which is exactly the miss this guards.
 	takeover := reapTask("takeoverguard", "takeover-task", "takeover",
-		tatarav1alpha1.StageImplementing, "", time.Now())
+		tatarav1alpha1.StateUnderImplementation, "", time.Now())
 	takeover.Annotations = map[string]string{tatarav1alpha1.AnnTakeoverHeadBranch: branch}
 
 	mr := &tatarav1alpha1.MergeRequest{
@@ -1667,12 +1790,12 @@ func TestReapDeletesBranchWhenOnlyTerminalTasksMapToIt(t *testing.T) {
 	repo := reapRepo("takeoverdead", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
 
 	dying := reapTask("takeoverdead", "abandoned-task", "clarify",
-		tatarav1alpha1.StageFailed, stage.ReasonTurnBudgetExhausted, time.Now().Add(-8*24*time.Hour))
+		tatarav1alpha1.StateUnderImplementation, stage.ReasonTurnBudgetExhausted, time.Now().Add(-8*24*time.Hour))
 	branch := agent.TaskBranch(&tatarav1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: "abandoned-task"}})
 	dying.Status.MRRefs = []string{tatarav1alpha1.MergeRequestName(repo.Name, 5)}
 
 	deadTakeover := reapTask("takeoverdead", "takeover-task", "takeover",
-		tatarav1alpha1.StageRejected, stage.ReasonMRClosedExternally, time.Now())
+		tatarav1alpha1.StateRejected, stage.ReasonMRClosedExternally, time.Now())
 	deadTakeover.Annotations = map[string]string{tatarav1alpha1.AnnTakeoverHeadBranch: branch}
 
 	mr := &tatarav1alpha1.MergeRequest{

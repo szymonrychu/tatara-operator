@@ -15,11 +15,11 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .status.stage
-      name: Stage
+    - jsonPath: .status.state
+      name: State
       type: string
-    - jsonPath: .status.stageReason
-      name: Reason
+    - jsonPath: .status.parkReason
+      name: Park
       type: string
     - jsonPath: .status.agentKind
       name: Agent
@@ -40,8 +40,8 @@ spec:
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: Task is one unit of agent-driven work, advanced through the F.1
-          stage machine.
+        description: Task is one unit of agent-driven work, advanced through the 8-state
+          machine.
         properties:
           apiVersion:
             description: |-
@@ -109,28 +109,37 @@ spec:
                   unrelated issues. Empty for non-incident Tasks and when no correlation
                   label was present on the alert.
                 type: string
-              initialStage:
+              initialParkReason:
                 description: |-
-                  InitialStage is the F.3 Create-edge target a mint chooses when it is NOT the
-                  default triaging: the sweep mints straight into parked(backlog-sweep) or
-                  triaging, and the nightly doc batch into documenting. It is carried in the
-                  IMMUTABLE spec so the TaskReconciler create-edge derives the stage with NO
-                  post-create status write that must win a race against the reconciler's own
-                  create-edge (fix C5). Empty = triaging.
+                  InitialParkReason is the park flag a mint stamps ALONGSIDE InitialState
+                  (e.g. backlog-sweep). Empty means the Task is minted un-parked. It is a
+                  PARK reason, never a state reason: a mint that wants a terminal Task does
+                  not exist.
                 type: string
-              initialStageReason:
+              initialState:
                 description: |-
-                  InitialStageReason is the stageReason paired with InitialStage (e.g.
-                  backlog-sweep). Empty for the reason-less initial stages.
+                  InitialState is the Create-edge target a mint chooses when it is NOT the
+                  default `new`. It is carried in the IMMUTABLE spec so the TaskReconciler
+                  create-edge derives the state with NO post-create status write that must
+                  win a race against the reconciler's own create-edge (fix C5). Empty = new.
+
+                  #521 renamed this from InitialStage. The two-field shape survived the
+                  rename because the create edge can now land in TWO orthogonal places at
+                  once: a sweep-minted backlog owner is `new` AND parked(backlog-sweep), and
+                  `parked` is no longer a state it could have been expressed as.
+                enum:
+                - new
+                - refined
+                - under-implementation
                 type: string
               kind:
                 description: |-
                   Kind is the ORIGIN. Immutable, baked into the name. NOT the running agent
-                  kind (that is Status.AgentKind, driven by the F.2 stage table).
+                  kind (that is Status.AgentKind, driven by the F.2 state/origin table).
                 enum:
                 - brainstorm
                 - incident
-                - clarify
+                - implement
                 - refine
                 - review
                 - documentation
@@ -159,7 +168,8 @@ spec:
               repositoryRef:
                 description: |-
                   RepositoryRef is the PRIMARY repo, set ONLY on documentation Tasks (and on
-                  a proposal-born clarify, which carries the repo its proposal was filed in).
+                  a proposal-born implement Task, which carries the repo its proposal was
+                  filed in).
                 type: string
               source:
                 description: |-
@@ -206,7 +216,6 @@ spec:
                 enum:
                 - brainstorm
                 - incident
-                - clarify
                 - refine
                 - review
                 - documentation
@@ -296,13 +305,22 @@ spec:
                 x-kubernetes-list-type: map
               conversationLastEventAt:
                 description: |-
-                  ConversationLastEventAt is the IDLE CLOCK BASE for the conversing stage. It
-                  is stamped on entry into conversing and RE-STAMPED by AppendTaskEvent on
-                  every non-bot event queued while conversing, so the clock measures silence
-                  rather than pod age.
+                  ConversationLastEventAt is the HUMAN half of the IDLE CLOCK BASE for every
+                  LIVE state. It is stamped on entry into a live state and RE-STAMPED by
+                  AppendTaskEvent on every non-bot event queued while live, so the clock
+                  measures silence rather than pod age.
 
-                  It is a field of its OWN and deliberately NOT stageWorkStartedAt. The TTL
-                  stop nils stageWorkStartedAt and PodWatchReconciler re-stamps it when the
+                  It is only ONE THIRD of the base. Nothing an AGENT does touches this field,
+                  so an idle clock reading it alone parks a silently-working agent at 60
+                  minutes, and a Task that queued for hours before its pod arrived is parked
+                  before turn 0 is ever submitted. stage.ArmedClock therefore disarms the idle
+                  clock entirely while a turn is in flight and otherwise measures from the
+                  LATEST of this field, stateWorkStartedAt and the turn-complete annotation.
+                  See stage.idleBase, which also records the pod-rotation ratchet that admits
+                  and the three caps that bound it.
+
+                  It is a field of its OWN and deliberately NOT stateWorkStartedAt. The TTL
+                  stop nils stateWorkStartedAt and PodWatchReconciler re-stamps it when the
                   REPLACEMENT pod becomes ready, so an idle clock based on it would reset on
                   every pod rotation and an idle conversation would never park - it would
                   rotate a pod forever. Nothing in the pod lifecycle touches this field.
@@ -404,7 +422,6 @@ spec:
                       enum:
                       - brainstorm
                       - incident
-                      - clarify
                       - refine
                       - review
                       - documentation
@@ -418,6 +435,15 @@ spec:
                       description: 'Go-side twin: NoteBodyMaxBytes (limits.go). Change
                         both together.'
                       maxLength: 4096
+                      type: string
+                    id:
+                      description: |-
+                        ID is the stable handle an agent quotes back as planNoteId. It is
+                        sha256(at|kind|body) truncated to 16 hex, so it is derivable from the
+                        note alone (no counter, no sequence) and CHANGES if the body changes -
+                        which is exactly what the approval gate's plan pin needs: an approved
+                        plan whose body was edited afterwards no longer matches the hash stored
+                        on ApprovalEvidence.
                       type: string
                     kind:
                       enum:
@@ -433,13 +459,58 @@ spec:
                   type: object
                 maxItems: 60
                 type: array
-              parkedFromStage:
+              parkReason:
                 description: |-
-                  ParkedFromStage is mostly OBSERVABILITY: the un-park TARGET is NEVER derived
-                  from it (fix 2); it is re-derived from Issue.status.status and the owned-MR
-                  state (F.6). It IS load-bearing for one gate: ReasonNoOutcome unpark
-                  eligibility requires it to be implementing or reviewing (#406), so a park
-                  from a pre-implement stage cannot auto-escalate straight into implementing.
+                  ParkReason is the PARK FLAG. Empty means NOT PARKED, and that is the
+                  whole test - there is no parked state to compare against. It is
+                  ORTHOGONAL to State: a Task parks WHERE IT IS, and un-parking returns it
+                  to the same state unless a rule says otherwise.
+
+                  THE WEDGE THIS INVITES, and the one mitigation: a writer that sets State
+                  and forgets to clear ParkReason wedges the Task forever with a stale
+                  reason - the same silent-drift genre as #521 itself. Mitigation:
+                  stage.Enter asserts ParkReason == "" on every non-park edge and refuses
+                  otherwise, and stage.Unpark is the ONE function that clears it. Nothing
+                  else in the codebase may assign to this field.
+                enum:
+                - backlog-sweep
+                - triage-stalled
+                - name-too-long
+                - stage-deadline
+                - awaiting-human
+                - identity-unverified
+                - implement-declined
+                - review-loop-exhausted
+                - review-post-refused
+                - merge-timeout
+                - merge-blocked
+                - merge-order-missing
+                - deploy-timeout
+                - deploy-blocked
+                - no-outcome
+                - turn-budget-exhausted
+                - pod-recreation-exhausted
+                - object-too-large
+                - fold-adoption-unverified
+                - admission-starved
+                - agent-contract-mismatch
+                - operator-error
+                - head-moving
+                - handoff-stalled
+                - ownership-lost
+                - merge-auth-refused
+                - ci-red
+                - ci-blocked
+                type: string
+              parkedAt:
+                format: date-time
+                type: string
+              parkedFromState:
+                description: |-
+                  ParkedFromState is OBSERVABILITY. The un-park target is NEVER derived
+                  from it. It is load-bearing for exactly one gate: no-outcome un-park
+                  eligibility requires it to be under-implementation or awaiting-review
+                  (#406).
                 type: string
               pendingEvents:
                 description: |-
@@ -489,6 +560,18 @@ spec:
                   type: object
                 maxItems: 25
                 type: array
+              pinnedPlanNoteId:
+                description: |-
+                  PinnedPlanNoteID is the id of the NEWEST plan note, re-derived on every
+                  note write. It exists because status.notes is capped at 50 with drop-oldest
+                  and the evicted batch is spilled to tatara-memory: a long-running Task can
+                  spill the very plan note the approval gate pinned, and the gate's
+                  plan-note-missing refusal would then fire on a legitimate submit.
+
+                  It holds the ID ONLY. The body is not retained, deliberately: the pin the
+                  gate re-checks is the sha256 stored on Issue.status.approval.planHash at
+                  GRANT, so nothing here has to survive for the check to work.
+                type: string
               podName:
                 type: string
               podStartedAt:
@@ -499,10 +582,10 @@ spec:
                     - the base of the pod TTL: t0 = podStartedAt + agentPodTTLSeconds (G.7).
 
                   LIFECYCLE, and it is LOAD-BEARING (fix V7-4):
-                    CLEARED on EVERY stage transition. Both this and StageWorkStartedAt.
+                    CLEARED on EVERY state transition. Both this and StateWorkStartedAt.
 
                   v6 declared this field with no doc comment and no clearing rule, while only
-                  StageWorkStartedAt said "cleared on every stage transition". On the NORMAL
+                  StateWorkStartedAt said "cleared on every state transition". On the NORMAL
                   re-entry edges (reviewing -> implementing, merging -> reviewing, every
                   un-park) a STALE non-nil PodStartedAt then:
                     (a) DISARMS clock 1 (which is armed only when PodStartedAt == nil) while
@@ -526,25 +609,6 @@ spec:
                 description: |-
                   ShortDescription is the first line of Spec.Goal, truncated to ~60 chars,
                   set on reconcile so `kubectl get task` is scannable without describe.
-                type: string
-              stage:
-                enum:
-                - triaging
-                - brainstorming
-                - clarifying
-                - investigating
-                - refining
-                - approved
-                - implementing
-                - reviewing
-                - conversing
-                - merging
-                - deploying
-                - delivered
-                - documenting
-                - rejected
-                - failed
-                - parked
                 type: string
               stageElapsedCarrySeconds:
                 description: |-
@@ -571,7 +635,7 @@ spec:
                   must never inherit a stale carry from an unrelated earlier cycle.
 
                   READ BACK BY REPORTING, NOT BY THE DEADLINE (issue #513 split this).
-                  operator_task_stage_age_seconds, operator_merge_cursor_stalled_seconds and
+                  operator_task_state_age_seconds, operator_merge_cursor_stalled_seconds and
                   deploy_waiting's stalled_seconds all add it to now.Sub(StageEnteredAt), via
                   stage.StageElapsedSeconds, so reported residency is CONTINUOUS across the
                   whole round trip instead of a sawtooth that resets every re-entry. That is
@@ -599,27 +663,43 @@ spec:
                   number of such cycles is what MaxHeadMoveReentries / MaxCIRedReentries bound.
                   Unchanged from #480, which zeroed the carry on exactly the same edges.
                 type: integer
-              stageEnteredAt:
+              state:
                 description: |-
-                  StageEnteredAt is stamped on EVERY stage transition. It is the clock for the
-                  POD-LESS stages (F.4).
+                  State is WHERE THE WORK IS. It is ORTHOGONAL to ParkReason (whether the
+                  Task is stalled) and to stage.Live(State) (whether an agent pod is
+                  attached). Collapsing those three axes into one value is what #521 fixed.
+                enum:
+                - new
+                - refined
+                - under-implementation
+                - awaiting-review
+                - merged
+                - deployed
+                - done
+                - rejected
+                type: string
+              stateEnteredAt:
+                description: |-
+                  StateEnteredAt is stamped on EVERY state transition. It is the clock for
+                  the OPERATOR-DRIVEN states (F.4).
                 format: date-time
                 type: string
-              stageReason:
+              stateReason:
                 description: |-
-                  StageReason is the machine reason for the current stage. MANDATORY on
-                  parked/failed/rejected. Closed set: F.5.
+                  StateReason is the machine reason for the current state. MANDATORY on
+                  done and rejected. It is NOT a park reason: the two vocabularies are
+                  disjoint and live in different fields on purpose.
                 type: string
-              stageWorkStartedAt:
+              stateWorkStartedAt:
                 description: |-
-                  StageWorkStartedAt is stamped when this stage's POD BECOMES READY (fix H12).
-                  It is the clock for every POD-SPAWNING stage's deadline. StageEnteredAt is
-                  NOT, because it starts ticking the moment the Task enters the stage - which
+                  StateWorkStartedAt is stamped when this state's POD BECOMES READY (fix H12).
+                  It is the clock for every POD-SPAWNING state's deadline. StateEnteredAt is
+                  NOT, because it starts ticking the moment the Task enters the state - which
                   is when its QueuedEvent is ENQUEUED, not when it is admitted. With 3 agent
                   slots and 3-4 serial pod admissions per Task, a Task could burn its entire
                   2h budget QUEUEING and die parked(stage-deadline) HAVING NEVER RUN A POD -
-                  and that park has no re-entry rule. The stage deadline must measure WORK,
-                  not queue wait. Cleared on every stage transition.
+                  and that park has no re-entry rule. The state deadline must measure WORK,
+                  not queue wait. Cleared on every state transition.
                 format: date-time
                 type: string
               stats:

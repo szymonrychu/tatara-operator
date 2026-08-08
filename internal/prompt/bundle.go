@@ -460,7 +460,7 @@ func RenderIndex(in IndexInput) (string, error) {
 		views = append(views, indexTaskView{
 			Name:   t.Name,
 			Kind:   t.Spec.Kind,
-			Stage:  t.Status.Stage,
+			Stage:  t.Status.State,
 			Age:    coarseAge(now.Sub(t.CreationTimestamp.Time)),
 			Title:  title,
 			Body:   body,
@@ -503,7 +503,7 @@ func buildView(in Input, issues []v1alpha1.Issue, mrs []v1alpha1.MergeRequest, t
 		Task: taskView{
 			Name:    in.Task.Name,
 			Kind:    in.Task.Spec.Kind,
-			Stage:   in.Task.Status.Stage,
+			Stage:   in.Task.Status.State,
 			Agent:   AgentKind(in.Task),
 			Project: in.Task.Spec.ProjectRef,
 		},

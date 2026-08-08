@@ -179,6 +179,20 @@ type ApprovalEvidence struct {
 	// Auto is the autoApproveTataraProposals path; Login is then the sentinel
 	// "<tatara:auto>" and CommentID is empty.
 	Auto bool `json:"auto,omitempty"`
+	// PlanHash is sha256 of the plan note's body AS IT STOOD AT GRANT. It is
+	// re-checked on the transition out of the gate into code.
+	//
+	// This is NEW in the merged model and it exists because the model created
+	// the gap: previously approval ended the clarify Task and a fresh implement
+	// pod started, so no artifact sat between approval and execution. Now the
+	// same live agent brainstorms, is approved, and implements - so the plan it
+	// was approved on is an artifact it can edit afterwards. A plan swapped
+	// after approval is refused with plan-hash-mismatch and the Task goes back
+	// to `refined` - the CHEAP path out, never a park: an agent that finds the
+	// plan gate expensive would simply stop updating its plan note, which
+	// destroys the note's value as continuation state.
+	// +optional
+	PlanHash string `json:"planHash,omitempty"`
 }
 
 // ApprovalCitation is the agent's CITATION of ONE maintainer comment it judged

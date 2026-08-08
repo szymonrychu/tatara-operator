@@ -3,6 +3,7 @@ package restapi_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -30,6 +31,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/queue"
 	"github.com/szymonrychu/tatara-operator/internal/restapi"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
+	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
 // reviewPanicForge answers the ONE read /outcome is allowed to make
@@ -91,7 +93,7 @@ func TestOutcome_HandlerContextIsBoundedByTheBudget(t *testing.T) {
 	forge := &deadlineForge{recordingForge: newRecordingForge()}
 	e := buildV2(t, v2Opts{writer: forge}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StageBrainstorming, "brainstorm"))
+		taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StateRefined, "brainstorm"))
 
 	before := time.Now()
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
@@ -120,23 +122,30 @@ func TestOutcome_HandlerContextIsBoundedByTheBudget(t *testing.T) {
 func TestOutcome_KindMustEqualAgentKind(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"))
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StateRefined, "clarify"))
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
 		`{"kind":"implement","payload":{"action":"declined","reason":"nope"}}`)
 	require.Equal(t, http.StatusConflict, w.Code, "the pod's claim is not trusted")
-	require.Equal(t, tatarav1alpha1.StageClarifying, e.task(t, "t1").Status.Stage)
+	require.Equal(t, tatarav1alpha1.StateRefined, e.task(t, "t1").Status.State)
 }
 
+// #521 folded `parked` and `failed` into the orthogonal park flag: both old
+// shapes are now the SAME terminal condition, Parked(t), alongside the two
+// genuine terminal STATES (done, rejected).
 func TestOutcome_TerminalStageIs409(t *testing.T) {
-	for _, stg := range []string{
-		tatarav1alpha1.StageRejected, tatarav1alpha1.StageFailed,
-		tatarav1alpha1.StageParked, tatarav1alpha1.StageDelivered,
-	} {
-		t.Run(stg, func(t *testing.T) {
+	cases := []struct {
+		name string
+		task *tatarav1alpha1.Task
+	}{
+		{"rejected", taskV2("t1", "tatara", "clarify", tatarav1alpha1.StateRejected, "clarify")},
+		{"done", taskV2("t1", "tatara", "clarify", tatarav1alpha1.StateDone, "clarify")},
+		{"parked", parkedTaskV2(t, "t1", "tatara", "clarify", tatarav1alpha1.StateRefined, "clarify", stage.ReasonOperatorError)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
 			e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
-				repoV2("tatara-operator", "tatara"),
-				taskV2("t1", "tatara", "clarify", stg, "clarify"))
+				repoV2("tatara-operator", "tatara"), tc.task)
 			w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
 				`{"kind":"clarify","payload":{"decision":"discuss","reason":"r"}}`)
 			require.Equal(t, http.StatusConflict, w.Code)
@@ -150,18 +159,18 @@ func TestOutcome_TerminalStageIs409(t *testing.T) {
 func TestOutcome_IdenticalRepeatIs200NotA409(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StageBrainstorming, "brainstorm"))
+		taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StateRefined, "brainstorm"))
 
 	body := `{"kind":"brainstorm","payload":{"action":"skip","reason":"nothing novel this cycle"}}`
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", body)
 	require.Equal(t, http.StatusOK, w.Code)
-	require.Equal(t, tatarav1alpha1.StageDelivered, e.task(t, "t1").Status.Stage)
+	require.Equal(t, tatarav1alpha1.StateDone, e.task(t, "t1").Status.State)
 
 	// The Task is now DELIVERED. Without the idempotency record this replay
 	// would 409 on the terminal-stage gate.
 	w = e.do(t, http.MethodPost, "/tasks/t1/outcome", body)
 	require.Equal(t, http.StatusOK, w.Code, "a TTL-stopped pod's retry must not 409")
-	require.Equal(t, tatarav1alpha1.StageDelivered, e.task(t, "t1").Status.Stage)
+	require.Equal(t, tatarav1alpha1.StateDone, e.task(t, "t1").Status.State)
 
 	// A DIFFERENT outcome on a terminal Task is still refused.
 	w = e.do(t, http.MethodPost, "/tasks/t1/outcome",
@@ -177,7 +186,7 @@ func TestOutcome_IdenticalRepeatIs200NotA409(t *testing.T) {
 func TestOutcome_Implement_SingleRepoMergeOrderIsResolved(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: &reviewPanicForge{heads: map[int]string{295: "live-head"}}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "implement", tatarav1alpha1.StageImplementing, "implement"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
 		mrV2("tatara-operator", 295, "t1"))
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
@@ -187,7 +196,7 @@ func TestOutcome_Implement_SingleRepoMergeOrderIsResolved(t *testing.T) {
 	got := e.task(t, "t1")
 	require.Equal(t, []string{"tatara-operator"}, got.Spec.MergeOrder,
 		"with one repo there is exactly one order and nothing to get wrong")
-	require.Equal(t, tatarav1alpha1.StageReviewing, got.Status.Stage)
+	require.Equal(t, tatarav1alpha1.StateAwaitingReview, got.Status.State)
 	require.Equal(t, "patch", e.mr(t, tatarav1alpha1.MergeRequestName("tatara-operator", 295)).Status.Significance)
 }
 
@@ -198,7 +207,7 @@ func TestOutcome_Implement_MultiRepoRequiresMergeOrder(t *testing.T) {
 	objs := []client.Object{
 		projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"), repoV2("tatara-cli", "tatara"),
-		taskV2("t1", "tatara", "implement", tatarav1alpha1.StageImplementing, "implement"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
 		mrV2("tatara-operator", 295, "t1"), mrV2("tatara-cli", 80, "t1"),
 	}
 	e := buildV2(t, v2Opts{writer: panicForge{}}, objs...)
@@ -231,7 +240,7 @@ func TestOutcome_Implement_MultiRepoRequiresMergeOrder(t *testing.T) {
 func TestOutcome_Implement_RecordsLiveBotHeadSHA(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: &reviewPanicForge{heads: map[int]string{295: "live-head-999"}}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "implement", tatarav1alpha1.StageImplementing, "implement"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
 		mrV2("tatara-operator", 295, "t1"))
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
@@ -257,7 +266,7 @@ func TestOutcome_Implement_RecordsLiveBotHeadSHA(t *testing.T) {
 func TestOutcome_Implement_ScmResolutionFailureDoesNotCorruptTheResponse(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), // no scmSecretV2(): the secret Get fails
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "implement", tatarav1alpha1.StageImplementing, "implement"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
 		mrV2("tatara-operator", 295, "t1"))
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
@@ -271,7 +280,7 @@ func TestOutcome_Implement_ScmResolutionFailureDoesNotCorruptTheResponse(t *test
 		"the response body must be exactly ONE valid JSON object, not two concatenated ones")
 
 	got := e.task(t, "t1")
-	require.Equal(t, tatarav1alpha1.StageReviewing, got.Status.Stage, "the stage transition still committed")
+	require.Equal(t, tatarav1alpha1.StateAwaitingReview, got.Status.State, "the stage transition still committed")
 
 	mr := e.mr(t, tatarav1alpha1.MergeRequestName("tatara-operator", 295))
 	require.Empty(t, mr.Status.LastBotHeadSHA, "a resolution failure must skip the stamp, not fabricate one")
@@ -280,7 +289,7 @@ func TestOutcome_Implement_ScmResolutionFailureDoesNotCorruptTheResponse(t *test
 func TestOutcome_Implement_SubmittedWithNoOpenMRIs400(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "implement", tatarav1alpha1.StageImplementing, "implement"))
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"))
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
 		`{"kind":"implement","payload":{"action":"submitted","title":"T","body":"B","changeSignificance":"patch"}}`)
 	require.Equal(t, http.StatusBadRequest, w.Code)
@@ -290,19 +299,73 @@ func TestOutcome_Implement_SubmittedWithNoOpenMRIs400(t *testing.T) {
 func TestOutcome_Implement_Declined(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "implement", tatarav1alpha1.StageImplementing, "implement"))
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"))
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
 		`{"kind":"implement","payload":{"action":"declined","reason":"the issue is already fixed"}}`)
 	require.Equal(t, http.StatusOK, w.Code)
 	got := e.task(t, "t1")
-	require.Equal(t, tatarav1alpha1.StageParked, got.Status.Stage)
-	require.Equal(t, "implement-declined", got.Status.StageReason)
+	require.Equal(t, tatarav1alpha1.StateUnderImplementation, got.Status.State, "a park never changes state")
+	require.True(t, tatarav1alpha1.Parked(got))
+	require.Equal(t, "implement-declined", got.Status.ParkReason)
+}
+
+// TestOutcome_Implement_DeclinedOnTheFrozenWireContract pins the EXACT bytes
+// tatara-cli sends for an implement decline. The cli's outcomeArgMap maps the
+// agent's snake_case decline_reason onto the WIRE key `reason` and strips
+// `task`; there is no `declineReason` key on the wire and there never was.
+// Every implement decline is this payload, so a refusal here is the ONLY way an
+// implement Task terminates on a decline going away entirely.
+func TestOutcome_Implement_DeclinedOnTheFrozenWireContract(t *testing.T) {
+	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"))
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"implement","payload":{"action":"declined","reason":"the issue is already fixed"}}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	got := e.task(t, "t1")
+	require.Equal(t, tatarav1alpha1.StateUnderImplementation, got.Status.State, "a park never changes state")
+	require.True(t, tatarav1alpha1.Parked(got))
+	require.Equal(t, stage.ReasonImplementDeclined, got.Status.ParkReason)
+	require.Len(t, got.Status.Notes, 1, "the decline is recorded as an agent note")
+	require.Equal(t, "declined: the issue is already fixed", got.Status.Notes[0].Body,
+		"the agent-facing note text now sources from the single wire `reason` field")
+}
+
+// TestOutcome_Implement_DeclineWithoutAReasonIs400: `reason` is REQUIRED on
+// action=declined. It is the same single field the gate actions use; only its
+// LEGALITY changes with the action.
+func TestOutcome_Implement_DeclineWithoutAReasonIs400(t *testing.T) {
+	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"))
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"implement","payload":{"action":"declined"}}`)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	require.Contains(t, w.Body.String(), "action=declined requires a non-empty reason")
+}
+
+// TestOutcome_Implement_DeclineReasonIsNotAWireKey: `declineReason` was an
+// operator invention that never appeared in tatara-cli's post-outcomeArgMap
+// output. It is not in the frozen key set, so DisallowUnknownFields refuses it
+// rather than the operator quietly growing a second contract.
+func TestOutcome_Implement_DeclineReasonIsNotAWireKey(t *testing.T) {
+	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"))
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"implement","payload":{"action":"declined","declineReason":"x"}}`)
+	require.Equal(t, http.StatusBadRequest, w.Code,
+		"declineReason is not in the frozen key set, so DisallowUnknownFields refuses it")
+	got := e.task(t, "t1")
+	require.False(t, tatarav1alpha1.Parked(got), "a refused payload parks nothing")
+	require.Empty(t, got.Status.Notes)
 }
 
 func TestOutcome_Implement_SubmittedForbidsReason(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "implement", tatarav1alpha1.StageImplementing, "implement"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
 		mrV2("tatara-operator", 295, "t1"))
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
 		`{"kind":"implement","payload":{"action":"submitted","title":"T","body":"B","changeSignificance":"patch","reason":"r"}}`)
@@ -324,12 +387,12 @@ func TestOutcome_Implement_SubmittedRequiresChangeSignificance(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 				repoV2("tatara-operator", "tatara"),
-				taskV2("t1", "tatara", "implement", tatarav1alpha1.StageImplementing, "implement"),
+				taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
 				mrV2("tatara-operator", 295, "t1"))
 			w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
 				`{"kind":"implement","payload":`+tc.payload+`}`)
 			require.Equal(t, http.StatusBadRequest, w.Code)
-			require.Equal(t, tatarav1alpha1.StageImplementing, e.task(t, "t1").Status.Stage)
+			require.Equal(t, tatarav1alpha1.StateUnderImplementation, e.task(t, "t1").Status.State)
 			require.Empty(t, e.mr(t, tatarav1alpha1.MergeRequestName("tatara-operator", 295)).Status.Significance)
 		})
 	}
@@ -343,7 +406,7 @@ func TestOutcome_Review_PersistsIntentAndNeverPostsToTheForge(t *testing.T) {
 	forge := &reviewPanicForge{heads: map[int]string{295: "sha1"}}
 	e := buildV2(t, v2Opts{writer: forge}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "implement", tatarav1alpha1.StageReviewing, "review"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateAwaitingReview, "review"),
 		mrV2("tatara-operator", 295, "t1"))
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"review","payload":{
@@ -368,14 +431,14 @@ func TestOutcome_Review_PersistsIntentAndNeverPostsToTheForge(t *testing.T) {
 	// every owned MR having pendingReview == nil (C.5.3). The reconciler posts
 	// the review, clears the intent, and only then may a pod be spawned to fix
 	// findings that have actually been recorded.
-	require.Equal(t, tatarav1alpha1.StageReviewing, e.task(t, "t1").Status.Stage)
+	require.Equal(t, tatarav1alpha1.StateAwaitingReview, e.task(t, "t1").Status.State)
 }
 
 func TestOutcome_Review_ApprovePersistsApprovedStatus(t *testing.T) {
 	forge := &reviewPanicForge{heads: map[int]string{295: "sha1"}}
 	e := buildV2(t, v2Opts{writer: forge}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "implement", tatarav1alpha1.StageReviewing, "review"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateAwaitingReview, "review"),
 		mrV2("tatara-operator", 295, "t1"))
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"review","payload":{
@@ -408,7 +471,7 @@ func TestOutcome_Review_HeadMovedRefreshesMirrorAndReturnsStructured409(t *testi
 	e := buildV2(t, v2Opts{writer: forge, reader: emptyCommentReader{}, metrics: metrics},
 		projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "implement", tatarav1alpha1.StageReviewing, "review"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateAwaitingReview, "review"),
 		mrV2("tatara-operator", 295, "t1"))
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"review","payload":{
@@ -451,7 +514,7 @@ func TestOutcome_Review_CoverageIsTotal(t *testing.T) {
 	forge := &reviewPanicForge{heads: map[int]string{295: "sha1", 80: "sha2"}}
 	e := buildV2(t, v2Opts{writer: forge}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"), repoV2("tatara-cli", "tatara"),
-		taskV2("t1", "tatara", "implement", tatarav1alpha1.StageReviewing, "review"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateAwaitingReview, "review"),
 		mrV2("tatara-operator", 295, "t1"), mrV2("tatara-cli", 80, "t1"))
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"review","payload":{
@@ -465,7 +528,7 @@ func TestOutcome_Review_ReviewedSHAsIsRequired(t *testing.T) {
 	forge := &reviewPanicForge{heads: map[int]string{295: "sha1"}}
 	e := buildV2(t, v2Opts{writer: forge}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "implement", tatarav1alpha1.StageReviewing, "review"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateAwaitingReview, "review"),
 		mrV2("tatara-operator", 295, "t1"))
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
 		`{"kind":"review","payload":{"verdict":"approve","reviewedSHAs":[]}}`)
@@ -477,7 +540,7 @@ func TestOutcome_Review_RequestChangesNeedsFindings(t *testing.T) {
 	forge := &reviewPanicForge{heads: map[int]string{295: "sha1"}}
 	e := buildV2(t, v2Opts{writer: forge}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "implement", tatarav1alpha1.StageReviewing, "review"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateAwaitingReview, "review"),
 		mrV2("tatara-operator", 295, "t1"))
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"review","payload":{
 	  "verdict":"request_changes","reviewedSHAs":[{"repo":"tatara-operator","number":295,"sha":"sha1"}]}}`)
@@ -493,7 +556,7 @@ func TestOutcome_Review_FindingLineOmitted_PersistsNilLine(t *testing.T) {
 	forge := &reviewPanicForge{heads: map[int]string{295: "sha1"}}
 	e := buildV2(t, v2Opts{writer: forge}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "implement", tatarav1alpha1.StageReviewing, "review"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateAwaitingReview, "review"),
 		mrV2("tatara-operator", 295, "t1"))
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"review","payload":{
@@ -514,7 +577,7 @@ func TestOutcome_Review_FindingLineRoundTripsToPointer(t *testing.T) {
 	forge := &reviewPanicForge{heads: map[int]string{295: "sha1"}}
 	e := buildV2(t, v2Opts{writer: forge}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "implement", tatarav1alpha1.StageReviewing, "review"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateAwaitingReview, "review"),
 		mrV2("tatara-operator", 295, "t1"))
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"review","payload":{
@@ -548,7 +611,7 @@ func TestOutcome_Review_ChangeSignificanceEscalatesOnly(t *testing.T) {
 			})
 			e := buildV2(t, v2Opts{writer: forge}, projectV2("tatara"), scmSecretV2(),
 				repoV2("tatara-operator", "tatara"),
-				taskV2("t1", "tatara", "implement", tatarav1alpha1.StageReviewing, "review"), mr)
+				taskV2("t1", "tatara", "implement", tatarav1alpha1.StateAwaitingReview, "review"), mr)
 
 			w := e.do(t, http.MethodPost, "/tasks/t1/outcome", fmt.Sprintf(`{"kind":"review","payload":{
 			  "verdict":"approve","changeSignificance":%q,
@@ -582,7 +645,7 @@ func TestOutcome_Review_RecordsReviewOutcomeMetric(t *testing.T) {
 			forge := &reviewPanicForge{heads: map[int]string{295: "sha1"}}
 			e := buildV2(t, v2Opts{writer: forge, metrics: metrics}, projectV2("tatara"), scmSecretV2(),
 				repoV2("tatara-operator", "tatara"),
-				taskV2("t1", "tatara", "implement", tatarav1alpha1.StageReviewing, "review"),
+				taskV2("t1", "tatara", "implement", tatarav1alpha1.StateAwaitingReview, "review"),
 				mrV2("tatara-operator", 295, "t1"))
 
 			w := e.do(t, http.MethodPost, "/tasks/t1/outcome", fmt.Sprintf(`{"kind":"review","payload":{
@@ -598,11 +661,87 @@ func TestOutcome_Review_RecordsReviewOutcomeMetric(t *testing.T) {
 	}
 }
 
-// --- clarify ---------------------------------------------------------------
+// --- gate (#521 folded the clarify kind's decision=implement into implement's
+// action=approved|discuss|rejected gate) -----------------------------------
 
-// Approval is in NO schema. The agent reports decision=implement with a reason;
+// gateResponseDTO decodes the folded gate's 200 refusal body
+// ({"granted":false,"reason":...,"declared":...}). A GRANT does not use this
+// shape at all: it returns the plain Task DTO, same as every other accepted
+// outcome.
+type gateResponseDTO struct {
+	Granted  bool   `json:"granted"`
+	Reason   string `json:"reason"`
+	Declared string `json:"declared"`
+}
+
+// gatePlanNoteBody / gatePlanNoteAt / gatePlanNoteID are the fixed plan note
+// the gate tests pin: action=approved is UNCONDITIONALLY required to name a
+// planNoteId (the plan pin is orthogonal to who approved), so every gate
+// fixture that reaches the approval branch needs one real note in
+// status.notes and its id in the payload.
+const gatePlanNoteBody = "plan: do the thing"
+
+var gatePlanNoteAt = metav1.NewTime(frozenNow.Add(-30 * time.Minute))
+var gatePlanNoteID = tatarav1alpha1.NewNoteID(gatePlanNoteAt, "plan", gatePlanNoteBody)
+
+func gatePlanNote() tatarav1alpha1.Note {
+	return tatarav1alpha1.Note{
+		ID: gatePlanNoteID, At: gatePlanNoteAt, Agent: "implement", Kind: "plan", Body: gatePlanNoteBody,
+	}
+}
+
+// gateHandoffNote is a note the SAME live agent wrote on the SAME Task that is
+// NOT a plan. It is the fixture for the plan pin's kind check: `planNoteId` is
+// a client-supplied id and nothing about the wire says the agent must send the
+// id of its plan.
+const gateHandoffNoteBody = "handoff: picked the work up again after the TTL stop"
+
+var gateHandoffNoteAt = metav1.NewTime(frozenNow.Add(-20 * time.Minute))
+var gateHandoffNoteID = tatarav1alpha1.NewNoteID(gateHandoffNoteAt, "handoff", gateHandoffNoteBody)
+
+func gateHandoffNote() tatarav1alpha1.Note {
+	return tatarav1alpha1.Note{
+		ID: gateHandoffNoteID, At: gateHandoffNoteAt, Agent: "implement",
+		Kind: "handoff", Body: gateHandoffNoteBody,
+	}
+}
+
+// gateSupersededPlanNote is an OLDER plan note, superseded by gatePlanNote.
+// status.pinnedPlanNoteId is re-derived to the NEWEST plan note on every note
+// write, so this one is a plan note the re-check will never read.
+const gateSupersededPlanBody = "plan: an earlier, narrower plan"
+
+var gateSupersededPlanAt = metav1.NewTime(frozenNow.Add(-90 * time.Minute))
+var gateSupersededPlanID = tatarav1alpha1.NewNoteID(gateSupersededPlanAt, "plan", gateSupersededPlanBody)
+
+func gateSupersededPlanNote() tatarav1alpha1.Note {
+	return tatarav1alpha1.Note{
+		ID: gateSupersededPlanID, At: gateSupersededPlanAt, Agent: "implement",
+		Kind: "plan", Body: gateSupersededPlanBody,
+	}
+}
+
+// gateTaskV2 is taskV2 plus the pinned plan note, for the gate's action=approved
+// tests: Spec.Kind and status.agentKind are both "implement" post-#521 - the
+// clarify kind is gone, folded entirely into implement.
+func gateTaskV2(name, projectRef, state string) *tatarav1alpha1.Task {
+	tk := taskV2(name, projectRef, "implement", state, "implement")
+	tk.Status.Notes = []tatarav1alpha1.Note{gatePlanNote()}
+	return tk
+}
+
+// gateTaskWithJournalV2 is gateTaskV2 with the journal written out in full,
+// OLDEST FIRST, exactly as postNote grows it - pinnedPlanNoteId walks it
+// backwards looking for the newest `plan`.
+func gateTaskWithJournalV2(name, projectRef, state string, notes ...tatarav1alpha1.Note) *tatarav1alpha1.Task {
+	tk := taskV2(name, projectRef, "implement", state, "implement")
+	tk.Status.Notes = notes
+	return tk
+}
+
+// Approval is in NO schema. The agent reports action=approved with a reason;
 // the operator INDEPENDENTLY runs the C.6 citation check over EVERY owned Issue.
-func TestOutcome_Clarify_ImplementRequiresApprovalOnEveryOwnedIssue(t *testing.T) {
+func TestOutcome_Gate_ImplementRequiresApprovalOnEveryOwnedIssue(t *testing.T) {
 	i1 := issueV2("tatara-operator", 291, "t1")
 	i2 := issueV2("tatara-operator", 292, "t1")
 
@@ -611,14 +750,17 @@ func TestOutcome_Clarify_ImplementRequiresApprovalOnEveryOwnedIssue(t *testing.T
 		writer:   panicForge{},
 		approval: &fakeApproval{grant: map[string]bool{i1.Name: true}},
 	}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"), i1, i2)
+		gateTaskV2("t1", "tatara", tatarav1alpha1.StateRefined), i1, i2)
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
-		`{"kind":"clarify","payload":{"decision":"implement","reason":"maintainer said go ahead"}}`)
+		`{"kind":"implement","payload":{"action":"approved","reason":"maintainer said go ahead","planNoteId":"`+gatePlanNoteID+`"}}`)
 	require.Equal(t, http.StatusOK, w.Code)
+	var resp gateResponseDTO
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.False(t, resp.Granted, "a refusal is a 200 with granted:false, never a park")
 	got := e.task(t, "t1")
-	require.Equal(t, tatarav1alpha1.StageParked, got.Status.Stage)
-	require.Equal(t, "identity-unverified", got.Status.StageReason)
+	require.Equal(t, tatarav1alpha1.StateRefined, got.Status.State, "a refusal must not move the task")
+	require.False(t, tatarav1alpha1.Parked(got), "#521: a gate refusal does NOT park; the agent is still alive")
 	require.Empty(t, e.issue(t, i1.Name).Status.Approval, "nothing is stamped when the scope gate fails")
 
 	// BOTH approved: the mandate is granted.
@@ -626,13 +768,14 @@ func TestOutcome_Clarify_ImplementRequiresApprovalOnEveryOwnedIssue(t *testing.T
 		writer:   panicForge{},
 		approval: &fakeApproval{grant: map[string]bool{i1.Name: true, i2.Name: true}},
 	}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"),
+		gateTaskV2("t1", "tatara", tatarav1alpha1.StateRefined),
 		issueV2("tatara-operator", 291, "t1"), issueV2("tatara-operator", 292, "t1"))
 
 	w = e2.do(t, http.MethodPost, "/tasks/t1/outcome",
-		`{"kind":"clarify","payload":{"decision":"implement","reason":"maintainer said go ahead"}}`)
+		`{"kind":"implement","payload":{"action":"approved","reason":"maintainer said go ahead","planNoteId":"`+gatePlanNoteID+`"}}`)
 	require.Equal(t, http.StatusOK, w.Code)
-	require.Equal(t, tatarav1alpha1.StageApproved, e2.task(t, "t1").Status.Stage)
+	require.Equal(t, tatarav1alpha1.StateUnderImplementation, e2.task(t, "t1").Status.State,
+		"a GRANT enters under-implementation (#521: was approved)")
 	require.Equal(t, "approved", e2.issue(t, i1.Name).Status.Status)
 	require.NotNil(t, e2.issue(t, i1.Name).Status.Approval)
 }
@@ -658,7 +801,11 @@ func TestOutcome_Clarify_ImplementRequiresApprovalOnEveryOwnedIssue(t *testing.T
 // the ONE edge, never the two-hop path through a GENUINE citation-check pass.
 func TestOutcome_Conversing_ImplementRefusedWhenLiveCitationCheckFails(t *testing.T) {
 	i1 := issueV2("tatara-operator", 291, "t1")
-	task := taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageConversing, "clarify")
+	// "conversing" is gone (#521: folded into StateRefined, one of the states
+	// stage.Live now covers), but the property under test - a Task standing at
+	// the gate gets NO credit for anything that happened before it arrived
+	// there - is unchanged.
+	task := gateTaskV2("t1", "tatara", tatarav1alpha1.StateRefined)
 
 	// fakeApproval grants NOTHING: the live C.6 citation check fails on this request.
 	e := buildV2(t, v2Opts{
@@ -667,13 +814,16 @@ func TestOutcome_Conversing_ImplementRefusedWhenLiveCitationCheckFails(t *testin
 	}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"), task, i1)
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
-		`{"kind":"clarify","payload":{"decision":"implement","reason":"the maintainer surely meant yes"}}`)
+		`{"kind":"implement","payload":{"action":"approved","reason":"the maintainer surely meant yes","planNoteId":"`+gatePlanNoteID+`"}}`)
 	require.Equal(t, http.StatusOK, w.Code)
+	var resp gateResponseDTO
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.False(t, resp.Granted, "refined -> under-implementation must be refused when the live scope gate fails")
 
 	got := e.task(t, "t1")
-	require.Equal(t, tatarav1alpha1.StageParked, got.Status.Stage,
-		"conversing -> approved must be refused when the live scope gate fails")
-	require.Equal(t, "identity-unverified", got.Status.StageReason)
+	require.Equal(t, tatarav1alpha1.StateRefined, got.Status.State)
+	require.False(t, tatarav1alpha1.Parked(got),
+		"#521: the OLD contract parked at identity-unverified; a refusal now keeps the agent live instead")
 	require.Empty(t, e.issue(t, i1.Name).Status.Approval, "nothing is stamped when the live scope gate fails")
 }
 
@@ -681,7 +831,7 @@ func TestOutcome_Conversing_ImplementRefusedWhenLiveCitationCheckFails(t *testin
 // site: a bot proposal reaching implement) increments operator_auto_approve_total
 // by proposal kind, so the last-gate-removed release is queryable without
 // log-scraping (hard rule 13).
-func TestOutcome_Clarify_AutoApproveIncrementsCounter(t *testing.T) {
+func TestOutcome_Gate_AutoApproveIncrementsCounter(t *testing.T) {
 	i1 := issueV2("tatara-operator", 291, "t1", func(iss *tatarav1alpha1.Issue) {
 		iss.Status.Author = "tatara-bot"
 		iss.Status.Body = tatarav1alpha1.StampProposalMarker("do the thing", tatarav1alpha1.ProposalKindBrainstorm)
@@ -693,59 +843,67 @@ func TestOutcome_Clarify_AutoApproveIncrementsCounter(t *testing.T) {
 		metrics:  metrics,
 		approval: &fakeApproval{grant: map[string]bool{i1.Name: true}, auto: true},
 	}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"), i1)
+		gateTaskV2("t1", "tatara", tatarav1alpha1.StateRefined), i1)
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
-		`{"kind":"clarify","payload":{"decision":"implement","reason":"the brainstorm was the review"}}`)
+		`{"kind":"implement","payload":{"action":"approved","reason":"the brainstorm was the review","planNoteId":"`+gatePlanNoteID+`"}}`)
 	require.Equal(t, http.StatusOK, w.Code)
-	require.Equal(t, tatarav1alpha1.StageApproved, e.task(t, "t1").Status.Stage)
+	require.Equal(t, tatarav1alpha1.StateUnderImplementation, e.task(t, "t1").Status.State)
 	require.True(t, e.issue(t, i1.Name).Status.Approval.Auto, "evidence must record Auto:true")
 	require.Equal(t, 1.0, testutil.ToFloat64(metrics.AutoApproveCounter(tatarav1alpha1.ProposalKindBrainstorm)))
 }
 
-// TestOutcome_Clarify_CitationsReachTheVerifierVerbatim: the handler is a pipe.
-// It parses the agent's citations off the clarify payload and hands them to the
+// TestOutcome_Gate_CitationsReachTheVerifierVerbatim: the handler is a pipe.
+// It parses the agent's citations off the gate payload and hands them to the
 // verifier UNCHANGED, for every owned Issue - it never inspects, normalises or
 // judges them itself. The whole verification lives in controller.verifyOneIssue.
-func TestOutcome_Clarify_CitationsReachTheVerifierVerbatim(t *testing.T) {
+func TestOutcome_Gate_CitationsReachTheVerifierVerbatim(t *testing.T) {
 	i1 := issueV2("tatara-operator", 291, "t1")
 	i2 := issueV2("tatara-operator", 292, "t1")
 	fa := &fakeApproval{grant: map[string]bool{i1.Name: true, i2.Name: true}, needCitation: true}
 	e := buildV2(t, v2Opts{writer: panicForge{}, approval: fa},
 		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"), i1, i2)
+		gateTaskV2("t1", "tatara", tatarav1alpha1.StateRefined), i1, i2)
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
-		`{"kind":"clarify","payload":{"decision":"implement","reason":"maintainer approved",`+
+		`{"kind":"implement","payload":{"action":"approved","reason":"maintainer approved",`+
+			`"planNoteId":"`+gatePlanNoteID+`","approvingMaintainer":"maintainer",`+
 			`"approvalCitations":[{"id":"c-2","quote":"go ahead, I approve!"}]}}`)
 	require.Equal(t, http.StatusOK, w.Code)
-	require.Equal(t, tatarav1alpha1.StageApproved, e.task(t, "t1").Status.Stage)
+	require.Equal(t, tatarav1alpha1.StateUnderImplementation, e.task(t, "t1").Status.State)
 
 	require.Len(t, fa.gotCitations, 2, "every owned Issue is offered the citation set")
 	for _, got := range fa.gotCitations {
 		require.Equal(t, []tatarav1alpha1.ApprovalCitation{{ID: "c-2", Quote: "go ahead, I approve!"}}, got)
 	}
+	for _, d := range fa.gotDeclared {
+		require.Equal(t, "maintainer", d, "declared must reach the verifier unchanged")
+	}
 }
 
-// TestOutcome_Clarify_CitationRefusalIs200AndParks is the load-bearing contract
-// shape. A missing or failing citation is a REFUSAL, not a client error: 200 +
-// park at identity-unverified, exactly as a failed grammar check did. A
-// mis-instructed agent then parks ONE task instead of deadlocking the fleet.
-// Only malformed JSON and a missing decision / blank reason stay 4xx.
-func TestOutcome_Clarify_CitationRefusalIs200AndParks(t *testing.T) {
+// TestOutcome_Gate_CitationRefusalIs200AndDoesNotPark is the load-bearing
+// contract shape. A missing or failing citation is a REFUSAL, not a client
+// error: 200 + granted:false, and the Task stays exactly where it is - #521
+// deleted the OLD park-at-identity-unverified behaviour outright, because
+// under the merged model the agent is still alive and should be told no and
+// keep talking, not stalled. Only malformed JSON and a missing action / blank
+// reason stay 4xx.
+func TestOutcome_Gate_CitationRefusalIs200AndDoesNotPark(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		body     string
 		approval *fakeApproval
 	}{
 		{
-			name:     "no citations at all",
-			body:     `{"decision":"implement","reason":"maintainer-1 approved"}`,
-			approval: &fakeApproval{grant: map[string]bool{"iss-tatara-operator-291": true}, needCitation: true},
+			name: "no citations at all",
+			body: `"action":"approved","reason":"maintainer-1 approved","planNoteId":"` + gatePlanNoteID + `"`,
+			approval: &fakeApproval{grant: map[string]bool{"iss-tatara-operator-291": true},
+				needCitation: true},
 		},
 		{
 			name: "citations present but the verifier refuses them",
-			body: `{"decision":"implement","reason":"x","approvalCitations":[{"id":"c-1","quote":"go ahead"}]}`,
+			body: `"action":"approved","reason":"x","planNoteId":"` + gatePlanNoteID + `",` +
+				`"approvingMaintainer":"someone","approvalCitations":[{"id":"c-1","quote":"go ahead"}]`,
 			// The verifier refuses (a non-maintainer's comment, a fabricated
 			// quote, a replayed id - the reason is the controller's business).
 			approval: &fakeApproval{grant: map[string]bool{}},
@@ -755,48 +913,52 @@ func TestOutcome_Clarify_CitationRefusalIs200AndParks(t *testing.T) {
 			i1 := issueV2("tatara-operator", 291, "t1")
 			e := buildV2(t, v2Opts{writer: panicForge{}, approval: tc.approval},
 				projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
-				taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"), i1)
+				gateTaskV2("t1", "tatara", tatarav1alpha1.StateRefined), i1)
 
 			w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
-				`{"kind":"clarify","payload":`+tc.body+`}`)
+				`{"kind":"implement","payload":{`+tc.body+`}}`)
 			require.Equal(t, http.StatusOK, w.Code, "a refusal is never a 4xx")
+			var resp gateResponseDTO
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+			require.False(t, resp.Granted)
 
 			got := e.task(t, "t1")
-			require.Equal(t, tatarav1alpha1.StageParked, got.Status.Stage)
-			require.Equal(t, "identity-unverified", got.Status.StageReason)
+			require.Equal(t, tatarav1alpha1.StateRefined, got.Status.State)
+			require.False(t, tatarav1alpha1.Parked(got), "#521: a gate refusal does not park")
 			require.Empty(t, e.issue(t, i1.Name).Status.Approval, "nothing is stamped on a refusal")
 		})
 	}
 }
 
-// TestOutcome_Clarify_BadShapeStays4xx pins the OTHER side of the line: a
+// TestOutcome_Gate_BadShapeStays4xx pins the OTHER side of the line: a
 // payload the operator cannot even read is still a client error.
-func TestOutcome_Clarify_BadShapeStays4xx(t *testing.T) {
+func TestOutcome_Gate_BadShapeStays4xx(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		body string
 	}{
-		{"malformed json", `{"decision":`},
-		{"unknown field", `{"decision":"implement","reason":"x","approvalCitation":[]}`},
-		{"unknown field inside a citation", `{"decision":"implement","reason":"x","approvalCitations":[{"id":"c-1","text":"go ahead"}]}`},
-		{"missing decision", `{"reason":"x"}`},
-		{"blank reason", `{"decision":"implement","reason":"   "}`},
+		{"malformed json", `{"action":`},
+		{"unknown field", `{"action":"approved","reason":"x","planNoteId":"` + gatePlanNoteID + `","approvalCitation":[]}`},
+		{"unknown field inside a citation", `{"action":"approved","reason":"x","planNoteId":"` + gatePlanNoteID + `",` +
+			`"approvingMaintainer":"m","approvalCitations":[{"id":"c-1","text":"go ahead"}]}`},
+		{"missing action", `{"reason":"x"}`},
+		{"blank reason", `{"action":"approved","reason":"   ","planNoteId":"` + gatePlanNoteID + `"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := buildV2(t, v2Opts{writer: panicForge{},
 				approval: &fakeApproval{grant: map[string]bool{"iss-tatara-operator-291": true}}},
 				projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
-				taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"),
+				gateTaskV2("t1", "tatara", tatarav1alpha1.StateRefined),
 				issueV2("tatara-operator", 291, "t1"))
 			w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
-				`{"kind":"clarify","payload":`+tc.body+`}`)
+				`{"kind":"implement","payload":`+tc.body+`}`)
 			require.GreaterOrEqual(t, w.Code, 400)
 			require.Less(t, w.Code, 500)
 		})
 	}
 }
 
-// TestOutcome_Clarify_GrantedWithNilEvidenceIsNotWritten: a LIVE Issue that the
+// TestOutcome_Gate_GrantedWithNilEvidenceIsNotWritten: a LIVE Issue that the
 // verifier grants with NO evidence must not approve anything, at either of the
 // two places it could. status=approved with a nil approval is an approved Issue
 // with NO approver - it defeats the idempotence short-circuit, defeats the
@@ -812,17 +974,17 @@ func TestOutcome_Clarify_BadShapeStays4xx(t *testing.T) {
 // half is the one that matters, because the earlier half-fix skipped the write
 // and then let control fall through to stage.Enter(approved) anyway. The writer
 // guard's own coverage is negative and lives in
-// TestOutcome_Clarify_ClosedIssueDoesNotBlockALiveOne.
-func TestOutcome_Clarify_GrantedWithNilEvidenceIsNotWritten(t *testing.T) {
+// TestOutcome_Gate_ClosedIssueDoesNotBlockALiveOne.
+func TestOutcome_Gate_GrantedWithNilEvidenceIsNotWritten(t *testing.T) {
 	i1 := issueV2("tatara-operator", 291, "t1")
 	e := buildV2(t, v2Opts{writer: panicForge{},
 		approval: &fakeApproval{grant: map[string]bool{i1.Name: true}, grantWithNilEvidence: true}},
 		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"), i1)
+		gateTaskV2("t1", "tatara", tatarav1alpha1.StateRefined), i1)
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
-		`{"kind":"clarify","payload":{"decision":"implement","reason":"x",`+
-			`"approvalCitations":[{"id":"c-2","quote":"go ahead"}]}}`)
+		`{"kind":"implement","payload":{"action":"approved","reason":"x","planNoteId":"`+gatePlanNoteID+`",`+
+			`"approvingMaintainer":"maintainer","approvalCitations":[{"id":"c-2","quote":"go ahead"}]}}`)
 	require.Equal(t, http.StatusOK, w.Code)
 
 	got := e.issue(t, i1.Name)
@@ -831,10 +993,10 @@ func TestOutcome_Clarify_GrantedWithNilEvidenceIsNotWritten(t *testing.T) {
 		"an approver-less approval must never be written")
 	// Skipping the Issue write is only HALF the guard, and asserting only that
 	// half is what certified the hole below: control still fell through to
-	// stage.Enter(approved), so the Task advanced on an evidence map that
-	// approved nothing.
-	require.NotEqual(t, tatarav1alpha1.StageApproved, e.task(t, "t1").Status.Stage,
-		"the Task must not reach approved on an approver-less approval")
+	// stage.Enter(under-implementation), so the Task advanced on an evidence
+	// map that approved nothing.
+	require.Equal(t, tatarav1alpha1.StateRefined, e.task(t, "t1").Status.State,
+		"the Task must not reach under-implementation on an approver-less approval")
 }
 
 // TestOutcome_Clarify_ClosedIssueIsNotALicence is the gate hole this branch's
@@ -852,23 +1014,24 @@ func TestOutcome_Clarify_GrantedWithNilEvidenceIsNotWritten(t *testing.T) {
 // thing that releases the work. THE EMPTY SET IS NOT A LICENCE: all([]) == true
 // must never gate code execution, and after the Task-level twin was deleted this
 // loop is the only place that principle is enforced at all.
-func TestOutcome_Clarify_ClosedIssueIsNotALicence(t *testing.T) {
+func TestOutcome_Gate_ClosedIssueIsNotALicence(t *testing.T) {
 	closed := issueV2("tatara-operator", 291, "t1", func(i *tatarav1alpha1.Issue) {
 		i.Status.State = "closed"
 	})
 	e := buildV2(t, v2Opts{writer: panicForge{}, approval: &fakeApproval{}},
 		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"), closed)
+		gateTaskV2("t1", "tatara", tatarav1alpha1.StateRefined), closed)
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
-		`{"kind":"clarify","payload":{"decision":"implement","reason":"they closed it, so ship it",`+
+		`{"kind":"implement","payload":{"action":"approved","reason":"they closed it, so ship it",`+
+			`"planNoteId":"`+gatePlanNoteID+`","approvingMaintainer":"maintainer",`+
 			`"approvalCitations":[{"id":"c-2","quote":"go ahead"}]}}`)
 	require.Equal(t, http.StatusOK, w.Code)
 
 	got := e.task(t, "t1")
-	require.Equal(t, tatarav1alpha1.StageParked, got.Status.Stage,
-		"a Task whose only Issue is CLOSED must not reach approved")
-	require.Equal(t, "identity-unverified", got.Status.StageReason)
+	require.Equal(t, tatarav1alpha1.StateRefined, got.Status.State,
+		"a Task whose only Issue is CLOSED must not reach under-implementation")
+	require.False(t, tatarav1alpha1.Parked(got), "#521: a gate refusal does not park")
 	require.Nil(t, e.issue(t, closed.Name).Status.Approval)
 }
 
@@ -886,7 +1049,7 @@ func TestOutcome_Clarify_ClosedIssueIsNotALicence(t *testing.T) {
 // identity-unverified is covered), but a park alert with no reason attribution,
 // next to a WARN naming the wrong cause, sent triage at the clarify agent
 // instead of at the human's veto.
-func TestOutcome_Clarify_EmptyScopeRefusalIsAttributed(t *testing.T) {
+func TestOutcome_Gate_EmptyScopeRefusalIsAttributed(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		objs    []client.Object
@@ -910,17 +1073,26 @@ func TestOutcome_Clarify_EmptyScopeRefusalIsAttributed(t *testing.T) {
 			metrics := obs.NewOperatorMetrics(reg)
 			var logBuf bytes.Buffer
 			base := []client.Object{projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
-				taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify")}
+				gateTaskV2("t1", "tatara", tatarav1alpha1.StateRefined)}
 			e := buildV2(t, v2Opts{writer: panicForge{}, metrics: metrics,
 				logger:   slog.New(slog.NewJSONHandler(&logBuf, nil)),
 				approval: &fakeApproval{}},
 				append(base, tc.objs...)...)
 
 			w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
-				`{"kind":"clarify","payload":{"decision":"implement","reason":"ship it",`+
+				`{"kind":"implement","payload":{"action":"approved","reason":"ship it",`+
+					`"planNoteId":"`+gatePlanNoteID+`","approvingMaintainer":"maintainer",`+
 					`"approvalCitations":[{"id":"c-2","quote":"go ahead"}]}}`)
 			require.Equal(t, http.StatusOK, w.Code)
-			require.Equal(t, "identity-unverified", e.task(t, "t1").Status.StageReason)
+
+			var resp gateResponseDTO
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+			require.False(t, resp.Granted)
+			require.Equal(t, controller.ApprovalRefusedNoLiveIssue, resp.Reason)
+
+			got := e.task(t, "t1")
+			require.Equal(t, tatarav1alpha1.StateRefined, got.Status.State)
+			require.False(t, tatarav1alpha1.Parked(got), "#521: a gate refusal does not park")
 
 			require.Equal(t, float64(1),
 				testutil.ToFloat64(metrics.ApprovalRefusedCounter(controller.ApprovalRefusedNoLiveIssue)),
@@ -956,7 +1128,7 @@ func TestOutcome_Clarify_EmptyScopeRefusalIsAttributed(t *testing.T) {
 // approver-less approval that never happened. Nothing was mis-written, but an
 // ERROR naming a security failure on the happy path is a triage trap and
 // violates hard rule 12's level discipline.
-func TestOutcome_Clarify_ClosedIssueDoesNotBlockALiveOne(t *testing.T) {
+func TestOutcome_Gate_ClosedIssueDoesNotBlockALiveOne(t *testing.T) {
 	live := issueV2("tatara-operator", 291, "t1")
 	closed := issueV2("tatara-cli", 12, "t1", func(i *tatarav1alpha1.Issue) {
 		i.Status.State = "closed"
@@ -967,14 +1139,15 @@ func TestOutcome_Clarify_ClosedIssueDoesNotBlockALiveOne(t *testing.T) {
 		approval: &fakeApproval{grant: map[string]bool{live.Name: true}, needCitation: true}},
 		projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"), repoV2("tatara-cli", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"), live, closed)
+		gateTaskV2("t1", "tatara", tatarav1alpha1.StateRefined), live, closed)
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
-		`{"kind":"clarify","payload":{"decision":"implement","reason":"maintainer-1 said go ahead",`+
+		`{"kind":"implement","payload":{"action":"approved","reason":"maintainer-1 said go ahead",`+
+			`"planNoteId":"`+gatePlanNoteID+`","approvingMaintainer":"maintainer-1",`+
 			`"approvalCitations":[{"id":"c-2","quote":"go ahead"}]}}`)
 	require.Equal(t, http.StatusOK, w.Code)
 
-	require.Equal(t, tatarav1alpha1.StageApproved, e.task(t, "t1").Status.Stage)
+	require.Equal(t, tatarav1alpha1.StateUnderImplementation, e.task(t, "t1").Status.State)
 	require.Equal(t, "approved", e.issue(t, live.Name).Status.Status)
 	require.NotEqual(t, "approved", e.issue(t, closed.Name).Status.Status,
 		"the out-of-scope Issue is skipped, never written")
@@ -989,15 +1162,20 @@ func TestOutcome_Clarify_ClosedIssueDoesNotBlockALiveOne(t *testing.T) {
 }
 
 // A nil verifier FAILS CLOSED.
-func TestOutcome_Clarify_NoVerifierFailsClosed(t *testing.T) {
+func TestOutcome_Gate_NoVerifierFailsClosed(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"),
+		gateTaskV2("t1", "tatara", tatarav1alpha1.StateRefined),
 		issueV2("tatara-operator", 291, "t1"))
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
-		`{"kind":"clarify","payload":{"decision":"implement","reason":"trust me"}}`)
+		`{"kind":"implement","payload":{"action":"approved","reason":"trust me","planNoteId":"`+gatePlanNoteID+`"}}`)
 	require.Equal(t, http.StatusOK, w.Code)
-	require.Equal(t, "identity-unverified", e.task(t, "t1").Status.StageReason)
+	var resp gateResponseDTO
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.False(t, resp.Granted)
+	got := e.task(t, "t1")
+	require.Equal(t, tatarav1alpha1.StateRefined, got.Status.State)
+	require.False(t, tatarav1alpha1.Parked(got), "#521: a refusal never parks, even fail-closed")
 }
 
 // TestOutcome_Clarify_GrantIsAuditedWithTheApprover is the counterpart to the
@@ -1015,20 +1193,21 @@ func TestOutcome_Clarify_NoVerifierFailsClosed(t *testing.T) {
 // The field names are pinned deliberately: they are exactly the ones the deleted
 // controller-side writer used, so a log consumer written against either sees one
 // shape rather than two.
-func TestOutcome_Clarify_GrantIsAuditedWithTheApprover(t *testing.T) {
+func TestOutcome_Gate_GrantIsAuditedWithTheApprover(t *testing.T) {
 	i1 := issueV2("tatara-operator", 291, "t1")
 	var logBuf bytes.Buffer
 	e := buildV2(t, v2Opts{writer: panicForge{},
 		logger:   slog.New(slog.NewJSONHandler(&logBuf, nil)),
 		approval: &fakeApproval{grant: map[string]bool{i1.Name: true}, needCitation: true}},
 		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"), i1)
+		gateTaskV2("t1", "tatara", tatarav1alpha1.StateRefined), i1)
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
-		`{"kind":"clarify","payload":{"decision":"implement","reason":"maintainer said go ahead",`+
+		`{"kind":"implement","payload":{"action":"approved","reason":"maintainer said go ahead",`+
+			`"planNoteId":"`+gatePlanNoteID+`","approvingMaintainer":"maintainer",`+
 			`"approvalCitations":[{"id":"1","quote":"go ahead"}]}}`)
 	require.Equal(t, http.StatusOK, w.Code)
-	require.Equal(t, tatarav1alpha1.StageApproved, e.task(t, "t1").Status.Stage)
+	require.Equal(t, tatarav1alpha1.StateUnderImplementation, e.task(t, "t1").Status.State)
 
 	line := findLogLine(t, logBuf.Bytes(), "approval_verified")
 	require.Equal(t, "INFO", line["level"], "the approval grant must be an INFO business action")
@@ -1103,7 +1282,7 @@ func findLogLineAtLevel(t *testing.T, buf []byte, level string) map[string]any {
 // already-approved arm is load-bearing for this test specifically: it grants
 // NOTHING here and demands a citation, so removing that arm refuses the request
 // and parks the Task.
-func TestOutcome_Clarify_AlreadyApprovedIssueNeedsNoFreshCitation(t *testing.T) {
+func TestOutcome_Gate_AlreadyApprovedIssueNeedsNoFreshCitation(t *testing.T) {
 	approvedAt := metav1.NewTime(frozenNow.Add(-time.Hour))
 	i1 := issueV2("tatara-operator", 291, "t1", func(iss *tatarav1alpha1.Issue) {
 		iss.Status.Status = "approved"
@@ -1114,12 +1293,12 @@ func TestOutcome_Clarify_AlreadyApprovedIssueNeedsNoFreshCitation(t *testing.T) 
 	e := buildV2(t, v2Opts{writer: panicForge{},
 		approval: &fakeApproval{grant: map[string]bool{}, needCitation: true}},
 		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"), i1)
+		gateTaskV2("t1", "tatara", tatarav1alpha1.StateRefined), i1)
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
-		`{"kind":"clarify","payload":{"decision":"implement","reason":"already approved last turn"}}`)
+		`{"kind":"implement","payload":{"action":"approved","reason":"already approved last turn","planNoteId":"`+gatePlanNoteID+`"}}`)
 	require.Equal(t, http.StatusOK, w.Code)
-	require.Equal(t, tatarav1alpha1.StageApproved, e.task(t, "t1").Status.Stage,
+	require.Equal(t, tatarav1alpha1.StateUnderImplementation, e.task(t, "t1").Status.State,
 		"an Issue that already carries evidence must not need a fresh citation")
 
 	got := e.issue(t, i1.Name).Status.Approval
@@ -1128,87 +1307,567 @@ func TestOutcome_Clarify_AlreadyApprovedIssueNeedsNoFreshCitation(t *testing.T) 
 	require.Equal(t, "c-1", got.CommentID)
 }
 
-func TestOutcome_Clarify_DiscussParksAwaitingHuman(t *testing.T) {
+func TestOutcome_Gate_DiscussParksAwaitingHuman(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"))
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateRefined, "implement"))
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
-		`{"kind":"clarify","payload":{"decision":"discuss","reason":"needs a human"}}`)
+		`{"kind":"implement","payload":{"action":"discuss","reason":"needs a human"}}`)
 	require.Equal(t, http.StatusOK, w.Code)
 	got := e.task(t, "t1")
-	require.Equal(t, tatarav1alpha1.StageParked, got.Status.Stage)
-	require.Equal(t, "awaiting-human", got.Status.StageReason)
+	require.Equal(t, tatarav1alpha1.StateRefined, got.Status.State, "a park never changes state")
+	require.True(t, tatarav1alpha1.Parked(got))
+	require.Equal(t, "awaiting-human", got.Status.ParkReason)
 }
 
-// An /outcome-driven park (this handler's own stage.Enter call, not routed
-// through controller.EnterStage) must still count against
+// An /outcome-driven park (this handler's own stage.Park call, not routed
+// through controller.ParkTask) must still count against
 // operator_task_parked_total - the same choke-point gap already closed for
 // operator_task_terminal_total (D1) via commit()'s TaskTerminalEntry call.
 // Regression coverage for the metric-wiring audit (issue #370).
-func TestOutcome_Clarify_DiscussParksAwaitingHuman_RecordsParkedMetric(t *testing.T) {
+func TestOutcome_Gate_DiscussParksAwaitingHuman_RecordsParkedMetric(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	metrics := obs.NewOperatorMetrics(reg)
 	e := buildV2(t, v2Opts{writer: panicForge{}, metrics: metrics}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"))
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateRefined, "implement"))
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
-		`{"kind":"clarify","payload":{"decision":"discuss","reason":"needs a human"}}`)
+		`{"kind":"implement","payload":{"action":"discuss","reason":"needs a human"}}`)
 	require.Equal(t, http.StatusOK, w.Code)
 
-	got := testutil.ToFloat64(metrics.TaskParkedCounter(tatarav1alpha1.StageClarifying, "awaiting-human"))
+	got := testutil.ToFloat64(metrics.TaskParkedCounter(tatarav1alpha1.StateRefined, "awaiting-human"))
 	require.Equal(t, float64(1), got,
-		"operator_task_parked_total{stage=clarifying,stageReason=awaiting-human} must record the outcome-driven park")
+		"operator_task_parked_total{state=refined,parkReason=awaiting-human} must record the outcome-driven park")
 }
 
-func TestOutcome_Clarify_CloseRejectsAndQueuesTheIssueClose(t *testing.T) {
+func TestOutcome_Gate_RejectedRejectsAndQueuesTheIssueClose(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateRefined, "implement"),
 		issueV2("tatara-operator", 291, "t1"))
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
-		`{"kind":"clarify","payload":{"decision":"close","reason":"wont fix"}}`)
+		`{"kind":"implement","payload":{"action":"rejected","reason":"wont fix"}}`)
 	require.Equal(t, http.StatusOK, w.Code)
-	require.Equal(t, tatarav1alpha1.StageRejected, e.task(t, "t1").Status.Stage)
+	require.Equal(t, tatarav1alpha1.StateRejected, e.task(t, "t1").Status.State)
 	require.Len(t, e.issue(t, tatarav1alpha1.IssueName("tatara-operator", 291)).Status.PendingComments, 1)
 }
 
-func TestOutcome_Clarify_ReasonAlwaysRequired(t *testing.T) {
+func TestOutcome_Gate_ReasonAlwaysRequired(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"))
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateRefined, "implement"))
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
-		`{"kind":"clarify","payload":{"decision":"discuss"}}`)
+		`{"kind":"implement","payload":{"action":"discuss"}}`)
 	require.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+// --- new #521 coverage: the fold, the required-tests list ------------------
+
+// TestOutcome_KindClarifyIsRejected: `clarify` is not an alias for `implement`,
+// deliberately. Its decisions folded into implement's action enum, but the
+// KIND itself is gone: a pod that still sends kind=clarify hits the unknown-
+// kind arm, same as any other bogus kind.
+func TestOutcome_KindClarifyIsRejected(t *testing.T) {
+	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		// agentKind is "clarify" too, so the kind gate passes on the matching
+		// bogus kind and the request reaches the switch's default arm.
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateRefined, "clarify"))
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"clarify","payload":{"decision":"discuss","reason":"r"}}`)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	require.Contains(t, w.Body.String(), "unknown outcome kind")
+}
+
+// TestOutcome_ImplementSubmittedStillWorksUnderTheMergedKind: the fold only
+// ADDED the gate actions to implement's action enum; the pre-existing code
+// path (action=submitted from under-implementation) must not have regressed.
+func TestOutcome_ImplementSubmittedStillWorksUnderTheMergedKind(t *testing.T) {
+	e := buildV2(t, v2Opts{writer: &reviewPanicForge{heads: map[int]string{295: "live-head"}}},
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
+		mrV2("tatara-operator", 295, "t1"))
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"implement","payload":{"action":"submitted","title":"T","body":"B","changeSignificance":"patch"}}`)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, tatarav1alpha1.StateAwaitingReview, e.task(t, "t1").Status.State,
+		"the code path did not regress under the merged kind")
+}
+
+// TestOutcome_Gate_RefusalIs200AndDoesNotPark pins the exact refusal body
+// shape and the state/park invariant in one place, independent of which
+// verifier clause refused.
+func TestOutcome_Gate_RefusalIs200AndDoesNotPark(t *testing.T) {
+	i1 := issueV2("tatara-operator", 291, "t1")
+	e := buildV2(t, v2Opts{writer: panicForge{},
+		approval: &fakeApproval{grant: map[string]bool{}, refusalReason: controller.ApprovalRefusedNoMaintainer}},
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		gateTaskV2("t1", "tatara", tatarav1alpha1.StateRefined), i1)
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"implement","payload":{"action":"approved","reason":"x","planNoteId":"`+gatePlanNoteID+`",`+
+			`"approvingMaintainer":"someone","approvalCitations":[{"id":"c-1","quote":"go ahead"}]}}`)
+	require.Equal(t, http.StatusOK, w.Code, "a gate refusal is a 200, never a 4xx")
+
+	var resp gateResponseDTO
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.False(t, resp.Granted)
+	require.Equal(t, controller.ApprovalRefusedNoMaintainer, resp.Reason)
+	require.Equal(t, "someone", resp.Declared)
+
+	got := e.task(t, "t1")
+	require.Equal(t, tatarav1alpha1.StateRefined, got.Status.State,
+		"the OLD contract parked at identity-unverified; #521 keeps the agent live instead")
+	require.False(t, tatarav1alpha1.Parked(got), "a gate refusal must NEVER park")
+}
+
+// TestOutcome_Gate_PlanNoteIdMustNameThePlanNote is THE PLAN PIN'S OWN
+// AUTHENTICITY CHECK.
+//
+// The pin is the anti-scope-drift control: it is supposed to guarantee that the
+// code that ships is the change the plan the maintainer approved describes. It
+// works by hashing a note at grant and re-hashing it at submit - so WHICH note
+// is hashed is the whole control. `planNoteId` is CLIENT-SUPPLIED and the wire
+// says nothing about its kind, so an agent may send the id of any note it has
+// written: a handoff note, a turn note, a superseded plan. Resolving it by id
+// ALONE hashed whatever it named and called that the approved plan.
+//
+// The re-check resolves the plan note a DIFFERENT way - the newest note of kind
+// `plan` (status.pinnedPlanNoteId) - so the two must agree or the pin proves
+// nothing whichever way it lands: an id naming a note the re-check never reads
+// either defeats the control (nothing to compare, no drift ever detected) or
+// fires it spuriously (a mismatch on a plan nobody touched).
+func TestOutcome_Gate_PlanNoteIdMustNameThePlanNote(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		notes  []tatarav1alpha1.Note
+		citeID string
+	}{
+		{
+			// The DEFEAT: a note of another kind entirely.
+			name:   "a handoff note is not a plan note",
+			notes:  []tatarav1alpha1.Note{gatePlanNote(), gateHandoffNote()},
+			citeID: gateHandoffNoteID,
+		},
+		{
+			// The SPURIOUS FIRE: a real plan note, but not the one the re-check
+			// reads, so the very next untouched submit reports drift.
+			name:   "a superseded plan note is not the plan note",
+			notes:  []tatarav1alpha1.Note{gateSupersededPlanNote(), gatePlanNote()},
+			citeID: gateSupersededPlanID,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			i1 := issueV2("tatara-operator", 291, "t1")
+			e := buildV2(t, v2Opts{writer: panicForge{},
+				approval: &fakeApproval{grant: map[string]bool{i1.Name: true}}},
+				projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+				gateTaskWithJournalV2("t1", "tatara", tatarav1alpha1.StateRefined, tc.notes...), i1)
+
+			w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+				`{"kind":"implement","payload":{"action":"approved","reason":"maintainer said go ahead",`+
+					`"planNoteId":"`+tc.citeID+`"}}`)
+			require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+			var resp gateResponseDTO
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+			require.False(t, resp.Granted, "the gate must not grant on a pin it cannot re-check")
+			require.Equal(t, controller.ApprovalRefusedPlanNoteNotPlan, resp.Reason)
+			require.Equal(t, "plan-note-not-plan", resp.Reason,
+				"the refusal reason is the wire vocabulary the agent branches on")
+
+			got := e.task(t, "t1")
+			require.Equal(t, tatarav1alpha1.StateRefined, got.Status.State,
+				"a refused gate leaves the agent live at the gate; it never reaches code")
+			require.False(t, tatarav1alpha1.Parked(got), "a gate refusal must NEVER park")
+			require.Nil(t, e.issue(t, i1.Name).Status.Approval,
+				"nothing is approved and nothing is pinned when the gate refuses")
+		})
+	}
+}
+
+// TestOutcome_Gate_TheGrantPinsTheSameNoteTheRecheckReads is the other half:
+// the grant and the re-check must resolve the SAME note, end to end, or the pin
+// is decorative. It walks a real Task through both halves of the control - the
+// grant that takes the hash, then the submit that re-takes it - over a journal
+// that carries decoy notes of other kinds, and asserts the hash the grant
+// stored is the hash of the note the re-check re-reads.
+func TestOutcome_Gate_TheGrantPinsTheSameNoteTheRecheckReads(t *testing.T) {
+	i1 := issueV2("tatara-operator", 291, "t1")
+	task := gateTaskWithJournalV2("t1", "tatara", tatarav1alpha1.StateRefined,
+		gateSupersededPlanNote(), gatePlanNote(), gateHandoffNote())
+	e := buildV2(t, v2Opts{writer: &reviewPanicForge{heads: map[int]string{295: "live-head"}},
+		approval: &fakeApproval{grant: map[string]bool{i1.Name: true}}},
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		task, i1, mrV2("tatara-operator", 295, "t1"))
+
+	// THE GRANT, citing the Task's actual plan note.
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"implement","payload":{"action":"approved","reason":"maintainer said go ahead",`+
+			`"planNoteId":"`+gatePlanNoteID+`"}}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.Equal(t, tatarav1alpha1.StateUnderImplementation, e.task(t, "t1").Status.State)
+
+	ev := e.issue(t, i1.Name).Status.Approval
+	require.NotNil(t, ev)
+	require.Equal(t, fmt.Sprintf("%x", sha256.Sum256([]byte(gatePlanNoteBody))), ev.PlanHash,
+		"the grant pins the PLAN note, not the newest note and not whatever id it was handed")
+
+	// THE RE-CHECK, with nothing touched. It resolves the same note, so it agrees.
+	w = e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"implement","payload":{"action":"submitted","title":"T","body":"B","changeSignificance":"patch"}}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NotContains(t, w.Body.String(), controller.ApprovalRefusedPlanHashMismatch,
+		"an untouched plan must never read as drift: that is grant and re-check disagreeing")
+	require.Equal(t, tatarav1alpha1.StateAwaitingReview, e.task(t, "t1").Status.State)
+}
+
+// TestOutcome_Gate_AutoApprovePathGrantsWithNeitherGateField: neither
+// approvingMaintainer nor approvalCitations is present - the auto-approve
+// path - and the verifier grants.
+func TestOutcome_Gate_AutoApprovePathGrantsWithNeitherGateField(t *testing.T) {
+	i1 := issueV2("tatara-operator", 291, "t1", func(iss *tatarav1alpha1.Issue) {
+		iss.Status.Author = "tatara-bot"
+		iss.Status.Body = tatarav1alpha1.StampProposalMarker("do the thing", tatarav1alpha1.ProposalKindBrainstorm)
+	})
+	e := buildV2(t, v2Opts{writer: panicForge{},
+		approval: &fakeApproval{grant: map[string]bool{i1.Name: true}, auto: true}},
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		gateTaskV2("t1", "tatara", tatarav1alpha1.StateRefined), i1)
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"implement","payload":{"action":"approved","reason":"bot proposal, auto-approved",`+
+			`"planNoteId":"`+gatePlanNoteID+`"}}`)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, tatarav1alpha1.StateUnderImplementation, e.task(t, "t1").Status.State)
+	require.True(t, e.issue(t, i1.Name).Status.Approval.Auto)
+}
+
+// TestOutcome_Gate_AutoApprovePathIsRefusedWhenTheVerifierSaysNoCitation: the
+// auto-approve path (neither gate field) is still a REAL verification, not a
+// rubber stamp - a verifier that wants a citation and gets none still refuses.
+func TestOutcome_Gate_AutoApprovePathIsRefusedWhenTheVerifierSaysNoCitation(t *testing.T) {
+	i1 := issueV2("tatara-operator", 291, "t1")
+	e := buildV2(t, v2Opts{writer: panicForge{},
+		approval: &fakeApproval{grant: map[string]bool{i1.Name: true}, needCitation: true}},
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		gateTaskV2("t1", "tatara", tatarav1alpha1.StateRefined), i1)
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"implement","payload":{"action":"approved","reason":"trust me","planNoteId":"`+gatePlanNoteID+`"}}`)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var resp gateResponseDTO
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.False(t, resp.Granted)
+	require.Equal(t, "no-citation", resp.Reason)
+	require.Equal(t, controller.ApprovalRefusedNoCitation, resp.Reason)
+
+	got := e.task(t, "t1")
+	require.Equal(t, tatarav1alpha1.StateRefined, got.Status.State)
+	require.False(t, tatarav1alpha1.Parked(got))
+}
+
+// TestOutcome_Gate_DeclaredKeyIsAlwaysPresentOnRefusal: `declared` is a
+// DEFINED field on every refusal body, including the auto-approve path where
+// the agent legitimately sent no approvingMaintainer - "" there means "the
+// agent declared no approver", not "the field never showed up". gateResponseDTO
+// above cannot see the difference between an empty string and an absent key
+// (it has no omitempty of its own), so this test decodes the RAW body into a
+// map and checks for the key's presence with the two-value lookup instead.
+func TestOutcome_Gate_DeclaredKeyIsAlwaysPresentOnRefusal(t *testing.T) {
+	i1 := issueV2("tatara-operator", 291, "t1")
+	e := buildV2(t, v2Opts{writer: panicForge{},
+		approval: &fakeApproval{grant: map[string]bool{i1.Name: true}, needCitation: true}},
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		gateTaskV2("t1", "tatara", tatarav1alpha1.StateRefined), i1)
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"implement","payload":{"action":"approved","reason":"trust me","planNoteId":"`+gatePlanNoteID+`"}}`)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &raw))
+	require.False(t, raw["granted"].(bool))
+	declared, present := raw["declared"]
+	require.True(t, present, "declared must be present on every refusal body, even when the agent sent none")
+	require.Equal(t, "", declared, "the auto-approve path legitimately sent no approvingMaintainer")
+}
+
+// TestOutcome_Gate_OneOfThePairWithoutTheOtherIsRefused: approvingMaintainer
+// and approvalCitations travel as a PAIR. Both present is a human-cited
+// approval, both absent is the autoApproveTataraProposals path; one without the
+// other is a client bug, refused BEFORE any verifier call - 400 both ways round.
+//
+// It is refused UP FRONT, not by the verifier, because a citation with no
+// declared approver skips the two cross-checks the declaration exists for
+// (approver-not-maintainer, approver-mismatch) and a declared approver with no
+// citation has nothing to be checked against - so a verifier that saw either
+// half alone would answer a question nobody asked. The refusal is counted under
+// its own reason so a client sending half a pair is visible as itself rather
+// than as generic gate noise.
+func TestOutcome_Gate_OneOfThePairWithoutTheOtherIsRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{
+			name: "approvingMaintainer without approvalCitations",
+			body: `"action":"approved","reason":"x","planNoteId":"` + gatePlanNoteID + `","approvingMaintainer":"maintainer"`,
+		},
+		{
+			name: "approvalCitations without approvingMaintainer",
+			body: `"action":"approved","reason":"x","planNoteId":"` + gatePlanNoteID +
+				`","approvalCitations":[{"id":"c-1","quote":"go ahead"}]`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := testutil.ToFloat64(
+				obs.RestOutcomeRejectedTotal.WithLabelValues("implement", "gate-pair-mismatch"))
+			approval := &fakeApproval{}
+			e := buildV2(t, v2Opts{writer: panicForge{}, approval: approval},
+				projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+				gateTaskV2("t1", "tatara", tatarav1alpha1.StateRefined),
+				issueV2("tatara-operator", 291, "t1"))
+			w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"implement","payload":{`+tc.body+`}}`)
+			require.Equal(t, http.StatusBadRequest, w.Code)
+			require.Contains(t, w.Body.String(),
+				"approvingMaintainer and approvalCitations must both be present or both be absent")
+
+			require.Empty(t, approval.gotCitations, "the pair rule refuses BEFORE any verification runs")
+
+			after := testutil.ToFloat64(
+				obs.RestOutcomeRejectedTotal.WithLabelValues("implement", "gate-pair-mismatch"))
+			require.Equal(t, before+1, after,
+				"the refusal is counted under its own reason, not folded into a generic one")
+
+			got := e.task(t, "t1")
+			require.Equal(t, tatarav1alpha1.StateRefined, got.Status.State, "a refused gate moves nothing")
+			require.False(t, tatarav1alpha1.Parked(got))
+			require.Empty(t, e.issue(t, tatarav1alpha1.IssueName("tatara-operator", 291)).Status.Approval,
+				"nothing is stamped when the pair rule refuses")
+		})
+	}
+}
+
+// TestOutcome_Gate_MissingPlanNoteIdIsRefused pins design addendum item 10's
+// fifth required gate test: planNoteId STAYS unconditionally required on
+// action=approved on BOTH the human-cited and the auto-approve paths, because
+// the plan pin is orthogonal to who approved - an agent that names a citation
+// or skips the pair entirely still has to name the plan note it wants pinned.
+// It is refused UP FRONT as a missing required field (400, same class as a
+// missing action or blank reason), before findNote or the verifier ever runs.
+func TestOutcome_Gate_MissingPlanNoteIdIsRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{
+			name: "human-cited path without planNoteId",
+			body: `"action":"approved","reason":"x","approvingMaintainer":"maintainer",` +
+				`"approvalCitations":[{"id":"c-1","quote":"go ahead"}]`,
+		},
+		{
+			name: "auto-approve path without planNoteId",
+			body: `"action":"approved","reason":"x"`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := testutil.ToFloat64(
+				obs.RestOutcomeRejectedTotal.WithLabelValues("implement", "missing-field"))
+			approval := &fakeApproval{grant: map[string]bool{"iss-tatara-operator-291": true}}
+			e := buildV2(t, v2Opts{writer: panicForge{}, approval: approval},
+				projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+				gateTaskV2("t1", "tatara", tatarav1alpha1.StateRefined),
+				issueV2("tatara-operator", 291, "t1"))
+			w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"implement","payload":{`+tc.body+`}}`)
+			require.Equal(t, http.StatusBadRequest, w.Code)
+			require.Contains(t, w.Body.String(), "action=approved requires planNoteId")
+
+			require.Empty(t, approval.gotCitations, "planNoteId is checked BEFORE any verification runs")
+
+			after := testutil.ToFloat64(
+				obs.RestOutcomeRejectedTotal.WithLabelValues("implement", "missing-field"))
+			require.Equal(t, before+1, after, "the refusal is counted as a missing-field rejection")
+
+			got := e.task(t, "t1")
+			require.Equal(t, tatarav1alpha1.StateRefined, got.Status.State, "a refused gate moves nothing")
+			require.False(t, tatarav1alpha1.Parked(got))
+			require.Empty(t, e.issue(t, tatarav1alpha1.IssueName("tatara-operator", 291)).Status.Approval,
+				"nothing is stamped when planNoteId is missing")
+		})
+	}
+}
+
+// planPinnedFixtureV2 builds an implement Task MID-IMPLEMENTATION under a
+// grant, plus the owned Issue carrying the approval evidence the gate wrote.
+// grantBody is the plan note's body AS IT STOOD AT GRANT (what
+// ApprovalEvidence.PlanHash was taken over); planBody is its body NOW.
+// Passing a planBody != grantBody IS the agent rewriting the approved plan
+// after the grant - the exact artifact the merged model created, because the
+// same live agent is now approved and implements, instead of a fresh implement
+// pod starting after a clarify Task ended.
+func planPinnedFixtureV2(grantBody, planBody string) (*tatarav1alpha1.Task, *tatarav1alpha1.Issue) {
+	task := taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement")
+	task.Status.Notes = []tatarav1alpha1.Note{{
+		ID: gatePlanNoteID, At: gatePlanNoteAt, Agent: "implement", Kind: "plan", Body: planBody,
+	}}
+	task.Status.PinnedPlanNoteID = gatePlanNoteID
+	iss := issueV2("tatara-operator", 291, "t1", func(is *tatarav1alpha1.Issue) {
+		is.Status.Status = "approved"
+		is.Status.Approval = &tatarav1alpha1.ApprovalEvidence{
+			Login: "maintainer", CommentID: "c-1", Phrase: "go ahead",
+			PlanHash: fmt.Sprintf("%x", sha256.Sum256([]byte(grantBody))),
+		}
+	})
+	return task, iss
+}
+
+// TestOutcome_Implement_PlanHashMismatchSendsTheTaskBackToTheGate is the
+// ANTI-SCOPE-DRIFT control, and it owns a live table edge
+// (`under-implementation -> refined`) that nothing else exercises.
+//
+// The plan note is the artifact the gate approved and the agent can edit
+// afterwards. A submitted outcome whose plan no longer hashes to the value
+// pinned at grant is shipping code nobody approved, so it MUST NOT reach
+// awaiting-review: it goes back to `refined` to ask again - the CHEAP path out,
+// never a park, because an agent that finds the plan gate expensive would
+// simply stop updating its plan note.
+func TestOutcome_Implement_PlanHashMismatchSendsTheTaskBackToTheGate(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	metrics := obs.NewOperatorMetrics(reg)
+	task, iss := planPinnedFixtureV2(gatePlanNoteBody, "plan: actually rewrite the whole scheduler")
+	e := buildV2(t, v2Opts{writer: panicForge{}, metrics: metrics},
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		task, iss, mrV2("tatara-operator", 295, "t1"))
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"implement","payload":{"action":"submitted","title":"T","body":"B","changeSignificance":"patch"}}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	var resp gateResponseDTO
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.False(t, resp.Granted, "a refusal is a 200 with granted:false")
+	require.Equal(t, controller.ApprovalRefusedPlanHashMismatch, resp.Reason)
+	require.Equal(t, "plan-hash-mismatch", resp.Reason,
+		"the refusal reason is the wire vocabulary the agent branches on")
+
+	got := e.task(t, "t1")
+	require.Equal(t, tatarav1alpha1.StateRefined, got.Status.State,
+		"the CHEAP path out is back to the gate, never a park")
+	require.False(t, tatarav1alpha1.Parked(got))
+	require.Empty(t, got.Spec.MergeOrder, "no code shipped, so mergeOrder is never resolved")
+	require.Empty(t, e.mr(t, tatarav1alpha1.MergeRequestName("tatara-operator", 295)).Status.Significance,
+		"a refused submit must not label the MR for release")
+
+	require.Equal(t, float64(1),
+		testutil.ToFloat64(metrics.ApprovalRefusedCounter(controller.ApprovalRefusedPlanHashMismatch)))
+}
+
+// TestOutcome_Implement_SubmittedShipsWhenThePlanStillMatchesItsPin is the
+// other half, so the refusal above cannot pass vacuously: the SAME fixture with
+// an untouched plan note ships normally.
+func TestOutcome_Implement_SubmittedShipsWhenThePlanStillMatchesItsPin(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	metrics := obs.NewOperatorMetrics(reg)
+	task, iss := planPinnedFixtureV2(gatePlanNoteBody, gatePlanNoteBody)
+	e := buildV2(t, v2Opts{writer: &reviewPanicForge{heads: map[int]string{295: "live-head"}}, metrics: metrics},
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		task, iss, mrV2("tatara-operator", 295, "t1"))
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"implement","payload":{"action":"submitted","title":"T","body":"B","changeSignificance":"patch"}}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	got := e.task(t, "t1")
+	require.Equal(t, tatarav1alpha1.StateAwaitingReview, got.Status.State)
+	require.Equal(t, []string{"tatara-operator"}, got.Spec.MergeOrder)
+	require.Equal(t, "patch",
+		e.mr(t, tatarav1alpha1.MergeRequestName("tatara-operator", 295)).Status.Significance)
+
+	require.Equal(t, float64(0),
+		testutil.ToFloat64(metrics.ApprovalRefusedCounter(controller.ApprovalRefusedPlanHashMismatch)))
+}
+
+// TestOutcome_ImplementReasonLegalityIsDecidedByAction is the operator's own
+// half of the frozen wire contract: there is ONE `reason` key, and WHICH
+// actions may carry it is decided by `action`. tatara-cli made exactly one of
+// its two agent-facing arguments legal per action (submitted/declined refuse
+// the gate `reason`; approved/discuss/rejected refuse `decline_reason`), which
+// collapses on the wire to one key with per-action legality. The operator is
+// the trust boundary and enforces it itself, because an old or hand-rolled
+// client can send anything.
+func TestOutcome_ImplementReasonLegalityIsDecidedByAction(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		code int
+	}{
+		{"submitted refuses reason", `"action":"submitted","title":"T","body":"B","changeSignificance":"patch","reason":"r"`, http.StatusBadRequest},
+		{"declined requires reason", `"action":"declined"`, http.StatusBadRequest},
+		{"declined accepts reason", `"action":"declined","reason":"already fixed"`, http.StatusOK},
+		{"approved requires reason", `"action":"approved","planNoteId":"x"`, http.StatusBadRequest},
+		{"discuss requires reason", `"action":"discuss"`, http.StatusBadRequest},
+		{"rejected requires reason", `"action":"rejected"`, http.StatusBadRequest},
+		// The invented key is gone from the schema, so it is now an unknown
+		// field on every action - the operator can never grow a second contract
+		// behind tatara-cli's back again.
+		{"declineReason is unknown on declined", `"action":"declined","declineReason":"y"`, http.StatusBadRequest},
+		{"declineReason is unknown on approved", `"action":"approved","reason":"x","declineReason":"nope"`, http.StatusBadRequest},
+		{"declineReason is unknown on discuss", `"action":"discuss","reason":"x","declineReason":"nope"`, http.StatusBadRequest},
+		{"declineReason is unknown on rejected", `"action":"rejected","reason":"x","declineReason":"nope"`, http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+				repoV2("tatara-operator", "tatara"),
+				taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"))
+			w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"implement","payload":{`+tc.body+`}}`)
+			require.Equal(t, tc.code, w.Code, "%s: %s", tc.name, w.Body.String())
+		})
+	}
+}
+
+// TestApprovalRefusalVocabularyIsEleven pins the CLOSED vocabulary's size and
+// shape: exactly eleven reasons, every one lowercase-hyphenated (the label
+// value on operator_approval_refused_total{reason} and the folded gate's 200
+// body). The eleventh is plan-note-not-plan, the plan pin's authenticity check.
+func TestApprovalRefusalVocabularyIsEleven(t *testing.T) {
+	require.Len(t, controller.ApprovalRefusals, 11)
+	for _, r := range controller.ApprovalRefusals {
+		require.Regexp(t, `^[a-z][a-z-]*[a-z]$`, r, "refusal reason %q must be lowercase-hyphenated", r)
+	}
 }
 
 // --- brainstorm -----------------------------------------------------------
 
-// Each proposal becomes its OWN new clarify Task, owning its OWN Issue.
-func TestOutcome_Brainstorm_ProposeSpawnsAClarifyTaskPerProposal(t *testing.T) {
+// Each proposal becomes its OWN new implement Task (the gate mint target;
+// #521 folded clarify's kind away and the CRD enum no longer accepts it),
+// owning its OWN Issue.
+func TestOutcome_Brainstorm_ProposeSpawnsAGateTaskPerProposal(t *testing.T) {
 	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StageBrainstorming, "brainstorm"))
+		taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StateRefined, "brainstorm"))
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"brainstorm","payload":{
 	  "action":"propose","proposals":[
 	    {"repo":"tatara-operator","title":"one","body":"b","kind":"bug"},
 	    {"repo":"tatara-operator","title":"two","body":"b","kind":"improvement"}]}}`)
 	require.Equal(t, http.StatusOK, w.Code)
-	require.Equal(t, tatarav1alpha1.StageDelivered, e.task(t, "t1").Status.Stage)
+	require.Equal(t, tatarav1alpha1.StateDone, e.task(t, "t1").Status.State)
 	require.Empty(t, e.task(t, "t1").Status.DocumentedBy,
 		"a brainstorm never spawns a docs task (fix 25)")
 
 	var tasks tatarav1alpha1.TaskList
 	require.NoError(t, e.c.List(context.Background(), &tasks, client.InNamespace(ns)))
-	clarifies := 0
+	gateTasks := 0
 	for i := range tasks.Items {
-		if tasks.Items[i].Spec.Kind == "clarify" {
-			clarifies++
+		if tasks.Items[i].Spec.Kind == "implement" {
+			gateTasks++
 		}
 	}
-	require.Equal(t, 2, clarifies)
+	require.Equal(t, 2, gateTasks)
 	require.Len(t, e.forge.createdRefs, 2)
 
-	// Each new clarify Task controller-owns its own Issue.
+	// Each new gate Task controller-owns its own Issue.
 	var issues tatarav1alpha1.IssueList
 	require.NoError(t, e.c.List(context.Background(), &issues, client.InNamespace(ns)))
 	require.Len(t, issues.Items, 2)
@@ -1223,7 +1882,7 @@ func TestOutcome_Brainstorm_ProposeSpawnsAClarifyTaskPerProposal(t *testing.T) {
 // the autoApproveTataraProposals carve-out, durable across a mirror refresh.
 func TestOutcome_Brainstorm_StampsProposalMarker(t *testing.T) {
 	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StageBrainstorming, "brainstorm"))
+		taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StateRefined, "brainstorm"))
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"brainstorm","payload":{
 	  "action":"propose","proposals":[
@@ -1253,7 +1912,7 @@ func TestOutcome_Brainstorm_StampsProposalMarker(t *testing.T) {
 func TestOutcome_Brainstorm_ProposalsAreCappedAt5(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StageBrainstorming, "brainstorm"))
+		taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StateRefined, "brainstorm"))
 	p := `{"repo":"tatara-operator","title":"x","body":"b","kind":"bug"}`
 	body := `{"kind":"brainstorm","payload":{"action":"propose","proposals":[` +
 		p + "," + p + "," + p + "," + p + "," + p + "," + p + `]}}`
@@ -1265,7 +1924,7 @@ func TestOutcome_Brainstorm_ProposalsAreCappedAt5(t *testing.T) {
 
 func TestOutcome_Incident_FileIssueCreatesTheTrackerUnderThisTask(t *testing.T) {
 	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StateRefined, "incident"))
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"incident","payload":{
 	  "action":"file_issue","alertRules":["tatara-operator-down"],"reason":"real outage",
@@ -1273,7 +1932,8 @@ func TestOutcome_Incident_FileIssueCreatesTheTrackerUnderThisTask(t *testing.T) 
 	require.Equal(t, http.StatusOK, w.Code)
 
 	got := e.task(t, "t1")
-	require.Equal(t, tatarav1alpha1.StageClarifying, got.Status.Stage)
+	require.Equal(t, tatarav1alpha1.StateDone, got.Status.State,
+		"filing the tracker FINISHES the incident Task: it opens no MR, so `refined -> done` is its path out")
 	require.Equal(t, []string{"tatara-operator-down"}, got.Spec.AlertRules,
 		"alertRules are merged into spec by the OPERATOR; spec is agent-unwritable")
 
@@ -1282,12 +1942,50 @@ func TestOutcome_Incident_FileIssueCreatesTheTrackerUnderThisTask(t *testing.T) 
 	require.True(t, *iss.OwnerReferences[0].Controller)
 }
 
+// TestOutcome_Incident_FileIssueAtTheReachableStateFilesExactlyOneForgeIssue is
+// the REACHABLE (state, agentKind) pair: AgentKindFor(refined, spec.kind
+// incident) is "incident", so `refined` is the only state an incident pod ever
+// runs at and the only state a file_issue outcome can arrive from. The old
+// fixture built the Task at `new`, where AgentKindFor returns "" for every
+// spec.kind - an unreachable pair that hid an illegal transition behind a
+// legal-only-from-`new` edge.
+//
+// file_issue is non-idempotent (it mints a forge issue), so a 409 here is not a
+// cosmetic wrong status code: o.conflict RELEASES the outcome claim, the agent
+// retries, and CreateIssue fires again, unboundedly.
+func TestOutcome_Incident_FileIssueAtTheReachableStateFilesExactlyOneForgeIssue(t *testing.T) {
+	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StateRefined, "incident"))
+
+	body := `{"kind":"incident","payload":{
+	  "action":"file_issue","alertRules":["tatara-operator-down"],"reason":"real outage",
+	  "issue":{"repo":"tatara-operator","title":"operator down","body":"trace"}}}`
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", body)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.Len(t, e.forge.createdReqs, 1, "exactly one forge issue for one file_issue")
+
+	got := e.task(t, "t1")
+	require.Equal(t, tatarav1alpha1.StateDone, got.Status.State,
+		"a filed tracker is the incident Task's terminal: it opens no MR, so `refined -> done` is its only path out")
+	require.Empty(t, got.Status.StateReason, "an ordinary delivery carries no reason")
+	require.False(t, tatarav1alpha1.Parked(got))
+	require.Len(t, got.Status.Notes, 1)
+	require.Equal(t, "file_issue: real outage", got.Status.Notes[0].Body)
+
+	// THE RETRY. A released claim is what turns a 409 into unbounded
+	// duplication, so the second identical call must mint nothing.
+	w2 := e.do(t, http.MethodPost, "/tasks/t1/outcome", body)
+	require.NotEqual(t, http.StatusConflict, w2.Code, "the retry must not 409 the claim back open")
+	require.Len(t, e.forge.createdReqs, 1, "a retry must never mint a second forge issue")
+}
+
 // The incident file_issue path stamps the tatara-proposed-by:incident marker on
 // BOTH the forge issue body and the minted Issue CR body (the carve-out's marker
 // factor for alert-driven incident issues).
 func TestOutcome_Incident_StampsProposalMarker(t *testing.T) {
 	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StateRefined, "incident"))
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"incident","payload":{
 	  "action":"file_issue","alertRules":["tatara-operator-down"],"reason":"real outage",
@@ -1315,7 +2013,7 @@ func TestOutcome_Incident_StampsProposalMarker(t *testing.T) {
 // forge CreateIssue call carried the tatara-alert-rule=<key> label - the O5
 // suppression lookup and the human-visible forge recovery index (O4).
 func TestOutcome_Incident_StampsRuleKeyLabel(t *testing.T) {
-	task := taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident")
+	task := taskV2("t1", "tatara", "incident", tatarav1alpha1.StateRefined, "incident")
 	task.Spec.DedupKey = "abc123def4567890" //gitleaks:allow // test fixture, not a secret
 	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"), task)
 
@@ -1339,7 +2037,7 @@ func TestOutcome_Incident_ParentLinkSuccess(t *testing.T) {
 	metrics := obs.NewOperatorMetrics(reg)
 	e := buildV2(t, v2Opts{metrics: metrics}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"), repoV2("tatara-memory", "tatara"),
-		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StateRefined, "incident"))
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"incident","payload":{
 	  "action":"file_issue","alertRules":["tatara-operator-down"],"reason":"related to open tracker",
@@ -1379,7 +2077,7 @@ func TestOutcome_Incident_ParentLinkFallbackOnUnsupported(t *testing.T) {
 	metrics := obs.NewOperatorMetrics(reg)
 	e := buildV2(t, v2Opts{metrics: metrics}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"), repoV2("tatara-memory", "tatara"),
-		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StateRefined, "incident"))
 	e.forge.addSubIssueErr = scm.ErrSubIssuesUnsupported
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"incident","payload":{
@@ -1403,7 +2101,7 @@ func TestOutcome_Incident_ParentLinkFallbackOnGenericError(t *testing.T) {
 	metrics := obs.NewOperatorMetrics(reg)
 	e := buildV2(t, v2Opts{metrics: metrics}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"), repoV2("tatara-memory", "tatara"),
-		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StateRefined, "incident"))
 	e.forge.addSubIssueErr = fmt.Errorf("github: parent already holds 100 sub-issues")
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"incident","payload":{
@@ -1428,7 +2126,7 @@ func TestOutcome_Incident_ParentLinkFailedWhenSubIssueAndCommentBothFail(t *test
 	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
 	e := buildV2(t, v2Opts{metrics: metrics, logger: logger}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"), repoV2("tatara-memory", "tatara"),
-		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StateRefined, "incident"))
 	e.forge.addSubIssueErr = fmt.Errorf("github: sub-issues cross-org create is forbidden (403)")
 	e.forge.commentErr = fmt.Errorf("github: comment forbidden (403)")
 
@@ -1465,7 +2163,7 @@ func TestOutcome_Incident_ParentRepoUnresolvableAndCommentFailsRecordsFailed(t *
 	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
 	e := buildV2(t, v2Opts{metrics: metrics, logger: logger}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"), // no "tatara-memory" repo CR registered
-		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StateRefined, "incident"))
 	e.forge.commentErr = fmt.Errorf("github: comment forbidden (403)")
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"incident","payload":{
@@ -1494,7 +2192,7 @@ func TestOutcome_Incident_ParentRepoUnresolvableFallsBackToChildOnly(t *testing.
 	metrics := obs.NewOperatorMetrics(reg)
 	e := buildV2(t, v2Opts{metrics: metrics}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"), // no "tatara-memory" repo CR registered
-		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StateRefined, "incident"))
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"incident","payload":{
 	  "action":"file_issue","alertRules":["tatara-operator-down"],"reason":"related to open tracker",
@@ -1515,7 +2213,7 @@ func TestOutcome_Incident_ParentRepoUnresolvableFallsBackToChildOnly(t *testing.
 // cross-reference comment - the link path is entirely opt-in.
 func TestOutcome_Incident_NoParentNoLinkCalls(t *testing.T) {
 	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StateRefined, "incident"))
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"incident","payload":{
 	  "action":"file_issue","alertRules":["tatara-operator-down"],"reason":"standalone",
@@ -1531,7 +2229,7 @@ func TestOutcome_Incident_NoParentNoLinkCalls(t *testing.T) {
 func TestOutcome_Incident_ParentMissingFieldsRejected(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StateRefined, "incident"))
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"incident","payload":{
 	  "action":"file_issue","alertRules":["tatara-operator-down"],"reason":"r",
@@ -1542,17 +2240,17 @@ func TestOutcome_Incident_ParentMissingFieldsRejected(t *testing.T) {
 func TestOutcome_Incident_FalsePositiveRejects(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StateRefined, "incident"))
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"incident","payload":{
 	  "action":"false_positive","alertRules":["flappy"],"reason":"the alert is wrong"}}`)
 	require.Equal(t, http.StatusOK, w.Code)
-	require.Equal(t, tatarav1alpha1.StageRejected, e.task(t, "t1").Status.Stage)
+	require.Equal(t, tatarav1alpha1.StateRejected, e.task(t, "t1").Status.State)
 }
 
 func TestOutcome_Incident_AlertRulesRequiredOnBothActions(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StateRefined, "incident"))
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
 		`{"kind":"incident","payload":{"action":"false_positive","alertRules":[],"reason":"r"}}`)
 	require.Equal(t, http.StatusBadRequest, w.Code)
@@ -1648,8 +2346,8 @@ func TestOutcome_IncidentComment_ZeroCooldownConfigNeverSuppresses(t *testing.T)
 	e := buildV2WithCooldown(t, metrics, 0, func() time.Time { return frozenNow },
 		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
 		incidentTrackerV2("tatara-operator", 101),
-		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"),
-		taskV2("t2", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StateRefined, "incident"),
+		taskV2("t2", "tatara", "incident", tatarav1alpha1.StateRefined, "incident"))
 
 	w1 := e.do(t, http.MethodPost, "/tasks/t1/outcome",
 		`{"kind":"incident","payload":{"action":"comment_issue","alertRules":["rule-1"],"reason":"r",
@@ -1673,15 +2371,15 @@ func TestIncidentComment_CooldownSuppressesAndCounts(t *testing.T) {
 	e := buildV2WithCooldown(t, metrics, 30*time.Minute, func() time.Time { return cur },
 		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
 		incidentTrackerV2("tatara-operator", 101),
-		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"),
-		taskV2("t2", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"),
-		taskV2("t3", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StateRefined, "incident"),
+		taskV2("t2", "tatara", "incident", tatarav1alpha1.StateRefined, "incident"),
+		taskV2("t3", "tatara", "incident", tatarav1alpha1.StateRefined, "incident"))
 
 	w1 := e.do(t, http.MethodPost, "/tasks/t1/outcome",
 		`{"kind":"incident","payload":{"action":"comment_issue","alertRules":["rule-1"],"reason":"first",
 		  "comment":{"repo":"tatara-operator","number":101,"body":"evidence one"}}}`)
 	require.Equal(t, http.StatusOK, w1.Code, w1.Body.String())
-	require.Equal(t, tatarav1alpha1.StageRejected, e.task(t, "t1").Status.Stage)
+	require.Equal(t, tatarav1alpha1.StateRejected, e.task(t, "t1").Status.State)
 	require.Len(t, e.forge.comments, 1)
 	require.Equal(t, "evidence one", e.forge.comments[0].Body)
 	require.Equal(t, float64(1), testutil.ToFloat64(metrics.IncidentTrackerCommentCounter("posted")))
@@ -1691,7 +2389,7 @@ func TestIncidentComment_CooldownSuppressesAndCounts(t *testing.T) {
 		`{"kind":"incident","payload":{"action":"comment_issue","alertRules":["rule-1"],"reason":"second",
 		  "comment":{"repo":"tatara-operator","number":101,"body":"evidence two"}}}`)
 	require.Equal(t, http.StatusOK, w2.Code, w2.Body.String())
-	require.Equal(t, tatarav1alpha1.StageRejected, e.task(t, "t2").Status.Stage,
+	require.Equal(t, tatarav1alpha1.StateRejected, e.task(t, "t2").Status.State,
 		"the suppressed path must still terminate the Task at rejected(tracked-elsewhere)")
 	require.Len(t, e.forge.comments, 1, "the SCM write itself must be suppressed")
 	require.Equal(t, float64(1), testutil.ToFloat64(metrics.IncidentTrackerCommentCounter("suppressed")))
@@ -1704,7 +2402,7 @@ func TestIncidentComment_CooldownSuppressesAndCounts(t *testing.T) {
 		`{"kind":"incident","payload":{"action":"comment_issue","alertRules":["rule-1"],"reason":"third",
 		  "comment":{"repo":"tatara-operator","number":101,"body":"evidence three"}}}`)
 	require.Equal(t, http.StatusOK, w3.Code, w3.Body.String())
-	require.Equal(t, tatarav1alpha1.StageRejected, e.task(t, "t3").Status.Stage)
+	require.Equal(t, tatarav1alpha1.StateRejected, e.task(t, "t3").Status.State)
 	require.Len(t, e.forge.comments, 2)
 	require.Contains(t, e.forge.comments[1].Body, "1 prior evidence comment")
 	require.Contains(t, e.forge.comments[1].Body, "evidence three")
@@ -1727,8 +2425,8 @@ func TestIncidentComment_CooldownExactThresholdIsNotSuppressed(t *testing.T) {
 	e := buildV2WithCooldown(t, metrics, 30*time.Minute, func() time.Time { return cur },
 		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
 		incidentTrackerV2("tatara-operator", 101),
-		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"),
-		taskV2("t2", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StateRefined, "incident"),
+		taskV2("t2", "tatara", "incident", tatarav1alpha1.StateRefined, "incident"))
 
 	w1 := e.do(t, http.MethodPost, "/tasks/t1/outcome",
 		`{"kind":"incident","payload":{"action":"comment_issue","alertRules":["rule-1"],"reason":"r",
@@ -1752,7 +2450,7 @@ func TestIncidentComment_CommentErrorReleasesClaim(t *testing.T) {
 	e := buildV2WithCooldown(t, metrics, 30*time.Minute, func() time.Time { return frozenNow },
 		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
 		incidentTrackerV2("tatara-operator", 101),
-		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StateRefined, "incident"))
 	e.forge.commentErr = fmt.Errorf("github: comment failed transiently")
 
 	body := `{"kind":"incident","payload":{"action":"comment_issue","alertRules":["rule-1"],"reason":"r",
@@ -1760,7 +2458,7 @@ func TestIncidentComment_CommentErrorReleasesClaim(t *testing.T) {
 
 	w1 := e.do(t, http.MethodPost, "/tasks/t1/outcome", body)
 	require.Equal(t, http.StatusBadGateway, w1.Code)
-	require.Equal(t, tatarav1alpha1.StageInvestigating, e.task(t, "t1").Status.Stage,
+	require.Equal(t, tatarav1alpha1.StateRefined, e.task(t, "t1").Status.State,
 		"a failed SCM comment must not move the stage")
 
 	e.forge.commentErr = nil
@@ -1768,7 +2466,7 @@ func TestIncidentComment_CommentErrorReleasesClaim(t *testing.T) {
 	require.Equal(t, http.StatusOK, w2.Code, w2.Body.String(),
 		"a held claim (missing o.release()) would 409 this identical retry instead of re-validating")
 	require.Len(t, e.forge.comments, 2, "both attempts must have reached the forge")
-	require.Equal(t, tatarav1alpha1.StageRejected, e.task(t, "t1").Status.Stage)
+	require.Equal(t, tatarav1alpha1.StateRejected, e.task(t, "t1").Status.State)
 }
 
 // TestIncidentComment_GateReasons is #445: the comment_issue gate must
@@ -1805,7 +2503,7 @@ func TestIncidentComment_GateReasons(t *testing.T) {
 			metrics := obs.NewOperatorMetrics(prometheus.NewRegistry())
 			objs := append([]client.Object{
 				projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
-				taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"),
+				taskV2("t1", "tatara", "incident", tatarav1alpha1.StateRefined, "incident"),
 			}, tt.extraObjs...)
 			e := buildV2WithCooldown(t, metrics, 30*time.Minute, func() time.Time { return frozenNow }, objs...)
 
@@ -1831,8 +2529,8 @@ func TestIncidentComment_GateReasons(t *testing.T) {
 	e := buildV2WithCooldown(t, metrics, 30*time.Minute, func() time.Time { return frozenNow },
 		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
 		issueV2("tatara-operator", 102, "tracker-task"),
-		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"),
-		taskV2("t2", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StateRefined, "incident"),
+		taskV2("t2", "tatara", "incident", tatarav1alpha1.StateRefined, "incident"))
 
 	wAbsent := e.do(t, http.MethodPost, "/tasks/t1/outcome",
 		`{"kind":"incident","payload":{"action":"comment_issue","alertRules":["rule-1"],"reason":"r",
@@ -1870,7 +2568,7 @@ func TestIncidentComment_ResetFitIssueFailureIsBestEffort(t *testing.T) {
 	e := buildV2WithCooldownAndInterceptor(t, metrics, 30*time.Minute, func() time.Time { return frozenNow }, funcs,
 		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
 		incidentTrackerV2("tatara-operator", 101),
-		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StateRefined, "incident"))
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
 		`{"kind":"incident","payload":{"action":"comment_issue","alertRules":["rule-1"],"reason":"r",
@@ -1878,7 +2576,7 @@ func TestIncidentComment_ResetFitIssueFailureIsBestEffort(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String(),
 		"a failed cooldown-marker reset must not fail the request; the comment already posted")
 	require.Len(t, e.forge.comments, 1, "the comment reaches the forge exactly once")
-	require.Equal(t, tatarav1alpha1.StageRejected, e.task(t, "t1").Status.Stage,
+	require.Equal(t, tatarav1alpha1.StateRejected, e.task(t, "t1").Status.State,
 		"the Task must still terminate despite the reset failure")
 }
 
@@ -1888,10 +2586,13 @@ func TestIncidentComment_ResetFitIssueFailureIsBestEffort(t *testing.T) {
 // umbrella with controller=true in ONE PUT (the API server rejects two
 // controller=true refs), and only THEN is the member deleted.
 func TestOutcome_Refine_FoldAdoptsVerifiesThenDeletes(t *testing.T) {
-	member := taskV2("t2", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify")
+	// foldMemberBusy treats StateRefined as LIVE (#521: it is one of the states
+	// an agent can actually be conversing in), so a foldable, quiescent member
+	// must sit at StateNew - not yet triaged into any agent's live work.
+	member := taskV2("t2", "tatara", "clarify", tatarav1alpha1.StateNew, "clarify")
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "refine", tatarav1alpha1.StageRefining, "refine"),
+		taskV2("t1", "tatara", "refine", tatarav1alpha1.StateRefined, "refine"),
 		member,
 		issueV2("tatara-operator", 291, "t2"),
 		mrV2("tatara-operator", 295, "t2"),
@@ -1925,7 +2626,7 @@ func TestOutcome_Refine_FoldAdoptsVerifiesThenDeletes(t *testing.T) {
 
 	got := e.task(t, "t1")
 	require.Empty(t, got.Status.FoldInFlight, "foldInFlight is cleared on success")
-	require.Equal(t, tatarav1alpha1.StageDelivered, got.Status.Stage)
+	require.Equal(t, tatarav1alpha1.StateDone, got.Status.State)
 
 	// C4: adoption transfers the CONTROLLER ref, but every downstream consumer
 	// (the C.6 approval citation check, the reaper's owned-set, the agent bundle)
@@ -1959,15 +2660,15 @@ func TestOutcome_Refine_FoldTargetWithWorkInFlightIs409(t *testing.T) {
 			m.Status.PodName, m.Status.PodStartedAt = "t2-implement", &started
 		}},
 		{"live post-approved stage", func(m *tatarav1alpha1.Task) {
-			m.Status.Stage, m.Status.AgentKind = tatarav1alpha1.StageMerging, ""
+			m.Status.State, m.Status.AgentKind = tatarav1alpha1.StateMerged, ""
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			member := taskV2("t2", "tatara", "implement", tatarav1alpha1.StageImplementing, "implement")
+			member := taskV2("t2", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement")
 			tc.apply(member)
 			e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 				repoV2("tatara-operator", "tatara"),
-				taskV2("t1", "tatara", "refine", tatarav1alpha1.StageRefining, "refine"), member)
+				taskV2("t1", "tatara", "refine", tatarav1alpha1.StateRefined, "refine"), member)
 
 			w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
 				`{"kind":"refine","payload":{"folds":[{"task":"t2"}]}}`)
@@ -1985,8 +2686,8 @@ func TestOutcome_Refine_FoldTargetWithWorkInFlightIs409(t *testing.T) {
 func TestOutcome_Refine_CloseTargetWithAnActiveTaskIs409(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "refine", tatarav1alpha1.StageRefining, "refine"),
-		taskV2("t2", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"),
+		taskV2("t1", "tatara", "refine", tatarav1alpha1.StateRefined, "refine"),
+		taskV2("t2", "tatara", "clarify", tatarav1alpha1.StateRefined, "clarify"),
 		issueV2("tatara-operator", 291, "t2"))
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
@@ -2026,8 +2727,12 @@ func TestOutcome_Refine_UnverifiedFoldClearsTheMarker(t *testing.T) {
 	e := buildV2WithCooldownAndInterceptor(t, obs.NewOperatorMetrics(prometheus.NewRegistry()), 0,
 		func() time.Time { return frozenNow }, stripController,
 		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "refine", tatarav1alpha1.StageRefining, "refine"),
-		taskV2("t2", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"),
+		taskV2("t1", "tatara", "refine", tatarav1alpha1.StateRefined, "refine"),
+		// foldMemberBusy treats StateRefined as LIVE (#521), so the member
+		// must be quiescent (StateNew) for this request to reach the
+		// adoption-verification step at all, rather than 409ing earlier at
+		// the liveness gate.
+		taskV2("t2", "tatara", "clarify", tatarav1alpha1.StateNew, "clarify"),
 		issueV2("tatara-operator", 291, "t2"))
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"refine","payload":{"folds":[{"task":"t2"}]}}`)
@@ -2037,7 +2742,11 @@ func TestOutcome_Refine_UnverifiedFoldClearsTheMarker(t *testing.T) {
 		client.ObjectKey{Namespace: ns, Name: "t2"}, &tatarav1alpha1.Task{}),
 		"an unverified adoption deletes nothing")
 	got := e.task(t, "t1")
-	require.Equal(t, tatarav1alpha1.StageFailed, got.Status.Stage)
+	// #521: `failed` is gone. An unverified fold adoption now PARKS the
+	// umbrella in place rather than moving it to a dead terminal stage.
+	require.Equal(t, tatarav1alpha1.StateRefined, got.Status.State, "a park never changes state")
+	require.True(t, tatarav1alpha1.Parked(got))
+	require.Equal(t, stage.ReasonFoldAdoptionUnverified, got.Status.ParkReason)
 	require.Empty(t, got.Status.FoldInFlight,
 		"a failed umbrella must not pin its members for FailedRetention")
 	require.Nil(t, got.Status.FoldInFlightSince)
@@ -2051,8 +2760,8 @@ func TestOutcome_Refine_UnverifiedFoldClearsTheMarker(t *testing.T) {
 func TestOutcome_Refine_ClosingAnOwnedIssueMidFoldIs409(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "refine", tatarav1alpha1.StageRefining, "refine"),
-		taskV2("t2", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"),
+		taskV2("t1", "tatara", "refine", tatarav1alpha1.StateRefined, "refine"),
+		taskV2("t2", "tatara", "clarify", tatarav1alpha1.StateRefined, "clarify"),
 		issueV2("tatara-operator", 291, "t1"))
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"refine","payload":{
@@ -2072,7 +2781,7 @@ func TestOutcome_Refine_ClosingAnOwnedIssueMidFoldIs409(t *testing.T) {
 // refine may act on a view up to an hour stale.
 func TestOutcome_Refine_CloseIsLiveRevalidated(t *testing.T) {
 	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "refine", tatarav1alpha1.StageRefining, "refine"),
+		taskV2("t1", "tatara", "refine", tatarav1alpha1.StateRefined, "refine"),
 		issueV2("tatara-operator", 291, "t1"),
 		issueV2("tatara-operator", 292, "t1"))
 	// 292 is ALREADY closed on the forge; the mirror still says open.
@@ -2091,8 +2800,8 @@ func TestOutcome_Refine_CloseIsLiveRevalidated(t *testing.T) {
 func TestOutcome_Refine_LinkAddsAPlainOwner(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "refine", tatarav1alpha1.StageRefining, "refine"),
-		taskV2("t2", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"),
+		taskV2("t1", "tatara", "refine", tatarav1alpha1.StateRefined, "refine"),
+		taskV2("t2", "tatara", "clarify", tatarav1alpha1.StateRefined, "clarify"),
 		issueV2("tatara-operator", 291, "t2"))
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
@@ -2112,10 +2821,12 @@ func TestOutcome_Refine_LinkAddsAPlainOwner(t *testing.T) {
 // release lets re-validate immediately - hit NotFound on its own fold target and
 // 500'd forever.
 func TestOutcome_Refine_MalformedLinkRejectsBeforeAnyFoldDeletes(t *testing.T) {
-	member := taskV2("t2", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify")
+	// foldMemberBusy treats StateRefined as LIVE (#521), so the corrected retry
+	// below (which must actually complete the fold) needs a quiescent member.
+	member := taskV2("t2", "tatara", "clarify", tatarav1alpha1.StateNew, "clarify")
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "refine", tatarav1alpha1.StageRefining, "refine"),
+		taskV2("t1", "tatara", "refine", tatarav1alpha1.StateRefined, "refine"),
 		member,
 		issueV2("tatara-operator", 291, "t2"))
 
@@ -2138,7 +2849,7 @@ func TestOutcome_Refine_MalformedLinkRejectsBeforeAnyFoldDeletes(t *testing.T) {
 func TestOutcome_Refine_EmptyPayloadIs400(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "refine", tatarav1alpha1.StageRefining, "refine"))
+		taskV2("t1", "tatara", "refine", tatarav1alpha1.StateRefined, "refine"))
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"refine","payload":{}}`)
 	require.Equal(t, http.StatusBadRequest, w.Code)
 	require.Contains(t, w.Body.String(), "at least one of folds, closes, links")
@@ -2147,8 +2858,8 @@ func TestOutcome_Refine_EmptyPayloadIs400(t *testing.T) {
 // --- documentation --------------------------------------------------------
 
 func TestOutcome_Documentation_DeclinedDeliversAndStampsDocumentedBy(t *testing.T) {
-	covered := taskV2("t9", "tatara", "implement", tatarav1alpha1.StageDelivered, "")
-	batch := taskV2("t1", "tatara", "documentation", tatarav1alpha1.StageDocumenting, "documentation")
+	covered := taskV2("t9", "tatara", "implement", tatarav1alpha1.StateDone, "")
+	batch := taskV2("t1", "tatara", "documentation", tatarav1alpha1.StateUnderImplementation, "documentation")
 	batch.Spec.DocumentsTasks = []string{"t9"}
 
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
@@ -2157,8 +2868,47 @@ func TestOutcome_Documentation_DeclinedDeliversAndStampsDocumentedBy(t *testing.
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
 		`{"kind":"documentation","payload":{"action":"declined","reason":"nothing user-visible"}}`)
 	require.Equal(t, http.StatusOK, w.Code)
-	require.Equal(t, tatarav1alpha1.StageDelivered, e.task(t, "t1").Status.Stage)
+	require.Equal(t, tatarav1alpha1.StateDone, e.task(t, "t1").Status.State)
 	require.Equal(t, "t1", e.task(t, "t9").Status.DocumentedBy)
+}
+
+// TestOutcome_Documentation_DeclinedOnTheFrozenWireContract is the
+// documentation half of the same frozen key set. Its schema's action enum is
+// submitted|declined only, and a declined batch carries its reason on the same
+// single `reason` key and finishes at done(doc-timeout) - the nightly batch's
+// ONLY non-MR terminal.
+func TestOutcome_Documentation_DeclinedOnTheFrozenWireContract(t *testing.T) {
+	covered := taskV2("t9", "tatara", "implement", tatarav1alpha1.StateDone, "")
+	batch := taskV2("t1", "tatara", "documentation", tatarav1alpha1.StateUnderImplementation, "documentation")
+	batch.Spec.DocumentsTasks = []string{"t9"}
+
+	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-documentation", "tatara"), batch, covered)
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"documentation","payload":{"action":"declined","reason":"nothing user-visible"}}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	got := e.task(t, "t1")
+	require.Equal(t, tatarav1alpha1.StateDone, got.Status.State)
+	require.Equal(t, stage.ReasonDocTimeout, got.Status.StateReason)
+	require.False(t, tatarav1alpha1.Parked(got), "a declined documentation batch is DONE, not parked")
+	require.Len(t, got.Status.Notes, 1)
+	require.Equal(t, "declined: nothing user-visible", got.Status.Notes[0].Body)
+	require.Equal(t, "t1", e.task(t, "t9").Status.DocumentedBy)
+}
+
+// TestOutcome_Documentation_DeclineWithoutAReasonIs400: the documentation
+// schema shares implement's single `reason` field and its per-action legality.
+func TestOutcome_Documentation_DeclineWithoutAReasonIs400(t *testing.T) {
+	batch := taskV2("t1", "tatara", "documentation", tatarav1alpha1.StateUnderImplementation, "documentation")
+	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-documentation", "tatara"), batch)
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"documentation","payload":{"action":"declined"}}`)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	require.Contains(t, w.Body.String(), "action=declined requires a non-empty reason")
 }
 
 // outcomeClaimStub seeds the exact durable state a process that DIED between
@@ -2178,23 +2928,24 @@ func outcomeClaimStub(t *testing.T, e *v2Env, task, fp, reason string, at time.T
 	require.NoError(t, e.c.Status().Update(context.Background(), cur))
 }
 
-// clarifyDiscussFingerprint is the fingerprint of the clarify body used below.
-// It is computed the way the handler computes it: sha256("clarify|" + canonical
-// payload JSON). The test asks the server for it rather than duplicating the
-// hash, by POSTing once against a throwaway env and reading the condition back.
-func clarifyDiscussFingerprint(t *testing.T) string {
+// gateDiscussFingerprint is the fingerprint of the gate discuss body used
+// below. It is computed the way the handler computes it: sha256("implement|" +
+// canonical payload JSON). The test asks the server for it rather than
+// duplicating the hash, by POSTing once against a throwaway env and reading
+// the condition back.
+func gateDiscussFingerprint(t *testing.T) string {
 	t.Helper()
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("fp", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"))
-	w := e.do(t, http.MethodPost, "/tasks/fp/outcome", clarifyDiscussBody)
+		taskV2("fp", "tatara", "implement", tatarav1alpha1.StateRefined, "implement"))
+	w := e.do(t, http.MethodPost, "/tasks/fp/outcome", gateDiscussBody)
 	require.Equal(t, http.StatusOK, w.Code)
 	cond := tatarav1alpha1.OutcomeCondition(e.task(t, "fp"))
 	require.NotNil(t, cond)
 	return cond.Message
 }
 
-const clarifyDiscussBody = `{"kind":"clarify","payload":{"decision":"discuss","reason":"r"}}`
+const gateDiscussBody = `{"kind":"implement","payload":{"action":"discuss","reason":"r"}}`
 
 // SPEC TEST 2. A claim whose process died before commit is an ORPHANED STUB.
 // Inside OutcomeClaimTTL (5m) an identical retry cannot tell "in flight on
@@ -2208,37 +2959,38 @@ const clarifyDiscussBody = `{"kind":"clarify","payload":{"decision":"discuss","r
 // OutcomeHandlerBudget) and this test is about the three-state behaviour at
 // whatever the boundary is, not about the number.
 func TestOutcome_BareClaimInsideTTLIs409_PastTTLReclaimsAndProceeds(t *testing.T) {
-	fp := clarifyDiscussFingerprint(t)
+	fp := gateDiscussFingerprint(t)
 
 	t.Run("inside the TTL: 409, the task is untouched", func(t *testing.T) {
 		e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 			repoV2("tatara-operator", "tatara"),
-			taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"))
+			taskV2("t1", "tatara", "implement", tatarav1alpha1.StateRefined, "implement"))
 		outcomeClaimStub(t, e, "t1", fp, tatarav1alpha1.OutcomeReasonClaimed,
 			frozenNow.Add(-tatarav1alpha1.OutcomeClaimTTL+time.Second))
 
-		w := e.do(t, http.MethodPost, "/tasks/t1/outcome", clarifyDiscussBody)
+		w := e.do(t, http.MethodPost, "/tasks/t1/outcome", gateDiscussBody)
 		require.Equal(t, http.StatusConflict, w.Code, "a fresh bare claim means another replica is mid-flight")
-		require.Equal(t, tatarav1alpha1.StageClarifying, e.task(t, "t1").Status.Stage,
+		require.Equal(t, tatarav1alpha1.StateRefined, e.task(t, "t1").Status.State,
 			"a 409 in-flight answer must change nothing")
 	})
 
 	t.Run("past the TTL: re-claim and proceed", func(t *testing.T) {
 		e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 			repoV2("tatara-operator", "tatara"),
-			taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"))
+			taskV2("t1", "tatara", "implement", tatarav1alpha1.StateRefined, "implement"))
 		outcomeClaimStub(t, e, "t1", fp, tatarav1alpha1.OutcomeReasonClaimed,
 			frozenNow.Add(-tatarav1alpha1.OutcomeClaimTTL-time.Second))
 
-		w := e.do(t, http.MethodPost, "/tasks/t1/outcome", clarifyDiscussBody)
+		w := e.do(t, http.MethodPost, "/tasks/t1/outcome", gateDiscussBody)
 		require.Equal(t, http.StatusOK, w.Code, "an orphaned stub must self-heal, not 409 forever")
 		got := e.task(t, "t1")
-		require.Equal(t, tatarav1alpha1.StageParked, got.Status.Stage,
-			"the outcome must actually be PROCESSED, not replayed as a no-op")
-		require.Equal(t, "awaiting-human", got.Status.StageReason)
+		require.Equal(t, tatarav1alpha1.StateRefined, got.Status.State,
+			"a park never changes state; the outcome must actually be PROCESSED, not replayed as a no-op")
+		require.True(t, tatarav1alpha1.Parked(got))
+		require.Equal(t, "awaiting-human", got.Status.ParkReason)
 		cond := tatarav1alpha1.OutcomeCondition(got)
 		require.NotNil(t, cond)
-		require.Equal(t, "Clarify", cond.Reason, "commit must overwrite the claim's Reason")
+		require.Equal(t, "Implement", cond.Reason, "commit must overwrite the claim's Reason")
 	})
 }
 
@@ -2248,19 +3000,20 @@ func TestOutcome_BareClaimInsideTTLIs409_PastTTLReclaimsAndProceeds(t *testing.T
 func TestOutcome_CommittedOutcomeStillReplays200(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"))
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateRefined, "implement"))
 
-	first := e.do(t, http.MethodPost, "/tasks/t1/outcome", clarifyDiscussBody)
+	first := e.do(t, http.MethodPost, "/tasks/t1/outcome", gateDiscussBody)
 	require.Equal(t, http.StatusOK, first.Code)
 	before := e.task(t, "t1")
-	require.Equal(t, tatarav1alpha1.StageParked, before.Status.Stage)
-	require.Equal(t, "Clarify", tatarav1alpha1.OutcomeCondition(before).Reason)
+	require.Equal(t, tatarav1alpha1.StateRefined, before.Status.State)
+	require.True(t, tatarav1alpha1.Parked(before))
+	require.Equal(t, "Implement", tatarav1alpha1.OutcomeCondition(before).Reason)
 
-	second := e.do(t, http.MethodPost, "/tasks/t1/outcome", clarifyDiscussBody)
+	second := e.do(t, http.MethodPost, "/tasks/t1/outcome", gateDiscussBody)
 	require.Equal(t, http.StatusOK, second.Code, "an identical retry of a COMMITTED outcome replays")
 	after := e.task(t, "t1")
-	require.Equal(t, before.Status.Stage, after.Status.Stage)
-	require.Equal(t, before.Status.StageReason, after.Status.StageReason)
+	require.Equal(t, before.Status.State, after.Status.State)
+	require.Equal(t, before.Status.ParkReason, after.Status.ParkReason)
 	require.Len(t, after.Status.Notes, len(before.Status.Notes),
 		"a replay must not re-append the outcome note")
 }
@@ -2275,9 +3028,9 @@ func TestOutcome_CommittedOutcomeStillReplays200(t *testing.T) {
 func TestOutcome_ValidationRejectionReleasesTheClaim(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"))
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateRefined, "implement"))
 
-	bad := `{"kind":"clarify","payload":{"decision":"discuss","reason":"  "}}`
+	bad := `{"kind":"implement","payload":{"action":"discuss","reason":"  "}}`
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", bad)
 	require.Equal(t, http.StatusBadRequest, w.Code)
 	require.Nil(t, tatarav1alpha1.OutcomeCondition(e.task(t, "t1")),
@@ -2291,9 +3044,11 @@ func TestOutcome_ValidationRejectionReleasesTheClaim(t *testing.T) {
 	require.Nil(t, tatarav1alpha1.OutcomeCondition(e.task(t, "t1")))
 
 	// And a CORRECTED retry must be processed for real.
-	fixed := e.do(t, http.MethodPost, "/tasks/t1/outcome", clarifyDiscussBody)
+	fixed := e.do(t, http.MethodPost, "/tasks/t1/outcome", gateDiscussBody)
 	require.Equal(t, http.StatusOK, fixed.Code)
-	require.Equal(t, tatarav1alpha1.StageParked, e.task(t, "t1").Status.Stage)
+	got := e.task(t, "t1")
+	require.Equal(t, tatarav1alpha1.StateRefined, got.Status.State)
+	require.True(t, tatarav1alpha1.Parked(got))
 }
 
 // The two top-of-handler gates run before any kind handler and stamp nothing,
@@ -2302,26 +3057,26 @@ func TestOutcome_TopOfHandlerGatesReleaseTheClaim(t *testing.T) {
 	t.Run("kind-mismatch", func(t *testing.T) {
 		e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 			repoV2("tatara-operator", "tatara"),
-			taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"))
+			taskV2("t1", "tatara", "implement", tatarav1alpha1.StateRefined, "implement"))
 		w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
-			`{"kind":"implement","payload":{"action":"declined","reason":"nope"}}`)
+			`{"kind":"review","payload":{"verdict":"approve","reviewedSHAs":[]}}`)
 		require.Equal(t, http.StatusConflict, w.Code)
 		require.Nil(t, tatarav1alpha1.OutcomeCondition(e.task(t, "t1")))
 	})
 	t.Run("terminal-stage", func(t *testing.T) {
 		e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 			repoV2("tatara-operator", "tatara"),
-			taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageParked, "clarify"))
-		w := e.do(t, http.MethodPost, "/tasks/t1/outcome", clarifyDiscussBody)
+			parkedTaskV2(t, "t1", "tatara", "implement", tatarav1alpha1.StateRefined, "implement", stage.ReasonAwaitingHuman))
+		w := e.do(t, http.MethodPost, "/tasks/t1/outcome", gateDiscussBody)
 		require.Equal(t, http.StatusConflict, w.Code)
 		require.Nil(t, tatarav1alpha1.OutcomeCondition(e.task(t, "t1")))
 	})
 	t.Run("payload decode", func(t *testing.T) {
 		e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 			repoV2("tatara-operator", "tatara"),
-			taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"))
+			taskV2("t1", "tatara", "implement", tatarav1alpha1.StateRefined, "implement"))
 		w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
-			`{"kind":"clarify","payload":{"decision":"discuss","bogusField":1}}`)
+			`{"kind":"implement","payload":{"action":"discuss","bogusField":1}}`)
 		require.Equal(t, http.StatusBadRequest, w.Code)
 		require.Nil(t, tatarav1alpha1.OutcomeCondition(e.task(t, "t1")))
 	})
@@ -2342,7 +3097,7 @@ func TestOutcome_UnknownKindReleasesTheClaim(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
 		// agentKind is bogus, so the kind gate PASSES on a matching bogus kind.
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "bogus"))
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StateRefined, "bogus"))
 
 	body := `{"kind":"bogus","payload":{"whatever":1}}`
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", body)
@@ -2366,7 +3121,7 @@ func TestOutcome_HeadMovedReleasesTheClaim(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: forge, reader: emptyCommentReader{}},
 		projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "implement", tatarav1alpha1.StageReviewing, "review"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateAwaitingReview, "review"),
 		mrV2("tatara-operator", 295, "t1"))
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"review","payload":{
@@ -2384,15 +3139,19 @@ func TestOutcome_HeadMovedReleasesTheClaim(t *testing.T) {
 func TestOutcome_IllegalTransitionWritesNothingAndReleasesTheClaim(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		// triaging has no parked edge at all, so clarify's decision=discuss
-		// (-> parked[awaiting-human]) is refused by the F.3 table.
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageTriaging, "clarify"))
+		// deployed carries NO edge to rejected (deployed work is never rewound,
+		// per the F.3 table), so the gate's action=rejected is illegal from
+		// here. #521: nothing targets a park - stage.Park is orthogonal to the
+		// edge table - so the discuss action this test used to exercise can
+		// no longer produce an illegal transition at all; rejected still can.
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateDeployed, "implement"))
 
+	body := `{"kind":"implement","payload":{"action":"rejected","reason":"nope"}}`
 	for i := range 3 {
-		w := e.do(t, http.MethodPost, "/tasks/t1/outcome", clarifyDiscussBody)
+		w := e.do(t, http.MethodPost, "/tasks/t1/outcome", body)
 		require.Equal(t, http.StatusConflict, w.Code, "attempt %d", i)
 		got := e.task(t, "t1")
-		require.Equal(t, tatarav1alpha1.StageTriaging, got.Status.Stage)
+		require.Equal(t, tatarav1alpha1.StateDeployed, got.Status.State)
 		require.Empty(t, got.Status.Notes,
 			"a refused transition must leave NO note behind, on any attempt")
 		require.Nil(t, tatarav1alpha1.OutcomeCondition(got),
@@ -2413,24 +3172,26 @@ func TestOutcome_IllegalTransitionWritesNothingAndReleasesTheClaim(t *testing.T)
 func TestOutcome_RejectionNeverUndoesACommittedOutcome(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"))
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateRefined, "implement"))
 
-	ok := e.do(t, http.MethodPost, "/tasks/t1/outcome", clarifyDiscussBody)
+	ok := e.do(t, http.MethodPost, "/tasks/t1/outcome", gateDiscussBody)
 	require.Equal(t, http.StatusOK, ok.Code)
 	before := e.task(t, "t1")
-	require.Equal(t, "Clarify", tatarav1alpha1.OutcomeCondition(before).Reason)
-	require.Equal(t, tatarav1alpha1.StageParked, before.Status.Stage)
+	require.Equal(t, "Implement", tatarav1alpha1.OutcomeCondition(before).Reason)
+	require.Equal(t, tatarav1alpha1.StateRefined, before.Status.State, "a park never changes state")
+	require.True(t, tatarav1alpha1.Parked(before))
 
-	// A DIFFERENT outcome now arrives. The Task is parked (terminal), so it 409s
-	// at the terminal gate, which releases the claim it just took.
+	// A DIFFERENT outcome now arrives. The Task is parked (terminal for this
+	// purpose), so it 409s at the terminal gate, which releases the claim it
+	// just took.
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
-		`{"kind":"clarify","payload":{"decision":"close","reason":"x"}}`)
+		`{"kind":"implement","payload":{"action":"rejected","reason":"x"}}`)
 	require.Equal(t, http.StatusConflict, w.Code)
 
 	after := e.task(t, "t1")
-	require.Equal(t, before.Status.Stage, after.Status.Stage,
+	require.Equal(t, before.Status.State, after.Status.State,
 		"a rejection must never undo the committed outcome's effect")
-	require.Equal(t, before.Status.StageReason, after.Status.StageReason)
+	require.Equal(t, before.Status.ParkReason, after.Status.ParkReason)
 	require.Equal(t, before.Status.Notes, after.Status.Notes)
 	require.Nil(t, tatarav1alpha1.OutcomeCondition(after),
 		"the second outcome's claim clobbered the committed condition before the gate ran, "+
@@ -2445,7 +3206,7 @@ func TestOutcome_Review_MergedMR_NoOpNot400(t *testing.T) {
 	before := testutil.ToFloat64(obs.RestOutcomeAcceptedTotal.WithLabelValues("review", "mr-terminal-noop"))
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-agent-skills", "tatara"),
-		taskV2("t1", "tatara", "review", tatarav1alpha1.StageReviewing, "review"), mr)
+		taskV2("t1", "tatara", "review", tatarav1alpha1.StateAwaitingReview, "review"), mr)
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
 		`{"kind":"review","payload":{"verdict":"approve","reviewedSHAs":[{"repo":"tatara-agent-skills","number":33,"sha":"s"}]}}`)
 	require.Equal(t, http.StatusOK, w.Code)
@@ -2469,9 +3230,9 @@ func TestOutcome_Review_TakenOverMR_NoOpNot400(t *testing.T) {
 		m.Status.Ownership = tatarav1alpha1.OwnershipTatara
 		m.Status.OwnershipReason = "takeover-requested-by:maintainer"
 	})
-	review := taskV2("t1", "tatara", "review", tatarav1alpha1.StageReviewing, "review")
+	review := taskV2("t1", "tatara", "review", tatarav1alpha1.StateAwaitingReview, "review")
 	review.Status.MRRefs = []string{tatarav1alpha1.MergeRequestName("tatara-agent-skills", 33)}
-	takeover := taskV2("tk1", "tatara", "takeover", tatarav1alpha1.StageImplementing, "implement")
+	takeover := taskV2("tk1", "tatara", "takeover", tatarav1alpha1.StateUnderImplementation, "implement")
 
 	before := testutil.ToFloat64(obs.RestOutcomeAcceptedTotal.WithLabelValues("review", "mr-taken-over-noop"))
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
@@ -2492,7 +3253,7 @@ func TestOutcome_Review_TakenOverMR_NoOpNot400(t *testing.T) {
 func TestOutcome_Review_NoMRsAtAll_Still400(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-agent-skills", "tatara"),
-		taskV2("t1", "tatara", "review", tatarav1alpha1.StageReviewing, "review"))
+		taskV2("t1", "tatara", "review", tatarav1alpha1.StateAwaitingReview, "review"))
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
 		`{"kind":"review","payload":{"verdict":"approve","reviewedSHAs":[{"repo":"tatara-agent-skills","number":33,"sha":"s"}]}}`)
 	require.Equal(t, http.StatusBadRequest, w.Code)
@@ -2504,7 +3265,7 @@ func TestOutcome_Review_ClosedMR_NoOpNot400(t *testing.T) {
 	mr.Status.State = "closed"
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-agent-skills", "tatara"),
-		taskV2("t1", "tatara", "review", tatarav1alpha1.StageReviewing, "review"), mr)
+		taskV2("t1", "tatara", "review", tatarav1alpha1.StateAwaitingReview, "review"), mr)
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
 		`{"kind":"review","payload":{"verdict":"approve","reviewedSHAs":[{"repo":"tatara-agent-skills","number":33,"sha":"s"}]}}`)
 	require.Equal(t, http.StatusOK, w.Code)
@@ -2520,18 +3281,18 @@ func TestOutcome_Review_OpenMR_NotNoOp(t *testing.T) {
 	mr := mrV2("tatara-agent-skills", 33, "t1") // open
 	e := buildV2(t, v2Opts{writer: &reviewPanicForge{heads: map[int]string{33: "s"}}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-agent-skills", "tatara"),
-		taskV2("t1", "tatara", "review", tatarav1alpha1.StageReviewing, "review"), mr)
+		taskV2("t1", "tatara", "review", tatarav1alpha1.StateAwaitingReview, "review"), mr)
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
 		`{"kind":"review","payload":{"verdict":"approve","reviewedSHAs":[{"repo":"tatara-agent-skills","number":33,"sha":"s"}]}}`)
 	require.NotContains(t, w.Body.String(), `"reason":"mr-terminal"`, "an open MR is never the terminal no-op")
 }
 
-// The clarify Task a brainstorm proposal becomes is minted directly here, and
-// carried the same issue #517 pod-name gap as the intake, docbatch and
-// takeover mints: no annotation, so it fell back to wrapper-<task-name>.
-func TestOutcome_Brainstorm_ProposedClarifyTaskCarriesPodName(t *testing.T) {
+// The gate (implement) Task a brainstorm proposal becomes is minted directly
+// here, and carried the same issue #517 pod-name gap as the intake, docbatch
+// and takeover mints: no annotation, so it fell back to wrapper-<task-name>.
+func TestOutcome_Brainstorm_ProposedGateTaskCarriesPodName(t *testing.T) {
 	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StageBrainstorming, "brainstorm"))
+		taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StateRefined, "brainstorm"))
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"brainstorm","payload":{
 	  "action":"propose","proposals":[
@@ -2540,13 +3301,14 @@ func TestOutcome_Brainstorm_ProposedClarifyTaskCarriesPodName(t *testing.T) {
 
 	var tasks tatarav1alpha1.TaskList
 	require.NoError(t, e.c.List(context.Background(), &tasks, client.InNamespace(ns)))
-	var clarify *tatarav1alpha1.Task
+	var gateTask *tatarav1alpha1.Task
 	for i := range tasks.Items {
-		if tasks.Items[i].Spec.Kind == "clarify" {
-			clarify = &tasks.Items[i]
+		if tasks.Items[i].Spec.Kind == "implement" {
+			gateTask = &tasks.Items[i]
 		}
 	}
-	require.NotNil(t, clarify)
+	require.NotNil(t, gateTask)
 	// recordingForge.nextNumber starts at 100; the first CreateIssue yields 101.
-	require.Equal(t, "clr-tatara-tatara-operator-i101", agent.PodName(clarify))
+	// "imp" is the implement kind's pod-name type token (#521: was "clr").
+	require.Equal(t, "imp-tatara-tatara-operator-i101", agent.PodName(gateTask))
 }

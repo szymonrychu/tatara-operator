@@ -15,6 +15,7 @@ import (
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
+	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
 // The three TTL stop outcomes (contract G.7), the values of the outcome label
@@ -108,7 +109,7 @@ func TTLDeadline(project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (ti
 		return time.Time{}, false
 	}
 	anchor := task.Status.PodStartedAt.Time
-	if task.Status.Stage == tatarav1alpha1.StageConversing && task.Status.ConversationLastEventAt != nil &&
+	if stage.Live(task.Status.State) && task.Status.ConversationLastEventAt != nil &&
 		task.Status.ConversationLastEventAt.After(anchor) {
 		anchor = task.Status.ConversationLastEventAt.Time
 	}

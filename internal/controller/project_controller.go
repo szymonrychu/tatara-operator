@@ -190,12 +190,12 @@ type ProjectReconciler struct {
 	UnparkDriveInterval time.Duration
 	lastDriveUnparks    map[string]time.Time
 
-	// lastComputeProjectCounts / lastResumeNoReentryParks / lastReapTerminal
-	// pace computeProjectCounts / resumeNoReentryParks / ReapTerminal, one map
-	// each, keyed per project (like lastDriveUnparks): three more full-
-	// namespace-List blocks that used to re-run on every single Reconcile pass
-	// regardless of cadence (tatara-operator#367). Read/written only on the
-	// serialised reconcile path (MaxConcurrentReconciles=1); no mutex required.
+	// lastComputeProjectCounts / lastResumeNoReentryParks / lastReapTerminal pace
+	// computeProjectCounts, resumeNoReentryParks and ReapTerminal, one map each,
+	// keyed per project (like lastDriveUnparks): full-namespace-List blocks that
+	// used to re-run on every single Reconcile pass regardless of cadence
+	// (tatara-operator#367). Read/written only on the serialised reconcile path
+	// (MaxConcurrentReconciles=1); no mutex required.
 	lastComputeProjectCounts map[string]time.Time
 	lastResumeNoReentryParks map[string]time.Time
 	lastReapTerminal         map[string]time.Time
@@ -430,30 +430,43 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 	requeueAfter = soonestRequeue(requeueAfter, unparkRequeue)
 
-	// The conversing ceiling's level-triggered backstop. The webhook's
-	// ConversingHasRoom check is the fast path that usually keeps a project's
-	// live conversing count in range; this converges whatever raced it, and it
-	// is also what keeps operator_conversing_pods honest for a project whose
+	// The live-pod ceiling's level-triggered backstop. The webhook's
+	// LiveHasRoom check is the fast path that usually keeps a project's
+	// live pod count in range; this converges whatever raced it, and it
+	// is also what keeps operator_live_pods honest for a project whose
 	// comments have stopped arriving (a pure webhook-side gauge would freeze at
 	// its last reading forever). Blocking, matching driveUnparksPaced/
-	// resumeNoReentryParksPaced/ReapTerminalPaced above: an eviction failure
+	// ReapTerminalPaced above: an eviction failure
 	// (a write conflict, a forge outage mid-handoff) must requeue rather than
 	// be silently swallowed, the same as every other paced backstop in this loop.
-	// enforceConversingCeiling caps how much overflow it evicts in ONE call
-	// (maxConversingEvictionsPerPass, conversing.go) so a large overflow cannot
+	// enforceLivePodCeiling caps how much overflow it evicts in ONE call
+	// (maxLivePodEvictionsPerPass, livepods.go) so a large overflow cannot
 	// wedge this single MaxConcurrentReconciles=1 loop for hours; the returned
 	// duration asks for a quick re-drive when work remains.
-	ceilingRequeue, err := r.enforceConversingCeiling(ctx, &project, time.Now())
+	ceilingRequeue, err := r.enforceLivePodCeiling(ctx, &project, time.Now())
 	if err != nil {
 		r.Metrics.ReconcileResult("Project", "error")
-		return ctrl.Result{}, fmt.Errorf("enforce conversing ceiling: %w", err)
+		return ctrl.Result{}, fmt.Errorf("enforce live pod ceiling: %w", err)
 	}
 	requeueAfter = soonestRequeue(requeueAfter, ceilingRequeue)
 
-	// WS3-I4: a human reply to a Task parked with a NO-RE-ENTRY reason triggers a
-	// fresh gated re-mint (sever(Orphan) + MintForItem), never a smuggled re-entry.
-	// Leader-only; the reaper is the backstop. Runs after driveUnparks so a
-	// re-entryable park has already been resumed and is no longer parked here.
+	// THE ONE-REPLY GUARANTEE for the UnparkNever population (finding H8). A
+	// human reply to a Task parked under one of the reasons NOBODY un-parks
+	// severs its owned open Issues, collects the old Task early, and re-mints
+	// the Issues fresh through MintForItem - a new, gate-respecting Task, never
+	// a re-entry of the old one.
+	//
+	// It is NOT redundant with the sweep, whatever "TaskDone is false now" might
+	// suggest. The sweep re-mints an ORPHAN Issue, and a parked Task RETAINS its
+	// controller ownership (fix H13 does not release it on a park), so
+	// resolveLiveIssueOwner finds a live owner, IsOrphanIssue answers
+	// issue_owned, and nothing re-mints until the reaper releases the Task at
+	// ParkRetention - seven days, by which time the reply is gone from
+	// pendingEvents and the maintainer has to comment a SECOND time. See
+	// resume.go for why the fix cannot live at the intake/sweep seam instead.
+	//
+	// Runs AFTER driveUnparks so a re-entryable park has already been resumed
+	// and is no longer parked here; the reaper is still the ultimate backstop.
 	resumeRequeue, err := r.resumeNoReentryParksPaced(ctx, &project, time.Now())
 	if err != nil {
 		r.Metrics.ReconcileResult("Project", "error")
@@ -529,7 +542,7 @@ func (r *ProjectReconciler) computeProjectCounts(ctx context.Context, project *t
 			switch t.Spec.Kind {
 			case "incident":
 				incidents++
-			case "clarify":
+			case SweepIssueKind:
 				issues++
 			}
 		}
@@ -735,15 +748,18 @@ func parseLightragStatusCounts(body []byte) (map[string]int, error) {
 	return payload.StatusCounts, nil
 }
 
-// issueStateFor returns the tatara_issue_state "state" label for a live Task:
-// its STAGE. A Task whose work is over (a closed-set terminal, or delivered)
-// returns "" and drops out of the gauge. It is a pure helper so it can be
-// unit-tested independently of the reconciler.
+// issueStateFor returns the tatara_issue_state "state" label for a live Task.
+// A Task whose work is over (done/rejected) returns "" and drops out of the
+// gauge, and so does a PARKED one: the gauge is "what is being worked on right
+// now", and a parked Task is by definition not. #521 needed that second clause
+// explicitly, because park stopped being folded into TaskDone - without it a
+// parked Task's raw state leaks into the gauge and reads as live work.
+// It is a pure helper so it can be unit-tested independently of the reconciler.
 func issueStateFor(t *tataradevv1alpha1.Task) string {
-	if tataradevv1alpha1.TaskDone(t) {
+	if tataradevv1alpha1.TaskDone(t) || tataradevv1alpha1.Parked(t) {
 		return ""
 	}
-	return t.Status.Stage
+	return t.Status.State
 }
 
 // updateIssueStateCounts recomputes tatara_issue_state from authoritative cluster
@@ -778,15 +794,15 @@ func (r *ProjectReconciler) updateIssueStateCounts(ctx context.Context) {
 	}
 }
 
-// taskStageBucket keys the operator_task_stage COUNT aggregation (contract
+// taskStageBucket keys the operator_task_state COUNT aggregation (contract
 // K.1): the metric is low-cardinality by design, one series per (stage,kind),
 // not per-task.
 type taskStageBucket struct {
 	stage, kind string
 }
 
-// updateTaskStageGauges recomputes operator_task_stage (a COUNT per
-// (stage,kind) bucket) and operator_task_stage_age_seconds (per-task, seconds
+// updateTaskStageGauges recomputes operator_task_state (a COUNT per
+// (stage,kind) bucket) and operator_task_state_age_seconds (per-task, seconds
 // since Status.StageEnteredAt) from authoritative cluster state (contract
 // K.1). A Reset() before each pass ensures a Task that left its stage or was
 // deleted does not leave a stale series behind (contract M22).
@@ -803,17 +819,17 @@ func (r *ProjectReconciler) updateTaskStageGauges(ctx context.Context) {
 	counts := make(map[taskStageBucket]int)
 	for i := range list.Items {
 		t := &list.Items[i]
-		stg := t.Status.Stage
+		stg := t.Status.State
 		if stg == "" {
 			continue
 		}
 		kind := t.Spec.Kind
 		counts[taskStageBucket{stage: stg, kind: kind}]++
-		if t.Status.StageEnteredAt != nil {
+		if t.Status.StateEnteredAt != nil {
 			// Carry-adjusted (issue #480): a merge-timeout/deploy-timeout un-park
 			// re-stamps StageEnteredAt, so a bare now.Sub would under-report true
 			// stage residency by up to a full budget per re-entry.
-			age := stage.StageElapsedSeconds(t, now)
+			age := stage.StateElapsedSeconds(t, now)
 			r.Metrics.SetTaskStageAge(t.Name, stg, kind, age)
 		}
 	}

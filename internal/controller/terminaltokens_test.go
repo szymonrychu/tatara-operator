@@ -53,13 +53,13 @@ func seedTerminalTokensTask(t *testing.T, name, project, repo, model string, in,
 			ProjectRef:    project,
 			RepositoryRef: repo,
 			Goal:          "test terminal tokens",
-			Kind:          "clarify",
+			Kind:          "implement",
 		},
 	}
 	if err := k8sClient.Create(ctx, task); err != nil {
 		t.Fatalf("create task: %v", err)
 	}
-	task.Status.Stage = tatarav1alpha1.StageImplementing
+	task.Status.State = tatarav1alpha1.StateUnderImplementation
 	task.Status.ResolvedModel = model
 	task.Status.Stats.TokensInput = in
 	task.Status.Stats.TokensOutput = out
@@ -74,18 +74,28 @@ func seedTerminalTokensTask(t *testing.T, name, project, repo, model string, in,
 // TestEnterStage_EmitsTerminalTokens guards operator_task_terminal_tokens_total.
 // Its only emitter used to be the retired machine's setDeployState; it now fires
 // from EnterStage, the single transition choke point, so EVERY terminal entry
-// (TaskReconciler's, StageDriver's, the doc batch's) is accounted. The `outcome`
-// label is the terminal STAGE, matching D1's stage vocabulary.
+// (TaskReconciler's, StageDriver's, the doc batch's) is accounted. The
+// `outcome` label is the terminal STATE, matching D1's vocabulary: done or
+// rejected, the only two tatarav1alpha1.TaskIsTerminalOutcome members.
+//
+// #521 retired `failed` as an Enter target: turn-budget-exhausted (and every
+// other former `failed` reason) is a PARK now, applied by ParkTask, which
+// never calls emitTerminalTokens - a park is not a terminal OUTCOME, the Task
+// may still resume and accumulate more tokens, and double/premature-counting
+// them at a stall that might not be the last one is exactly what the terminal
+// counter must not do. The positive case below moves to `rejected`, a genuine
+// TaskIsTerminalOutcome member, and a new negative case pins that a park -
+// the modern shape of the old `failed` scenario - still does not emit.
 func TestEnterStage_EmitsTerminalTokens(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
 
-	t.Run("failed", func(t *testing.T) {
+	t.Run("rejected", func(t *testing.T) {
 		task := seedTerminalTokensTask(t, "tt-task-churn", "tt-proj-churn", "tt-repo-churn", "claude-sonnet-5", 1000, 300, 500, 50)
 
 		reg := prometheus.NewRegistry()
 		m := obs.NewOperatorMetrics(reg)
 		if err := EnterStage(ctx, k8sClient, nil, m, task, nil,
-			tatarav1alpha1.StageFailed, stage.ReasonTurnBudgetExhausted, time.Now(), nil); err != nil {
+			tatarav1alpha1.StateRejected, stage.ReasonDeclined, time.Now(), nil); err != nil {
 			t.Fatalf("EnterStage: %v", err)
 		}
 
@@ -94,8 +104,8 @@ func TestEnterStage_EmitsTerminalTokens(t *testing.T) {
 			class string
 			want  float64
 		}{{"input", 1000}, {"output", 300}, {"cache_read", 500}, {"cache_creation", 50}} {
-			if got := testutil.ToFloat64(m.TaskTerminalTokensCounter(proj, repo, tatarav1alpha1.StageFailed, model, tc.class)); got != tc.want {
-				t.Errorf("failed %s = %v, want %v", tc.class, got, tc.want)
+			if got := testutil.ToFloat64(m.TaskTerminalTokensCounter(proj, repo, tatarav1alpha1.StateRejected, model, tc.class)); got != tc.want {
+				t.Errorf("rejected %s = %v, want %v", tc.class, got, tc.want)
 			}
 		}
 	})
@@ -106,12 +116,26 @@ func TestEnterStage_EmitsTerminalTokens(t *testing.T) {
 		reg := prometheus.NewRegistry()
 		m := obs.NewOperatorMetrics(reg)
 		if err := EnterStage(ctx, k8sClient, nil, m, task, nil,
-			tatarav1alpha1.StageReviewing, "", time.Now(), nil); err != nil {
+			tatarav1alpha1.StateAwaitingReview, "", time.Now(), nil); err != nil {
 			t.Fatalf("EnterStage: %v", err)
 		}
-		got := testutil.ToFloat64(m.TaskTerminalTokensCounter("tt-proj-live", "tt-repo-live", tatarav1alpha1.StageReviewing, "claude-opus-5", "input"))
+		got := testutil.ToFloat64(m.TaskTerminalTokensCounter("tt-proj-live", "tt-repo-live", tatarav1alpha1.StateAwaitingReview, "claude-opus-5", "input"))
 		if got != 0 {
 			t.Errorf("a non-terminal stage entry must not emit terminal tokens, got %v", got)
+		}
+	})
+
+	t.Run("no emit on a park (the modern shape of the old failed scenario)", func(t *testing.T) {
+		task := seedTerminalTokensTask(t, "tt-task-parked", "tt-proj-parked", "tt-repo-parked", "claude-opus-5", 900, 400, 200, 20)
+
+		reg := prometheus.NewRegistry()
+		m := obs.NewOperatorMetrics(reg)
+		if err := ParkTask(ctx, k8sClient, nil, m, task, stage.ReasonTurnBudgetExhausted, time.Now(), nil); err != nil {
+			t.Fatalf("ParkTask: %v", err)
+		}
+		got := testutil.ToFloat64(m.TaskTerminalTokensCounter("tt-proj-parked", "tt-repo-parked", tatarav1alpha1.StateUnderImplementation, "claude-opus-5", "input"))
+		if got != 0 {
+			t.Errorf("a park must not emit terminal tokens: the Task is not done, it may still resume, got %v", got)
 		}
 	})
 }

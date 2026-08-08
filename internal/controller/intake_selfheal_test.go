@@ -195,7 +195,7 @@ func TestMintReviewTask_RepairNeverStealsForeignOwner(t *testing.T) {
 	m, c := minterFor(t, proj, repo, twin, stub)
 	pr := reviewPRItem(num).PR
 	_, outcome, err := m.MintReviewTask(context.Background(), proj, repo, pr, stub,
-		tatarav1alpha1.StageTriaging, "", nil)
+		tatarav1alpha1.StateNew, "", nil)
 	require.NoError(t, err, "refusing to steal is a clean no-op, never a heartbeat-suppressing error")
 	require.Equal(t, MintExistingLive, outcome)
 
@@ -267,7 +267,7 @@ func TestMintIssueTask_RepairsUnboundIssueStub(t *testing.T) {
 	ext := scm.Issue{Number: num, State: "open", Author: "alice", Title: "boom",
 		URL: "https://github.com/szymonrychu/tatara-operator/issues/" + strconv.Itoa(num)}
 	_, outcome, err := m.MintIssueTask(context.Background(), proj, repo, ext,
-		tatarav1alpha1.StageTriaging, "", nil)
+		tatarav1alpha1.StateNew, "", nil)
 	require.NoError(t, err)
 	require.Equal(t, MintExistingLive, outcome, "the live twin already holds the natural key; the create no-ops")
 

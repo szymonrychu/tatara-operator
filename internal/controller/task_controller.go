@@ -184,12 +184,20 @@ func (r *TaskReconciler) reconcileStage(ctx context.Context, project *tatarav1al
 
 	l := log.FromContext(ctx)
 
-	// MINT (F.3's Create edges). The sweep mints straight into triaging or
-	// parked(backlog-sweep) and the nightly batch straight into documenting. Those
-	// targets are carried in the IMMUTABLE Spec.InitialStage (fix C5) so this edge
-	// derives them here, with no racing post-create status write by the minter;
-	// anything else starts at triaging.
-	if task.Status.Stage == "" {
+	// MINT (the Create edges). A sweep mints into `new`, optionally ALSO parked
+	// with an initial park reason (backlog-sweep, awaiting-human), and the nightly
+	// batch mints straight into under-implementation. Those targets are carried in
+	// the IMMUTABLE Spec.InitialState / Spec.InitialParkReason (fix C5) so this
+	// edge derives them here, with no racing post-create status write by the
+	// minter; anything else starts at `new`.
+	//
+	// THE STATE AND THE PARK ARE ONE WRITE. A Task minted with an initial park
+	// reason was minted TO BE PARKED, and two writes leave a window in which it
+	// is LIVE with no park reason - a crash, a conflict or an eviction inside it
+	// mints an unparked Task that gets picked up and worked. MintParked applies
+	// both in one status update (Enter then Park inside the one mutation: Enter
+	// refuses a parked Task, so the order within it is still load-bearing).
+	if task.Status.State == "" {
 		// status.stage == "" is a CACHED read. Confirm it against the API server
 		// before applying the Create edge: see the APIReader field's comment.
 		minted, err := r.mintedAlready(ctx, task)
@@ -202,11 +210,50 @@ func (r *TaskReconciler) reconcileStage(ctx context.Context, project *tatarav1al
 			// transition counter for a Task that is perfectly healthy.
 			return ctrl.Result{RequeueAfter: time.Second}, nil
 		}
-		initStage := task.Spec.InitialStage
-		if initStage == "" {
-			initStage = tatarav1alpha1.StageTriaging
+		// THE #521 TERMINAL-RESET GUARD, and it runs HERE - on the ordinary
+		// create edge - rather than as a startup pass, because that is where the
+		// damage would happen. The #521 cutover removed status.stage from the
+		// CRD, structural pruning drops it on the READ path, and the accepted
+		// consequence is that every pre-cutover Task arrives STATELESS and takes
+		// this edge again. Nothing else needs doing for the ones still working;
+		// the ones that had FINISHED must not be re-triaged into reopening their
+		// issues and respawning agents. See reset_guard.go.
+		//
+		// ON THIS EDGE, NOT IN main.go, for four reasons. It is IDEMPOTENT for
+		// free: the edge is gated on state == "" and stamping a terminal closes
+		// that gate permanently. It CANNOT BLOCK STARTUP: it is one reconcile
+		// among many, and a failure is retried by the work queue instead of
+		// crash-looping the manager. It reads the same OWNED MIRRORS the rest of
+		// this reconciler already reads, through the same cache, rather than
+		// needing an uncached pre-cache List of the whole namespace. And it has
+		// NO CUTOVER WINDOW - a Task that arrives stateless a week later, from a
+		// restored backup or a re-created CR, is guarded on exactly the same
+		// evidence, which a one-shot boot pass could never do.
+		if to, reason, err := terminalResetTarget(ctx, r.Client, task); err != nil {
+			return ctrl.Result{}, err
+		} else if to != "" {
+			// The terminal is entered INSTEAD of the mint target, and
+			// Spec.InitialParkReason is deliberately NOT applied: a terminal
+			// Task is the reaper's, and parking one would wedge it behind an
+			// un-park rule it can never satisfy.
+			if err := r.enter(ctx, project, task, nil, to, reason, now); err != nil {
+				return ctrl.Result{}, err
+			}
+			l.Info("stateless task stamped terminal by the #521 reset guard",
+				"action", "terminal_reset_guard", "resource_id", task.Name,
+				"state", to, "state_reason", reason, "kind", task.Spec.Kind)
+			return ctrl.Result{}, nil
 		}
-		if err := r.enter(ctx, project, task, nil, initStage, task.Spec.InitialStageReason, now); err != nil {
+
+		initStage := task.Spec.InitialState
+		if initStage == "" {
+			initStage = tatarav1alpha1.StateNew
+		}
+		if reason := task.Spec.InitialParkReason; reason != "" {
+			if err := r.enterParkedAtMint(ctx, project, task, initStage, reason, now); err != nil {
+				return ctrl.Result{}, err
+			}
+		} else if err := r.enter(ctx, project, task, nil, initStage, "", now); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{Requeue: true}, nil
@@ -220,15 +267,25 @@ func (r *TaskReconciler) reconcileStage(ctx context.Context, project *tatarav1al
 		return ctrl.Result{}, err
 	}
 
-	// The REAPER owns a terminal Task (B.6). This reconciler never deletes one and
-	// never resurrects one: a parked Task's ONLY exits are the narrow F.6 re-entry
+	// THE PARK/LIVE INVARIANT. parkReason != "" AND a live pod is a state the
+	// design calls transient, and it IS - ParkTask stamps the flag and deletes
+	// the pod in the same call. Nothing bounds the gap, though: a crash, a
+	// conflict retry that loses the pod delete, or an eviction between the two
+	// leaves a parked Task holding a pod that burns an admission slot with NO
+	// clock armed. Repair it on sight and COUNT it.
+	if handled, err := r.repairParkedWithLivePod(ctx, project, task); err != nil || handled {
+		return ctrl.Result{Requeue: handled}, err
+	}
+
+	// The REAPER owns a done Task (B.6). This reconciler never deletes one and
+	// never resurrects one; a PARKED Task's only exits are the narrow re-entry
 	// rules, which stage.Unpark applies from the webhook and the sweep - plus the
 	// parked binding repair above, the one narrow self-heal that may run first.
-	if tatarav1alpha1.StageTerminal(task) {
+	if tatarav1alpha1.TaskDone(task) || tatarav1alpha1.Parked(task) {
 		return ctrl.Result{}, nil
 	}
 
-	// task.Status.Stage is a CACHED read here too, and every branch below -
+	// task.Status.State is a CACHED read here too, and every branch below -
 	// reconcileClocks, reconcileCaps, reconcileTriaging's own edges, the
 	// pod-less and pod-stage handlers - derives its next edge from it. Take the
 	// API server's copy and work from THAT, so none of them re-derives an edge
@@ -239,11 +296,11 @@ func (r *TaskReconciler) reconcileStage(ctx context.Context, project *tatarav1al
 		return ctrl.Result{}, err
 	}
 
-	// The terminal check again, on the FRESH object: a Task that went terminal
-	// between the cached read and the live read belongs to the reaper, and must
-	// take the early return above rather than fall through into clocks and caps
-	// on the strength of a stage it no longer has.
-	if tatarav1alpha1.StageTerminal(task) {
+	// The terminal check again, on the FRESH object: a Task that went done or
+	// parked between the cached read and the live read belongs to the reaper or
+	// to the un-park rules, and must take the early return above rather than fall
+	// through into clocks and caps on the strength of a state it no longer has.
+	if tatarav1alpha1.TaskDone(task) || tatarav1alpha1.Parked(task) {
 		return ctrl.Result{}, nil
 	}
 
@@ -267,36 +324,29 @@ func (r *TaskReconciler) reconcileStage(ctx context.Context, project *tatarav1al
 		return ctrl.Result{}, err
 	}
 
-	agentKind := stage.AgentKindFor(task.Status.Stage)
+	agentKind := stage.AgentKindFor(task.Status.State, task.Spec.Kind)
 	if agentKind == "" {
-		switch task.Status.Stage {
-		case tatarav1alpha1.StageTriaging:
+		switch task.Status.State {
+		case tatarav1alpha1.StateNew:
 			return r.reconcileTriaging(ctx, project, task, now)
 
-		case tatarav1alpha1.StageApproved:
-			// POD-LESS, and yet it needs a ticket: F.3's approved -> implementing
-			// edge IS the admission of the implement pod's ticket, and the
-			// DISPATCHER applies it (queue_controller.go admitTicket). Enqueue the
-			// ticket and wait; applying the edge here too would double-transition.
-			if _, err := r.ensureTicket(ctx, project, task, stage.AgentImplement); err != nil {
-				return ctrl.Result{}, err
-			}
-			return res, nil
-
-		case tatarav1alpha1.StageMerging, tatarav1alpha1.StageDeploying:
+		case tatarav1alpha1.StateMerged, tatarav1alpha1.StateDeployed:
 			// StageReconciler (stage_controller.go) drives these through StageDriver -
 			// the single merge egress. This reconciler owns only their CLOCKS, which
 			// ran above: merging's 4h -> parked(merge-timeout), deploying's 2h ->
 			// parked(deploy-timeout).
 			return res, nil
 
-		case tatarav1alpha1.StageDelivered:
-			// Quasi-terminal. Its clock (48h) elapses to (reap) and the reaper
-			// collects it once the nightly batch has documented it.
+		case tatarav1alpha1.StateDone, tatarav1alpha1.StateRejected:
+			// Terminal. The early return above already caught these; this arm
+			// exists so the "no driver" log below cannot fire for them.
 			return res, nil
 		}
-		l.Info("stage has no driver", "action", "stage_no_driver",
-			"resource_id", task.Name, "stage", task.Status.Stage)
+		// A LIVE state with no agent kind means spec.kind is not in
+		// originAgentKinds: AgentKindFor failed CLOSED rather than spawning a
+		// default agent. Nothing drives it and nothing should.
+		l.Info("state has no driver", "action", "stage_no_driver",
+			"resource_id", task.Name, "state", task.Status.State, "kind", task.Spec.Kind)
 		return res, nil
 	}
 
@@ -325,7 +375,7 @@ func (r *TaskReconciler) mintedAlready(ctx context.Context, task *tatarav1alpha1
 		}
 		return false, fmt.Errorf("mint: live read of task %s: %w", task.Name, err)
 	}
-	return live.Status.Stage != "", nil
+	return live.Status.State != "", nil
 }
 
 // refreshTaskFromAPI re-reads the Task from the API SERVER (never the cache)
@@ -376,7 +426,7 @@ func refreshTaskFromAPI(ctx context.Context, api client.Reader, task *tatarav1al
 		}
 		return fmt.Errorf("stage refresh: live read of task %s: %w", task.Name, err)
 	}
-	if live.Status.Stage != task.Status.Stage {
+	if live.Status.State != task.Status.State {
 		// Drift is a business action, not a silent internal detail: adoption makes
 		// it self-healing, which is exactly what makes a WEDGED watch (as opposed
 		// to an informer merely a beat behind) invisible - every reconcile would
@@ -385,8 +435,8 @@ func refreshTaskFromAPI(ctx context.Context, api client.Reader, task *tatarav1al
 		// trickle from a wedge.
 		log.FromContext(ctx).Info("task stage drifted: the cache is behind the api server",
 			"action", "task_stage_drift", "resource_id", task.Name,
-			"cached_stage", task.Status.Stage, "live_stage", live.Status.Stage)
-		obs.StageDrift(task.Status.Stage)
+			"cached_stage", task.Status.State, "live_stage", live.Status.State)
+		obs.StageDrift(task.Status.State)
 	}
 	*task = live
 	return nil
@@ -488,8 +538,12 @@ func (r *TaskReconciler) projectRepos(ctx context.Context, project *tatarav1alph
 
 // taskHasInflightTurn reports whether the Task has an agent turn in flight: a
 // current-turn id is set and its completion callback has not yet arrived.
+// It DELEGATES rather than repeating the two-annotation test: stage.ArmedClock
+// disarms the idle clock on the same predicate, and a Task that is "working" to
+// the turn dispatcher but "idle" to the clock model would be parked mid-turn -
+// the #521 regression this predicate now guards.
 func taskHasInflightTurn(task *tatarav1alpha1.Task) bool {
-	return task.Annotations[annCurrentTurn] != "" && task.Annotations[annTurnComplete] == ""
+	return stage.TurnInFlight(task)
 }
 
 // stampResolvedModel records the MODEL env resolved for this Task's agent pod
@@ -596,7 +650,7 @@ func (r *TaskReconciler) handleTurnSubmitFailure(ctx context.Context, proj *tata
 		r.Metrics.TurnSubmit(task.Spec.Kind, "transient", outcome, elapsed)
 		log.FromContext(ctx).Info("wrapper past TTL (410 Gone) on turn submit; running G.7 handoff",
 			"action", "agent_turn_submit", "resource_id", task.Name, "phase", phase, "outcome", outcome)
-		return r.ttlStop(ctx, proj, task, stage.AgentKindFor(task.Status.Stage), time.Now())
+		return r.ttlStop(ctx, proj, task, stage.AgentKindFor(task.Status.State, task.Spec.Kind), time.Now())
 	}
 	// A wrapper 409 "session busy" is expected backpressure, not a dispatch
 	// failure: the session already has a turn in flight (the operator's view of
@@ -668,7 +722,7 @@ func shortDescription(goal string) string {
 
 // inflightKinds are the Task ORIGIN kinds the per-kind in-flight gauge always
 // emits, so a kind with no live Task reports 0 rather than dropping its series.
-var inflightKinds = []string{"brainstorm", "incident", "clarify", "refine", "review", "documentation"}
+var inflightKinds = []string{"brainstorm", "incident", "implement", "refine", "review", "documentation"}
 
 // updateInflightGauge sets operator_tasks_inflight (aggregate) and
 // tatara_tasks_inflight{kind} (per-kind) to the count of Tasks in a POD stage.
@@ -684,7 +738,8 @@ func (r *TaskReconciler) updateInflightGauge(ctx context.Context) {
 	byKind := map[string]int{}
 	for i := range list.Items {
 		t := &list.Items[i]
-		if tatarav1alpha1.TaskDone(t) || stage.AgentKindFor(t.Status.Stage) == "" {
+		if tatarav1alpha1.TaskDone(t) || tatarav1alpha1.Parked(t) ||
+			stage.AgentKindFor(t.Status.State, t.Spec.Kind) == "" {
 			continue
 		}
 		n++

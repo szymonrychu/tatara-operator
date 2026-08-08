@@ -129,6 +129,14 @@ func run(ctx context.Context) error {
 	if err := addWebhookServer(ctx, mgr, cfg, operatorMetrics, seqAlloc); err != nil {
 		return err
 	}
+	// NO MIGRATION RUNS HERE, and that is a RULING, not an omission. #521 removed
+	// status.stage from the CRD, and CRD structural pruning applies on the READ
+	// path: once the narrowed schema is served, no GET returns the legacy field
+	// on any object, so a one-shot migrator has nothing to read and cannot work.
+	// The accepted consequence is that every pre-#521 Task boots STATELESS and
+	// re-derives through the ordinary create edge in TaskReconciler, guarded
+	// against resurrecting terminal work by controller.terminalResetTarget.
+	// See MEMORY.md 2026-08-08.
 	logger.Info("starting manager",
 		slog.String("action", "manager_start"),
 		slog.String("version", version.String()),

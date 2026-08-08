@@ -16,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 // mirrorScheme builds a scheme carrying the tatara types for the fake-client
@@ -37,9 +38,20 @@ func mirrorScheme(t *testing.T) *runtime.Scheme {
 // the five contract A.3 field indexes registered.
 func newMirrorClient(t *testing.T, objs ...client.Object) client.Client {
 	t.Helper()
+	return newMirrorClientIntercepted(t, interceptor.Funcs{}, objs...)
+}
+
+// newMirrorClientIntercepted is newMirrorClient with interceptor funcs, for the
+// tests that must observe the WRITES a reconcile makes rather than only the
+// object it leaves behind. A status subresource is the unit of atomicity, so
+// "how many writes, carrying what" is the only way to test that two facts land
+// together.
+func newMirrorClientIntercepted(t *testing.T, funcs interceptor.Funcs, objs ...client.Object) client.Client {
+	t.Helper()
 	return fake.NewClientBuilder().
 		WithScheme(mirrorScheme(t)).
 		WithObjects(objs...).
+		WithInterceptorFuncs(funcs).
 		WithStatusSubresource(&tatarav1alpha1.Issue{}, &tatarav1alpha1.MergeRequest{}, &tatarav1alpha1.Task{}).
 		WithIndex(&tatarav1alpha1.Issue{}, IssueKeyIndex, IssueKeyIndexer).
 		WithIndex(&tatarav1alpha1.MergeRequest{}, MRKeyIndex, MRKeyIndexer).
@@ -459,24 +471,24 @@ func TestMirrorCadence(t *testing.T) {
 		notes string
 	}{
 		{name: "nil task (unowned mirror)", task: nil, want: MirrorCadenceActive},
-		{name: "triaging", task: taskAtStage(tatarav1alpha1.StageTriaging, ""), want: MirrorCadenceActive},
-		{name: "implementing", task: taskAtStage(tatarav1alpha1.StageImplementing, ""), want: MirrorCadenceActive},
-		{name: "reviewing", task: taskAtStage(tatarav1alpha1.StageReviewing, ""), want: MirrorCadenceActive},
-		{name: "merging", task: taskAtStage(tatarav1alpha1.StageMerging, ""), want: MirrorCadenceActive},
+		{name: "triaging", task: taskAtStage(tatarav1alpha1.StateNew, ""), want: MirrorCadenceActive},
+		{name: "implementing", task: taskAtStage(tatarav1alpha1.StateUnderImplementation, ""), want: MirrorCadenceActive},
+		{name: "reviewing", task: taskAtStage(tatarav1alpha1.StateAwaitingReview, ""), want: MirrorCadenceActive},
+		{name: "merging", task: taskAtStage(tatarav1alpha1.StateMerged, ""), want: MirrorCadenceActive},
 		{
 			name: "parked(backlog-sweep)",
-			task: taskAtStage(tatarav1alpha1.StageParked, "backlog-sweep"),
+			task: taskAtStage(tatarav1alpha1.StateNew, "backlog-sweep"),
 			want: MirrorCadenceParked,
 		},
 		{
 			// EVERY parked Task, not just backlog-sweep (fix M11).
 			name: "parked(identity-unverified)",
-			task: taskAtStage(tatarav1alpha1.StageParked, "identity-unverified"),
+			task: taskAtStage(tatarav1alpha1.StateRefined, "identity-unverified"),
 			want: MirrorCadenceParked,
 		},
 		{
 			name: "parked(review-loop-exhausted)",
-			task: taskAtStage(tatarav1alpha1.StageParked, "review-loop-exhausted"),
+			task: taskAtStage(tatarav1alpha1.StateAwaitingReview, "review-loop-exhausted"),
 			want: MirrorCadenceParked,
 		},
 	}
@@ -495,12 +507,24 @@ func TestMirrorCadence(t *testing.T) {
 	}
 }
 
-func taskAtStage(stage, reason string) *tatarav1alpha1.Task {
-	return &tatarav1alpha1.Task{
+// taskAtStage builds a Task at state, carrying reason on whichever field state
+// implies: status.stateReason for the two outcome states (done/rejected),
+// status.parkReason for every other state (a park is a flag orthogonal to
+// state - see stage.Park). An empty reason sets neither.
+func taskAtStage(state, reason string) *tatarav1alpha1.Task {
+	t := &tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{Name: "t-1", Namespace: testNS},
 		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "proj"},
-		Status:     tatarav1alpha1.TaskStatus{Stage: stage, StageReason: reason},
 	}
+	t.Status.State = state
+	if reason != "" {
+		if state == tatarav1alpha1.StateDone || state == tatarav1alpha1.StateRejected {
+			t.Status.StateReason = reason
+		} else {
+			t.Status.ParkReason = reason
+		}
+	}
+	return t
 }
 
 // TestSyncIssueOnDemand is fix M11. A non-bot pendingEvent on a parked Task

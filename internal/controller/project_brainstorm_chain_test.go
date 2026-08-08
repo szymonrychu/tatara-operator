@@ -114,7 +114,7 @@ func TestBrainstormChainWakesProjectReconcile(t *testing.T) {
 		t.Fatal("the Task CREATE woke the Project reconcile; the parent creates these Tasks and would trigger itself")
 	}
 
-	task.Status.Stage = tatarav1alpha1.StageBrainstorming
+	task.Status.State = tatarav1alpha1.StateRefined
 	if err := k8sClient.Status().Update(ctx, task); err != nil {
 		t.Fatalf("status update to brainstorming: %v", err)
 	}
@@ -123,7 +123,7 @@ func TestBrainstormChainWakesProjectReconcile(t *testing.T) {
 	}
 
 	// THE SKIP: submit_outcome(action="skip") lands the cycle on delivered.
-	task.Status.Stage = tatarav1alpha1.StageDelivered
+	task.Status.State = tatarav1alpha1.StateDone
 	if err := k8sClient.Status().Update(ctx, task); err != nil {
 		t.Fatalf("status update to delivered: %v", err)
 	}

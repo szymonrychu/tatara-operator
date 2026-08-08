@@ -150,9 +150,10 @@ func (r *PodWatchReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	if err := r.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: taskName}, task); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	// The greenness gate: only the new stage model owns these timestamps. A
-	// legacy phase-driven Task is driven entirely by TaskReconciler.
-	if task.Status.Stage == "" || tatarav1alpha1.StageTerminal(task) {
+	// The greenness gate: only the state model owns these timestamps. A Task with
+	// no state yet is driven entirely by TaskReconciler's create edge, and a
+	// PARKED Task holds no pod worth arming a clock for.
+	if task.Status.State == "" || tatarav1alpha1.TaskDone(task) || tatarav1alpha1.Parked(task) {
 		return ctrl.Result{}, nil
 	}
 
@@ -172,7 +173,7 @@ func (r *PodWatchReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	if err := r.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: taskName}, task); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	if task.Status.StageWorkStartedAt != nil {
+	if task.Status.StateWorkStartedAt != nil {
 		return ctrl.Result{}, nil
 	}
 
@@ -193,7 +194,7 @@ func (r *PodWatchReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 	log.FromContext(ctx).Info("agent pod ready; stage work clock armed",
 		"action", "stage_work_started", "resource_id", taskName,
-		"stage", task.Status.Stage, "agent_kind", task.Status.AgentKind, "pod", pod.Name)
+		"state", task.Status.State, "agent_kind", task.Status.AgentKind, "pod", pod.Name)
 	return ctrl.Result{}, nil
 }
 
@@ -214,33 +215,35 @@ func (r *PodWatchReconciler) handleNotReady(ctx context.Context, pod *corev1.Pod
 	if err := r.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: taskName}, fresh); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	if fresh.Status.Stage == "" || fresh.Status.StageWorkStartedAt != nil {
+	if fresh.Status.State == "" || fresh.Status.StateWorkStartedAt != nil {
 		return ctrl.Result{}, nil
 	}
 	edge, terminal := stage.RecordRespawn(fresh, r.maxRecreations())
 	recreations := fresh.Status.Stats.PodRecreations
 	if terminal {
-		l.Info("agent pod never became ready; recreation budget exhausted, failing task",
+		l.Info("agent pod never became ready; recreation budget exhausted, parking task",
 			"action", "pod_recreation_exhausted", "resource_id", taskName, "pod", pod.Name)
-		// Through the CHOKE POINT: it stamps the clocks, tears the pod down, and
-		// fires the D1 terminal counter. Doing it with a raw Status().Update here
-		// (as this did) is exactly how a terminal entry goes uncounted.
-		return ctrl.Result{}, EnterStage(ctx, r.Client, r.spillerForTask(ctx, fresh), r.Metrics,
-			fresh, nil, edge.To, edge.Reason, time.Now(), nil)
+		// Through the PARK CHOKE POINT: it stamps the tuple, tears the pod down,
+		// and counts the park. stage.RecordRespawn's terminal edge is a PARK
+		// (#521 deleted `failed`), so EnterStage would refuse it - doing this with
+		// a raw Status().Update, as it once did, is exactly how the exhaustion
+		// went uncounted.
+		return ctrl.Result{}, ParkTask(ctx, r.Client, r.spillerForTask(ctx, fresh), r.Metrics,
+			fresh, edge.Reason, time.Now(), nil)
 	}
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		cur := &tatarav1alpha1.Task{}
 		if err := r.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: taskName}, cur); err != nil {
 			return err
 		}
-		if cur.Status.Stage == "" || cur.Status.StageWorkStartedAt != nil {
+		if cur.Status.State == "" || cur.Status.StateWorkStartedAt != nil {
 			return nil
 		}
 		cur.Status.Stats.PodRecreations = recreations
 		// The pod is going away; clear its clock so the replacement re-stamps a
 		// FRESH podStartedAt rather than inheriting the dead pod's.
 		cur.Status.PodStartedAt = nil
-		cur.Status.StageWorkStartedAt = nil
+		cur.Status.StateWorkStartedAt = nil
 		return r.Status().Update(ctx, cur)
 	}); err != nil {
 		return ctrl.Result{}, err
@@ -284,12 +287,12 @@ func (r *PodWatchReconciler) failContractMismatch(ctx context.Context, pod *core
 	if err := r.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: task.Name}, fresh); err != nil {
 		return client.IgnoreNotFound(err)
 	}
-	if tatarav1alpha1.StageTerminal(fresh) {
+	if tatarav1alpha1.TaskDone(fresh) || tatarav1alpha1.Parked(fresh) {
 		return nil
 	}
-	// Through the CHOKE POINT: it deletes the wrapper and fires D1.
-	return EnterStage(ctx, r.Client, r.spillerForTask(ctx, fresh), r.Metrics, fresh, nil,
-		tatarav1alpha1.StageFailed, stage.ReasonAgentContractMismatch, time.Now(), nil)
+	// Through the PARK CHOKE POINT: it deletes the wrapper and counts the park.
+	return ParkTask(ctx, r.Client, r.spillerForTask(ctx, fresh), r.Metrics, fresh,
+		stage.ReasonAgentContractMismatch, time.Now(), nil)
 }
 
 // StampPodStartedAt arms CLOCK 2: it stamps status.podStartedAt from the pod's
@@ -304,7 +307,7 @@ func StampPodStartedAt(ctx context.Context, c client.Client, namespace, taskName
 		if err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: taskName}, fresh); err != nil {
 			return err
 		}
-		if fresh.Status.Stage == "" {
+		if fresh.Status.State == "" {
 			return nil
 		}
 		if cur := fresh.Status.PodStartedAt; cur != nil && !cur.Time.Before(at) {
@@ -312,7 +315,7 @@ func StampPodStartedAt(ctx context.Context, c client.Client, namespace, taskName
 		}
 		stamp := metav1.NewTime(at)
 		fresh.Status.PodStartedAt = &stamp
-		fresh.Status.StageWorkStartedAt = nil
+		fresh.Status.StateWorkStartedAt = nil
 		fresh.Status.Stats.PodRuns++
 		return c.Status().Update(ctx, fresh)
 	})
@@ -327,14 +330,14 @@ func StampStageWorkStartedAt(ctx context.Context, c client.Client, namespace, ta
 		if err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: taskName}, fresh); err != nil {
 			return err
 		}
-		if fresh.Status.Stage == "" || fresh.Status.PodStartedAt == nil {
+		if fresh.Status.State == "" || fresh.Status.PodStartedAt == nil {
 			return nil
 		}
-		if fresh.Status.StageWorkStartedAt != nil {
+		if fresh.Status.StateWorkStartedAt != nil {
 			return nil
 		}
 		stamp := metav1.NewTime(at)
-		fresh.Status.StageWorkStartedAt = &stamp
+		fresh.Status.StateWorkStartedAt = &stamp
 		return c.Status().Update(ctx, fresh)
 	})
 }

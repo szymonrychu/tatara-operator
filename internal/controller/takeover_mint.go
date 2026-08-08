@@ -89,10 +89,15 @@ func (m *Minter) mintOrUnparkTakeoverTask(ctx context.Context, proj *tatarav1alp
 	var existing tatarav1alpha1.Task
 	err := m.Client.Get(ctx, client.ObjectKey{Namespace: proj.Namespace, Name: name}, &existing)
 	if err == nil {
-		if existing.Status.Stage == tatarav1alpha1.StageParked && existing.Status.StageReason == stage.ReasonOwnershipLost {
-			if eerr := EnterStage(ctx, m.Client, sp, m.Metrics, &existing, nil,
-				tatarav1alpha1.StageApproved, stage.ReasonOwnershipLost, time.Now(), nil); eerr != nil {
-				return nil, fmt.Errorf("takeover: re-enter approved on %s: %w", existing.Name, eerr)
+		if existing.Status.ParkReason == stage.ReasonOwnershipLost {
+			// THE ONE STATE-MOVING UN-PARK. A maintainer re-took ownership, so the
+			// parked takeover Task resumes at under-implementation to push again -
+			// from wherever the ownership flip caught it. stage.UnparkTakeover is
+			// the only function allowed to clear the flag and move state together,
+			// and it refuses every other park reason.
+			if eerr := UnparkTakeoverTask(ctx, m.Client, sp, m.Metrics, &existing,
+				tatarav1alpha1.StateUnderImplementation, time.Now()); eerr != nil {
+				return nil, fmt.Errorf("takeover: un-park %s: %w", existing.Name, eerr)
 			}
 		}
 		return &existing, nil
@@ -114,13 +119,12 @@ func (m *Minter) mintOrUnparkTakeoverTask(ctx context.Context, proj *tatarav1alp
 			RepositoryRef: repo.Name,
 			Kind:          takeoverKind,
 			Goal:          takeoverGoal(mr, requestingUser, commentBody),
-			InitialStage:  tatarav1alpha1.StageApproved,
-			// InitialStageReason is left empty: approved is not a reason-required
-			// target (reasonRequired only gates parked/failed/rejected) and
-			// "requested by <user>" is not an F.5 closed-set reason - stamping it
-			// here would make the create-edge's stage.Enter reject the mint with
-			// UnknownReasonError. The requester and trigger comment live in Goal
-			// instead, which is free text.
+			InitialState:  tatarav1alpha1.StateRefined,
+			// InitialParkReason is left empty: a takeover mint is NOT parked - a
+			// maintainer just asked for it - and "requested by <user>" is not a
+			// park reason anyway, so stamping it would make the create edge's
+			// stage.Park refuse with UnknownReasonError. The requester and the
+			// trigger comment live in Goal instead, which is free text.
 			MergeOrder: []string{repo.Name},
 			Source: &tatarav1alpha1.TaskSource{
 				Provider:    providerOf(proj),

@@ -422,16 +422,23 @@ func FitTask(ctx context.Context, c client.Client, sp Spiller, key types.Namespa
 	})
 }
 
-// MinimalFailPatch fails task with the given stageReason via a JSON merge
-// patch whose body carries ONLY .status.stage and .status.stageReason -
+// MinimalFailPatch parks task with the given park reason via a JSON merge
+// patch whose body carries ONLY .status.parkReason and .status.parkedAt -
 // never the object itself. This is the way out of the circularity
 // ErrObjectTooLarge creates: recording the failure by marshalling and
 // writing the very object that is too large to write would 413 again.
+//
+// It writes the PARK FLAG and not a state, because under the 8-state model a
+// failure does not move the Task: it stalls it where it is (#521). It cannot
+// call stage.Park for the same reason it cannot marshal the object - the patch
+// body has to stay minimal - so the two must not drift: the fields written here
+// are exactly the ones Park stamps, minus parkedFromState (which needs a read
+// of the current state this patch deliberately does not have).
 func MinimalFailPatch(ctx context.Context, c client.Client, task *tatarav1alpha1.Task, reason string) error {
 	body, err := json.Marshal(map[string]any{
 		"status": map[string]any{
-			"stage":       tatarav1alpha1.StageFailed,
-			"stageReason": reason,
+			"parkReason": reason,
+			"parkedAt":   time.Now().UTC().Format(time.RFC3339),
 		},
 	})
 	if err != nil {

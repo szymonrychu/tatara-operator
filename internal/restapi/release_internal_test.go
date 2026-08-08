@@ -39,7 +39,7 @@ func TestRelease_IsOwnershipChecked(t *testing.T) {
 			task := &tatarav1alpha1.Task{
 				ObjectMeta: metav1.ObjectMeta{Name: "t1", Namespace: "tatara"},
 				Status: tatarav1alpha1.TaskStatus{
-					Stage: tatarav1alpha1.StageReviewing,
+					State: tatarav1alpha1.StateAwaitingReview,
 					Conditions: []metav1.Condition{{
 						Type:               tatarav1alpha1.ConditionOutcomeAccepted,
 						Status:             metav1.ConditionTrue,

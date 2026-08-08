@@ -51,9 +51,9 @@ func isBrainstormTask(t *tatarav1alpha1.Task) bool {
 //	Generic NEVER
 //
 // It reuses tatarav1alpha1.TaskDone rather than defining a second stage set:
-// TaskDone is StageTerminal || delivered, and delivered - deliberately absent
+// TaskDone is exactly {done, rejected}, and a PARKED Task - deliberately absent
 // from terminalStages (task_types.go:207) - is where every skipped cycle lands.
-// A predicate written against StageTerminal alone would drop every real case.
+// A predicate written against TaskDone alone would drop every real case.
 //
 // GenerationChangedPredicate MUST NOT be composed onto this edge. Task carries
 // +kubebuilder:subresource:status and a stage change is a status write; that

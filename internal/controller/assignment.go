@@ -37,11 +37,16 @@ import (
 func requiredSkillsForKind(kind string) []string {
 	switch kind {
 	case "implement":
-		return []string{"tatara-implement-workflow", "test-driven-development"}
+		// THE MERGED KIND (#521). It runs the approval gate AND the code, so it
+		// needs the gate skill as well as the implementation ones. `clarify`'s
+		// `tatara-clarify-conversation` is superseded by
+		// `tatara-implement-gate`, which carries the withdrawal-veto paragraph
+		// this package duplicates verbatim in the turn-0 job text.
+		return []string{"tatara-implement-gate", "tatara-implement-workflow", "test-driven-development"}
 	case "review":
 		return []string{"tatara-review-checklist"}
-	case "clarify":
-		return []string{"tatara-clarify-conversation"}
+	case "takeover":
+		return []string{"tatara-implement-workflow", "test-driven-development"}
 	case "brainstorm":
 		return []string{"tatara-brainstorm-guardrails"}
 	case "incident":
@@ -56,7 +61,7 @@ func requiredSkillsForKind(kind string) []string {
 // isReferenceKind reports whether kind uses advisory "Consult" wording (REFERENCE
 // skills) rather than mandatory "Required/Invoke" wording.
 func isReferenceKind(kind string) bool {
-	return kind == "brainstorm" || kind == "clarify"
+	return kind == "brainstorm"
 }
 
 // skillsDirective builds the required-skills line for the given kind. Returns ""
@@ -128,40 +133,12 @@ func agentJob(agentKind string) string {
 			"data and expect that to hold. `skip` is a correct and common answer; a made-up proposal is not." +
 			promptguidance.ToolingNoteGuidance
 
-	case stage.AgentClarify:
-		return "## Your job\n\n" +
-			"Decide what happens to the issue(s) above by reading them AND their full thread.\n\n" +
-			"  - A maintainer's comment reads to you as a go-ahead -> `submit_outcome(kind=clarify, " +
-			"decision=implement, approvalCitations=[...])`.\n" +
-			"  - It is a duplicate, out of scope, or the human declined -> `decision=close`.\n" +
-			"  - It still needs the human -> `decision=discuss`, with your questions as the comment.\n\n" +
-			"YOU judge whether a comment approves. There is no wordlist. On `decision=implement` you " +
-			"CITE the comment you judged: one `approvalCitations` entry per LIVE issue this Task owns, " +
-			"`{id, quote}`, where `id` is that comment's forge external id - already an attribute on the " +
-			"`<comment external_id=\"...\">` element in this prompt, so do not re-crawl the forge for " +
-			"it - and `quote` is a VERBATIM substring of that same comment's body. Copy it; a " +
-			"paraphrase is refused as a fabrication.\n\n" +
-			"The operator verifies WHO and WHAT WAS SAID, never intent: that the cited comment is on " +
-			"that issue, that its author is a verified non-bot maintainer, that your quote occurs in " +
-			"the body it holds, and that the comment was not already spent as evidence. Any of those " +
-			"failing parks the Task at identity-unverified.\n\n" +
-			"NEVER CITE A COMMENT THAT DECLINES. A go-ahead carrying a scope note (\"yes, but keep it " +
-			"to one package\") is an approval; a conditional one (\"not until the tests pass\") is not, " +
-			"however agreeable its wording. You are the only reader of intent in this loop.\n\n" +
-			"IT DOES NOT CHECK RECENCY, SO THE WITHDRAWAL VETO IS YOURS. Read every maintainer comment " +
-			"newer than the one you want to cite. A benign follow-up (\"ping me when the PR is up\") " +
-			"leaves the go-ahead standing; one that takes it back (\"actually hold off\") means " +
-			"`decision=discuss` instead. Nothing downstream catches this.\n\n" +
-			"Omit `approvalCitations` only when NO human has commented at all - a tatara-proposed issue " +
-			"has no comment to cite. Never invent one to fill the field.\n\n" +
-			"Write no code this turn. Only the conversation survives."
-
 	case stage.AgentIncident:
 		return "## Your job\n\n" +
 			"Investigate the firing alert. Use the Grafana/observability tooling to establish what is " +
 			"actually broken, and read the code that produces it.\n\n" +
 			"  - It is a real problem -> `submit_outcome(kind=incident, action=file_issue)` with the " +
-			"tracker issue. The Task then goes to clarify, where a human decides whether to fix it.\n" +
+			"tracker issue. The Task then goes to the implement gate, where a human decides whether to fix it.\n" +
 			"  - The alert is wrong -> `submit_outcome(kind=incident, action=false_positive)`.\n\n" +
 			"Do not fix anything this turn." + promptguidance.ToolingNoteGuidance
 
@@ -175,18 +152,65 @@ func agentJob(agentKind string) string {
 			"issue text is a fold that will be refused."
 
 	case stage.AgentImplement:
+		// THE MERGED ARM (#521). `clarify` was a separate agent kind with its own
+		// job text until the fold; its three decisions are now action values on
+		// this one outcome, so ONE agent reads the thread, judges the go-ahead,
+		// and then writes the code. The text below is therefore the gate FIRST
+		// and the implementation SECOND, in the order the same agent meets them.
 		return "## Your job\n\n" +
-			"Implement the issue(s) above, in full, in one change. Every project repo is cloned under " +
-			"`/workspace/<name>`; change whichever of them the issue needs. Your commits are pushed to " +
-			"the task branch at the end of each turn and each changed repo gets its own PR - never " +
-			"commit to a default branch.\n\n" +
+			"You own this issue end to end: decide what should happen to it, get a maintainer's " +
+			"go-ahead on your plan, and then implement it.\n\n" +
+			"### 1. The gate\n\n" +
+			"Read the issue(s) above AND their full thread, write your plan with " +
+			"`task_note(kind=\"plan\", ...)`, and keep the note id it returns.\n\n" +
+			"  - A maintainer's comment reads to you as a go-ahead -> " +
+			"`submit_outcome(kind=implement, action=approved, approving_maintainer=..., " +
+			"plan_note_id=..., approval_citations=[...], reason=...)`.\n" +
+			"  - It is a duplicate, out of scope, or the human declined -> `action=rejected` with a " +
+			"reason; the operator closes the issue.\n" +
+			"  - It still needs the human -> `action=discuss` with your questions as the reason.\n\n" +
+			"YOU judge whether a comment approves. There is no wordlist. On `action=approved` you " +
+			"CITE the comment you judged: one the approval_citations field entry per LIVE issue this Task owns, " +
+			"`{id, quote}`, where `id` is that comment's forge external id - already an attribute on the " +
+			"`<comment external_id=\"...\">` element in this prompt, so do not re-crawl the forge for " +
+			"it - and `quote` is a VERBATIM substring of that same comment's body. Copy it; a " +
+			"paraphrase is refused as a fabrication. the approving_maintainer field is the LOGIN of that " +
+			"comment's author: it is a DECLARATION, not an authority, and the operator refuses if it " +
+			"is not a verified maintainer or does not match the comment you cited.\n\n" +
+			"The operator verifies WHO and WHAT WAS SAID, never intent: that the cited comment is on " +
+			"that issue, that its author is a verified non-bot maintainer, that your quote occurs in " +
+			"the body it holds, and that the comment was not already spent as evidence. A refusal " +
+			"comes back as `granted:false` with a `reason` - it is a NORMAL RESULT, not an error, " +
+			"your Task is NOT parked, and you keep talking.\n\n" +
+			"NEVER CITE A COMMENT THAT DECLINES. A go-ahead carrying a scope note (\"yes, but keep it " +
+			"to one package\") is an approval; a conditional one (\"not until the tests pass\") is not, " +
+			"however agreeable its wording. You are the only reader of intent in this loop.\n\n" +
+			"IT DOES NOT CHECK RECENCY, SO THE WITHDRAWAL VETO IS YOURS. Read every maintainer comment " +
+			"newer than the one you want to cite. A benign follow-up (\"ping me when the PR is up\") " +
+			"leaves the go-ahead standing; one that takes it back (\"actually hold off\") means " +
+			"`action=discuss` instead. Nothing downstream catches this. " +
+			"THIS PARAGRAPH IS DUPLICATED VERBATIM IN tatara-agent-skills' " +
+			"`skills/tatara-implement-gate/SKILL.md`; the two must not drift.\n\n" +
+			"Omit the approving_maintainer field AND the approval_citations field TOGETHER, and only when NO human has " +
+			"commented at all - a tatara-proposed issue has no comment to cite. They travel as a pair; " +
+			"one without the other is refused. the plan_note_id field is ALWAYS required.\n\n" +
+			"### 2. The implementation\n\n" +
+			"Once the gate GRANTS, implement the issue(s), in full, in one change. Every project repo " +
+			"is cloned under `/workspace/<name>`; change whichever of them the issue needs. Your " +
+			"commits are pushed to the task branch at the end of each turn and each changed repo gets " +
+			"its own PR - never commit to a default branch.\n\n" +
+			"DO NOT REWRITE THE PLAN NOTE AFTER APPROVAL. The operator hashed it at grant and " +
+			"re-checks the hash when you submit; a plan swapped after approval sends you back to the " +
+			"gate. Amend it BEFORE you ask, or ask again afterwards.\n\n" +
 			"When the change is complete and pushed:\n" +
 			"`submit_outcome(kind=implement, action=submitted, title=..., body=..., " +
-			"changeSignificance=major|minor|patch, mergeOrder=[...])`. mergeOrder is REQUIRED when you " +
-			"changed more than one repo: it is the DEPENDENCY order the repos merge in, and there is no " +
-			"default - getting it backwards ships a dependent repo against a parent that never published.\n\n" +
-			"If you will not do the work, `submit_outcome(kind=implement, action=declined, reason=...)`. " +
-			"There is no partial delivery: implement the whole scope or decline it." +
+			"change_significance=major|minor|patch, merge_order=[...])`. merge_order is REQUIRED when " +
+			"you changed more than one repo: it is the DEPENDENCY order the repos merge in, and there " +
+			"is no default - getting it backwards ships a dependent repo against a parent that never " +
+			"published.\n\n" +
+			"If you will not do the work, `submit_outcome(kind=implement, action=declined, " +
+			"decline_reason=...)`. There is no partial delivery: implement the whole scope or decline " +
+			"it." +
 			promptguidance.ToolingConsumeGuidance
 
 	case stage.AgentReview:

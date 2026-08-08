@@ -244,7 +244,7 @@ func (d *StageDriver) ReconcileMerging(ctx context.Context, proj *tatarav1alpha1
 		obs.ClearMergeCursorStalled(task.Name)
 		l.Error(nil, "merge: merging entered with an empty mergeOrder",
 			"action", "merge_order_missing", "resource_id", task.Name)
-		return ctrl.Result{}, d.enterStage(ctx, proj, task, tatarav1alpha1.StageFailed, stage.ReasonMergeOrderMissing, nil)
+		return ctrl.Result{}, d.parkTask(ctx, proj, task, stage.ReasonMergeOrderMissing)
 	}
 
 	mrs, err := ownedMergeRequests(ctx, d.Client, task)
@@ -264,7 +264,7 @@ func (d *StageDriver) ReconcileMerging(ctx context.Context, proj *tatarav1alpha1
 			obs.ClearMergeCursorStalled(task.Name)
 			l.Error(nil, "merge: mergeOrder names a repo this Task owns no open MR for",
 				"action", "merge_operator_error", "resource_id", task.Name, "repo", repoRef)
-			return ctrl.Result{}, d.enterStage(ctx, proj, task, tatarav1alpha1.StageFailed, stage.ReasonOperatorError, mrs)
+			return ctrl.Result{}, d.parkTask(ctx, proj, task, stage.ReasonOperatorError)
 		}
 
 		// IDEMPOTENT RESUME: an MR already merged (by us on an earlier pass, or by
@@ -370,7 +370,7 @@ func (d *StageDriver) ReconcileMerging(ctx context.Context, proj *tatarav1alpha1
 			// fail fast to parked instead of hot-requeueing until merge-timeout.
 			l.Info("merge: forge refused the merge credential; parking",
 				"action", "merge_auth_refused", "resource_id", task.Name, "repo", repoRef, "pr", mr.Spec.Number)
-			return ctrl.Result{}, d.enterStage(ctx, proj, task, tatarav1alpha1.StageParked, stage.ReasonMergeAuthRefused, mrs)
+			return ctrl.Result{}, d.parkTask(ctx, proj, task, stage.ReasonMergeAuthRefused)
 		default:
 			return ctrl.Result{}, fmt.Errorf("merge: %s!%d: %w", repoRef, mr.Spec.Number, mergeErr)
 		}
@@ -409,7 +409,7 @@ func (d *StageDriver) ReconcileMerging(ctx context.Context, proj *tatarav1alpha1
 	obs.ClearMergeCursorStalled(task.Name)
 	l.Info("merge: every repo in mergeOrder merged",
 		"action", "merge_complete", "resource_id", task.Name, "repos", len(task.Spec.MergeOrder))
-	return ctrl.Result{}, d.enterStageWithCursor(ctx, proj, task, tatarav1alpha1.StageDeploying, "", mrs, cursor)
+	return ctrl.Result{}, d.enterStageWithCursor(ctx, proj, task, tatarav1alpha1.StateDeployed, "", mrs, cursor)
 }
 
 // headMoved is CYCLE 4 (fix M3-9): merging -> reviewing, bounded by
@@ -422,11 +422,11 @@ func (d *StageDriver) headMoved(ctx context.Context, proj *tatarav1alpha1.Projec
 
 	edge, _ := stage.HeadMoved(task, tatarav1alpha1.MaxHeadMoveReentries)
 	reentries := task.Status.HeadMoveReentries
-	if edge.To == tatarav1alpha1.StageFailed {
-		l.Error(nil, "merge: head keeps moving; failing the Task",
+	if edge.To == stage.ParkTarget {
+		l.Error(nil, "merge: head keeps moving; parking the Task",
 			"action", "merge_head_moving", "resource_id", task.Name,
 			"repo", mr.Spec.RepositoryRef, "pr", mr.Spec.Number, "reason", why)
-		return d.enterStage(ctx, proj, task, tatarav1alpha1.StageFailed, stage.ReasonHeadMoving, mrs)
+		return d.parkTask(ctx, proj, task, stage.ReasonHeadMoving)
 	}
 
 	// The MR goes back to unreviewed. A head nobody reviewed is never merged.
@@ -446,7 +446,7 @@ func (d *StageDriver) headMoved(ctx context.Context, proj *tatarav1alpha1.Projec
 	if err != nil {
 		return err
 	}
-	return d.enterStageWithCursor(ctx, proj, task, tatarav1alpha1.StageReviewing, "", fresh, cursor)
+	return d.enterStageWithCursor(ctx, proj, task, tatarav1alpha1.StateAwaitingReview, "", fresh, cursor)
 }
 
 // stallMerge parks the pass on a poll: the cursor stays put and
@@ -462,7 +462,7 @@ func (d *StageDriver) stallMerge(ctx context.Context, proj *tatarav1alpha1.Proje
 	// StageEnteredAt, so a bare now.Sub would read the stall clock as reset to
 	// near-zero on every re-entry instead of the whole stuck cycle.
 	// StageElapsedSeconds returns 0 for a nil stamp itself, so no guard here.
-	stalledFor := stage.StageElapsedSeconds(task, d.now())
+	stalledFor := stage.StateElapsedSeconds(task, d.now())
 	obs.MergeCursorStalledSeconds.WithLabelValues(task.Name, repo).Set(stalledFor)
 	log.FromContext(ctx).Info("merge: waiting",
 		"action", "merge_waiting", "resource_id", task.Name, "repo", repo,
@@ -572,6 +572,18 @@ func (d *StageDriver) enterStageWithCursor(ctx context.Context, proj *tatarav1al
 	return EnterStage(ctx, d.Client, d.spiller(proj), d.Metrics, task, mrs, to, reason, now, mutate)
 }
 
+// parkTask is StageDriver's binding of the park choke point.
+func (d *StageDriver) parkTask(ctx context.Context, proj *tatarav1alpha1.Project,
+	task *tatarav1alpha1.Task, reason string) error {
+	return ParkTask(ctx, d.Client, d.spiller(proj), d.Metrics, task, reason, d.now(), nil)
+}
+
+// unparkTakeover is StageDriver's binding of the ONE state-moving un-park.
+func (d *StageDriver) unparkTakeover(ctx context.Context, proj *tatarav1alpha1.Project,
+	task *tatarav1alpha1.Task, to string) error {
+	return UnparkTakeoverTask(ctx, d.Client, d.spiller(proj), d.Metrics, task, to, d.now())
+}
+
 // CloseIssuesOnDelivery is contract C.4: DELIVERY HAS AN ACTOR.
 //
 // v1 required "every owned Issue closed" for deploying -> delivered while
@@ -641,7 +653,7 @@ func (d *StageDriver) CloseIssuesOnDelivery(ctx context.Context, proj *tatarav1a
 	// success outcome the platform has, and every failure-ratio alert divides by it.
 	now := metav1.NewTime(d.now())
 	if err := EnterStage(ctx, d.Client, d.spiller(proj), d.Metrics, task, mrs,
-		tatarav1alpha1.StageDelivered, "", d.now(), func(t *tatarav1alpha1.Task) {
+		tatarav1alpha1.StateDone, "", d.now(), func(t *tatarav1alpha1.Task) {
 			t.Status.DeliveredAt = &now
 		}); err != nil {
 		return fmt.Errorf("delivery: %w", err)

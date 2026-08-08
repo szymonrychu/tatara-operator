@@ -31,7 +31,7 @@ func TestOutcome_Incident_CommentIssueAppendsToTracker(t *testing.T) {
 	tracker := incidentTracker("tatara-memory", 7, map[string]string{queue.LabelAlertRuleKey: "abc123def4567890"}) //gitleaks:allow
 	e := buildV2(t, v2Opts{metrics: metrics}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"), repoV2("tatara-memory", "tatara"),
-		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"), tracker)
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StateRefined, "incident"), tracker)
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"incident","payload":{
 	  "action":"comment_issue","alertRules":["cnpg-connections-high"],"reason":"same CNPG outage as tracker",
@@ -44,8 +44,9 @@ func TestOutcome_Incident_CommentIssueAppendsToTracker(t *testing.T) {
 	require.Empty(t, e.forge.createdReqs, "comment_issue files NO new issue")
 
 	got := e.task(t, "t1")
-	require.Equal(t, tatarav1alpha1.StageRejected, got.Status.Stage)
-	require.Equal(t, "tracked-elsewhere", got.Status.StageReason)
+	require.Equal(t, tatarav1alpha1.StateRejected, got.Status.State)
+	require.Equal(t, "tracked-elsewhere", got.Status.StateReason,
+		"rejected is a genuine terminal state, not a park: the reason is stateReason")
 	require.Equal(t, float64(1), testutil.ToFloat64(metrics.IncidentTrackerCommentCounter("posted")))
 }
 
@@ -56,21 +57,21 @@ func TestOutcome_Incident_CommentIssueRejectsNonTracker(t *testing.T) {
 	plain := incidentTracker("tatara-memory", 7, nil) // no alert label => not a tracker
 	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"), repoV2("tatara-memory", "tatara"),
-		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"), plain)
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StateRefined, "incident"), plain)
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"incident","payload":{
 	  "action":"comment_issue","alertRules":["x"],"reason":"r",
 	  "comment":{"repo":"tatara-memory","number":7,"body":"evidence"}}}`)
 	require.Equal(t, http.StatusBadRequest, w.Code)
 	require.Empty(t, e.forge.comments, "no comment may be posted to a non-tracker issue")
-	require.Equal(t, tatarav1alpha1.StageInvestigating, e.task(t, "t1").Status.Stage)
+	require.Equal(t, tatarav1alpha1.StateRefined, e.task(t, "t1").Status.State)
 }
 
 // comment_issue with a missing comment body is a 400; a comment on a
 // false_positive action is a 400 (unexpected field).
 func TestOutcome_Incident_CommentIssueValidation(t *testing.T) {
 	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
-		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StateRefined, "incident"))
 
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"incident","payload":{
 	  "action":"comment_issue","alertRules":["x"],"reason":"r",
@@ -92,7 +93,7 @@ func TestOutcome_Incident_FileIssueAutoLinksGroupSibling(t *testing.T) {
 	groupKey := "group0123456789a"
 	sibling := incidentTracker("tatara-memory", 7, map[string]string{
 		queue.LabelAlertGroupKey: groupKey, queue.LabelAlertRuleKey: "rulekeyB0000000"})
-	task := taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident")
+	task := taskV2("t1", "tatara", "incident", tatarav1alpha1.StateRefined, "incident")
 	task.Spec.DedupKey = "rulekeyA0000000"
 	task.Spec.GroupKey = groupKey
 	e := buildV2(t, v2Opts{metrics: metrics}, projectV2("tatara"), scmSecretV2(),

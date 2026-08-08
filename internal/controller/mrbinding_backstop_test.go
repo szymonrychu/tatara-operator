@@ -40,7 +40,7 @@ func (w *mbWriter) Comment(_ context.Context, token, issueRef, body string) erro
 // (the exact shape of an interrupted MintReviewTask mint - live proof:
 // mt-r-tatara-cli-87), stageEnteredAt backdated by age.
 func mbTask(name string, age time.Duration) *tatarav1alpha1.Task {
-	return mbTaskAtStage(name, age, tatarav1alpha1.StageReviewing)
+	return mbTaskAtStage(name, age, tatarav1alpha1.StateAwaitingReview)
 }
 
 // mbTaskAtStage is mbTask with the FROM stage overridable, so the backstop's
@@ -57,7 +57,7 @@ func mbTaskAtStage(name string, age time.Duration, fromStage string) *tatarav1al
 				Number: 87, IsPR: true, Title: "fix the thing",
 			},
 		},
-		Status: tatarav1alpha1.TaskStatus{Stage: fromStage, StageEnteredAt: &entered},
+		Status: tatarav1alpha1.TaskStatus{State: fromStage, StateEnteredAt: &entered},
 	}
 }
 
@@ -88,8 +88,9 @@ func TestMRBindingBackstop_ParksPastGrace(t *testing.T) {
 		t.Fatalf("reconcileMRBindingBackstop = %v, %v, want handled=true, err=nil", handled, err)
 	}
 	got := mdGetTask(t, c, task.Name)
-	if got.Status.Stage != tatarav1alpha1.StageParked || got.Status.StageReason != stage.ReasonAwaitingHuman {
-		t.Fatalf("stage = %s(%s), want parked(awaiting-human)", got.Status.Stage, got.Status.StageReason)
+	if got.Status.State != tatarav1alpha1.StateAwaitingReview || !tatarav1alpha1.Parked(got) || got.Status.ParkReason != stage.ReasonAwaitingHuman {
+		t.Fatalf("state=%q parked=%v reason=%q, want awaiting-review/parked/awaiting-human",
+			got.Status.State, tatarav1alpha1.Parked(got), got.Status.ParkReason)
 	}
 	if n := testutil.ToFloat64(m.MRBindingBackstopParkedCounter(proj.Name, "review")); n != 1 {
 		t.Fatalf("operator_mr_binding_backstop_total = %v, want 1", n)
@@ -117,8 +118,8 @@ func TestMRBindingBackstop_WithinGraceIsUntouched(t *testing.T) {
 		t.Fatalf("reconcileMRBindingBackstop = %v, %v, want handled=false, err=nil", handled, err)
 	}
 	got := mdGetTask(t, c, task.Name)
-	if got.Status.Stage != tatarav1alpha1.StageReviewing {
-		t.Fatalf("stage = %s, want unchanged reviewing", got.Status.Stage)
+	if got.Status.State != tatarav1alpha1.StateAwaitingReview {
+		t.Fatalf("stage = %s, want unchanged reviewing", got.Status.State)
 	}
 }
 
@@ -164,8 +165,7 @@ func TestMRBindingBackstop_AlreadyParkedFiresOnce(t *testing.T) {
 	ctx := context.Background()
 	proj := tsProject(3)
 	task := mbTask("t-already-parked", mrBindingBackstopGrace+time.Hour)
-	task.Status.Stage = tatarav1alpha1.StageParked
-	task.Status.StageReason = stage.ReasonAwaitingHuman
+	task.Status.ParkReason = stage.ReasonAwaitingHuman
 	c := newMirrorClient(t, proj, mdSecret(), task)
 	r, m := mbReconciler(c, &mbWriter{})
 
@@ -195,37 +195,44 @@ func TestMRBindingBackstop_CommentFailureDoesNotBlockPark(t *testing.T) {
 		t.Fatalf("reconcileMRBindingBackstop = %v, %v, want handled=true, err=nil", handled, err)
 	}
 	got := mdGetTask(t, c, task.Name)
-	if got.Status.Stage != tatarav1alpha1.StageParked {
-		t.Fatalf("stage = %s, want parked despite the comment failure", got.Status.Stage)
+	if got.Status.State != tatarav1alpha1.StateAwaitingReview || !tatarav1alpha1.Parked(got) {
+		t.Fatalf("state=%q parked=%v, want awaiting-review/parked despite the comment failure",
+			got.Status.State, tatarav1alpha1.Parked(got))
 	}
 	if n := testutil.ToFloat64(m.MRBindingBackstopParkedCounter(proj.Name, "review")); n != 1 {
 		t.Fatalf("operator_mr_binding_backstop_total = %v, want 1 even though the comment failed", n)
 	}
 }
 
-// TestMRBindingBackstop_TriagingIsNotParked is the issue #381 review BLOCKER:
-// triaging->parked is NOT a legal F.3 edge (stage.Transitions has no such row),
-// so a source-bearing triaging Task with zero refs past grace must fall
-// through to normal reconcile (the triage-stalled clock owns that case)
-// instead of calling r.enter into an illegal edge, which would return
-// *stage.IllegalTransitionError and infinite-requeue crash-loop the Task.
-func TestMRBindingBackstop_TriagingIsNotParked(t *testing.T) {
+// TestMRBindingBackstop_ParksEvenFromTriaging replaces the issue #381 review
+// BLOCKER this test used to guard: under the OLD 16-stage machine,
+// triaging->parked was NOT a legal F.3 edge, so calling stage.Enter into it
+// 500'd with *stage.IllegalTransitionError and crash-looped the Task on every
+// reconcile. #521 makes that failure mode structurally impossible rather than
+// merely avoided: park is a FLAG orthogonal to state now, stage.Park never
+// consults the transition table at all (only IsParkReason and "not already
+// parked"), so parking is unconditionally legal from ANY state, `new`
+// included. This asserts the backstop now parks a source-bearing triaging
+// Task past grace exactly like it would from any other state - the state
+// itself is left untouched (park never moves it).
+func TestMRBindingBackstop_ParksEvenFromTriaging(t *testing.T) {
 	ctx := context.Background()
 	proj := tsProject(3)
-	task := mbTaskAtStage("t-triaging", mrBindingBackstopGrace+time.Minute, tatarav1alpha1.StageTriaging)
+	task := mbTaskAtStage("t-triaging", mrBindingBackstopGrace+time.Minute, tatarav1alpha1.StateNew)
 	c := newMirrorClient(t, proj, mdSecret(), task)
 	r, m := mbReconciler(c, &mbWriter{})
 
 	handled, err := r.reconcileMRBindingBackstop(ctx, proj, task, time.Now())
-	if err != nil || handled {
-		t.Fatalf("reconcileMRBindingBackstop = %v, %v, want handled=false, err=nil (falls through to triage-stalled clock)", handled, err)
+	if err != nil || !handled {
+		t.Fatalf("reconcileMRBindingBackstop = %v, %v, want handled=true, err=nil", handled, err)
 	}
 	got := mdGetTask(t, c, task.Name)
-	if got.Status.Stage != tatarav1alpha1.StageTriaging {
-		t.Fatalf("stage = %s, want unchanged triaging", got.Status.Stage)
+	if got.Status.State != tatarav1alpha1.StateNew || !tatarav1alpha1.Parked(got) || got.Status.ParkReason != stage.ReasonAwaitingHuman {
+		t.Fatalf("state=%q parked=%v reason=%q, want new/parked/awaiting-human: park is legal from any state now (#521)",
+			got.Status.State, tatarav1alpha1.Parked(got), got.Status.ParkReason)
 	}
-	if n := testutil.ToFloat64(m.MRBindingBackstopParkedCounter(proj.Name, "review")); n != 0 {
-		t.Fatalf("operator_mr_binding_backstop_total = %v, want 0", n)
+	if n := testutil.ToFloat64(m.MRBindingBackstopParkedCounter(proj.Name, "review")); n != 1 {
+		t.Fatalf("operator_mr_binding_backstop_total = %v, want 1", n)
 	}
 }
 
@@ -251,9 +258,9 @@ func TestMRBindingBackstop_RepairsUnboundMRInsteadOfParking(t *testing.T) {
 		t.Fatalf("reconcileMRBindingBackstop = %v, %v, want handled=true (repaired), err=nil", handled, err)
 	}
 	got := mdGetTask(t, c, task.Name)
-	if got.Status.Stage != tatarav1alpha1.StageReviewing {
+	if got.Status.State != tatarav1alpha1.StateAwaitingReview {
 		t.Fatalf("stage = %s(%s), want unchanged reviewing: a repairable bind must not park",
-			got.Status.Stage, got.Status.StageReason)
+			got.Status.State, got.Status.ParkReason)
 	}
 	wantRef := tatarav1alpha1.MergeRequestName("tatara-cli", 87)
 	if len(got.Status.MRRefs) != 1 || got.Status.MRRefs[0] != wantRef {
@@ -276,7 +283,7 @@ func TestMRBindingBackstop_RepairsUnboundMRInsteadOfParking(t *testing.T) {
 func TestMRBindingBackstop_RepairsUnboundIssueInsteadOfParking(t *testing.T) {
 	ctx := context.Background()
 	proj := tsProject(3)
-	task := mbTaskAtStage("mt-i-tatara-cli-12", mrBindingBackstopGrace+time.Minute, tatarav1alpha1.StageClarifying)
+	task := mbTaskAtStage("mt-i-tatara-cli-12", mrBindingBackstopGrace+time.Minute, tatarav1alpha1.StateRefined)
 	task.Spec.Kind = "clarify"
 	task.Spec.Source = &tatarav1alpha1.TaskSource{
 		Provider: "github",
@@ -294,8 +301,8 @@ func TestMRBindingBackstop_RepairsUnboundIssueInsteadOfParking(t *testing.T) {
 		t.Fatalf("reconcileMRBindingBackstop = %v, %v, want handled=true (repaired), err=nil", handled, err)
 	}
 	got := mdGetTask(t, c, task.Name)
-	if got.Status.Stage != tatarav1alpha1.StageClarifying {
-		t.Fatalf("stage = %s(%s), want unchanged clarifying", got.Status.Stage, got.Status.StageReason)
+	if got.Status.State != tatarav1alpha1.StateRefined {
+		t.Fatalf("stage = %s(%s), want unchanged clarifying", got.Status.State, got.Status.ParkReason)
 	}
 	wantRef := tatarav1alpha1.IssueName("tatara-cli", 12)
 	if len(got.Status.IssueRefs) != 1 || got.Status.IssueRefs[0] != wantRef {
@@ -326,9 +333,9 @@ func TestMRBindingBackstop_ForeignOwnedMRStillParks(t *testing.T) {
 		t.Fatalf("reconcileMRBindingBackstop = %v, %v, want handled=true, err=nil", handled, err)
 	}
 	got := mdGetTask(t, c, task.Name)
-	if got.Status.Stage != tatarav1alpha1.StageParked || got.Status.StageReason != stage.ReasonAwaitingHuman {
-		t.Fatalf("stage = %s(%s), want parked(awaiting-human): an unrepairable bind falls through to the park",
-			got.Status.Stage, got.Status.StageReason)
+	if got.Status.State != tatarav1alpha1.StateAwaitingReview || !tatarav1alpha1.Parked(got) || got.Status.ParkReason != stage.ReasonAwaitingHuman {
+		t.Fatalf("state=%q parked=%v reason=%q, want awaiting-review/parked/awaiting-human: an unrepairable bind falls through to the park",
+			got.Status.State, tatarav1alpha1.Parked(got), got.Status.ParkReason)
 	}
 	if n := testutil.ToFloat64(m.MRBindingBackstopParkedCounter(proj.Name, "review")); n != 1 {
 		t.Fatalf("operator_mr_binding_backstop_total = %v, want 1", n)
@@ -344,7 +351,7 @@ func TestMRBindingBackstop_ForeignOwnedMRStillParks(t *testing.T) {
 func TestMRBindingBackstop_DeliveredIsNotParked(t *testing.T) {
 	ctx := context.Background()
 	proj := tsProject(3)
-	task := mbTaskAtStage("t-delivered", mrBindingBackstopGrace+time.Minute, tatarav1alpha1.StageDelivered)
+	task := mbTaskAtStage("t-delivered", mrBindingBackstopGrace+time.Minute, tatarav1alpha1.StateDone)
 	c := newMirrorClient(t, proj, mdSecret(), task)
 	r, m := mbReconciler(c, &mbWriter{})
 
@@ -353,8 +360,8 @@ func TestMRBindingBackstop_DeliveredIsNotParked(t *testing.T) {
 		t.Fatalf("reconcileMRBindingBackstop = %v, %v, want handled=false, err=nil", handled, err)
 	}
 	got := mdGetTask(t, c, task.Name)
-	if got.Status.Stage != tatarav1alpha1.StageDelivered {
-		t.Fatalf("stage = %s, want unchanged delivered", got.Status.Stage)
+	if got.Status.State != tatarav1alpha1.StateDone {
+		t.Fatalf("stage = %s, want unchanged delivered", got.Status.State)
 	}
 	if n := testutil.ToFloat64(m.MRBindingBackstopParkedCounter(proj.Name, "review")); n != 0 {
 		t.Fatalf("operator_mr_binding_backstop_total = %v, want 0", n)

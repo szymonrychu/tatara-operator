@@ -64,7 +64,14 @@ func (s SessionInfo) TurnInFlight() bool { return s.State == SessionStateBusy }
 // to start its MCP server and an old wrapper fails AssertContractVersion at
 // pod-ready, so a straggler is a loud pre-work failure rather than a silent
 // mid-turn 400.
-const ContractVersion = 3
+//
+// 3 -> 4: the #521 lifecycle and agent merge. The `clarify` profile is DELETED
+// and its three decisions became action values on the implement outcome
+// (approved / discuss / rejected alongside submitted / declined), carrying
+// approvingMaintainer, planNoteId and approvalCitations; `documentation` got its
+// own schema so it does not inherit them. Three independent breaking changes to
+// the agent-facing surface, so the constant moves once for all of them.
+const ContractVersion = 4
 
 // Session is the operator's view of one wrapper session. baseURL is the
 // per-pod wrapper address (http://<svc>.<ns>.svc:8080).

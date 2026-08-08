@@ -52,8 +52,8 @@ func (r *StageReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	if !task.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, nil
 	}
-	switch task.Status.Stage {
-	case tatarav1alpha1.StageMerging, tatarav1alpha1.StageDeploying:
+	switch task.Status.State {
+	case tatarav1alpha1.StateMerged, tatarav1alpha1.StateDeployed:
 	default:
 		return ctrl.Result{}, nil
 	}
@@ -66,7 +66,7 @@ func (r *StageReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, fmt.Errorf("stage: get project %s: %w", task.Spec.ProjectRef, err)
 	}
 
-	if task.Status.Stage == tatarav1alpha1.StageMerging {
+	if task.Status.State == tatarav1alpha1.StateMerged {
 		return r.Driver.ReconcileMerging(ctx, &proj, &task)
 	}
 	return r.Driver.ReconcileDeploying(ctx, &proj, &task)

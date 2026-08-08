@@ -371,7 +371,7 @@ func mdTask(name, kind, stg string) *tatarav1alpha1.Task {
 	return &tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: mdNS, UID: types.UID("uid-" + name)},
 		Spec:       tatarav1alpha1.TaskSpec{Kind: kind, ProjectRef: "proj"},
-		Status:     tatarav1alpha1.TaskStatus{Stage: stg},
+		Status:     tatarav1alpha1.TaskStatus{State: stg},
 	}
 }
 
@@ -463,7 +463,7 @@ func mdGetIssue(t *testing.T, c client.Client, name string) *tatarav1alpha1.Issu
 // A Task owning ONE MR in ONE repo merges. mergeOrder was resolved at /outcome
 // (fix C2) - the single-repo case is the COMMON case and v3 could not merge it.
 func TestMergeSingleRepoMerges(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageMerging)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateMerged)
 	task.Spec.MergeOrder = []string{"tatara-operator"}
 	mr := mdMR(task, "tatara-operator", 7)
 	mr.Status.ReviewedSHA = "sha-a"
@@ -484,8 +484,8 @@ func TestMergeSingleRepoMerges(t *testing.T) {
 		t.Fatalf("merge pinned to %q, want the reviewed head sha-a", f.mergedHeads[0])
 	}
 	got := mdGetTask(t, c, "t1")
-	if got.Status.Stage != tatarav1alpha1.StageDeploying {
-		t.Fatalf("stage = %q, want deploying", got.Status.Stage)
+	if got.Status.State != tatarav1alpha1.StateDeployed {
+		t.Fatalf("stage = %q, want deploying", got.Status.State)
 	}
 	if got.Status.MergeCursor != 1 {
 		t.Fatalf("mergeCursor = %d, want 1", got.Status.MergeCursor)
@@ -497,7 +497,7 @@ func TestMergeSingleRepoMerges(t *testing.T) {
 
 // merging entered with an EMPTY mergeOrder is a BUG, and it is treated as one.
 func TestMergeEmptyMergeOrderFails(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageMerging)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateMerged)
 	mr := mdMR(task, "tatara-operator", 7)
 	c := newMirrorClient(t, mdProject(), mdSecret(), mdRepo("tatara-operator"), task, mr)
 
@@ -507,8 +507,9 @@ func TestMergeEmptyMergeOrderFails(t *testing.T) {
 		t.Fatalf("ReconcileMerging: %v", err)
 	}
 	got := mdGetTask(t, c, "t1")
-	if got.Status.Stage != tatarav1alpha1.StageFailed || got.Status.StageReason != stage.ReasonMergeOrderMissing {
-		t.Fatalf("stage = %q/%q, want failed/merge-order-missing", got.Status.Stage, got.Status.StageReason)
+	if got.Status.State != tatarav1alpha1.StateMerged || !tatarav1alpha1.Parked(got) ||
+		got.Status.ParkReason != stage.ReasonMergeOrderMissing {
+		t.Fatalf("state/park = %q/%q, want merged, parked(merge-order-missing)", got.Status.State, got.Status.ParkReason)
 	}
 	if f.mergeCalls != 0 {
 		t.Fatalf("merge calls = %d, want 0", f.mergeCalls)
@@ -517,7 +518,7 @@ func TestMergeEmptyMergeOrderFails(t *testing.T) {
 
 // mergeOrder is SEQUENTIAL and dependency-ordered: operator before cli, always.
 func TestMergeSequentialOrder(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageMerging)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateMerged)
 	task.Spec.MergeOrder = []string{"tatara-operator", "tatara-cli"}
 	mrA := mdMR(task, "tatara-operator", 7)
 	mrA.Status.ReviewedSHA = "sha-a"
@@ -540,7 +541,7 @@ func TestMergeSequentialOrder(t *testing.T) {
 	if f.mergedRepos[0] != "https://github.com/szymonrychu/tatara-operator" {
 		t.Fatalf("merged %q first, want tatara-operator (mergeOrder is dependency-ordered)", f.mergedRepos[0])
 	}
-	if mdGetTask(t, c, "t1").Status.Stage != tatarav1alpha1.StageDeploying {
+	if mdGetTask(t, c, "t1").Status.State != tatarav1alpha1.StateDeployed {
 		t.Fatalf("stage != deploying")
 	}
 }
@@ -548,7 +549,7 @@ func TestMergeSequentialOrder(t *testing.T) {
 // A head that moves between /outcome and Merge yields stage=reviewing, never a
 // merged wrong SHA. Merge is NEVER called.
 func TestMergeHeadMovedBeforeMergeReReviews(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageMerging)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateMerged)
 	task.Spec.MergeOrder = []string{"tatara-operator"}
 	mr := mdMR(task, "tatara-operator", 7)
 	mr.Status.ReviewedSHA = "sha-a"
@@ -566,8 +567,8 @@ func TestMergeHeadMovedBeforeMergeReReviews(t *testing.T) {
 		t.Fatalf("merge calls = %d, want 0: the head moved off the reviewed SHA", f.mergeCalls)
 	}
 	got := mdGetTask(t, c, "t1")
-	if got.Status.Stage != tatarav1alpha1.StageReviewing {
-		t.Fatalf("stage = %q, want reviewing", got.Status.Stage)
+	if got.Status.State != tatarav1alpha1.StateAwaitingReview {
+		t.Fatalf("stage = %q, want reviewing", got.Status.State)
 	}
 	if got.Status.HeadMoveReentries != 1 {
 		t.Fatalf("headMoveReentries = %d, want 1", got.Status.HeadMoveReentries)
@@ -581,7 +582,7 @@ func TestMergeHeadMovedBeforeMergeReReviews(t *testing.T) {
 // The TOCTOU close: Merge itself 409s "head sha changed" -> re-review, never a
 // merged wrong SHA.
 func TestMergeHeadMoved409ReReviews(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageMerging)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateMerged)
 	task.Spec.MergeOrder = []string{"tatara-operator"}
 	mr := mdMR(task, "tatara-operator", 7)
 	mr.Status.ReviewedSHA = "sha-a"
@@ -596,8 +597,8 @@ func TestMergeHeadMoved409ReReviews(t *testing.T) {
 		t.Fatalf("ReconcileMerging: %v", err)
 	}
 	got := mdGetTask(t, c, "t1")
-	if got.Status.Stage != tatarav1alpha1.StageReviewing {
-		t.Fatalf("stage = %q, want reviewing", got.Status.Stage)
+	if got.Status.State != tatarav1alpha1.StateAwaitingReview {
+		t.Fatalf("stage = %q, want reviewing", got.Status.State)
 	}
 	if got.Status.HeadMoveReentries != 1 {
 		t.Fatalf("headMoveReentries = %d, want 1", got.Status.HeadMoveReentries)
@@ -612,7 +613,7 @@ func TestMergeHeadMoved409ReReviews(t *testing.T) {
 // the MR is left exactly as reviewed (no reset, no cursor advance) so a human
 // fixing the credential can resume from where it stopped.
 func TestMergeAuthFailureParks(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageMerging)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateMerged)
 	task.Spec.MergeOrder = []string{"tatara-operator"}
 	mr := mdMR(task, "tatara-operator", 7)
 	mr.Status.ReviewedSHA = "sha-a"
@@ -627,8 +628,9 @@ func TestMergeAuthFailureParks(t *testing.T) {
 		t.Fatalf("ReconcileMerging: %v", err)
 	}
 	got := mdGetTask(t, c, "t1")
-	if got.Status.Stage != tatarav1alpha1.StageParked || got.Status.StageReason != stage.ReasonMergeAuthRefused {
-		t.Fatalf("stage = %q/%q, want parked/merge-auth-refused", got.Status.Stage, got.Status.StageReason)
+	if got.Status.State != tatarav1alpha1.StateMerged || !tatarav1alpha1.Parked(got) ||
+		got.Status.ParkReason != stage.ReasonMergeAuthRefused {
+		t.Fatalf("state/park = %q/%q, want merged, parked(merge-auth-refused)", got.Status.State, got.Status.ParkReason)
 	}
 	if got.Status.MergeCursor != 0 {
 		t.Fatalf("mergeCursor = %d, want 0 (unmoved)", got.Status.MergeCursor)
@@ -644,7 +646,7 @@ func TestMergeAuthFailureParks(t *testing.T) {
 
 // The head-move cycle is BOUNDED: the fourth lap is refused.
 func TestMergeHeadMovingExhausted(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageMerging)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateMerged)
 	task.Spec.MergeOrder = []string{"tatara-operator"}
 	task.Status.HeadMoveReentries = tatarav1alpha1.MaxHeadMoveReentries
 	mr := mdMR(task, "tatara-operator", 7)
@@ -659,15 +661,16 @@ func TestMergeHeadMovingExhausted(t *testing.T) {
 		t.Fatalf("ReconcileMerging: %v", err)
 	}
 	got := mdGetTask(t, c, "t1")
-	if got.Status.Stage != tatarav1alpha1.StageFailed || got.Status.StageReason != stage.ReasonHeadMoving {
-		t.Fatalf("stage = %q/%q, want failed/head-moving", got.Status.Stage, got.Status.StageReason)
+	if got.Status.State != tatarav1alpha1.StateMerged || !tatarav1alpha1.Parked(got) ||
+		got.Status.ParkReason != stage.ReasonHeadMoving {
+		t.Fatalf("state/park = %q/%q, want merged, parked(head-moving)", got.Status.State, got.Status.ParkReason)
 	}
 }
 
 // An MR already merged on the forge resumes idempotently: the cursor advances,
 // Merge is not called again.
 func TestMergeIdempotentResumeOnMergedMR(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageMerging)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateMerged)
 	task.Spec.MergeOrder = []string{"tatara-operator"}
 	mr := mdMR(task, "tatara-operator", 7)
 	mr.Status.State = "merged"
@@ -682,8 +685,8 @@ func TestMergeIdempotentResumeOnMergedMR(t *testing.T) {
 		t.Fatalf("merge calls = %d, want 0 (already merged)", f.mergeCalls)
 	}
 	got := mdGetTask(t, c, "t1")
-	if got.Status.Stage != tatarav1alpha1.StageDeploying || got.Status.MergeCursor != 1 {
-		t.Fatalf("stage = %q cursor = %d, want deploying/1", got.Status.Stage, got.Status.MergeCursor)
+	if got.Status.State != tatarav1alpha1.StateDeployed || got.Status.MergeCursor != 1 {
+		t.Fatalf("stage = %q cursor = %d, want deploying/1", got.Status.State, got.Status.MergeCursor)
 	}
 }
 
@@ -691,7 +694,7 @@ func TestMergeIdempotentResumeOnMergedMR(t *testing.T) {
 // advance. One bot identity means the merge gate is operator logic, not a forge
 // permission, so this is the only thing that can see it being bypassed.
 func TestMergeUnexpectedMergeDetector(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageMerging)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateMerged)
 	task.Spec.MergeOrder = []string{"tatara-operator", "tatara-cli"}
 	task.Status.MergeCursor = 1 // operator merged; cli has NOT been merged by us
 
@@ -724,7 +727,7 @@ func TestMergeUnexpectedMergeDetector(t *testing.T) {
 // A never-taken-over external MR (ownershipReason=initial) is human-merged
 // only: the operator refuses, and no forge merge occurs.
 func TestMerge_RefusesExternalInitialMR(t *testing.T) {
-	task := mdTask("t1", takeoverKind, tatarav1alpha1.StageMerging)
+	task := mdTask("t1", takeoverKind, tatarav1alpha1.StateMerged)
 	task.Spec.MergeOrder = []string{"tatara-operator"}
 	mr := mdMR(task, "tatara-operator", 7)
 	mr.Status.ReviewedSHA = "sha-a"
@@ -750,7 +753,7 @@ func TestMerge_RefusesExternalInitialMR(t *testing.T) {
 // A stood-down-after-takeover MR (ownershipReason has prefix "external-push:")
 // keeps merge-on-approve: the approved human head still merges.
 func TestMerge_AllowsExternalPushStandDownMR(t *testing.T) {
-	task := mdTask("t1", takeoverKind, tatarav1alpha1.StageMerging)
+	task := mdTask("t1", takeoverKind, tatarav1alpha1.StateMerged)
 	task.Spec.MergeOrder = []string{"tatara-operator"}
 	mr := mdMR(task, "tatara-operator", 7)
 	mr.Status.ReviewedSHA = "sha-a"
@@ -772,7 +775,7 @@ func TestMerge_AllowsExternalPushStandDownMR(t *testing.T) {
 
 // A tatara-owned MR always merges, regardless of ownershipReason.
 func TestMerge_AllowsTataraOwnedMR(t *testing.T) {
-	task := mdTask("t1", takeoverKind, tatarav1alpha1.StageMerging)
+	task := mdTask("t1", takeoverKind, tatarav1alpha1.StateMerged)
 	task.Spec.MergeOrder = []string{"tatara-operator"}
 	mr := mdMR(task, "tatara-operator", 7)
 	mr.Status.ReviewedSHA = "sha-a"
@@ -798,7 +801,7 @@ func TestMerge_AllowsTataraOwnedMR(t *testing.T) {
 // deliveredAt. Nobody else can satisfy the precondition: issue_write(close) is
 // gated to clarify + refine, and neither runs at deploying.
 func TestDeliveryClosesIssuesThenStampsDeliveredAt(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageDeploying)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateDeployed)
 	mr := mdMR(task, "tatara-operator", 7)
 	mr.Status.State = "merged"
 	now := metav1.NewTime(time.Date(2026, 7, 12, 11, 0, 0, 0, time.UTC))
@@ -824,8 +827,8 @@ func TestDeliveryClosesIssuesThenStampsDeliveredAt(t *testing.T) {
 		t.Fatalf("issue state = %q/%q, want closed/done", gi.Status.State, gi.Status.Status)
 	}
 	got := mdGetTask(t, c, "t1")
-	if got.Status.Stage != tatarav1alpha1.StageDelivered {
-		t.Fatalf("stage = %q, want delivered", got.Status.Stage)
+	if got.Status.State != tatarav1alpha1.StateDone {
+		t.Fatalf("stage = %q, want delivered", got.Status.State)
 	}
 	if got.Status.DeliveredAt == nil {
 		t.Fatalf("deliveredAt not stamped")
@@ -835,7 +838,7 @@ func TestDeliveryClosesIssuesThenStampsDeliveredAt(t *testing.T) {
 // deliveredAt is NOT stamped while an owned MR is unmerged or undeployed, and
 // the EMPTY set is not a licence.
 func TestDeliveryWaitsForEveryOwnedMR(t *testing.T) {
-	task := mdTask("t1", "implement", tatarav1alpha1.StageDeploying)
+	task := mdTask("t1", "implement", tatarav1alpha1.StateDeployed)
 	mrA := mdMR(task, "tatara-operator", 7)
 	mrA.Status.State = "merged"
 	now := metav1.NewTime(time.Date(2026, 7, 12, 11, 0, 0, 0, time.UTC))
@@ -854,12 +857,12 @@ func TestDeliveryWaitsForEveryOwnedMR(t *testing.T) {
 	if len(f.closedIssues) != 0 {
 		t.Fatalf("closed an issue before every owned MR deployed")
 	}
-	if got := mdGetTask(t, c, "t1"); got.Status.DeliveredAt != nil || got.Status.Stage != tatarav1alpha1.StageDeploying {
-		t.Fatalf("delivered early: stage=%q deliveredAt=%v", got.Status.Stage, got.Status.DeliveredAt)
+	if got := mdGetTask(t, c, "t1"); got.Status.DeliveredAt != nil || got.Status.State != tatarav1alpha1.StateDeployed {
+		t.Fatalf("delivered early: stage=%q deliveredAt=%v", got.Status.State, got.Status.DeliveredAt)
 	}
 
 	// The empty set is NOT a licence: a Task owning zero MRs never delivers here.
-	bare := mdTask("t2", "implement", tatarav1alpha1.StageDeploying)
+	bare := mdTask("t2", "implement", tatarav1alpha1.StateDeployed)
 	c2 := newMirrorClient(t, mdProject(), mdSecret(), mdRepo("tatara-operator"), bare)
 	d2 := mdNewDriver(t, f, c2)
 	if err := d2.CloseIssuesOnDelivery(context.Background(), mdProject(), bare); err != nil {

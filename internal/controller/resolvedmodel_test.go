@@ -57,7 +57,7 @@ func TestEnsureStagePod_StampsResolvedModel(t *testing.T) {
 			ProjectRef:    "rm-proj",
 			RepositoryRef: "rm-repo",
 			Goal:          "test resolved model stamp",
-			Kind:          "clarify",
+			Kind:          "implement",
 		},
 	}
 	if err := k8sClient.Create(ctx, task); err != nil {

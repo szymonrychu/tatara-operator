@@ -134,7 +134,7 @@ func TaskDocumentsTasksIndexer(obj client.Object) []string {
 // re-read from the forge (contract B.4). EVERY parked Task syncs DAILY; every
 // other Task - and an artifact with no owning Task at all - syncs HOURLY.
 func MirrorCadence(t *tatarav1alpha1.Task) time.Duration {
-	if t != nil && t.Status.Stage == tatarav1alpha1.StageParked {
+	if t != nil && tatarav1alpha1.Parked(t) {
 		return MirrorCadenceParked
 	}
 	return MirrorCadenceActive

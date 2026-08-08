@@ -144,10 +144,15 @@ const (
 	// series cannot be alerted on.
 	SweepSkipMintNotOwed = "mint_not_owed"
 
-	// SweepIssueKind is the Task kind a sweep-minted ISSUE Task carries. F.3 has
-	// NO triaging -> implementing edge: an issue Task enters clarifying, where the
-	// C.6 approval citation check gates it, and only an APPROVED Task implements.
-	SweepIssueKind = "clarify"
+	// SweepIssueKind is the Task kind a sweep-minted ISSUE Task carries.
+	//
+	// It was "clarify" until #521 folded that kind away. It is NOT a hole in the
+	// approval gate: an issue Task still enters `refined`, which is where the
+	// gate RUNS, and the ONLY edge out of refined into under-implementation is
+	// the one restapi grants on a verified citation. What changed is that ONE
+	// agent now judges the go-ahead and then writes the code, instead of a
+	// clarify pod handing off to a fresh implement pod.
+	SweepIssueKind = "implement"
 	// SweepReviewKind is the Task kind minted for a HUMAN-authored PR in reaction
 	// scope. Every review-kind Task is non-bot-authored BY CONSTRUCTION (clause
 	// 2), which is what lets F.3 DELETE the reviewing -> merging edge for
@@ -434,7 +439,7 @@ func (m *Minter) dropStaleOwner(ctx context.Context, cr client.Object, owner str
 // the author's standing (TestMintStage/PRECEDENCE:_tatara-parked_BEATS_a_trusted_author).
 // It is NOT pinned "before the marker" or before humanHasLastWord, and do not
 // claim it is: this clause, webhookOriginated and humanHasLastWord all return
-// the identical (StageTriaging, ""), so their relative order among themselves
+// the identical (StateNew, ""), so their relative order among themselves
 // has ZERO observable effect on any test or any real mint - moving this
 // clause to the last position, after both, leaves every MintStage case green.
 // It is written first only because it is cheapest to evaluate and it is the
@@ -468,20 +473,25 @@ func (m *Minter) dropStaleOwner(ctx context.Context, cr client.Object, owner str
 // reaper's tatara-parked stamp (the OUTERMOST gate, above) makes the park
 // PERMANENT, so the same issue is never re-minted a second time. Per-pass
 // exposure is further bounded by maxNewTasksPerSweep and maxOpenTasks.
+//
+// It returns the CREATE-EDGE STATE and the PARK REASON to stamp alongside it, in
+// that order - not a stage and a stage reason (#521). A backlog owner is `new`
+// AND parked(backlog-sweep): the two are orthogonal now, so an owner that costs
+// nothing no longer has to wear a fake terminal stage to say so.
 func MintStage(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, iss scm.Issue, webhookOriginated bool) (string, string) {
 	if hasLabel(iss.Labels, TataraParkedLabel) {
-		return tatarav1alpha1.StageParked, stage.ReasonBacklogSweep
+		return tatarav1alpha1.StateNew, stage.ReasonBacklogSweep
 	}
 	if iss.Author != botLoginOf(proj) && tatarav1alpha1.IsTrustedAuthor(proj, repo, iss.Author) {
-		return tatarav1alpha1.StageTriaging, ""
+		return tatarav1alpha1.StateNew, ""
 	}
 	if webhookOriginated {
-		return tatarav1alpha1.StageTriaging, ""
+		return tatarav1alpha1.StateNew, ""
 	}
 	if humanHasLastWord(proj, iss.Comments) {
-		return tatarav1alpha1.StageTriaging, ""
+		return tatarav1alpha1.StateNew, ""
 	}
-	return tatarav1alpha1.StageParked, stage.ReasonBacklogSweep
+	return tatarav1alpha1.StateNew, stage.ReasonBacklogSweep
 }
 
 // WebhookOriginated reports whether cr carries the marker an issues.opened /
@@ -826,13 +836,13 @@ func ClassifyPR(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, p
 // humanReviewRounds (cap 5) - exactly as if the Task had never been reaped.
 func MintReviewStage(cr *tatarav1alpha1.MergeRequest) (string, string) {
 	if cr == nil {
-		return tatarav1alpha1.StageTriaging, ""
+		return tatarav1alpha1.StateNew, ""
 	}
 	switch cr.Status.Status {
 	case "", "new":
-		return tatarav1alpha1.StageTriaging, ""
+		return tatarav1alpha1.StateNew, ""
 	}
-	return tatarav1alpha1.StageParked, stage.ReasonAwaitingHuman
+	return tatarav1alpha1.StateNew, stage.ReasonAwaitingHuman
 }
 
 // carriedHumanReviewRounds reads back the V7-9 counter the reaper stamped on the
@@ -867,20 +877,18 @@ func prCandidate(pr scm.PRRef) candidate {
 	}
 }
 
-// StageActive reports whether t counts against Project.spec.maxOpenTasks:
-// stage NOT IN (parked, delivered, rejected, failed). parked(backlog-sweep)
-// Tasks are NOT active and do not count - that is the whole point of them.
+// StageActive reports whether t counts against Project.spec.maxOpenTasks: NOT
+// done and NOT parked. parked(backlog-sweep) Tasks are NOT active and do not
+// count - that is the whole point of them, and under the 8-state model it is the
+// PARK FLAG that says so rather than a fake terminal stage.
 //
-// A Task with an EMPTY stage belongs to the dying phase machine (tasks 1-19 are
-// additive; the old machine keeps running until Task 20) and is not counted.
+// A Task with an EMPTY state has not taken its create edge yet and is not
+// counted.
 func StageActive(t *tatarav1alpha1.Task) bool {
-	switch t.Status.Stage {
-	case "", tatarav1alpha1.StageParked, tatarav1alpha1.StageDelivered,
-		tatarav1alpha1.StageRejected, tatarav1alpha1.StageFailed:
+	if t.Status.State == "" {
 		return false
-	default:
-		return true
 	}
+	return !tatarav1alpha1.TaskDone(t) && !tatarav1alpha1.Parked(t)
 }
 
 // sweepBudget holds the two creation budgets, which BOTH bind on every pass
@@ -907,25 +915,37 @@ func newSweepBudget(proj *tatarav1alpha1.Project, active int) *sweepBudget {
 	return &sweepBudget{project: proj.Name, maxNew: maxNew, maxOpen: maxOpen, active: active, hit: map[string]bool{}}
 }
 
-// allow reports whether one more Task may be minted at stg. It records the cap
-// that bound so the caller can WARN once per pass.
-func (b *sweepBudget) allow(ctx context.Context, stg string) bool {
+// allow reports whether one more Task may be minted with this PARK REASON. It
+// records the cap that bound so the caller can WARN once per pass.
+//
+// The discriminator is the park flag, not the state: every mint now lands on
+// `new` or `refined`, and what decides whether it costs an open-task slot is
+// whether it is minted parked. An empty reason is an active mint.
+func (b *sweepBudget) allow(ctx context.Context, parkReason string) bool {
 	if b.minted >= b.maxNew {
 		b.capHit(ctx, obs.SweepCapMaxNewTasksPerSweep)
 		return false
 	}
-	if stg != tatarav1alpha1.StageParked && b.active >= b.maxOpen {
+	if parkReason == "" && b.active >= b.maxOpen {
 		b.capHit(ctx, obs.SweepCapMaxOpenTasks)
 		return false
 	}
 	return true
 }
 
-func (b *sweepBudget) record(stg string) {
+func (b *sweepBudget) record(parkReason string) {
 	b.minted++
-	if stg != tatarav1alpha1.StageParked {
+	if parkReason == "" {
 		b.active++
 	}
+}
+
+// mintedBucket names the sweep_pass log line's two mint counters.
+func mintedBucket(parkReason string) string {
+	if parkReason == "" {
+		return "active"
+	}
+	return "parked"
 }
 
 func (b *sweepBudget) capHit(ctx context.Context, cap string) {
@@ -969,7 +989,7 @@ func (r *ProjectReconciler) SweepProject(ctx context.Context, proj *tatarav1alph
 	}
 	requeue := time.Duration(0)
 	budget := newSweepBudget(proj, active)
-	minted := map[string]int{tatarav1alpha1.StageTriaging: 0, tatarav1alpha1.StageParked: 0}
+	minted := map[string]int{"active": 0, "parked": 0}
 	var firstErr error
 	fail := func(reason string, err error, kv ...any) {
 		obs.SweepErrorsTotal.WithLabelValues(proj.Name, activity, reason).Inc()
@@ -1039,8 +1059,8 @@ func (r *ProjectReconciler) SweepProject(ctx context.Context, proj *tatarav1alph
 	l.Info("sweep: pass complete",
 		"action", "sweep_pass", "resource_id", proj.Name, "activity", activity,
 		"repos", repoNames(repos),
-		"minted_triaging", minted[tatarav1alpha1.StageTriaging],
-		"minted_parked", minted[tatarav1alpha1.StageParked],
+		"minted_active", minted["active"],
+		"minted_parked", minted["parked"],
 		"active_tasks", budget.active, "duration_ms", time.Since(now).Milliseconds())
 	return requeue, nil
 }
@@ -1227,7 +1247,7 @@ func (r *ProjectReconciler) sweepIssues(ctx context.Context, proj *tatarav1alpha
 		// empty. Nothing else can tell it from a cold backlog issue.
 		live := WebhookOriginated(cr)
 		stg, reason := MintStage(proj, repo, ext, live)
-		if !budget.allow(ctx, stg) {
+		if !budget.allow(ctx, reason) {
 			skipIssue(ctx, proj, repo, ref.Number, activity, SweepSkipMintBudget)
 			r.strandOrphan(proj, repo, ref, now)
 			continue
@@ -1246,11 +1266,11 @@ func (r *ProjectReconciler) sweepIssues(ctx context.Context, proj *tatarav1alpha
 					fail("clear_webhook_marker", cerr, "repo", repo.Name, "number", ref.Number)
 				}
 			}
-			budget.record(stg)
-			minted[stg]++
+			budget.record(reason)
+			minted[mintedBucket(reason)]++
 			log.FromContext(ctx).Info("sweep: minted task for orphan issue",
 				"action", "sweep_mint", "resource_id", task.Name, "activity", activity,
-				"repo", repo.Name, "number", ref.Number, "stage", stg, "stage_reason", reason,
+				"repo", repo.Name, "number", ref.Number, "state", stg, "park_reason", reason,
 				"webhook_originated", live)
 		case MintExistingLive:
 			// A webhook already minted this natural key; the sweep's backstop no-ops.
@@ -1323,11 +1343,11 @@ func (r *ProjectReconciler) sweepPRs(ctx context.Context, proj *tatarav1alpha1.P
 				"repo", repo.Name, "number", pr.Number, "head_branch", pr.HeadBranch)
 		case PRReview:
 			stg, reason := MintReviewStage(cr)
-			if !budget.allow(ctx, stg) {
+			if !budget.allow(ctx, reason) {
 				// Counted AND logged. This arm used to count nothing at all, so
 				// an orphan PR deferred by the budget was the one skip in the
 				// pass with no series and no line anywhere.
-				skipPR(ctx, proj, repo, pr.Number, activity, SweepSkipMintBudget, "stage", stg)
+				skipPR(ctx, proj, repo, pr.Number, activity, SweepSkipMintBudget, "state", stg)
 				continue
 			}
 			task, outcome, merr := r.minter().MintReviewTask(ctx, proj, repo, pr, cr, stg, reason, sp)
@@ -1337,11 +1357,11 @@ func (r *ProjectReconciler) sweepPRs(ctx context.Context, proj *tatarav1alpha1.P
 			}
 			switch outcome {
 			case MintCreated:
-				budget.record(stg)
-				minted[stg]++
+				budget.record(reason)
+				minted[mintedBucket(reason)]++
 				l.Info("sweep: minted review task for human PR",
 					"action", "sweep_mint", "resource_id", task.Name, "activity", activity,
-					"repo", repo.Name, "number", pr.Number, "stage", stg, "stage_reason", reason,
+					"repo", repo.Name, "number", pr.Number, "state", stg, "park_reason", reason,
 					"kind", SweepReviewKind, "adopted_mirror", cr != nil,
 					"human_review_rounds", task.Status.HumanReviewRounds)
 			case MintExistingLive:
@@ -1600,12 +1620,13 @@ func betterBranchOwner(cur, cand *tatarav1alpha1.Task) bool {
 	return cand.Name > cur.Name
 }
 
-// taskStillPushes reports whether t may still push to its branch. parked counts
-// as pushing even though TaskDone calls it terminal: a parked(ownership-lost)
-// Task is re-entered into approved/merging (F.3, DrainStandDownMerge) and
-// RESUMES pushing. Only delivered/failed/rejected are past pushing.
+// taskStillPushes reports whether t may still push to its branch. It is exactly
+// !TaskDone. The old `|| stage == StageParked` clause is gone with #521: parked
+// stopped being a terminal, so a parked(ownership-lost) Task - which
+// DrainStandDownMerge re-drives and which RESUMES pushing - is already covered
+// by !TaskDone.
 func taskStillPushes(t *tatarav1alpha1.Task) bool {
-	return !tatarav1alpha1.TaskDone(t) || t.Status.Stage == tatarav1alpha1.StageParked
+	return !tatarav1alpha1.TaskDone(t)
 }
 
 // liveTaskPushingTo returns the name of a Task OTHER than exclude that still

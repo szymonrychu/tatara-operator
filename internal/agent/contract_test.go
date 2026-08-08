@@ -106,14 +106,14 @@ func decodeSessionInfo(t *testing.T, body string) agent.SessionInfo {
 	return info
 }
 
-// TestContractVersionIsThree pins the cross-repo constant. It goes 2 -> 3 in
-// tatara-operator, tatara-cli and tatara-claude-code-wrapper in ONE shot: an
-// old cli refuses to start its MCP server, and an old wrapper fails
-// AssertContractVersion at pod-ready, BEFORE turn 0. Loud pre-work failure
-// instead of a silent mid-turn 400.
-func TestContractVersionIsThree(t *testing.T) {
-	if agent.ContractVersion != 3 {
-		t.Fatalf("ContractVersion = %d, want 3", agent.ContractVersion)
+// TestContractVersionIsFour pins the cross-repo constant. It goes 3 -> 4 in
+// tatara-operator, tatara-cli and tatara-claude-code-wrapper in ONE shot for
+// #521's lifecycle and agent merge: an old cli refuses to start its MCP
+// server, and an old wrapper fails AssertContractVersion at pod-ready, BEFORE
+// turn 0. Loud pre-work failure instead of a silent mid-turn 400.
+func TestContractVersionIsFour(t *testing.T) {
+	if agent.ContractVersion != 4 {
+		t.Fatalf("ContractVersion = %d, want 4", agent.ContractVersion)
 	}
 }
 
@@ -127,14 +127,14 @@ func TestAssertContractVersion(t *testing.T) {
 		wantErr bool
 		wantGot int
 	}{
-		{name: "matching version", body: `{"state":"ready","contractVersion":3}`},
-		{name: "old wrapper reports v2", body: `{"state":"ready","contractVersion":2}`, wantErr: true, wantGot: 2},
+		{name: "matching version", body: `{"state":"ready","contractVersion":4}`},
+		{name: "old wrapper reports v3", body: `{"state":"ready","contractVersion":3}`, wantErr: true, wantGot: 3},
 		{
 			name:    "old wrapper has no contractVersion field at all",
 			body:    `{"state":"ready","turnsCompleted":0,"turnsFinished":0,"model":"m","repo":"r","lastActivityAt":"2026-07-12T10:00:00Z"}`,
 			wantErr: true, wantGot: 0,
 		},
-		{name: "future version", body: `{"state":"ready","contractVersion":4}`, wantErr: true, wantGot: 4},
+		{name: "future version", body: `{"state":"ready","contractVersion":5}`, wantErr: true, wantGot: 5},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := &turnRefusingSession{t: t, body: tc.body}

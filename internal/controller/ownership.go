@@ -220,55 +220,26 @@ func (d *StageDriver) parkAndHandBack(ctx context.Context, proj *tatarav1alpha1.
 }
 
 // parkOwnerTask parks task ownership-lost when it is pushing-capable
-// (kind != review), not terminal, and not ALREADY parked(ownership-lost) - the
-// last check is what makes a retry (resumeFlipToExternal) safe: re-entering
-// the SAME to=parked/reason=ownership-lost edge on an already-parked task is
-// illegal (stage.Transitions["parked"] carries no self edge) and would log a
-// spurious "no park edge from its current stage" error instead of the
-// no-op this is meant to be.
+// (kind != review), not done, and not ALREADY parked - stage.Park is idempotent
+// (first reason wins) but the early return keeps the metric honest.
+//
+// THE PER-STAGE EDGE TABLE IS GONE (#521). Parking is orthogonal to state now,
+// so there is no "does this stage carry an ownership-lost park edge" question to
+// ask and no stage that can be left running because the answer was no. Every
+// non-done state can hold the flag; hasOwnershipLostParkEdge and its
+// ownership_flip_park_skipped log line are deleted with the question they
+// answered.
 func (d *StageDriver) parkOwnerTask(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task) error {
-	if task.Spec.Kind == SweepReviewKind || tatarav1alpha1.StageTerminal(task) {
+	if task.Spec.Kind == SweepReviewKind || tatarav1alpha1.TaskDone(task) {
 		return nil
 	}
-	if task.Status.Stage == tatarav1alpha1.StageParked && task.Status.StageReason == stage.ReasonOwnershipLost {
+	if tatarav1alpha1.Parked(task) {
 		return nil
 	}
-	if !hasOwnershipLostParkEdge(task.Status.Stage) {
-		// The F.3 table (OP3) carries no parked(ownership-lost) edge from this
-		// stage: entering it anyway would be a transition nobody reasoned about
-		// for THIS stage's own invariants (merge cursor, admission clocks, ...).
-		// approved and merging DO carry the edge (OP11: a takeover Task mints
-		// straight into approved already controller-owning the MR, and a Task
-		// can still be mid-merge when a further push races it) - only a
-		// pod-less/mint-adjacent stage with no reachable controller-owning
-		// window (e.g. deploying, where the owned MR is already merged/closed
-		// and ReconcileOwnership's open-state guard never re-enters this
-		// branch) is left without one. Flip the MR's ownership regardless
-		// (already done by the caller) and leave the Task running; a human
-		// sees the stand-down on the MR.
-		log.FromContext(ctx).Error(nil, "flip: owner task has no ownership-lost park edge from its current stage; ownership flipped but the task was left running",
-			"action", "ownership_flip_park_skipped", "resource_id", task.Name,
-			"kind", task.Spec.Kind, "stage", task.Status.Stage)
-		return nil
-	}
-	if err := d.enterStage(ctx, proj, task, tatarav1alpha1.StageParked, stage.ReasonOwnershipLost, nil); err != nil {
+	if err := d.parkTask(ctx, proj, task, stage.ReasonOwnershipLost); err != nil {
 		return fmt.Errorf("flip: park owner task: %w", err)
 	}
 	return nil
-}
-
-// hasOwnershipLostParkEdge reports whether stage's F.3 edge table (OP3)
-// carries a documented To=parked, Reason=ownership-lost transition. Queries
-// stage.Transitions directly rather than hardcoding "implementing" and
-// "reviewing" (the only two rows that carry it today), so this stays correct
-// if OP3's edges ever add or remove one.
-func hasOwnershipLostParkEdge(from string) bool {
-	for _, e := range stage.Transitions[from] {
-		if e.To == tatarav1alpha1.StageParked && e.Reason == stage.ReasonOwnershipLost {
-			return true
-		}
-	}
-	return false
 }
 
 // handBackToReviewTask moves the MR mirror's controller ownership to the

@@ -72,20 +72,34 @@ spec:
           annotations:
             summary: "tatara-operator reconciles are erroring"
             description: "operator_reconcile_total{result=\"error\"} has been increasing for 15m; reconciliation is failing for at least one resource kind."
-        - alert: TataraTaskFailures
-          expr: increase(operator_task_terminal_total{stage="failed"}[30m]) > 0
+        - alert: TataraTaskRejections
+          expr: increase(operator_task_terminal_total{state="rejected"}[30m]) > 0
           labels:
             severity: {{ .Values.prometheusRule.severityLabel | quote }}
           annotations:
-            summary: "Tasks are reaching the terminal failed stage"
-            description: "{{ "{{" }} $value {{ "}}" }} Task(s) entered stage=failed in the last 30m. The stageReason label carries why (pod-recreation-exhausted, agent-unreachable, merge-conflict, merge-timeout, ...). operator_task_terminal_total is labelled {kind, stage, stageReason} since the task-centric redesign - the old {phase=\"Failed\"} selector matched nothing and this alert was silently green."
+            summary: "Tasks are reaching the terminal rejected state"
+            description: "{{ "{{" }} $value {{ "}}" }} Task(s) entered state=rejected in the last 30m. The stateReason label carries why (declined, false-positive, tracked-elsewhere, issue-closed, mr-closed-externally, mr-taken-over). #521 removed `failed` as a state: a FAILURE now parks, so TataraTasksParked is where an exhaustion shows up."
         - alert: TataraTasksParked
-          expr: increase(operator_task_terminal_total{stage="parked"}[1h]) > 0
+          expr: increase(operator_task_parked_total[1h]) > 0
           labels:
             severity: {{ .Values.prometheusRule.severityLabel | quote }}
           annotations:
             summary: "Tasks are parking (the loop gave up and wants a human)"
-            description: "{{ "{{" }} $value {{ "}}" }} Task(s) entered stage=parked in the last 1h: the loop stopped making progress on its own and is waiting on a human. The stageReason label carries why (admission-starved, stage-deadline, awaiting-human, review-cap, ...). Replaces the pre-redesign TataraLifecycleGiveups: tatara_lifecycle_giveup_total died with the issueLifecycle machine. A sweep-minted park (from=\"\") is NOT counted - only a Task that actually ran and then gave up."
+            description: "{{ "{{" }} $value {{ "}}" }} Task(s) parked in the last 1h: the loop stopped making progress on its own and is waiting on a human or a bounded retry. The parkReason label carries why (admission-starved, stage-deadline, awaiting-human, merge-timeout, pod-recreation-exhausted, ...) and the state label says where it stalled. #521 made park a FLAG orthogonal to state, so operator_task_terminal_total no longer sees a park at all and this counter is the only signal. A sweep-minted park is NOT counted - only a Task that actually ran and then gave up."
+        - alert: TataraResidencyExceeded
+          expr: increase(operator_task_residency_exceeded_total[1h]) > 0
+          labels:
+            severity: {{ .Values.prometheusRule.severityLabel | quote }}
+          annotations:
+            summary: "agents are hitting the absolute residency bound instead of finishing"
+            description: "{{ "{{" }} $value {{ "}}" }} Task(s) were parked by the ABSOLUTE residency backstop in the last 1h. #521 replaced a live state's work clock with an IDLE clock on conversationLastEventAt, which a chatty reviewer resets forever; this counter is how often the backstop had to fire instead. A sustained rate means agents are ping-ponging rather than converging - read the state and kind labels."
+        - alert: TataraParkedWithLivePod
+          expr: increase(operator_task_parked_with_live_pod_repaired_total[1h]) > 2
+          labels:
+            severity: {{ .Values.prometheusRule.severityLabel | quote }}
+          annotations:
+            summary: "parked Tasks keep being found still holding a live agent pod"
+            description: "{{ "{{" }} $value {{ "}}" }} repair(s) in the last 1h. parkReason != \"\" with a live pod is a TRANSIENT by design - ParkTask stamps the flag and deletes the pod in one call - so a SUSTAINED non-zero rate means the park-then-stop sequence is not completing and admission slots are leaking with no clock armed."
         - alert: TataraTurnTimeouts
           expr: increase(operator_turn_timeout_total[1h]) > 0
           labels:
@@ -94,12 +108,12 @@ spec:
             summary: "agent turns are timing out"
             description: "operator_turn_timeout_total increased in the last 1h: one or more agent turns stalled past the inactivity deadline."
         - alert: TataraAgentBootCrashLoop
-          expr: increase(operator_task_terminal_total{stage="failed",stageReason="pod-recreation-exhausted"}[30m]) > 0
+          expr: increase(operator_task_parked_total{parkReason="pod-recreation-exhausted"}[30m]) > 0
           labels:
             severity: {{ .Values.prometheusRule.severityLabel | quote }}
           annotations:
             summary: "wrapper agents are failing to boot"
-            description: "A Task terminated failed(pod-recreation-exhausted) in the last 30m: its wrapper Pod exhausted maxPodRecreations without /readyz coming up inside podReadyTimeout. The redesign deleted bootcrash.go and with it the only emitter of operator_agent_boot_crash_total, so this alert now selects the terminal stage reason the stage machine actually writes (F.4 clock 2 -> respawn, budget spent -> failed(pod-recreation-exhausted))."
+            description: "A Task parked pod-recreation-exhausted in the last 30m: its wrapper Pod exhausted maxPodRecreations without /readyz coming up inside podReadyTimeout. The redesign deleted bootcrash.go and with it the only emitter of operator_agent_boot_crash_total, so this alert selects the reason the machine actually writes (clock 2 -> respawn, budget spent -> park(pod-recreation-exhausted)). #521 moved it from a terminal stage to the park flag."
         - alert: TataraAgentUnreachable
           expr: increase(operator_agent_unreachable_termination_total[15m]) > 0
           labels:
@@ -201,7 +215,7 @@ spec:
             severity: {{ .Values.prometheusRule.severityLabel | quote }}
           annotations:
             summary: "the B.4 sweep keeps skipping the same item"
-            description: "operator_sweep_skipped_total{project=\"{{ "{{" }} $labels.project {{ "}}" }}\",activity=\"{{ "{{" }} $labels.activity {{ "}}" }}\",reason=\"{{ "{{" }} $labels.reason {{ "}}" }}\"} increased {{ "{{" }} $value {{ "}}" }} times in {{ .Values.prometheusRule.sweepSkipWindow }}: a single sweep skip is a NORMAL steady state (reason=mr_claimed_by_other_task means a live Task legitimately controller-owns that MergeRequest, including while parked - parked is re-entrant), so this alerts only on one that never clears. That means the owning Task has stopped progressing and is not being reaped: find it with operator_task_stage_age_seconds, then resolve or reap it. Issue #477: this replaces the ERROR-line trickle that used to report the same condition as a repeating sweep fault."
+            description: "operator_sweep_skipped_total{project=\"{{ "{{" }} $labels.project {{ "}}" }}\",activity=\"{{ "{{" }} $labels.activity {{ "}}" }}\",reason=\"{{ "{{" }} $labels.reason {{ "}}" }}\"} increased {{ "{{" }} $value {{ "}}" }} times in {{ .Values.prometheusRule.sweepSkipWindow }}: a single sweep skip is a NORMAL steady state (reason=mr_claimed_by_other_task means a live Task legitimately controller-owns that MergeRequest, including while parked - parked is re-entrant), so this alerts only on one that never clears. That means the owning Task has stopped progressing and is not being reaped: find it with operator_task_state_age_seconds, then resolve or reap it. Issue #477: this replaces the ERROR-line trickle that used to report the same condition as a repeating sweep fault."
         - alert: TataraObjectTooLarge
           expr: increase(operator_object_too_large_total[1h]) > 0
           labels:

@@ -632,7 +632,7 @@ func (r *RepositoryReconciler) computeRepoCounts(ctx context.Context, repo *tata
 		switch t.Spec.Kind {
 		case "incident":
 			incidents++
-		case "clarify":
+		case SweepIssueKind:
 			issues++
 		}
 	}

@@ -96,7 +96,7 @@ func reconcileIssue(t *testing.T, r *IssueReconciler, name string) ctrl.Result {
 func TestIssueControllerNeverWritesStatusFromLabel(t *testing.T) {
 	ctx := context.Background()
 	proj, repo := mirrorProject("tatara-bot"), mirrorRepo()
-	task := taskAtStage(tatarav1alpha1.StageClarifying, "")
+	task := taskAtStage(tatarav1alpha1.StateRefined, "")
 	iss := ownedIssue(tatarav1alpha1.IssueName(repo.Name, 1), 1, task, tatarav1alpha1.IssueStatus{
 		State:  "open",
 		Status: "new",
@@ -129,7 +129,7 @@ func TestIssueControllerNeverWritesStatusFromLabel(t *testing.T) {
 // OWNED Issue.
 func TestIssueControllerRepairsZeroController(t *testing.T) {
 	proj, repo := mirrorProject("tatara-bot"), mirrorRepo()
-	task := taskAtStage(tatarav1alpha1.StageClarifying, "")
+	task := taskAtStage(tatarav1alpha1.StateRefined, "")
 	task.UID = "task-uid"
 
 	iss := ownedIssue(tatarav1alpha1.IssueName(repo.Name, 2), 2, nil, tatarav1alpha1.IssueStatus{State: "open"})
@@ -195,7 +195,7 @@ func TestIssueControllerProjectsLabels(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			proj, repo := mirrorProject("tatara-bot"), mirrorRepo()
-			task := taskAtStage(tatarav1alpha1.StageClarifying, "")
+			task := taskAtStage(tatarav1alpha1.StateRefined, "")
 			iss := ownedIssue(tatarav1alpha1.IssueName(repo.Name, 3), 3, task, tatarav1alpha1.IssueStatus{
 				State:  "open",
 				Status: tc.status,
@@ -234,22 +234,22 @@ func TestIssueControllerSyncsAtCadence(t *testing.T) {
 	}{
 		{
 			name:  "active task, mirror fresh: no read, hourly requeue",
-			stage: tatarav1alpha1.StageImplementing, lastSynced: 10 * time.Minute,
+			stage: tatarav1alpha1.StateUnderImplementation, lastSynced: 10 * time.Minute,
 			wantRequeue: MirrorCadenceActive, wantReads: 0,
 		},
 		{
 			name:  "active task, mirror an hour stale: one read",
-			stage: tatarav1alpha1.StageImplementing, lastSynced: 90 * time.Minute,
+			stage: tatarav1alpha1.StateUnderImplementation, lastSynced: 90 * time.Minute,
 			wantRequeue: MirrorCadenceActive, wantReads: 1,
 		},
 		{
 			name:  "parked task, mirror an hour stale: NO read (daily cadence)",
-			stage: tatarav1alpha1.StageParked, reason: "backlog-sweep", lastSynced: 90 * time.Minute,
+			stage: tatarav1alpha1.StateNew, reason: "backlog-sweep", lastSynced: 90 * time.Minute,
 			wantRequeue: MirrorCadenceParked, wantReads: 0,
 		},
 		{
 			name:  "parked task, mirror a day stale: one read",
-			stage: tatarav1alpha1.StageParked, reason: "identity-unverified", lastSynced: 25 * time.Hour,
+			stage: tatarav1alpha1.StateRefined, reason: "identity-unverified", lastSynced: 25 * time.Hour,
 			wantRequeue: MirrorCadenceParked, wantReads: 1,
 		},
 	}
@@ -283,7 +283,7 @@ func TestIssueControllerSyncsAtCadence(t *testing.T) {
 // the label vocabulary is an Issue-only projection.
 func TestMergeRequestControllerReconciles(t *testing.T) {
 	proj, repo := mirrorProject("tatara-bot"), mirrorRepo()
-	task := taskAtStage(tatarav1alpha1.StageReviewing, "")
+	task := taskAtStage(tatarav1alpha1.StateAwaitingReview, "")
 	task.UID = "task-uid"
 
 	no := false

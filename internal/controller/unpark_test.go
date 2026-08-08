@@ -48,6 +48,7 @@ func TestApplyUnpark_UsesLiveReadNotCachedGet(t *testing.T) {
 	// The CACHED view: parked(awaiting-human), no pendingEvent yet - what the
 	// informer still shows.
 	stale := wfParkedTask("t-cachelag", "review", stage.ReasonAwaitingHuman)
+	wantState := stale.Status.State // un-park never moves state (#521)
 	// The LIVE view: the same Task on the real API server, AFTER the human
 	// comment's AppendTaskEvent write landed.
 	live := stale.DeepCopy()
@@ -58,20 +59,27 @@ func TestApplyUnpark_UsesLiveReadNotCachedGet(t *testing.T) {
 	liveClient := newMirrorClient(t, proj, live)
 	cached := &staleGetClient{Client: liveClient, stale: stale.DeepCopy()}
 
-	target, decline, err := ApplyUnpark(context.Background(), cached, liveClient, proj, stale, 0, 6, false, time.Now())
+	// liveHasRoom=true: this test is about the cache-lag fix, not the live-pod
+	// ceiling (#521 widened liveRoomDecline to every live state, so a parked
+	// review Task's awaiting-human re-entry now consults it too - room=false
+	// would decline no-live-room and mask the assertion this test exists for).
+	unparked, decline, err := ApplyUnpark(context.Background(), cached, liveClient, proj, stale, 0, 6, true, time.Now())
 	if err != nil {
 		t.Fatalf("ApplyUnpark: %v", err)
 	}
 	if decline != DeclineNone {
 		t.Fatalf("decline = %q, want DeclineNone on a successful un-park", decline)
 	}
-	if target != tatarav1alpha1.StageReviewing {
-		t.Fatalf("ApplyUnpark declined (target=%q) despite a fresh non-bot pendingEvent visible on the live read; "+
-			"the cached Get's staleness was not bypassed", target)
+	if !unparked {
+		t.Fatalf("ApplyUnpark declined despite a fresh non-bot pendingEvent visible on the live read; " +
+			"the cached Get's staleness was not bypassed")
 	}
 	got := mdGetTask(t, liveClient, stale.Name)
-	if got.Status.Stage != tatarav1alpha1.StageReviewing {
-		t.Fatalf("persisted stage = %s, want reviewing", got.Status.Stage)
+	if got.Status.State != wantState {
+		t.Fatalf("persisted state = %s, want unchanged %s: un-park never moves state", got.Status.State, wantState)
+	}
+	if tatarav1alpha1.Parked(got) {
+		t.Fatal("the park flag survived a successful un-park")
 	}
 }
 
@@ -86,12 +94,12 @@ func TestApplyUnpark_BotOnlyEventStillDeclines(t *testing.T) {
 	}}
 	c := newMirrorClient(t, proj, task)
 
-	target, decline, err := ApplyUnpark(context.Background(), c, c, proj, task, 0, 6, false, time.Now())
+	unparked, decline, err := ApplyUnpark(context.Background(), c, c, proj, task, 0, 6, false, time.Now())
 	if err != nil {
 		t.Fatalf("ApplyUnpark: %v", err)
 	}
-	if target != "" {
-		t.Fatalf("a bot-only pendingEvent must never un-park; got target=%q", target)
+	if unparked {
+		t.Fatal("a bot-only pendingEvent must never un-park")
 	}
 	if decline != DeclineNoHumanEvent {
 		t.Fatalf("decline = %q, want DeclineNoHumanEvent for a bot-only-event non-error refusal", decline)
@@ -119,23 +127,23 @@ func TestApplyUnpark_StageReasonGuardStillShortCircuitsOnLiveRead(t *testing.T) 
 	// regardless of hasNonBotEvent - proving the guard, not the reason dispatch,
 	// is what stops it.
 	live := caller.DeepCopy()
-	live.Status.StageReason = stage.ReasonMergeTimeout
+	live.Status.ParkReason = stage.ReasonMergeTimeout
 
 	c := newMirrorClient(t, proj, live, mr)
 
-	target, decline, err := ApplyUnpark(context.Background(), c, c, proj, caller, 0, 6, false, time.Now())
+	unparked, decline, err := ApplyUnpark(context.Background(), c, c, proj, caller, 0, 6, false, time.Now())
 	if err != nil {
 		t.Fatalf("ApplyUnpark: %v", err)
 	}
-	if target != "" {
-		t.Fatalf("guard must refuse an unpark whose live stageReason no longer matches the caller's park; got target=%q", target)
+	if unparked {
+		t.Fatal("guard must refuse an unpark whose live stageReason no longer matches the caller's park")
 	}
 	if decline != DeclineGuard {
 		t.Fatalf("decline = %q, want DeclineGuard when the live stageReason drifted", decline)
 	}
 	got := mdGetTask(t, c, caller.Name)
-	if got.Status.Stage != tatarav1alpha1.StageParked || got.Status.StageReason != stage.ReasonMergeTimeout {
-		t.Fatalf("guard must leave the live object untouched; got stage=%s(%s)", got.Status.Stage, got.Status.StageReason)
+	if !tatarav1alpha1.Parked(got) || got.Status.ParkReason != stage.ReasonMergeTimeout {
+		t.Fatalf("guard must leave the live object untouched; got parked=%v reason=%s", tatarav1alpha1.Parked(got), got.Status.ParkReason)
 	}
 }
 
@@ -147,7 +155,7 @@ func TestApplyUnpark_StageReasonGuardStillShortCircuitsOnLiveRead(t *testing.T) 
 // anyway; it must now stay parked, since no agent turn ever ran.
 func TestDriveUnparks_IncidentNoOutcomeStaysParked(t *testing.T) {
 	task := wfParkedTask("t-incident-no-outcome", "incident", stage.ReasonNoOutcome)
-	task.Status.ParkedFromStage = tatarav1alpha1.StageInvestigating
+	task.Status.ParkedFromState = tatarav1alpha1.StateRefined
 	task.Status.Stats.PodRecreations = 3
 	c := newMirrorClient(t, task)
 	r := &ProjectReconciler{Client: c, Scheme: c.Scheme(), Metrics: wfMetrics()}
@@ -155,10 +163,44 @@ func TestDriveUnparks_IncidentNoOutcomeStaysParked(t *testing.T) {
 		t.Fatalf("driveUnparks: %v", err)
 	}
 	got := mdGetTask(t, c, task.Name)
-	if got.Status.Stage != tatarav1alpha1.StageParked {
-		t.Fatalf("incident parked(no-outcome) from investigating re-entered %s, want parked", got.Status.Stage)
+	if !tatarav1alpha1.Parked(got) {
+		t.Fatalf("incident parked(no-outcome) from investigating re-entered %s, want still parked", got.Status.State)
 	}
-	if got.Status.StageReason != stage.ReasonNoOutcome {
-		t.Fatalf("stageReason = %q, want unchanged no-outcome", got.Status.StageReason)
+	if got.Status.ParkReason != stage.ReasonNoOutcome {
+		t.Fatalf("stageReason = %q, want unchanged no-outcome", got.Status.ParkReason)
+	}
+}
+
+// TestApplyUnpark_WritesBackIntoTheCallersTask closes a stale-read window the
+// retry loop opened.
+//
+// The loop mutates and persists `fresh`, a copy it Got itself, and used to
+// throw it away: the caller's *task kept its parkReason for the rest of the
+// pass, so every later Parked(task) / ParkReason read in that same pass
+// answered from a state the API server no longer held. The applier's own
+// "unparked task" log was the first victim - it reads task.Status - and any
+// caller that branches on parkedness after a successful un-park is the next.
+func TestApplyUnpark_WritesBackIntoTheCallersTask(t *testing.T) {
+	proj := wfProject()
+	task := wfParkedTask("t-writeback", "review", stage.ReasonAwaitingHuman)
+	task.Status.PendingEvents = []tatarav1alpha1.TaskEvent{{
+		At: metav1.Now(), Kind: "issue_comment", Author: "human", Body: "go ahead",
+	}}
+	wantState := task.Status.State // un-park never moves state (#521)
+	c := newMirrorClient(t, proj, task.DeepCopy())
+
+	unparked, decline, err := ApplyUnpark(context.Background(), c, c, proj, task, 0, 6, true, time.Now())
+	if err != nil {
+		t.Fatalf("ApplyUnpark: %v", err)
+	}
+	if !unparked || decline != DeclineNone {
+		t.Fatalf("unparked=%v decline=%q, want a clean un-park", unparked, decline)
+	}
+	if tatarav1alpha1.Parked(task) {
+		t.Fatalf("the caller's task still reads parked(%s) after a successful un-park; "+
+			"the persisted result was never written back", task.Status.ParkReason)
+	}
+	if task.Status.State != wantState {
+		t.Fatalf("caller's state = %s, want unchanged %s", task.Status.State, wantState)
 	}
 }

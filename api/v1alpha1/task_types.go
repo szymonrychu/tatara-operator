@@ -54,11 +54,24 @@ var projectScopedKinds = map[string]bool{
 
 // unconstrainedKinds are the umbrella origin kinds that validate with either an
 // empty or a non-empty RepositoryRef: the sweep mints them with no repo, while
-// a proposal-born clarify carries its proposal's repo.
+// a proposal-born implement Task carries its proposal's repo.
+//
+// implement REPLACED clarify here in #521 and it is not cosmetic: every Task
+// minted from now on carries kind=implement where it used to carry clarify, and
+// IsKnownKind("implement") must be true or the QueuedEvent validator rejects
+// every one of them.
+//
+// THE 61 LIVE Tasks that still carry spec.kind=clarify are NOT rewritten - the
+// #521 migrator was withdrawn (see MEMORY.md 2026-08-08) and spec.kind is
+// immutable anyway. They read back as clarify (an enum is validated on WRITE,
+// and 1.33 ratcheting lets an unchanged invalid value through), triageTarget
+// has no clarify row, and each one parks ONCE at triage-stalled with
+// action=triage_unknown_kind before the 7-day park retention reaps it. Loud,
+// bounded, and deliberately not special-cased.
 var unconstrainedKinds = map[string]bool{
-	"review":   true,
-	"clarify":  true,
-	"takeover": true,
+	"review":    true,
+	"implement": true,
+	"takeover":  true,
 }
 
 // IsProjectScopedKind reports whether a task kind is project-scoped (operates on
@@ -100,7 +113,8 @@ func ValidateTaskSpec(spec TaskSpec) error {
 type TaskSpec struct {
 	ProjectRef string `json:"projectRef"`
 	// RepositoryRef is the PRIMARY repo, set ONLY on documentation Tasks (and on
-	// a proposal-born clarify, which carries the repo its proposal was filed in).
+	// a proposal-born implement Task, which carries the repo its proposal was
+	// filed in).
 	// +optional
 	RepositoryRef string `json:"repositoryRef,omitempty"`
 	// Goal is NON-EVICTABLE: the A.7 byte guard can spill comments and notes, but
@@ -116,8 +130,8 @@ type TaskSpec struct {
 	// +optional
 	Source *TaskSource `json:"source,omitempty"`
 	// Kind is the ORIGIN. Immutable, baked into the name. NOT the running agent
-	// kind (that is Status.AgentKind, driven by the F.2 stage table).
-	// +kubebuilder:validation:Enum=brainstorm;incident;clarify;refine;review;documentation;takeover
+	// kind (that is Status.AgentKind, driven by the F.2 state/origin table).
+	// +kubebuilder:validation:Enum=brainstorm;incident;implement;refine;review;documentation;takeover
 	// +optional
 	Kind string `json:"kind,omitempty"`
 	// DedupKey is the dedup identity for an incident Task: the alert-group hash
@@ -164,114 +178,84 @@ type TaskSpec struct {
 	// Task. Zero = Project.spec.agent.maxTurnsPerTask (default 300).
 	// +optional
 	MaxTurnsPerTask int `json:"maxTurnsPerTask,omitempty"`
-	// InitialStage is the F.3 Create-edge target a mint chooses when it is NOT the
-	// default triaging: the sweep mints straight into parked(backlog-sweep) or
-	// triaging, and the nightly doc batch into documenting. It is carried in the
-	// IMMUTABLE spec so the TaskReconciler create-edge derives the stage with NO
-	// post-create status write that must win a race against the reconciler's own
-	// create-edge (fix C5). Empty = triaging.
+	// InitialState is the Create-edge target a mint chooses when it is NOT the
+	// default `new`. It is carried in the IMMUTABLE spec so the TaskReconciler
+	// create-edge derives the state with NO post-create status write that must
+	// win a race against the reconciler's own create-edge (fix C5). Empty = new.
+	//
+	// #521 renamed this from InitialStage. The two-field shape survived the
+	// rename because the create edge can now land in TWO orthogonal places at
+	// once: a sweep-minted backlog owner is `new` AND parked(backlog-sweep), and
+	// `parked` is no longer a state it could have been expressed as.
+	// +kubebuilder:validation:Enum=new;refined;under-implementation
 	// +optional
-	InitialStage string `json:"initialStage,omitempty"`
-	// InitialStageReason is the stageReason paired with InitialStage (e.g.
-	// backlog-sweep). Empty for the reason-less initial stages.
+	InitialState string `json:"initialState,omitempty"`
+	// InitialParkReason is the park flag a mint stamps ALONGSIDE InitialState
+	// (e.g. backlog-sweep). Empty means the Task is minted un-parked. It is a
+	// PARK reason, never a state reason: a mint that wants a terminal Task does
+	// not exist.
 	// +optional
-	InitialStageReason string `json:"initialStageReason,omitempty"`
+	InitialParkReason string `json:"initialParkReason,omitempty"`
 }
 
-// Stage* are the 16 members of the task-centric stage machine (contract F.1).
-// conversing is the 16th: a POD-BEARING, NON-TERMINAL stage a Task enters when a
-// comment needs a live agent on the other end. Because it is pod-bearing and
-// non-terminal it needs NO exception in the reaper (which gates on TaskDone), in
-// the concurrency accountant (queueTaskHoldsSlot = !TaskDone && !StagePodless) or
-// in the F.3 table. That is the whole reason it is a stage rather than a warm pod
-// kept alive through parked: the three carve-outs that would have needed each map
-// to a past production incident.
+// State* are the 8 members of the task lifecycle. They name WHERE THE WORK IS,
+// and nothing else: whether a Task is stalled is status.parkReason, and whether
+// a live agent is attached is stage.Live(state). Those two are ORTHOGONAL to
+// this enum, deliberately - the 16-stage machine folded all three axes into one
+// value, which is how `parked` came to be simultaneously a stage, a terminal,
+// and a pod-less marker, and how TaskDone(parked) ended up true.
+//
+// NAMING TRAP: `merged` and `deployed` name the PHASE, not the milestone.
+// merged means "the verdict is approve and the operator owns the merge cursor",
+// NOT "every MR is merged". Per-MR truth stays on mr.status.state.
 const (
-	StageTriaging      = "triaging"
-	StageBrainstorming = "brainstorming"
-	StageClarifying    = "clarifying"
-	StageInvestigating = "investigating"
-	StageRefining      = "refining"
-	StageApproved      = "approved"
-	StageImplementing  = "implementing"
-	StageReviewing     = "reviewing"
-	StageConversing    = "conversing"
-	StageMerging       = "merging"
-	StageDeploying     = "deploying"
-	StageDelivered     = "delivered"
-	StageDocumenting   = "documenting"
-	StageRejected      = "rejected"
-	StageFailed        = "failed"
-	StageParked        = "parked"
+	StateNew                 = "new"
+	StateRefined             = "refined"
+	StateUnderImplementation = "under-implementation"
+	StateAwaitingReview      = "awaiting-review"
+	StateMerged              = "merged"
+	StateDeployed            = "deployed"
+	StateDone                = "done"
+	StateRejected            = "rejected"
 )
 
-// terminalStages is the closed set StageTerminal checks. delivered is
-// deliberately NOT here: it is quasi-terminal (reaped separately at 48h by
-// the reaper, once documentedBy is stamped or the Task provably needs no
-// coverage), not a stage machine terminal.
-var terminalStages = map[string]bool{
-	StageRejected: true,
-	StageFailed:   true,
-	StageParked:   true,
-}
-
-// podlessStages is the closed set StagePodless checks: the eight stages
-// (contract F.2) that run no agent pod - triaging/approved/merging/deploying
-// are pure operator work, delivered/rejected/failed/parked spawn nothing.
-// These stages run ONLY clock 3 (WORK), measured from stageEnteredAt, and
-// never clock 1 (ADMISSION) - v6 gave merging a 24h admission clock, so the
-// bounded merge cycle (mergeReentries) could never engage.
-var podlessStages = map[string]bool{
-	StageTriaging:  true,
-	StageApproved:  true,
-	StageMerging:   true,
-	StageDeploying: true,
-	StageDelivered: true,
-	StageRejected:  true,
-	StageFailed:    true,
-	StageParked:    true,
-}
-
-// StageTerminal reports whether t's stage is one of the three closed-set
-// terminals (rejected/failed/parked). delivered is quasi-terminal and is
-// handled by the reaper, not this predicate.
-func StageTerminal(t *Task) bool {
-	return terminalStages[t.Status.Stage]
-}
-
-// StagePodless reports whether stage runs no agent pod (contract F.2). A
-// podless stage's only clock is WORK, measured from stageEnteredAt.
-func StagePodless(stage string) bool {
-	return podlessStages[stage]
-}
-
-// StageIsTerminalOutcome reports whether entering stage is a TERMINAL OUTCOME of
-// a Task, i.e. the thing operator_task_terminal_total{kind,stage,stageReason}
-// counts (contract K.1 / D1). It is StageTerminal PLUS delivered: delivered is
-// quasi-terminal for the REAPER (it is collected on its own schedule once
-// documented), but it is absolutely an outcome for the ALERTS - it is the only
-// SUCCESS outcome the platform has, and the failure-ratio rules divide by it.
-func StageIsTerminalOutcome(stage string) bool {
-	return terminalStages[stage] || stage == StageDelivered
-}
-
-// TaskDone reports whether a Task's work is over: a closed-set terminal, or
-// delivered (quasi-terminal, pod-less, collected by the reaper at 48h). It is
-// the stage-machine replacement for the deleted TaskTerminal.
+// TaskDone reports whether a Task's work is over. It is EXACTLY
+// state in {done, rejected} - nothing else, and in particular NOT parked.
+//
+// This is issue #521's fix and it is structural. Under the stage machine
+// terminalStages contained StageParked, so TaskDone(parked) was true, so
+// intake.createTaskRaceSafe's live-twin branch (intake.go:311) was skipped for
+// every parked Task, so the Create 409ed and control reached the delete at
+// intake.go:332 - deleting a live Task and cascading its owned Issue and
+// MergeRequest mirrors. Once done is exactly {done, rejected}, a parked Task
+// takes the live-twin branch and that delete is structurally unreachable for
+// it.
 func TaskDone(t *Task) bool {
-	return StageTerminal(t) || t.Status.Stage == StageDelivered
+	return t.Status.State == StateDone || t.Status.State == StateRejected
+}
+
+// Parked reports whether a Task is stalled. Empty ParkReason means not parked
+// and that is the whole test.
+func Parked(t *Task) bool { return t.Status.ParkReason != "" }
+
+// TaskIsTerminalOutcome reports whether entering state is a TERMINAL OUTCOME,
+// i.e. what operator_task_terminal_total counts. Same set as TaskDone: under
+// the 8-state model `done` absorbed `delivered`, so there is no quasi-terminal
+// left to special-case.
+func TaskIsTerminalOutcome(state string) bool {
+	return state == StateDone || state == StateRejected
 }
 
 // FoldStartedAt is the anchor for both fold-hold clocks: the explicit
-// FoldInFlightSince stamp, else the generic stage clock, else the zero time (a
+// FoldInFlightSince stamp, else the generic state clock, else the zero time (a
 // marker so old it carries neither, which reads as expired - the safe direction,
 // because the alternative is the unbounded hold of issue #467).
 func FoldStartedAt(t *Task) time.Time {
 	if t.Status.FoldInFlightSince != nil {
 		return t.Status.FoldInFlightSince.Time
 	}
-	if t.Status.StageEnteredAt != nil {
-		return t.Status.StageEnteredAt.Time
+	if t.Status.StateEnteredAt != nil {
+		return t.Status.StateEnteredAt.Time
 	}
 	return time.Time{}
 }
@@ -400,17 +384,32 @@ func sanitizeNamePart(s string, max int) string {
 // Note is one entry in a Task's append-only journal (contract A.4). Notes ARE
 // the continuation state read back by task_context(notes=all).
 type Note struct {
+	// ID is the stable handle an agent quotes back as planNoteId. It is
+	// sha256(at|kind|body) truncated to 16 hex, so it is derivable from the
+	// note alone (no counter, no sequence) and CHANGES if the body changes -
+	// which is exactly what the approval gate's plan pin needs: an approved
+	// plan whose body was edited afterwards no longer matches the hash stored
+	// on ApprovalEvidence.
+	// +optional
+	ID string      `json:"id,omitempty"`
 	At metav1.Time `json:"at"`
 	// Agent is the WRITER. The REST layer stamps it from Status.AgentKind; an
 	// agent can NEVER produce "operator" (fix 19). The only writer of
 	// agent="operator" is the operator itself, in-process.
-	// +kubebuilder:validation:Enum=brainstorm;incident;clarify;refine;review;documentation;implement;operator
+	// +kubebuilder:validation:Enum=brainstorm;incident;refine;review;documentation;implement;operator
 	Agent string `json:"agent"`
 	// +kubebuilder:validation:Enum=note;plan;handoff
 	Kind string `json:"kind"`
 	// Go-side twin: NoteBodyMaxBytes (limits.go). Change both together.
 	// +kubebuilder:validation:MaxLength=4096
 	Body string `json:"body"`
+}
+
+// NewNoteID derives a Note's stable id. It is a pure function of the note's
+// own content, so any reader can re-derive it and a body edit invalidates it.
+func NewNoteID(at metav1.Time, kind, body string) string {
+	sum := sha256.Sum256([]byte(strconv.FormatInt(at.Unix(), 10) + "|" + kind + "|" + body))
+	return "n-" + hex.EncodeToString(sum[:])[:16]
 }
 
 // TaskStats is the running usage/token accounting for a Task (contract A.4).
@@ -470,24 +469,54 @@ type TaskStatus struct {
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
-	// +kubebuilder:validation:Enum=triaging;brainstorming;clarifying;investigating;refining;approved;implementing;reviewing;conversing;merging;deploying;delivered;documenting;rejected;failed;parked
+	// State is WHERE THE WORK IS. It is ORTHOGONAL to ParkReason (whether the
+	// Task is stalled) and to stage.Live(State) (whether an agent pod is
+	// attached). Collapsing those three axes into one value is what #521 fixed.
+	// +kubebuilder:validation:Enum=new;refined;under-implementation;awaiting-review;merged;deployed;done;rejected
 	// +optional
-	Stage string `json:"stage,omitempty"`
-	// StageEnteredAt is stamped on EVERY stage transition. It is the clock for the
-	// POD-LESS stages (F.4).
+	State string `json:"state,omitempty"`
+	// StateEnteredAt is stamped on EVERY state transition. It is the clock for
+	// the OPERATOR-DRIVEN states (F.4).
 	// +optional
-	StageEnteredAt *metav1.Time `json:"stageEnteredAt,omitempty"`
-	// StageWorkStartedAt is stamped when this stage's POD BECOMES READY (fix H12).
-	// It is the clock for every POD-SPAWNING stage's deadline. StageEnteredAt is
-	// NOT, because it starts ticking the moment the Task enters the stage - which
+	StateEnteredAt *metav1.Time `json:"stateEnteredAt,omitempty"`
+	// StateReason is the machine reason for the current state. MANDATORY on
+	// done and rejected. It is NOT a park reason: the two vocabularies are
+	// disjoint and live in different fields on purpose.
+	// +optional
+	StateReason string `json:"stateReason,omitempty"`
+	// ParkReason is the PARK FLAG. Empty means NOT PARKED, and that is the
+	// whole test - there is no parked state to compare against. It is
+	// ORTHOGONAL to State: a Task parks WHERE IT IS, and un-parking returns it
+	// to the same state unless a rule says otherwise.
+	//
+	// THE WEDGE THIS INVITES, and the one mitigation: a writer that sets State
+	// and forgets to clear ParkReason wedges the Task forever with a stale
+	// reason - the same silent-drift genre as #521 itself. Mitigation:
+	// stage.Enter asserts ParkReason == "" on every non-park edge and refuses
+	// otherwise, and stage.Unpark is the ONE function that clears it. Nothing
+	// else in the codebase may assign to this field.
+	// +kubebuilder:validation:Enum=backlog-sweep;triage-stalled;name-too-long;stage-deadline;awaiting-human;identity-unverified;implement-declined;review-loop-exhausted;review-post-refused;merge-timeout;merge-blocked;merge-order-missing;deploy-timeout;deploy-blocked;no-outcome;turn-budget-exhausted;pod-recreation-exhausted;object-too-large;fold-adoption-unverified;admission-starved;agent-contract-mismatch;operator-error;head-moving;handoff-stalled;ownership-lost;merge-auth-refused;ci-red;ci-blocked
+	// +optional
+	ParkReason string `json:"parkReason,omitempty"`
+	// +optional
+	ParkedAt *metav1.Time `json:"parkedAt,omitempty"`
+	// ParkedFromState is OBSERVABILITY. The un-park target is NEVER derived
+	// from it. It is load-bearing for exactly one gate: no-outcome un-park
+	// eligibility requires it to be under-implementation or awaiting-review
+	// (#406).
+	// +optional
+	ParkedFromState string `json:"parkedFromState,omitempty"`
+	// StateWorkStartedAt is stamped when this state's POD BECOMES READY (fix H12).
+	// It is the clock for every POD-SPAWNING state's deadline. StateEnteredAt is
+	// NOT, because it starts ticking the moment the Task enters the state - which
 	// is when its QueuedEvent is ENQUEUED, not when it is admitted. With 3 agent
 	// slots and 3-4 serial pod admissions per Task, a Task could burn its entire
 	// 2h budget QUEUEING and die parked(stage-deadline) HAVING NEVER RUN A POD -
-	// and that park has no re-entry rule. The stage deadline must measure WORK,
-	// not queue wait. Cleared on every stage transition.
+	// and that park has no re-entry rule. The state deadline must measure WORK,
+	// not queue wait. Cleared on every state transition.
 	// +optional
-	StageWorkStartedAt *metav1.Time `json:"stageWorkStartedAt,omitempty"`
-	// +kubebuilder:validation:Enum=brainstorm;incident;clarify;refine;review;documentation;implement
+	StateWorkStartedAt *metav1.Time `json:"stateWorkStartedAt,omitempty"`
+	// +kubebuilder:validation:Enum=brainstorm;incident;refine;review;documentation;implement
 	// +optional
 	AgentKind string `json:"agentKind,omitempty"`
 	// PodStartedAt is stamped when the pod is CREATED (not when it becomes Ready),
@@ -496,10 +525,10 @@ type TaskStatus struct {
 	//   - the base of the pod TTL: t0 = podStartedAt + agentPodTTLSeconds (G.7).
 	//
 	// LIFECYCLE, and it is LOAD-BEARING (fix V7-4):
-	//   CLEARED on EVERY stage transition. Both this and StageWorkStartedAt.
+	//   CLEARED on EVERY state transition. Both this and StateWorkStartedAt.
 	//
 	// v6 declared this field with no doc comment and no clearing rule, while only
-	// StageWorkStartedAt said "cleared on every stage transition". On the NORMAL
+	// StateWorkStartedAt said "cleared on every state transition". On the NORMAL
 	// re-entry edges (reviewing -> implementing, merging -> reviewing, every
 	// un-park) a STALE non-nil PodStartedAt then:
 	//   (a) DISARMS clock 1 (which is armed only when PodStartedAt == nil) while
@@ -540,24 +569,22 @@ type TaskStatus struct {
 	// +optional
 	// +kubebuilder:validation:MaxItems=50
 	MRRefs []string `json:"mrRefs,omitempty"`
-	// StageReason is the machine reason for the current stage. MANDATORY on
-	// parked/failed/rejected. Closed set: F.5.
-	// +optional
-	StageReason string `json:"stageReason,omitempty"`
-	// ParkedFromStage is mostly OBSERVABILITY: the un-park TARGET is NEVER derived
-	// from it (fix 2); it is re-derived from Issue.status.status and the owned-MR
-	// state (F.6). It IS load-bearing for one gate: ReasonNoOutcome unpark
-	// eligibility requires it to be implementing or reviewing (#406), so a park
-	// from a pre-implement stage cannot auto-escalate straight into implementing.
-	// +optional
-	ParkedFromStage string `json:"parkedFromStage,omitempty"`
-	// ConversationLastEventAt is the IDLE CLOCK BASE for the conversing stage. It
-	// is stamped on entry into conversing and RE-STAMPED by AppendTaskEvent on
-	// every non-bot event queued while conversing, so the clock measures silence
-	// rather than pod age.
+	// ConversationLastEventAt is the HUMAN half of the IDLE CLOCK BASE for every
+	// LIVE state. It is stamped on entry into a live state and RE-STAMPED by
+	// AppendTaskEvent on every non-bot event queued while live, so the clock
+	// measures silence rather than pod age.
 	//
-	// It is a field of its OWN and deliberately NOT stageWorkStartedAt. The TTL
-	// stop nils stageWorkStartedAt and PodWatchReconciler re-stamps it when the
+	// It is only ONE THIRD of the base. Nothing an AGENT does touches this field,
+	// so an idle clock reading it alone parks a silently-working agent at 60
+	// minutes, and a Task that queued for hours before its pod arrived is parked
+	// before turn 0 is ever submitted. stage.ArmedClock therefore disarms the idle
+	// clock entirely while a turn is in flight and otherwise measures from the
+	// LATEST of this field, stateWorkStartedAt and the turn-complete annotation.
+	// See stage.idleBase, which also records the pod-rotation ratchet that admits
+	// and the three caps that bound it.
+	//
+	// It is a field of its OWN and deliberately NOT stateWorkStartedAt. The TTL
+	// stop nils stateWorkStartedAt and PodWatchReconciler re-stamps it when the
 	// REPLACEMENT pod becomes ready, so an idle clock based on it would reset on
 	// every pod rotation and an idle conversation would never park - it would
 	// rotate a pod forever. Nothing in the pod lifecycle touches this field.
@@ -616,7 +643,7 @@ type TaskStatus struct {
 	// must never inherit a stale carry from an unrelated earlier cycle.
 	//
 	// READ BACK BY REPORTING, NOT BY THE DEADLINE (issue #513 split this).
-	// operator_task_stage_age_seconds, operator_merge_cursor_stalled_seconds and
+	// operator_task_state_age_seconds, operator_merge_cursor_stalled_seconds and
 	// deploy_waiting's stalled_seconds all add it to now.Sub(StageEnteredAt), via
 	// stage.StageElapsedSeconds, so reported residency is CONTINUOUS across the
 	// whole round trip instead of a sawtooth that resets every re-entry. That is
@@ -692,6 +719,17 @@ type TaskStatus struct {
 	// model that actually ran.
 	// +optional
 	ResolvedModel string `json:"resolvedModel,omitempty"`
+	// PinnedPlanNoteID is the id of the NEWEST plan note, re-derived on every
+	// note write. It exists because status.notes is capped at 50 with drop-oldest
+	// and the evicted batch is spilled to tatara-memory: a long-running Task can
+	// spill the very plan note the approval gate pinned, and the gate's
+	// plan-note-missing refusal would then fire on a legitimate submit.
+	//
+	// It holds the ID ONLY. The body is not retained, deliberately: the pin the
+	// gate re-checks is the sha256 stored on Issue.status.approval.planHash at
+	// GRANT, so nothing here has to survive for the check to work.
+	// +optional
+	PinnedPlanNoteID string `json:"pinnedPlanNoteId,omitempty"`
 	// ShortDescription is the first line of Spec.Goal, truncated to ~60 chars,
 	// set on reconcile so `kubectl get task` is scannable without describe.
 	// +optional
@@ -701,15 +739,15 @@ type TaskStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced
-// +kubebuilder:printcolumn:name="Stage",type=string,JSONPath=`.status.stage`
-// +kubebuilder:printcolumn:name="Reason",type=string,JSONPath=`.status.stageReason`
+// +kubebuilder:printcolumn:name="State",type=string,JSONPath=`.status.state`
+// +kubebuilder:printcolumn:name="Park",type=string,JSONPath=`.status.parkReason`
 // +kubebuilder:printcolumn:name="Agent",type=string,JSONPath=`.status.agentKind`
 // +kubebuilder:printcolumn:name="Kind",type=string,JSONPath=`.spec.kind`
 // +kubebuilder:printcolumn:name="Project",type=string,JSONPath=`.spec.projectRef`,priority=1
 // +kubebuilder:printcolumn:name="Turns",type=integer,JSONPath=`.status.stats.turns`
 // +kubebuilder:printcolumn:name="Description",type=string,JSONPath=`.status.shortDescription`
 
-// Task is one unit of agent-driven work, advanced through the F.1 stage machine.
+// Task is one unit of agent-driven work, advanced through the 8-state machine.
 type Task struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

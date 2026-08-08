@@ -20,7 +20,7 @@ import (
 // orphanReason's TaskDone gate never fires for it - and the pod's agent-kind
 // label matches the stage's, so the superseded check never fires either.
 func TestRisk_ReaperDoesNotCollectALiveConversingPod(t *testing.T) {
-	task := conversingTask("c1", "infrastructure", time.Now())
+	task := liveStateTask("c1", "infrastructure", time.Now())
 	task.UID = "uid-1"
 	task.Annotations = map[string]string{
 		annTurnStartedAt: time.Now().Add(-1 * time.Minute).UTC().Format(time.RFC3339),
@@ -33,7 +33,7 @@ func TestRisk_ReaperDoesNotCollectALiveConversingPod(t *testing.T) {
 	pod.Labels = map[string]string{
 		agent.LabelTask:      task.Name,
 		agent.LabelTaskUID:   string(task.UID),
-		agent.LabelAgentKind: stage.AgentKindFor(tatarav1alpha1.StageConversing),
+		agent.LabelAgentKind: stage.AgentKindFor(tatarav1alpha1.StateRefined, "implement"),
 	}
 
 	srv := &CallbackServer{ReaperGrace: time.Minute, IdlePodReapAfter: time.Hour}
@@ -49,7 +49,7 @@ func TestRisk_ReaperDoesNotCollectALiveConversingPod(t *testing.T) {
 // would be silently reused by conversing, running the wrong kind, model and
 // skills. The superseded check is what stops that, and it must keep working.
 func TestRisk_ReaperStillCollectsASupersededPodUnderConversing(t *testing.T) {
-	task := conversingTask("c2", "infrastructure", time.Now())
+	task := liveStateTask("c2", "infrastructure", time.Now())
 	task.UID = "uid-2"
 
 	pod := &corev1.Pod{}
@@ -59,7 +59,7 @@ func TestRisk_ReaperStillCollectsASupersededPodUnderConversing(t *testing.T) {
 	pod.Labels = map[string]string{
 		agent.LabelTask:      task.Name,
 		agent.LabelTaskUID:   string(task.UID),
-		agent.LabelAgentKind: stage.AgentImplement, // stamped for a DIFFERENT stage
+		agent.LabelAgentKind: stage.AgentReview, // stamped for a DIFFERENT stage
 	}
 
 	srv := &CallbackServer{ReaperGrace: time.Minute}
@@ -76,7 +76,7 @@ func TestRisk_ReaperStillCollectsASupersededPodUnderConversing(t *testing.T) {
 // impossible by construction, and BotRounds makes any residual cycle visible.
 func TestRisk_AnAgentCommentNeverWakesItsOwnKind(t *testing.T) {
 	task := &tatarav1alpha1.Task{}
-	task.Status.Stage = tatarav1alpha1.StageReviewing
+	task.Status.State = tatarav1alpha1.StateAwaitingReview
 	reacting := ReactingAgentKind(task)
 	if reacting != stage.AgentReview {
 		t.Fatalf("ReactingAgentKind(reviewing) = %q, want review", reacting)
@@ -154,12 +154,11 @@ func TestRisk_SameKindAgentEventNeverEntersPendingEventsOrResetsTheIdleClock(t *
 // parks. Both halves, or the leak comes back.
 func TestRisk_ConversingHoldsALaneAndReleasesItOnPark(t *testing.T) {
 	task := &tatarav1alpha1.Task{}
-	task.Status.Stage = tatarav1alpha1.StageConversing
+	task.Status.State = tatarav1alpha1.StateRefined
 	if !queueTaskHoldsSlot(task) {
-		t.Fatal("a conversing Task holds no slot: its pod runs off the MaxConcurrentAgents books")
+		t.Fatal("a live Task holds no slot: its pod runs off the MaxConcurrentAgents books")
 	}
-	task.Status.Stage = tatarav1alpha1.StageParked
-	task.Status.StageReason = stage.ReasonAwaitingHuman
+	task.Status.ParkReason = stage.ReasonAwaitingHuman
 	if queueTaskHoldsSlot(task) {
 		t.Fatal("a parked Task still holds a slot: this is operator-laneoccupancy-starves-recovery-2026-06-15")
 	}
@@ -172,18 +171,18 @@ func TestRisk_ConversingHoldsALaneAndReleasesItOnPark(t *testing.T) {
 // StageActive predicate, with no bespoke list anywhere.
 func TestRisk_ConversingIsCountedOnceByTheClosedPredicate(t *testing.T) {
 	task := &tatarav1alpha1.Task{}
-	task.Status.Stage = tatarav1alpha1.StageConversing
+	task.Status.State = tatarav1alpha1.StateRefined
 	if !StageActive(task) {
-		t.Fatal("a conversing Task is not ACTIVE: maxOpenTasks would over-admit against it")
+		t.Fatal("a live Task is not ACTIVE: maxOpenTasks would over-admit against it")
 	}
 	if tatarav1alpha1.TaskDone(task) {
-		t.Fatal("a conversing Task is DONE: it would be counted as finished AND hold a pod")
+		t.Fatal("a live Task is DONE: it would be counted as finished AND hold a pod")
 	}
 	// The whole point of the closed tables: no bespoke exclusion list exists to
-	// drift. If conversing ever needs one, this assertion is where the argument
-	// has to be made.
-	if tatarav1alpha1.StagePodless(tatarav1alpha1.StageConversing) {
-		t.Fatal("conversing is podless: it would be excluded from the pod accounting while running a pod")
+	// drift. If a live state ever needs one, this assertion is where the
+	// argument has to be made. StagePodless(x) is now !stage.Live(x) (#521).
+	if !stage.Live(tatarav1alpha1.StateRefined) {
+		t.Fatal("refined is not live: it would be excluded from the pod accounting while running a pod")
 	}
 }
 

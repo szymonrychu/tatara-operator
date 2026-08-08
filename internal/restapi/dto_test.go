@@ -34,13 +34,13 @@ func TestToTaskDTO_Source(t *testing.T) {
 			ProjectRef: "demo", RepositoryRef: "repo", Goal: "do the thing",
 			Source: &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#1", URL: "https://gh/1"},
 		},
-		Status: tatarav1alpha1.TaskStatus{Stage: tatarav1alpha1.StageImplementing},
+		Status: tatarav1alpha1.TaskStatus{State: tatarav1alpha1.StateUnderImplementation},
 	}
 	d := toTaskDTO(task)
 	require.Equal(t, "do the thing", d.Goal)
 	require.NotNil(t, d.Source)
 	require.Equal(t, "github", d.Source.Provider)
-	require.Equal(t, tatarav1alpha1.StageImplementing, d.Status.Stage)
+	require.Equal(t, tatarav1alpha1.StateUnderImplementation, d.Status.State)
 }
 
 func TestToTaskDTO_IncludesDedupKeyAndAlertRules(t *testing.T) {

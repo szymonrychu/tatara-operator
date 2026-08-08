@@ -2,7 +2,7 @@
   <event kind="issue_comment" repo="tatara-operator" number="291" author="szymonrychu" at="2026-07-12T12:10Z">Actually, also handle the GitLab case.</event>
   <event kind="mr_review" repo="tatara-operator" number="295" author="szymonrychu" at="2026-07-12T12:12Z">Requested changes: see inline.</event>
 </events>
-<task_context task="tatara-clarify-2026-07-12-m4z8q" kind="clarify" stage="clarifying" agent="clarify" project="tatara">
+<task_context task="tatara-clarify-2026-07-12-m4z8q" kind="clarify" stage="refined" agent="clarify" project="tatara">
   <goal></goal>
   <issue repo="tatara-operator" number="291" state="open" status="approved" url="https://github.com/szymonrychu/tatara-operator/issues/291">
     <title>Reaper phase race</title>
