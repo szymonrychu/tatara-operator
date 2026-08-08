@@ -396,7 +396,14 @@ type Note struct {
 	// Agent is the WRITER. The REST layer stamps it from Status.AgentKind; an
 	// agent can NEVER produce "operator" (fix 19). The only writer of
 	// agent="operator" is the operator itself, in-process.
-	// +kubebuilder:validation:Enum=brainstorm;incident;refine;review;documentation;implement;operator
+	// clarify is RETAINED here and nowhere else. #521 deleted it as a live agent
+	// kind, but this field is a historical RECORD of who wrote a note, not a
+	// selector - notes already in etcd say clarify and are immutable. Dropping it
+	// made the apiserver reject every status write to any Task carrying one,
+	// because appending a note revalidates its siblings and ratcheting only
+	// exempts unchanged keypaths. That broke enforce-live-pod-ceiling into a
+	// reconcile error loop. No writer can produce it: AgentKindFor has no clarify.
+	// +kubebuilder:validation:Enum=brainstorm;incident;refine;review;documentation;implement;operator;clarify
 	Agent string `json:"agent"`
 	// +kubebuilder:validation:Enum=note;plan;handoff
 	Kind string `json:"kind"`
