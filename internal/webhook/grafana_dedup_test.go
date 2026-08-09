@@ -112,3 +112,90 @@ func TestIncidentDedupKey_AlertnameFallbackToGroupKey(t *testing.T) {
 		t.Fatal("with alertname absent, differing groupKey must change the key")
 	}
 }
+
+// tatara-operator#523: the SAME alertname recurring for a genuinely different
+// root cause (a different "category") must NOT collapse onto one tracker -
+// #523's own refire history shows category=memory_inconsistent,
+// workspace_broken, and directive_contradiction all landing on the same
+// issue. incidentDedupKey now includes category (read per-item, see
+// alertCategory), so two otherwise-identical firings differing only in
+// category must produce DIFFERENT keys.
+func TestIncidentDedupKey_523_CategoryDiffers(t *testing.T) {
+	base := func(category string) GrafanaAlert {
+		return GrafanaAlert{
+			CommonLabels: map[string]string{
+				"alertname": "Tatara agent reported platform problem",
+				"component": "operator",
+				"severity":  "warning",
+			},
+			Alerts: []GrafanaAlertItem{
+				{Labels: map[string]string{"category": category, "component": "operator"}},
+			},
+		}
+	}
+	memoryInconsistent := incidentDedupKey(base("memory_inconsistent"), "tatara")
+	workspaceBroken := incidentDedupKey(base("workspace_broken"), "tatara")
+	directiveContradiction := incidentDedupKey(base("directive_contradiction"), "tatara")
+
+	if memoryInconsistent == workspaceBroken {
+		t.Fatalf("category memory_inconsistent vs workspace_broken must differ: both %s", memoryInconsistent)
+	}
+	if memoryInconsistent == directiveContradiction {
+		t.Fatalf("category memory_inconsistent vs directive_contradiction must differ: both %s", memoryInconsistent)
+	}
+	if workspaceBroken == directiveContradiction {
+		t.Fatalf("category workspace_broken vs directive_contradiction must differ: both %s", workspaceBroken)
+	}
+}
+
+// #398's actual failure mode, replicated for category specifically: within one
+// Grafana evaluation, category=tool_error co-fired alongside category=other
+// under the SAME alertname (see #398's "live re-confirmation" comment), which
+// makes category DROP OUT of Grafana's CommonLabels for that evaluation even
+// though the rule identity hasn't changed. A dedup key that trusted
+// CommonLabels["category"] would flip presence/absence run to run. Because
+// incidentDedupKey never reads category from CommonLabels (alertCategory
+// reads per-item Labels instead), a batch where CommonLabels happens to carry
+// a churning "category" entry - or not - must NOT change the key.
+func TestIncidentDedupKey_398_CategoryChurnInCommonLabelsIgnored(t *testing.T) {
+	withCategoryInCommonLabels := GrafanaAlert{
+		CommonLabels: map[string]string{
+			"alertname": "Tatara agent reported platform problem",
+			"category":  "tool_error", // present this evaluation: only tool_error fired
+		},
+	}
+	withoutCategoryInCommonLabels := GrafanaAlert{
+		CommonLabels: map[string]string{
+			"alertname": "Tatara agent reported platform problem",
+			// category absent this evaluation: tool_error co-fired with a
+			// different category, so it fell out of the CommonLabels
+			// intersection (#398's member-set churn).
+		},
+	}
+	ka := incidentDedupKey(withCategoryInCommonLabels, "tatara")
+	kb := incidentDedupKey(withoutCategoryInCommonLabels, "tatara")
+	if ka != kb {
+		t.Fatalf("CommonLabels category churn must not change the key: ka=%s kb=%s", ka, kb)
+	}
+}
+
+// A genuinely mixed batch (distinct categories co-firing at once, per-item)
+// must not silently and arbitrarily pick one - alertCategory falls back to ""
+// (no category component in the key), matching pre-#523-fix behaviour rather
+// than depending on item order.
+func TestAlertCategory_MixedBatchIsUnresolved(t *testing.T) {
+	mixed := GrafanaAlert{Alerts: []GrafanaAlertItem{
+		{Labels: map[string]string{"category": "tool_error"}},
+		{Labels: map[string]string{"category": "other"}},
+	}}
+	if got := alertCategory(mixed); got != "" {
+		t.Fatalf("mixed-category batch must resolve to \"\", got %q", got)
+	}
+	agreeing := GrafanaAlert{Alerts: []GrafanaAlertItem{
+		{Labels: map[string]string{"category": "tool_error"}},
+		{Labels: map[string]string{"category": "tool_error"}},
+	}}
+	if got := alertCategory(agreeing); got != "tool_error" {
+		t.Fatalf("unanimous category must resolve, got %q", got)
+	}
+}

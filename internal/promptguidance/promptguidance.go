@@ -24,12 +24,13 @@ const PlatformProblemGuidance = "\n\n## Platform problems\n" +
 // the platform must no longer take on a memory outage.
 const MemoryDegradedGuidance = "\n\n## Memory recall is unavailable this turn\n" +
 	"The recall subsystem is down for this project right now. Every memory and code-graph tool " +
-	"will fail. This is EXPECTED, it is already alerted on, and it OVERRIDES the 'report it and " +
+	"will fail. This is EXPECTED and it is already alerted on, and it OVERRIDES the 'report it and " +
 	"stop' rule above for those tools specifically: a failing memory tool is NOT a reason to stop.\n" +
 	"  - Work from the repository itself: Serena/LSP, git history, and plain file reads give you " +
 	"everything memory would have summarised, just more slowly.\n" +
-	"  - Call `report_internal_issue` ONCE for the failure, then move on. Do not retry the memory " +
-	"tools in a loop and do not report each failure separately.\n" +
+	"  - Do NOT call `report_internal_issue` for this - the degraded condition is already tracked " +
+	"and alerted on upstream, so a fresh report every turn would only manufacture duplicate " +
+	"platform-problem alerts (tatara-operator#523). Do not retry the memory tools in a loop either.\n" +
 	"  - Say in your outcome body (or in your decline reason) that memory recall was unavailable, " +
 	"so a reviewer knows what you could not check.\n" +
 	"  - COMPLETE the assignment with reduced recall. Declining for this reason alone is wrong."
