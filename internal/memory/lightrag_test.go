@@ -51,6 +51,70 @@ func TestLightragDeployment(t *testing.T) {
 	require.Equal(t, "password", env["NEO4J_PASSWORD"].ValueFrom.SecretKeyRef.Key)
 }
 
+// TestLightragDeployment_ReadinessProbesTheDataPlane pins the root cause of
+// issue #502. The readinessProbe was a bare tcpSocket on 9621 and there was no
+// livenessProbe at all. A TCP connect always succeeds against a wedged HTTP
+// server, so mem-tatara-lightrag sat Ready=true with 0 restarts for hours,
+// stayed in the Service endpoints, and black-holed 100% of data-plane traffic
+// while every /queries and /memories:bulk call burned its full client budget and
+// returned 503.
+//
+// The obvious repair does NOT work and the issue says so explicitly: GET /health
+// answered in 2-23ms throughout the incident (tatara-memory's own /readyz calls
+// it), because upstream's /health handler only reads in-process shared state and
+// never touches Postgres or Neo4j. The probe has to exercise the DATA PLANE.
+//
+// GET /documents/status_counts is that check: verified present at the pinned tag
+// v1.4.16 with the router mounted at prefix /documents, no path or query
+// parameters, and unauthenticated (auth is off with LIGHTRAG_API_KEY and
+// AUTH_ACCOUNTS both unset). Its handler awaits doc_status.get_all_status_counts()
+// against the Postgres pool on every call with no caching, so a wedged pool
+// either hangs past timeoutSeconds or 500s - both fail the probe.
+func TestLightragDeployment_ReadinessProbesTheDataPlane(t *testing.T) {
+	c := memory.LightragDeployment(testProject("acme"), testCfg()).Spec.Template.Spec.Containers[0]
+
+	require.NotNil(t, c.ReadinessProbe, "lightrag needs a readinessProbe")
+	require.Nil(t, c.ReadinessProbe.TCPSocket,
+		"a tcpSocket readiness check cannot distinguish a wedged HTTP server from a "+
+			"healthy one - it is what kept the dead pod in Service endpoints (#502)")
+	require.NotNil(t, c.ReadinessProbe.HTTPGet, "readiness must be an HTTP check")
+	require.Equal(t, "/documents/status_counts", c.ReadinessProbe.HTTPGet.Path,
+		"readiness must exercise the data plane; /health is served from in-process "+
+			"state and stayed green for the whole incident (#502)")
+	require.Equal(t, "http", c.ReadinessProbe.HTTPGet.Port.StrVal)
+	require.Greater(t, c.ReadinessProbe.TimeoutSeconds, int32(1),
+		"the default 1s timeout is too tight for a storage-backed probe")
+}
+
+// TestLightragDeployment_LivenessProbeOnControlPlane covers the second half of
+// #502's root cause: there was no livenessProbe anywhere in the container spec,
+// so a lightrag process that died or hung outright was never restarted.
+//
+// Liveness deliberately targets /health, NOT the data-plane path. A liveness
+// probe on a Postgres-backed endpoint would restart-loop lightrag through any
+// Postgres outage longer than the failure budget - the incident's own trigger
+// was a ~2h CNPG outage, and no threshold separates that from a permanent wedge.
+// Draining endpoints (readiness) is the correct response to a dead dependency;
+// restarting is the correct response to a dead process. Keep them apart.
+func TestLightragDeployment_LivenessProbeOnControlPlane(t *testing.T) {
+	c := memory.LightragDeployment(testProject("acme"), testCfg()).Spec.Template.Spec.Containers[0]
+
+	require.NotNil(t, c.LivenessProbe,
+		"lightrag had no livenessProbe at all, so nothing ever restarted it (#502)")
+	require.NotNil(t, c.LivenessProbe.HTTPGet)
+	require.Equal(t, "/health", c.LivenessProbe.HTTPGet.Path,
+		"liveness must NOT depend on Postgres, or a dependency outage becomes a "+
+			"restart loop (#502)")
+
+	require.NotNil(t, c.StartupProbe,
+		"a startupProbe must gate liveness while lightrag boots, or a slow cold "+
+			"start is killed mid-startup")
+	require.NotNil(t, c.StartupProbe.HTTPGet)
+	require.Equal(t, "/health", c.StartupProbe.HTTPGet.Path)
+	require.Greater(t, c.StartupProbe.PeriodSeconds*c.StartupProbe.FailureThreshold, int32(120),
+		"startup budget must comfortably exceed lightrag's cold start")
+}
+
 func TestLightragDeployment_ImagePullSecrets(t *testing.T) {
 	p := testProject("acme")
 
