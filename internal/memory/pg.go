@@ -124,6 +124,50 @@ func clampStorageSize(desired *string, existing string) (bool, error) {
 // LocalObjectReference is a type alias for github.com/cloudnative-pg/machinery/pkg/api.LocalObjectReference
 // (not corev1.LocalObjectReference), so we build the slice here rather than
 // reusing the corev1-typed imagePullSecrets helper.
+const (
+	// pgStartDelaySeconds overrides CNPG's 3600s spec.startDelay default (issue
+	// #526). CNPG derives the postgres container's startup-probe failureThreshold
+	// as ceiling(startDelay/10) at a 10s period, so startDelay is really "how long
+	// an instance may take to finish starting before the kubelet KILLS it".
+	//
+	// The kill is destructive, not corrective: a container killed mid-crash-recovery
+	// restarts recovery from the beginning, so at 3600s an instance whose startup
+	// legitimately needs longer can never converge - it just re-enters startup
+	// forever. mem-mtg-pg-1 ran exactly that loop for ~24h (first probe failure to
+	// first kill was 3600s to the second; 8215 probe failures, 22 kills, 33
+	// restarts, zero progress), and each kill also destroyed the `kubectl logs
+	// --previous` output that was the only evidence of WHY recovery stalled.
+	//
+	// 6h is deliberately far above any plausible recovery for these volumes (20Gi
+	// PGDATA / 10Gi WAL). It does not heal a genuinely broken instance - nothing in
+	// the Cluster spec can - but it stops the operator's own render from
+	// GUARANTEEING a non-converging loop, and it leaves the failed container intact
+	// for diagnosis instead of shredding it hourly. Nothing else depends on this
+	// budget: failover to a healthy replica is driven by CNPG's own health checks,
+	// not by startDelay.
+	pgStartDelaySeconds = 6 * 60 * 60
+
+	// pgIdleInTransactionSessionTimeout bounds how long any client may hold a
+	// transaction open while doing nothing, in milliseconds (issue #526).
+	//
+	// The Cluster previously carried max_slot_wal_keep_size and nothing else. An
+	// abandoned `tatara_memory` transaction therefore survived 20h18m on
+	// mem-mtg-pg-1, blocking every /code-graph:bulk write behind its row locks and
+	// preceding that instance's 24h startup loop. tatara-memory has since bounded
+	// its OWN sessions (statement_timeout, idle_in_transaction_session_timeout and
+	// PG_LOCK_TIMEOUT as pgx runtime params), but LightRAG's asyncpg pool sets none
+	// of them, so the guard has to live on the cluster to cover every client.
+	//
+	// This kills only sessions idle INSIDE a transaction, which is always a bug -
+	// a long-running statement is untouched, so bulk ingest and analytics recompute
+	// are unaffected. 15 minutes is far above any legitimate think-time and far
+	// below the 20 hours actually observed. statement_timeout and lock_timeout are
+	// deliberately NOT set here: they bound real work, their safe values are
+	// workload-specific, and tatara-memory already sets both for the connections
+	// that do that work.
+	pgIdleInTransactionSessionTimeout = "900000"
+)
+
 func pgImagePullSecrets(cfg Config) []cnpgv1.LocalObjectReference {
 	if cfg.ImagePullSecret == "" {
 		return nil
@@ -153,6 +197,10 @@ func PGCluster(p *tatarav1alpha1.Project, cfg Config) *cnpgv1.Cluster {
 		Spec: cnpgv1.ClusterSpec{
 			Instances:        PgInstances(p),
 			ImagePullSecrets: pgImagePullSecrets(cfg),
+			// Raise the startup budget off CNPG's 3600s default so a slow crash
+			// recovery is allowed to finish instead of being killed and restarted
+			// from scratch every hour forever (issue #526). See pgStartDelaySeconds.
+			MaxStartDelay: pgStartDelaySeconds,
 			// Spread the pg stack the same way as the native workloads (issue #365).
 			// cnpg owns the WITHIN-cluster anti-affinity (this project's own pg
 			// instances) via PodAntiAffinityType "preferred" on the shared
@@ -188,9 +236,16 @@ func PGCluster(p *tatarav1alpha1.Project, cfg Config) *cnpgv1.Cluster {
 			// caps that retention: past the cap postgres invalidates the slot
 			// (that standby re-syncs) instead of filling the disk. Derived as
 			// half the WAL volume in pgMaxSlotWalKeepSize.
+			//
+			// idle_in_transaction_session_timeout is the session guardrail the
+			// cluster was missing entirely: it reaps a client that opened a
+			// transaction and walked away, which is how an abandoned tatara_memory
+			// transaction reached 20h18m holding write locks (issue #526). See
+			// pgIdleInTransactionSessionTimeout.
 			PostgresConfiguration: cnpgv1.PostgresConfiguration{
 				Parameters: map[string]string{
-					"max_slot_wal_keep_size": pgMaxSlotWalKeepSize(p),
+					"max_slot_wal_keep_size":              pgMaxSlotWalKeepSize(p),
+					"idle_in_transaction_session_timeout": pgIdleInTransactionSessionTimeout,
 				},
 			},
 			// Continuous WAL archiving + retention to an object store (issue #432).

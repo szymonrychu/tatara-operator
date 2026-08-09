@@ -117,8 +117,77 @@ func lightragInitContainers(n Names, cfg Config) []corev1.Container {
 	}}
 }
 
+const (
+	// lightragHealthPath is LightRAG's LIVENESS surface. Upstream's GET /health
+	// handler only reads in-process shared state (the pipeline-status namespace
+	// dict) plus static config; it never touches Postgres or Neo4j. It is also on
+	// LightRAG's default WHITELIST_PATHS, so it answers unauthenticated whatever
+	// the auth config becomes.
+	//
+	// That makes it the RIGHT liveness check and a USELESS readiness check. During
+	// issue #502 it answered in 2-23ms for hours while every data-plane call hung -
+	// tatara-memory's own /readyz calls it and stayed green throughout, which is
+	// why the issue warns that "just make the probe httpGet /health" would not
+	// have caught the incident.
+	lightragHealthPath = "/health"
+
+	// lightragDataPlanePath is LightRAG's READINESS surface: the cheapest
+	// unauthenticated GET that actually round-trips the storage backend. Upstream's
+	// handler awaits doc_status.get_all_status_counts() on every call with no
+	// caching, which with LIGHTRAG_DOC_STATUS_STORAGE=PGDocStatusStorage is a
+	// single indexed `SELECT status, COUNT(*) ... GROUP BY status` against the
+	// asyncpg pool. Constant cost regardless of corpus size, and it returns
+	// {"status_counts":{"all":0}} on an empty corpus rather than erroring.
+	//
+	// A wedged data plane - the #502 failure, where the async worker pool is
+	// permanently occupied and nothing progresses - makes this either hang past
+	// timeoutSeconds or return 500. Either fails the probe, the pod leaves the
+	// Service endpoints instead of black-holing traffic, AvailableReplicas drops,
+	// and memoryPhase() demotes the stack so ingest is gated and the stack-not-ready
+	// alert can finally see it. None of that was possible with a tcpSocket check.
+	//
+	// Verified against the pinned image (ghcr.io/hkuds/lightrag:v1.4.16): the route
+	// exists on a router mounted at prefix /documents, takes no path or query
+	// parameters, and passes auth unauthenticated because LIGHTRAG_API_KEY and
+	// AUTH_ACCOUNTS are both unset in lightragEnv. If either is ever set, this path
+	// is NOT on the default whitelist and the probe needs an X-API-Key header
+	// (widening WHITELIST_PATHS instead would also re-open POST /api/chat).
+	lightragDataPlanePath = "/documents/status_counts"
+)
+
+// httpGet builds an HTTPGetAction against the lightrag container's named http
+// port, so the three probes cannot drift on port wiring.
+func httpGet(path string) *corev1.HTTPGetAction {
+	return &corev1.HTTPGetAction{Path: path, Port: intstr.FromString("http")}
+}
+
 // LightragDeployment builds the per-Project lightrag Deployment (port 9621,
 // Recreate strategy because the data PVC is RWO with one replica).
+//
+// Probe design (issue #502) - the split between the three is the whole point:
+//
+//   - startupProbe /health, 5s x 60 = 5m. Gates liveness while lightrag boots
+//     (storage init, schema setup, embedding config) so a slow cold start is not
+//     killed mid-startup.
+//   - livenessProbe /health. Restarts a process that is dead or hung outright.
+//     There was NO livenessProbe at all before, so nothing ever restarted
+//     lightrag under any circumstances.
+//   - readinessProbe /documents/status_counts. Drains the pod from the Service
+//     when the DATA PLANE stops working, which a tcpSocket connect and /health
+//     both report as healthy.
+//
+// Liveness deliberately does NOT use the data-plane path. The #502 wedge was
+// TRIGGERED by a ~2h CNPG outage, and no failure budget separates "upstream
+// Postgres is down" from "this process is permanently wedged". A data-plane
+// liveness probe would therefore restart-loop lightrag through every Postgres
+// outage - the exact anti-pattern tatara-memory removed from its own startup
+// path. Draining endpoints is the right answer to a dead dependency; restarting
+// is the right answer to a dead process.
+//
+// Not fixed here, deliberately: the container still declares no resources, so it
+// runs BestEffort. Requests/limits are a capacity decision that needs live
+// measurement, and a wrong guess (unschedulable, or OOMKilled at 877MB working
+// set) is worse on a re-enable than BestEffort is.
 func LightragDeployment(p *tatarav1alpha1.Project, cfg Config) *appsv1.Deployment {
 	n := NamesFor(p.Name)
 	replicas := int32(1)
@@ -147,9 +216,25 @@ func LightragDeployment(p *tatarav1alpha1.Project, cfg Config) *appsv1.Deploymen
 							{Name: "http", ContainerPort: 9621, Protocol: corev1.ProtocolTCP},
 						},
 						Env: lightragEnv(p, cfg),
+						// See lightragDataPlanePath / lightragHealthPath for why these
+						// three probes target the paths they do (issue #502).
+						StartupProbe: &corev1.Probe{
+							ProbeHandler:     corev1.ProbeHandler{HTTPGet: httpGet(lightragHealthPath)},
+							PeriodSeconds:    5,
+							TimeoutSeconds:   5,
+							FailureThreshold: 60,
+						},
+						LivenessProbe: &corev1.Probe{
+							ProbeHandler:     corev1.ProbeHandler{HTTPGet: httpGet(lightragHealthPath)},
+							PeriodSeconds:    10,
+							TimeoutSeconds:   5,
+							FailureThreshold: 6,
+						},
 						ReadinessProbe: &corev1.Probe{
-							ProbeHandler:  corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromString("http")}},
-							PeriodSeconds: 10,
+							ProbeHandler:     corev1.ProbeHandler{HTTPGet: httpGet(lightragDataPlanePath)},
+							PeriodSeconds:    15,
+							TimeoutSeconds:   5,
+							FailureThreshold: 3,
 						},
 						VolumeMounts: []corev1.VolumeMount{{Name: "data", MountPath: "/app/data"}},
 					}},

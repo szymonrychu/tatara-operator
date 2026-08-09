@@ -84,6 +84,44 @@ func TestMemoryDeployment_StartupProbe(t *testing.T) {
 	require.Equal(t, "/healthz", c.LivenessProbe.HTTPGet.Path)
 }
 
+// TestMemoryDeployment_ProbeTimeoutsAreExplicit pins issue #528's second defect.
+// None of the three probes set timeoutSeconds, so all three inherited the
+// Kubernetes default of 1 second - including the readinessProbe, whose /readyz
+// handler pings Postgres AND does a full HTTP round-trip to LightRAG, returning
+// the first error with no retry, grace or warm-up.
+//
+// During the 2026-08-01 node reboot that cost ~95 seconds of entirely
+// self-inflicted NotReady: mem-infrastructure logged nine consecutive
+// `readyz failed / lightrag: context canceled` lines, one per 10s period, each
+// with duration_s pinned at 1.000008544 / 0.999578 / 0.999913 - a 1.000s wall,
+// and `context canceled` (the kubelet hung up) rather than `context deadline
+// exceeded` (a server-side deadline). LightRAG was merely cold-starting from its
+// own restart and answered fine moments later.
+//
+// The same 1s budget also flaps the pod NotReady on any dependency blip over a
+// second, which for a probe that makes two network calls is routine.
+func TestMemoryDeployment_ProbeTimeoutsAreExplicit(t *testing.T) {
+	c := memory.MemoryDeployment(testProject("acme"), testCfg()).Spec.Template.Spec.Containers[0]
+
+	for _, tc := range []struct {
+		name  string
+		probe *corev1.Probe
+	}{
+		{"readinessProbe", c.ReadinessProbe},
+		{"livenessProbe", c.LivenessProbe},
+		{"startupProbe", c.StartupProbe},
+	} {
+		require.NotNilf(t, tc.probe, "%s missing", tc.name)
+		require.Greaterf(t, tc.probe.TimeoutSeconds, int32(1),
+			"%s leaves timeoutSeconds unset, so the kubelet cancels it at 1s (#528)", tc.name)
+	}
+
+	// Readiness is the one that actually costs an outage: it fans out to Postgres
+	// and LightRAG, so its budget must clear two network round-trips with margin.
+	require.GreaterOrEqual(t, c.ReadinessProbe.TimeoutSeconds, int32(5),
+		"/readyz pings Postgres AND LightRAG; 1-2s cannot cover both (#528)")
+}
+
 func TestMemoryConfigMap(t *testing.T) {
 	p := testProject("acme")
 	cm := memory.MemoryConfigMap(p, testCfg())

@@ -241,6 +241,66 @@ func TestBuildJob_IncrementalIngest(t *testing.T) {
 	}
 }
 
+// ingestCommand returns the ingest container's full shell command line.
+func ingestCommand(job *batchv1.Job) string {
+	main := job.Spec.Template.Spec.Containers[0]
+	return strings.Join(main.Command, " ") + " " + strings.Join(main.Args, " ")
+}
+
+// TestBuildJob_FullIngestPassesFullFlag pins issue #505: the incremental->full
+// self-heal escalates by CLEARING since, but the assembled command never carried
+// --full, and tatara-ingest's --full flag defaults to false. So an escalated Job
+// was labelled mode=full, counted as mode=full, and ran INCREMENTAL with no
+// watermark - the corpus-rebuild escape hatch was inert fleet-wide. The failing
+// Job's own first log line showed both halves at once: {"since":"","full":false}.
+func TestBuildJob_FullIngestPassesFullFlag(t *testing.T) {
+	cmd := ingestCommand(BuildJob(testProject(), testRepository(), "", testBaseURL, testConfig()))
+	if !strings.Contains(cmd, " --full") {
+		t.Errorf("full ingest (since=\"\") must pass --full to tatara-ingest: %q", cmd)
+	}
+}
+
+// TestBuildJob_IncrementalIngestOmitsFullFlag is the other direction: an
+// incremental attempt must never claim to be full, or every ingest would rebuild
+// the whole corpus.
+func TestBuildJob_IncrementalIngestOmitsFullFlag(t *testing.T) {
+	cmd := ingestCommand(BuildJob(testProject(), testRepository(), "abc1234", testBaseURL, testConfig()))
+	if strings.Contains(cmd, "--full") {
+		t.Errorf("incremental ingest must not pass --full: %q", cmd)
+	}
+}
+
+// TestBuildJob_IngestModeLabelMatchesCommand is the invariant #505 actually
+// broke: the Job label (which the controller reads back to attribute
+// operator_ingest_job_total by mode, and which the "Tatara ingest job failing"
+// alert filters on) must describe the mode the ingester was actually told to
+// run. Asserting label-vs-command agreement catches the two flags drifting apart
+// again regardless of which side changes.
+func TestBuildJob_IngestModeLabelMatchesCommand(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		since    string
+		wantMode string
+	}{
+		{"escalated full re-ingest", "", IngestModeFull},
+		{"incremental", "abc1234", IngestModeIncremental},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			job := BuildJob(testProject(), testRepository(), tc.since, testBaseURL, testConfig())
+			cmd := ingestCommand(job)
+			gotFull := strings.Contains(cmd, "--full")
+			for _, labels := range []map[string]string{job.Labels, job.Spec.Template.Labels} {
+				if got := labels[LabelIngestMode]; got != tc.wantMode {
+					t.Errorf("%s = %q, want %q", LabelIngestMode, got, tc.wantMode)
+				}
+			}
+			if wantFull := tc.wantMode == IngestModeFull; gotFull != wantFull {
+				t.Errorf("label says mode=%q but command --full=%v: %q", tc.wantMode, gotFull, cmd)
+			}
+		})
+	}
+}
+
 func TestBuildJob_SCMTokenFromSecret(t *testing.T) {
 	job := BuildJob(testProject(), testRepository(), "", testBaseURL, testConfig())
 	clone := job.Spec.Template.Spec.InitContainers[0]
