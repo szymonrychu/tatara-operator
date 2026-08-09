@@ -256,8 +256,22 @@ jobs:
   #
   # Cost controls that ARE applied: needs [build], so a PR that does not even
   # compile in Go never reaches buildkitd; no checkout at all, so no clone (the
-  # build context is remote); and --output type=cacheonly, which exports no
-  # image and warms the same cache the post-merge push build then reads.
+  # build context is remote); and NO EXPORTER, so not one byte of the result is
+  # serialised or transferred, while the executed steps still land in
+  # buildkitd's cache for the post-merge push build to reuse.
+  #
+  # DO NOT "fix" the missing --output by adding type=cacheonly. buildkitd here
+  # is moby/buildkit v0.18.2 (rootless) and its exporter registry has no such
+  # name - it answers `exporter "cacheonly" could not be found` and the job
+  # reds on every PR in every consuming repo. Probed against the live daemon on
+  # 2026-08-09: cacheonly ABSENT; tar, image, local and oci all present. tar
+  # and oci stream the whole image to the CLIENT (dest= is client-side), which
+  # is real in-cluster traffic per PR for no benefit here. Omitting --output
+  # entirely still evaluates the full graph and still exits non-zero on a
+  # failing step - verified end to end against this repo's own Dockerfile:
+  # a builder pinned below go.mod exits 1 with
+  # `go: go.mod requires go >= 1.26.3 (running go 1.25.12; GOTOOLCHAIN=local)`,
+  # which is the exact break #556 is about.
   image-verify:
     needs: [build]
     # smoke and chart-validate are deliberately NOT depended on: neither can
@@ -300,9 +314,10 @@ jobs:
           # it is stable across pushes to the same PR, so the ldflags layer
           # stays a cache hit when only unrelated files move.
           #
-          # cacheonly exports no image. Nothing is pushed, no Harbor
-          # credentials are on this path at all, and the layers land in
-          # buildkitd's cache for the post-merge push build to reuse.
+          # NO --output ON PURPOSE - see the block above the job. buildkit
+          # solves the whole graph and exports nothing, so every stage runs and
+          # a failing step still exits non-zero, with zero bytes serialised and
+          # no exporter that could later be edited into a push.
           buildctl --addr "$BUILDKITD_ADDR" build \
             --frontend dockerfile.v0 \
             --opt context="https://github.com/szymonrychu/${REPO}.git#refs/pull/${PR_NUMBER}/merge" \
@@ -311,8 +326,7 @@ jobs:
             --opt build-arg:COMMIT="${GITHUB_SHA:0:7}" \
             --opt build-arg:DATE="1970-01-01T00:00:00Z" \
             "${extra[@]}" \
-            --secret id=GIT_AUTH_TOKEN,env=GITHUB_TOKEN \
-            --output type=cacheonly
+            --secret id=GIT_AUTH_TOKEN,env=GITHUB_TOKEN
 
           echo "buildkit: Dockerfile compiled for PR #${PR_NUMBER}; nothing published"
 
