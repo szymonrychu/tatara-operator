@@ -57,6 +57,27 @@ const (
 	TTLHandoffNone = "none"
 )
 
+// TTLCause* answers the THIRD question: WHY DID THE STOP RUN AT ALL?
+//
+// All four ran through this one sequence and reported one undifferentiated
+// counter, which made a routine hourly TTL rotation and a hung agent being killed
+// indistinguishable on the metric. They are not the same event and they do not
+// have the same fix.
+const (
+	// TTLCauseTTL: the pod reached t0. The routine, healthy rotation, and the only
+	// cause this sequence was originally written for.
+	TTLCauseTTL = "ttl"
+	// TTLCauseStall: a turn went silent past turnTimeoutSeconds and the operator
+	// stopped it. NOT routine.
+	TTLCauseStall = "stall"
+	// TTLCauseEviction: the live-pod ceiling reclaimed this pod's slot for another
+	// Task. The pod was healthy; the fleet was full.
+	TTLCauseEviction = "eviction"
+	// TTLCauseIdle: a live conversation exhausted its idle budget with no human
+	// reply. Also healthy; the human simply went away.
+	TTLCauseIdle = "idle"
+)
+
 // TTLStopResult is one stop, reported on both dimensions.
 type TTLStopResult struct {
 	// Outcome is graceful | force_deleted: how the POD was stopped.
@@ -291,6 +312,22 @@ type TTLStopInput struct {
 	MaxWait       time.Duration
 	LastFinalText string
 	PushedRepos   []string
+	// Cause is the ttl|stall|eviction|idle label on
+	// operator_agent_pod_ttl_expired_total: WHY this stop ran. Empty defaults to
+	// TTLCauseTTL, which is both the historic meaning of the counter and the only
+	// value a caller can omit without lying.
+	Cause string
+}
+
+// cause is the metric label, defaulted. An empty string is never emitted: a blank
+// label value is a hole in the series that no query can select for, and the
+// default is the one value that was already true of every increment before the
+// label existed.
+func (in TTLStopInput) cause() string {
+	if in.Cause == "" {
+		return TTLCauseTTL
+	}
+	return in.Cause
 }
 
 // waitBound is the per-step wait: MaxWait when the caller set one, else the
@@ -318,7 +355,7 @@ type TTLStopper struct {
 	Namespace string
 	// Record is the operator_agent_pod_ttl_expired_total hook
 	// (obs.AgentPodTTLExpired). Optional.
-	Record func(agentKind, outcome, handoff string)
+	Record func(agentKind, outcome, handoff, cause string)
 	// RecordEmptySynthetic is the operator_agent_synthetic_handoff_empty_total
 	// hook (obs.AgentSyntheticHandoffEmpty): a synthetic note was written with NO
 	// continuation state to put in it, which is the #527 failure. Optional.
@@ -476,7 +513,7 @@ func (s *TTLStopper) wrapperGone(ctx context.Context, task *tatarav1alpha1.Task)
 // record emits the metric (when wired) and returns the result the caller logs.
 func (s *TTLStopper) record(in TTLStopInput, outcome, handoff string) TTLStopResult {
 	if s.Record != nil {
-		s.Record(in.AgentKind, outcome, handoff)
+		s.Record(in.AgentKind, outcome, handoff, in.cause())
 	}
 	return TTLStopResult{Outcome: outcome, Handoff: handoff}
 }

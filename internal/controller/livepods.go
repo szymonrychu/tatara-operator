@@ -82,6 +82,7 @@ func (r *TaskReconciler) liveHandoffAndPark(ctx context.Context, proj *tatarav1a
 			// sequence rather than any pod TTL.
 			Deadline:    now,
 			TurnTimeout: time.Duration(proj.Spec.Agent.TurnTimeoutSeconds) * time.Second,
+			Cause:       ttlCauseForLiveExit(cause),
 			// #527: the persisted last-turn continuation state, so the synthetic
 			// note carries what the agent actually did instead of "(none)".
 			LastFinalText: task.Status.LastTurnFinalText,
@@ -151,6 +152,18 @@ const (
 	causeEvicted = "evicted"
 )
 
+// ttlCauseForLiveExit maps this file's live-exit cause onto the stop sequence's
+// metric label. The two vocabularies are deliberately separate rather than merged
+// into one constant: causeIdle/causeEvicted also label operator_live_closed_total,
+// which is an already-emitted series, and re-spelling "evicted" as "eviction"
+// there to save a two-line mapper would break every existing selector on it.
+func ttlCauseForLiveExit(cause string) string {
+	if cause == causeEvicted {
+		return agent.TTLCauseEviction
+	}
+	return agent.TTLCauseIdle
+}
+
 // agentAskedSomething re-reads the Task from the API server and reports whether
 // an AGENT-authored handoff note exists. It re-reads deliberately: the stop
 // sequence that just ran may have appended one microseconds ago, and the caller's
@@ -179,6 +192,9 @@ func (r *TaskReconciler) reArmWithoutHandoff(ctx context.Context, proj *tatarav1
 	}); err != nil {
 		return fmt.Errorf("livepods: re-arm %s after a handoff-less pod: %w", task.Name, err)
 	}
+	// AFTER the patch, not inside the mutator: patchTaskStatus retries the closure
+	// on conflict, so counting in there would report N recreations for one.
+	obs.PodRecreation(task.Spec.ProjectRef, task.Spec.Kind)
 	// stage.ReArmAfterPodLoss nils the pod clocks and nothing else - annotations
 	// are not among its three documented stamps, and they could not be: it is a
 	// pure status mutation in a package that cannot write metadata. This is the

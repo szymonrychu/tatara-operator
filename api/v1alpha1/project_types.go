@@ -302,6 +302,35 @@ type AgentSpec struct {
 	// +kubebuilder:default=1800
 	// +optional
 	TurnTimeoutSeconds int `json:"turnTimeoutSeconds,omitempty"`
+	// StallProbeGraceSeconds is how long the operator waits for a stall probe to
+	// be ANSWERED before counting that attempt as unanswered.
+	//
+	// It is not a second turn timeout. The probe is delivered at the agent's next
+	// TOOL-CALL BOUNDARY, so a healthy agent inside one long tool call answers
+	// late rather than never: a measured 70s sleep buffered the probe 58.2s. The
+	// floor of 60s exists so a grace shorter than a single ordinary tool call
+	// cannot be configured, which would turn every long tool call into a stall.
+	//
+	// Read by nothing in this release. The schema lands FIRST and deliberately
+	// ahead of any consumer: structural-CRD pruning drops unknown fields SILENTLY,
+	// so a values file that set this before the schema existed would be discarded
+	// with no error anywhere.
+	// +kubebuilder:validation:Minimum=60
+	// +kubebuilder:default=300
+	// +optional
+	StallProbeGraceSeconds int `json:"stallProbeGraceSeconds,omitempty"`
+	// StallProbeMaxAttempts is how many unanswered probes the operator sends
+	// before escalating. Bounded at 5 because each attempt costs a full
+	// StallProbeGraceSeconds, so the escalation delay is the product of the two
+	// and an unbounded attempt count would push a genuinely hung turn past its
+	// pod TTL, where the stall handling stops mattering.
+	//
+	// Read by nothing in this release; see StallProbeGraceSeconds.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=5
+	// +kubebuilder:default=2
+	// +optional
+	StallProbeMaxAttempts int `json:"stallProbeMaxAttempts,omitempty"`
 	// MaxTurnsPerPod bounds turns within ONE pod's life. The implement agent
 	// kind is EXEMPT (a long, healthy coding run must not be cut off mid-pod;
 	// the boot-crash and TTL watchdogs remain its runaway bounds).

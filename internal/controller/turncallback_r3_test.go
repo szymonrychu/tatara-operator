@@ -341,3 +341,15 @@ func (d *deadlineCapturingSession) Interject(_ context.Context, _, _ string) err
 func (d *deadlineCapturingSession) DeleteSession(_ context.Context, _ string) error {
 	return nil
 }
+
+func (d *deadlineCapturingSession) Probe(_ context.Context, _, _ string) (string, error) {
+	return "", agent.ErrProbeUnsupported
+}
+
+func (d *deadlineCapturingSession) ProbeStatus(_ context.Context, _, _ string) (agent.ProbeResult, error) {
+	return agent.ProbeResult{}, agent.ErrProbeUnsupported
+}
+
+func (d *deadlineCapturingSession) Interrupt(_ context.Context, _ string) error {
+	return agent.ErrProbeUnsupported
+}

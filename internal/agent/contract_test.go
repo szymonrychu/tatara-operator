@@ -218,3 +218,17 @@ func TestIsTTLGone(t *testing.T) {
 	require.True(t, agent.IsTransientWrapper(&agent.HTTPError{Status: http.StatusServiceUnavailable}))
 	require.False(t, agent.IsTransientWrapper(&agent.HTTPError{Status: http.StatusGone}))
 }
+
+// The probe surface is inert for this fixture: it exercises the G.10 handshake,
+// which predates the probe endpoints and never calls them.
+func (s *turnRefusingSession) Probe(context.Context, string, string) (string, error) {
+	return "", agent.ErrProbeUnsupported
+}
+
+func (s *turnRefusingSession) ProbeStatus(context.Context, string, string) (agent.ProbeResult, error) {
+	return agent.ProbeResult{}, agent.ErrProbeUnsupported
+}
+
+func (s *turnRefusingSession) Interrupt(context.Context, string) error {
+	return agent.ErrProbeUnsupported
+}

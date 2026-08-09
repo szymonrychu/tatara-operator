@@ -5531,6 +5531,37 @@ spec:
                       SkillsRef is the git ref (branch, tag, or SHA) of the tatara-agent-skills
                       repo to clone at boot. Empty defaults to "main".
                     type: string
+                  stallProbeGraceSeconds:
+                    default: 300
+                    description: |-
+                      StallProbeGraceSeconds is how long the operator waits for a stall probe to
+                      be ANSWERED before counting that attempt as unanswered.
+
+                      It is not a second turn timeout. The probe is delivered at the agent's next
+                      TOOL-CALL BOUNDARY, so a healthy agent inside one long tool call answers
+                      late rather than never: a measured 70s sleep buffered the probe 58.2s. The
+                      floor of 60s exists so a grace shorter than a single ordinary tool call
+                      cannot be configured, which would turn every long tool call into a stall.
+
+                      Read by nothing in this release. The schema lands FIRST and deliberately
+                      ahead of any consumer: structural-CRD pruning drops unknown fields SILENTLY,
+                      so a values file that set this before the schema existed would be discarded
+                      with no error anywhere.
+                    minimum: 60
+                    type: integer
+                  stallProbeMaxAttempts:
+                    default: 2
+                    description: |-
+                      StallProbeMaxAttempts is how many unanswered probes the operator sends
+                      before escalating. Bounded at 5 because each attempt costs a full
+                      StallProbeGraceSeconds, so the escalation delay is the product of the two
+                      and an unbounded attempt count would push a genuinely hung turn past its
+                      pod TTL, where the stall handling stops mattering.
+
+                      Read by nothing in this release; see StallProbeGraceSeconds.
+                    maximum: 5
+                    minimum: 1
+                    type: integer
                   turnTimeoutSeconds:
                     default: 1800
                     description: |-

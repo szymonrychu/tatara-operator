@@ -171,4 +171,80 @@ func (s *httpSession) DeleteSession(ctx context.Context, baseURL string) error {
 	return s.do(ctx, "delete_session", http.MethodDelete, baseURL+"/v1/session", nil, nil)
 }
 
+// probeUnsupported maps the two statuses that mean "this wrapper has no such
+// endpoint" onto ErrProbeUnsupported, and passes every other error through
+// untouched.
+//
+// 404 is a route that was never mounted; 405 is a path that exists on another
+// method (a wrapper that grew /v1/probe/{id} before /v1/probe, say). Both mean
+// the caller must fall back to the pre-probe behaviour, and NEITHER may surface
+// as a hard failure: an old wrapper is a routine mid-train state, not a fault.
+// Every other status - 5xx, 401, a timeout - is a real error and stays one, so a
+// broken NEW wrapper is never silently downgraded to "old".
+func probeUnsupported(err error) error {
+	var he *HTTPError
+	if errors.As(err, &he) && (he.Status == http.StatusNotFound || he.Status == http.StatusMethodNotAllowed) {
+		return fmt.Errorf("%w (http %d)", ErrProbeUnsupported, he.Status)
+	}
+	return err
+}
+
+// probeReq is the POST /v1/probe body. It carries no callbackUrl: a probe is not
+// a turn and completes nothing, so there is nothing to call back about.
+type probeReq struct {
+	Text string `json:"text"`
+}
+
+func (s *httpSession) Probe(ctx context.Context, baseURL, text string) (string, error) {
+	var out struct {
+		ProbeID string `json:"probeId"`
+	}
+	if err := s.do(ctx, "probe", http.MethodPost, baseURL+"/v1/probe", probeReq{Text: text}, &out); err != nil {
+		return "", probeUnsupported(err)
+	}
+	return out.ProbeID, nil
+}
+
+func (s *httpSession) ProbeStatus(ctx context.Context, baseURL, probeID string) (ProbeResult, error) {
+	var out struct {
+		ProbeID     string `json:"probeId"`
+		State       string `json:"state"`
+		Answer      string `json:"answer"`
+		SentAt      string `json:"sentAt"`
+		DeliveredAt string `json:"deliveredAt"`
+		AnsweredAt  string `json:"answeredAt"`
+	}
+	if err := s.do(ctx, "probe_status", http.MethodGet, baseURL+"/v1/probe/"+probeID, nil, &out); err != nil {
+		return ProbeResult{}, probeUnsupported(err)
+	}
+	// An unparseable timestamp degrades to zero rather than failing the read: the
+	// STATE is what the caller decides on, and losing the whole status because one
+	// optional stamp is malformed would escalate a cosmetic wrapper bug into a
+	// stall verdict.
+	return ProbeResult{
+		ProbeID:     out.ProbeID,
+		State:       out.State,
+		Answer:      out.Answer,
+		SentAt:      parseRFC3339(out.SentAt),
+		DeliveredAt: parseRFC3339(out.DeliveredAt),
+		AnsweredAt:  parseRFC3339(out.AnsweredAt),
+	}, nil
+}
+
+func (s *httpSession) Interrupt(ctx context.Context, baseURL string) error {
+	return probeUnsupported(s.do(ctx, "interrupt", http.MethodPost, baseURL+"/v1/interrupt", nil, nil))
+}
+
+// parseRFC3339 returns the zero time for an empty or unparseable value.
+func parseRFC3339(v string) time.Time {
+	if v == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339, v)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
 var _ Session = (*httpSession)(nil)

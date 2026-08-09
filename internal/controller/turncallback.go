@@ -671,9 +671,15 @@ func (s *CallbackServer) PollOnce(ctx context.Context) {
 		// Refresh the last-activity annotation so the stall deadline (checked on
 		// the next cycle) tracks the wrapper. The backstop owns this annotation;
 		// the reconcile path only reads it.
-		if !tr.LastActivityAt.IsZero() {
-			s.refreshLastActivity(ctx, task.Name, task.Namespace, turn, tr.LastActivityAt.UTC().Format(time.RFC3339))
-		}
+		//
+		// TWO SOURCES, and the second one is why this loop now makes a second call.
+		// GET /v1/messages/{turnId} reports activity on the PARENT transcript only,
+		// and a parent blocked on a Task tool call writes nothing there while its
+		// subagent works - 2095 seconds of measured parent silence on one healthy
+		// run. GET /v1/session carries the subagent stamp, so the two are merged
+		// before stamping.
+		s.refreshLastActivity(ctx, task.Name, task.Namespace, turn,
+			tr.LastActivityAt, s.subagentActivity(ctx, agent.BaseURL(task, s.Namespace)))
 		if tr.State == "complete" || tr.State == "failed" {
 			// GET /v1/messages/{turnId} carries no pushedRepos, so this path knows
 			// the final text and NOT the repos: it must not clear what the callback
@@ -684,10 +690,74 @@ func (s *CallbackServer) PollOnce(ctx context.Context) {
 	}
 }
 
+// subagentActivity reads GET /v1/session for the wrapper's subagent activity
+// stamp, or nil when there is none to be had.
+//
+// nil covers THREE distinct cases on purpose, because the correct handling of all
+// three is identical - fall back to the parent transcript's own activity, exactly
+// as this loop behaved before subagents were visible at all:
+//
+//	no Session wired        - tests and degraded configurations
+//	the call failed         - unreachable, 5xx, timeout, a dead wrapper
+//	the field was absent    - an OLD wrapper, which is a guaranteed mid-train state
+//
+// The last one is why SessionInfo.LastSubagentActivityAt is a pointer. A plain
+// time.Time from an old wrapper would arrive as the zero value and merge as "no
+// activity since the epoch", which is silently correct here but would be an
+// active lie anywhere that compares it.
+func (s *CallbackServer) subagentActivity(ctx context.Context, baseURL string) *time.Time {
+	if s.Session == nil {
+		return nil
+	}
+	// Bounded on the same reasoning as the GetTurn call above: one slow wrapper
+	// must not stall the whole backstop cycle.
+	getCtx, cancel := context.WithTimeout(ctx, pollGetTurnTimeout)
+	defer cancel()
+	info, err := s.Session.GetSession(getCtx, baseURL)
+	if err != nil {
+		return nil
+	}
+	return info.LastSubagentActivityAt
+}
+
+// mergeSubagentActivity returns the LATER of the parent transcript's activity and
+// the subagent transcripts'.
+//
+// THIS IS THE FIX. The wrapper's lastActivityAt tails only the parent session
+// file, and a parent waiting on a Task tool call writes NOTHING to it for as long
+// as the child runs: one measured run went silent for 2095 seconds (35 minutes)
+// with a completely healthy agent underneath. Against the default 1800s stall
+// window that turn was declared dead 5 minutes before its subagent finished, and
+// every signal the operator had agreed with the verdict.
+//
+// A nil subagent stamp returns the parent's value UNCHANGED - not zero, not now -
+// so an old wrapper produces byte-identical behaviour to before this phase.
+func mergeSubagentActivity(parentActivity time.Time, subagentActivity *time.Time) time.Time {
+	if subagentActivity == nil {
+		return parentActivity
+	}
+	if subagentActivity.After(parentActivity) {
+		return *subagentActivity
+	}
+	return parentActivity
+}
+
 // refreshLastActivity stamps the turn-last-activity-at annotation on the task,
-// best-effort. It is a no-op when the turn has advanced or the value is
-// unchanged, so it adds no write when an idle wrapper reports the same timestamp.
-func (s *CallbackServer) refreshLastActivity(ctx context.Context, taskName, namespace, turnID, lastActivity string) {
+// best-effort, from the LATER of the parent-transcript and subagent-transcript
+// activity (see mergeSubagentActivity). It is a no-op when the turn has advanced,
+// when neither source reported anything, or when the value is unchanged, so it
+// adds no write when an idle wrapper reports the same timestamp.
+func (s *CallbackServer) refreshLastActivity(ctx context.Context, taskName, namespace, turnID string,
+	parentActivity time.Time, subagentActivity *time.Time) {
+
+	merged := mergeSubagentActivity(parentActivity, subagentActivity)
+	// Nothing to stamp. The pre-subagent code guarded on the parent stamp alone at
+	// the call site; the guard moved here so the subagent-only case (parent zero,
+	// subagent set - a turn whose FIRST act was to spawn a Task) still stamps.
+	if merged.IsZero() {
+		return
+	}
+	lastActivity := merged.UTC().Format(time.RFC3339)
 	_ = retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.Task{}
 		if err := s.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: taskName}, fresh); err != nil {
