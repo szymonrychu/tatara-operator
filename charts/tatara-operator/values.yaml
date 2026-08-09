@@ -226,6 +226,23 @@ agentFsGroup: ""
 #     affinity: {}
 agentScheduling: {}
 
+# mcpScheduling is the cluster-specific Pod placement (nodeSelector /
+# tolerations / affinity) for the per-Project grafana-mcp Deployments the
+# operator stamps. Exact mirror of agentScheduling above: rule 6 list-shaped
+# data rendered into the operator ConfigMap as a single JSON document key
+# (MCP_SCHEDULING) and parsed at runtime; EMPTY by default so the chart stays
+# cluster-agnostic (rule 14). Empty means the stamped Deployments carry no
+# placement at all, which is how a grafana-mcp pod can end up on any node in the
+# cluster. The deploying helmfile supplies the real placement, e.g.
+#   mcpScheduling:
+#     affinity:
+#       nodeAffinity:
+#         requiredDuringSchedulingIgnoredDuringExecution:
+#           nodeSelectorTerms:
+#             - matchExpressions:
+#                 - {key: node-role.kubernetes.io/control-plane, operator: Exists}
+mcpScheduling: {}
+
 # Secret-backed scalars. Provided by a SOPS-encrypted values overlay at deploy
 # time. Set existingSecret to use an externally-managed Secret instead.
 existingSecret: ""

@@ -118,6 +118,8 @@ AGENT_RUN_AS_USER: {{ .Values.agentRunAsUser | quote }}
 AGENT_FS_GROUP: {{ .Values.agentFsGroup | quote }}
 {{/* List-shaped placement (rule 6): one JSON document key, empty default keeps the chart cluster-agnostic (rule 14). */}}
 AGENT_SCHEDULING: {{ .Values.agentScheduling | toJson | quote }}
+{{/* Same rule-6 single-JSON-document shape for the operator-stamped grafana-mcp Deployments. */}}
+MCP_SCHEDULING: {{ .Values.mcpScheduling | toJson | quote }}
 {{/* Token-budget admission gate (issue #189): off until tokenBudgetEnabled. */}}
 TOKEN_BUDGET_ENABLED: {{ .Values.tokenBudgetEnabled | quote }}
 TOKEN_BUDGET_MODE: {{ .Values.tokenBudgetMode | quote }}
