@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -70,6 +71,19 @@ type TTLStopResult struct {
 // the string the runbook's diagnosis step greps for, so it is a constant rather
 // than a literal buried in a format directive.
 const SyntheticNoteLostMarker = "NO CONTINUATION STATE WAS CAPTURED"
+
+// EnvAgentPodTTLSeconds is the wrapper env carrying this pod's own copy of the
+// resolved TTL. The wrapper computes its 410-Gone cutoff from it, and the reaper
+// reads it back off the pod spec (PodTTLDeadlineFromSpec) because it resolves no
+// Projects.
+const EnvAgentPodTTLSeconds = "AGENT_POD_TTL_SECONDS"
+
+// EnvTurnTimeoutSeconds is the wrapper env carrying
+// Project.spec.agent.turnTimeoutSeconds. The stop sequence's step-4 hard cap is
+// derived from it, so the reaper reads it back off the pod spec to learn how
+// long the stop can legitimately still hold this pod
+// (PodTTLStopWindowFromSpec).
+const EnvTurnTimeoutSeconds = "TURN_TIMEOUT_SECONDS"
 
 // NoteKindHandoff is the Note.Kind the handoff turn asks the agent to write and
 // the operator writes for it when the agent cannot. Notes ARE the continuation
@@ -141,7 +155,17 @@ func TTLDeadline(project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (ti
 	// two ever diverge the wrapper 410s turns the operator still believes are
 	// admissible (or the operator stops a pod the wrapper is happily serving).
 	ttl := PodTTLSeconds(project, task)
-	if ttl <= 0 || task.Status.PodStartedAt == nil {
+	anchor, ok := ttlAnchor(task)
+	if ttl <= 0 || !ok {
+		return time.Time{}, false
+	}
+	return anchor.Add(time.Duration(ttl) * time.Second), true
+}
+
+// ttlAnchor is the instant t0 is measured FROM. See TTLDeadline for why a live
+// Task anchors on the later of podStartedAt and conversationLastEventAt.
+func ttlAnchor(task *tatarav1alpha1.Task) (time.Time, bool) {
+	if task.Status.PodStartedAt == nil {
 		return time.Time{}, false
 	}
 	anchor := task.Status.PodStartedAt.Time
@@ -149,7 +173,83 @@ func TTLDeadline(project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (ti
 		task.Status.ConversationLastEventAt.After(anchor) {
 		anchor = task.Status.ConversationLastEventAt.Time
 	}
-	return anchor.Add(time.Duration(ttl) * time.Second), true
+	return anchor, true
+}
+
+// PodTTLDeadlineFromSpec is TTLDeadline computed WITHOUT a Project, by reading
+// back the AGENT_POD_TTL_SECONDS the operator stamped on the pod itself (PodSpec
+// sets it from the same PodTTLSeconds resolver, so the two cannot diverge).
+//
+// It exists for the reaper, which sweeps pods and Tasks and resolves no
+// Projects, and which has to be able to tell whether the G.7 stop already owns a
+// pod's teardown (#527).
+//
+// ok is false when the pod carries no readable TTL: no TTL means no t0, no TTL
+// stop is coming, and the caller must NOT treat the pod as spoken for.
+func PodTTLDeadlineFromSpec(pod *corev1.Pod, task *tatarav1alpha1.Task) (time.Time, bool) {
+	anchor, ok := ttlAnchor(task)
+	if !ok {
+		return time.Time{}, false
+	}
+	ttl, ok := podEnvSeconds(pod, EnvAgentPodTTLSeconds)
+	if !ok || ttl <= 0 {
+		return time.Time{}, false
+	}
+	return anchor.Add(ttl), true
+}
+
+// PodTTLStopWindowFromSpec is the interval [start, end) during which the G.7
+// stop sequence OWNS this pod's teardown, computed from the pod's own env for a
+// caller that resolves no Projects.
+//
+//	start = t0                            (PodTTLDeadlineFromSpec)
+//	end   = t0 + 2*turnTimeout + TTLGrace (StopWithHandoff's step-4 hard cap)
+//
+// The FAR END is the point of this function. The idle reaper must stand down
+// inside the window - the stop needs the wrapper ALIVE to offer the agent its
+// one handoff turn (#527) - but standing down from t0 with no far end would
+// trade a backstop for an ASSUMPTION: that some reconcile actually reaches the
+// TTL gate. reconcilePodStage can early-return before it, and any persistent
+// error upstream of it never gets there either, which is exactly the class of
+// wedged reconcile #237's backstop exists for. Past the hard cap the stop has
+// either finished or is not coming, and #237 re-arms with its full reach.
+//
+// The cap, NOT the reaper's own IdlePodReapAfter: at the stock
+// turnTimeoutSeconds=900 the cap is 31m, LONGER than the 30m backstop, so
+// borrowing that constant would re-arm the reaper mid-sequence and re-open the
+// race. An unreadable turnTimeout degrades to zero, matching the stopper, whose
+// TurnTimeout comes from the same Project field and whose waits then collapse.
+//
+// ok is false when the pod carries no readable TTL: no t0, no stop, not spoken
+// for.
+func PodTTLStopWindowFromSpec(pod *corev1.Pod, task *tatarav1alpha1.Task) (start, end time.Time, ok bool) {
+	t0, ok := PodTTLDeadlineFromSpec(pod, task)
+	if !ok {
+		return time.Time{}, time.Time{}, false
+	}
+	turnTimeout, _ := podEnvSeconds(pod, EnvTurnTimeoutSeconds)
+	if turnTimeout < 0 {
+		turnTimeout = 0
+	}
+	return t0, t0.Add(2*turnTimeout + TTLGrace), true
+}
+
+// podEnvSeconds reads an integer-seconds env off the pod's containers. ok is
+// false when the var is absent or unparseable; the value is then zero.
+func podEnvSeconds(pod *corev1.Pod, name string) (time.Duration, bool) {
+	for i := range pod.Spec.Containers {
+		for _, e := range pod.Spec.Containers[i].Env {
+			if e.Name != name {
+				continue
+			}
+			n, err := strconv.Atoi(e.Value)
+			if err != nil {
+				return 0, false
+			}
+			return time.Duration(n) * time.Second, true
+		}
+	}
+	return 0, false
 }
 
 // TTLExpired reports whether the Task's pod is past t0.
