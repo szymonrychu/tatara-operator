@@ -247,10 +247,20 @@ func TestPollOnce_StallAwareKeepsActiveTurnAlive(t *testing.T) {
 // So the backstop must now DETECT and LEAVE IT ALONE. If this test ever goes
 // back to asserting the annotation is cleared here, the graceful path has been
 // bypassed and the note-loss bug is back.
+//
+// THE POD IS PART OF THE PREMISE (#566). "The reconciler will stop it
+// gracefully" is only true of a Task the reconciler can reach, and
+// reconcilePodStage's stalledTurnStop branch sits behind
+// `task.Status.PodStartedAt != nil`. This fixture used to leave the pod clocks
+// nil, which described a Task nothing would ever act on - the exact shape that
+// logged turn_timeout every 30 seconds forever - so it now stamps the clock it
+// always meant to have. The no-pod half is asserted separately, in
+// orphaned_turn_test.go.
 func TestPollOnce_DoesNotTearDownAStalledTurn(t *testing.T) {
 	mkTaskProject(t, "p-stale", 3)
 	mkTaskRepository(t, "r-stale", "p-stale")
 	mkTask(t, "t-stale", "p-stale", "r-stale")
+	setTaskPodStartedAt(t, "t-stale", time.Now().Add(-2*time.Hour))
 	stale := time.Now().Add(-2 * time.Hour).UTC().Format(time.RFC3339)
 	annotate(t, "t-stale", map[string]string{
 		annCurrentTurn:      "turn-stale",

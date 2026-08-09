@@ -588,6 +588,46 @@ func (s *CallbackServer) PollOnce(ctx context.Context) {
 		// Detection stays here only as the observability edge - the reconciler
 		// re-evaluates the same turnTimedOut predicate itself.
 		if s.isTurnTimedOut(ctx, task) {
+			// WHO IS THE DEFERRAL TARGET? The comment above says "the stage
+			// reconciler", and that is only true when the stage reconciler can
+			// actually reach the stop. It cannot for a Task with no live pod:
+			//
+			//   - reconcileStage returns early for a PARKED Task, before any pod
+			//     stage runs at all; and
+			//   - reconcilePodStage's turnTimedOut -> stalledTurnStop branch sits
+			//     behind `task.Status.PodStartedAt != nil`.
+			//
+			// #551 moved the teardown here without that guard, so a Task in either
+			// shape was logged at every 30s tick with nothing on the other side to
+			// end it. Live on v2.1.5: 1109 lines in 30 minutes over 19 parked
+			// Tasks, each firing 60 times, forever (#566).
+			//
+			// The annotations are what is actually wrong, so this REPAIRS rather
+			// than skips - it is the only loop in the operator that visits every
+			// Task on a fixed cadence (30s, leader-only), and a parked Task gets no
+			// timed requeue from its own reconciler at all, so a reconcile-side
+			// repair would never fire for the Tasks already carrying stale state.
+			// It clears ONCE and logs ONCE per Task; the next pass sees no turn and
+			// says nothing.
+			//
+			// A turn that reported completion never reaches here (the
+			// annTurnComplete guard above), so this only ever retires a turn that
+			// went silent AND whose pod is gone - genuinely orphaned, with no
+			// callback still possible from a pod that no longer exists.
+			if tatarav1alpha1.Parked(task) || task.Status.PodStartedAt == nil {
+				if err := clearTurnAnnotations(ctx, s.Client, task); err != nil {
+					l.Error(err, "orphaned turn annotations could not be cleared",
+						"action", "orphaned_turn_clear_failed", "task", task.Name, "turn_id", turn)
+					continue
+				}
+				if s.Metrics != nil {
+					s.Metrics.OrphanedTurnCleared(task.Spec.ProjectRef)
+				}
+				l.Info("turn annotations orphaned by a pod that is gone; cleared",
+					"action", "orphaned_turn_cleared", "task", task.Name, "turn_id", turn,
+					"park_reason", task.Status.ParkReason, "project", task.Spec.ProjectRef)
+				continue
+			}
 			if s.Metrics != nil {
 				s.Metrics.TurnTimeout("poll_backstop")
 			}

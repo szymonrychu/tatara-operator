@@ -20,6 +20,7 @@ type taskMetrics struct {
 	liveClosedTotal         *prometheus.CounterVec
 	residencyExceededTotal  *prometheus.CounterVec
 	parkedLivePodRepaired   *prometheus.CounterVec
+	orphanedTurnCleared     *prometheus.CounterVec
 	botRounds               *prometheus.GaugeVec
 }
 
@@ -96,6 +97,10 @@ func newTaskMetrics(reg prometheus.Registerer) *taskMetrics {
 			Name: "operator_task_parked_with_live_pod_repaired_total",
 			Help: "Parked Tasks found still holding a live agent pod and repaired. parkReason != \"\" with a live pod is a TRANSIENT by design; a sustained non-zero rate means the park-then-stop sequence is not completing and slots are leaking.",
 		}, []string{"project", "park_reason"}),
+		orphanedTurnCleared: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_orphaned_turn_annotations_cleared_total",
+			Help: "Turn annotations retired by the poll backstop because the pod that was running the turn is gone (the Task is parked, or its pod clocks are nil). This is a REPAIR of an invariant the pod-teardown paths are supposed to maintain themselves, so a sustained non-zero rate means one of them is still leaking - the same reading as operator_task_parked_with_live_pod_repaired_total. A one-off burst after a rollout is the pre-existing backlog draining (issue #566).",
+		}, []string{"project"}),
 		botRounds: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "operator_bot_rounds",
 			Help: "Highest consecutive agent-authored comment rounds with no intervening human comment, by project. There is deliberately no ping-pong cap (decision D7); this gauge is the ONLY way a cycling agent pair becomes observable before a human finds it by reading duplicate comments.",
@@ -117,6 +122,7 @@ func newTaskMetrics(reg prometheus.Registerer) *taskMetrics {
 		m.liveClosedTotal,
 		m.residencyExceededTotal,
 		m.parkedLivePodRepaired,
+		m.orphanedTurnCleared,
 		m.botRounds,
 	)
 	return m
@@ -377,6 +383,21 @@ func (m *OperatorMetrics) ParkedWithLivePodRepaired(project, parkReason string) 
 // operator_task_parked_with_live_pod_repaired_total counter.
 func (m *OperatorMetrics) ParkedWithLivePodRepairedCounter(project, parkReason string) prometheus.Counter {
 	return m.parkedLivePodRepaired.WithLabelValues(project, parkReason)
+}
+
+// OrphanedTurnCleared counts one repair of the pod-scoped turn-annotation
+// invariant by the poll backstop.
+func (m *OperatorMetrics) OrphanedTurnCleared(project string) {
+	if m == nil || m.orphanedTurnCleared == nil {
+		return
+	}
+	m.orphanedTurnCleared.WithLabelValues(project).Inc()
+}
+
+// OrphanedTurnClearedCounter returns the
+// operator_orphaned_turn_annotations_cleared_total counter.
+func (m *OperatorMetrics) OrphanedTurnClearedCounter(project string) prometheus.Counter {
+	return m.orphanedTurnCleared.WithLabelValues(project)
 }
 
 // SetBotRounds sets operator_bot_rounds for one project. The ONE caller is
