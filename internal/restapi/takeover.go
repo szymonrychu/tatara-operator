@@ -54,7 +54,7 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 
 	var req mrTakeoverReq
 	if err := decodeJSON(r, w, &req); err != nil {
-		writeDecodeError(w, r, err)
+		s.writeDecodeError(w, r, err)
 		return
 	}
 	if req.Repo == "" || req.Number <= 0 || req.CommentExternalID == "" {

@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -189,18 +192,58 @@ func decodeJSON(r *http.Request, w http.ResponseWriter, dst any) error {
 	return dec.Decode(dst)
 }
 
+// decodeFieldChars caps the field name echoed back to the caller. The name is
+// a key out of the caller's own JSON, so it is caller-controlled and otherwise
+// only bounded by maxBodyBytes; a 1 MB key must not become a 1 MB error body.
+const decodeFieldChars = 64
+
+// unknownFieldPrefix is what encoding/json puts in front of the rejected key
+// when DisallowUnknownFields trips. The error is a bare errors.New, so the name
+// can only be recovered by parsing - there is no typed error to match on.
+const unknownFieldPrefix = `json: unknown field `
+
+// decodeErrorMessage turns a decoder failure into a message that names the
+// field the caller got wrong. Anything it does not recognise degrades to the
+// generic text: only names derived from the caller's own keys are echoed, never
+// the decoder's raw output, so internal type detail cannot leak.
+func decodeErrorMessage(err error) string {
+	var typeErr *json.UnmarshalTypeError
+	if errors.As(err, &typeErr) && typeErr.Field != "" {
+		return fmt.Sprintf("invalid JSON body: field %q has the wrong type",
+			truncateValidUTF8(typeErr.Field, decodeFieldChars))
+	}
+	if msg := err.Error(); strings.HasPrefix(msg, unknownFieldPrefix) {
+		if name, uerr := strconv.Unquote(strings.TrimPrefix(msg, unknownFieldPrefix)); uerr == nil && name != "" {
+			return fmt.Sprintf("invalid JSON body: unknown field %q",
+				truncateValidUTF8(name, decodeFieldChars))
+		}
+	}
+	return "invalid JSON body"
+}
+
 // writeDecodeError writes the appropriate HTTP error for a decodeJSON failure.
-// Oversized bodies become 413; all other decode errors become 400 with a generic
-// message so internal json-decoder detail is not echoed to callers.
-func writeDecodeError(w http.ResponseWriter, r *http.Request, err error) {
+// Oversized bodies become 413; every other decode failure becomes a 400 naming
+// the offending field.
+//
+// It is a METHOD so the line goes through s.log at WARN. The only thing that
+// can fail here is bytes the CALLER supplied, so the answer is always a 4xx and
+// the operator did nothing wrong - but this site logged it at log.Log.Error,
+// which is what "Tatara operator error recurring" counts (#558). One agent
+// guessing a payload shape 5 times read as 5 operator errors.
+//
+// Naming the field is the other half. The old bare "invalid JSON body" is why
+// the agent had to guess: it re-submitted 5 times over 48s against a 400 that
+// never said which key was rejected.
+func (s *Server) writeDecodeError(w http.ResponseWriter, r *http.Request, err error) {
 	var maxErr *http.MaxBytesError
 	if errors.As(err, &maxErr) {
 		writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
 		return
 	}
-	// Log real error server-side; return generic message to caller.
-	log.Log.Error(err, "restapi: decode body failed", "path", r.URL.Path)
-	writeError(w, http.StatusBadRequest, "invalid JSON body")
+	msg := decodeErrorMessage(err)
+	// The full decoder error stays server-side; only msg goes to the caller.
+	s.log.Warn("restapi: decode body failed", "path", r.URL.Path, "error", err.Error(), "detail", msg)
+	writeError(w, http.StatusBadRequest, msg)
 }
 
 func (s *Server) getTask(w http.ResponseWriter, r *http.Request) {
