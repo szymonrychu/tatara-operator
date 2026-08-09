@@ -198,10 +198,21 @@ func BuildJob(project *tataradevv1alpha1.Project, repo *tataradevv1alpha1.Reposi
 	cloneCmd := `set -e; git -c "credential.helper=!f() { echo username=x-access-token; echo password=${SCM_TOKEN}; }; f" ` +
 		`clone --branch "$GIT_BRANCH" "$GIT_CLONE_URL" "$GIT_REPO_DIR"`
 
+	// The flag is derived from `mode`, the SAME decision that stamps
+	// LabelIngestMode above, not re-derived from `since`. Issue #505: the two
+	// were computed independently and drifted - the escalation path clears
+	// `since` to mean "do a full ingest", the Job was labelled and metered
+	// mode=full, but the command never carried --full and tatara-ingest's --full
+	// defaults to false. Every escalated "full re-ingest" therefore ran
+	// INCREMENTAL with no watermark, so the documented incremental->full
+	// self-heal could never rebuild a stale corpus for any repo in any project,
+	// and the alert rule's mode="full" filter counted incremental runs.
 	ingestArgs := fmt.Sprintf(
 		`tatara-ingest --repo-root "$GIT_REPO_DIR" --repo-name %s --base-url %s`,
 		repo.Name, baseURL)
-	if since != "" {
+	if mode == IngestModeFull {
+		ingestArgs += " --full"
+	} else {
 		ingestArgs += " --since " + since
 	}
 	// After a successful ingest, resolve HEAD and patch the result ConfigMap
