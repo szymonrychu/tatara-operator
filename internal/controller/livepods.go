@@ -242,12 +242,173 @@ func countLive(ctx context.Context, r client.Reader, proj *tatarav1alpha1.Projec
 // conversation is cheap to START and long to HOLD, and it holds a real
 // concurrency slot, so without this bound a handful of chatty threads would
 // occupy every agent slot the project has.
+//
+// IT IS THE RESUMPTION HALF OF THE CEILING and it is not the whole ceiling.
+// Its callers are the un-park paths (unpark.go, reaper.go,
+// ownership_redeliver.go) and the webhook's live-entry check - every one of them
+// asking whether an EXISTING Task may go (or stay) live. The CREATION half is
+// liveMintBudget below, which the dispatcher's mint branch consults; before
+// #570 there was no creation half at all and the ceiling bounded resumption
+// while fresh work walked straight past it.
 func LiveHasRoom(ctx context.Context, r client.Reader, proj *tatarav1alpha1.Project) (bool, error) {
 	live, err := countLive(ctx, r, proj)
 	if err != nil {
 		return false, err
 	}
 	return len(live) < tatarav1alpha1.MaxLivePods(proj), nil
+}
+
+// preLive reports whether state is a MINTED-BUT-NOT-YET-LIVE state: the Task
+// exists, has been paid for, and the very next thing that happens to it is the
+// operator's `new` triage pass moving it into one of the three live states.
+//
+// A mint lands here, always: queue.BuildTaskFromQueuedEvent sets no Status at
+// all, so a freshly created Task carries the empty state until triage stamps
+// one. Both spellings are the same population and both must count - see
+// liveMintBudget for why leaving them out reopens the hole this whole file is
+// about.
+func preLive(state string) bool {
+	return state == "" || state == tatarav1alpha1.StateNew
+}
+
+// resumptionBlockedOnRoom reports whether t is a parked Task whose ONLY obstacle
+// is the live-pod ceiling: the human has replied, every other re-entry rule
+// passes, and stage.Unpark would let it back in the moment a slot existed.
+//
+// IT ASKS THE REAL PREDICATE, on a DeepCopy, exactly as reaper.go's unparkFires
+// does - it does NOT reimplement a cheap approximation of it. That is the whole
+// safety argument for the reservation in liveMintBudget below. A cheap
+// approximation ("parked, live state, has a non-bot event") would also match a
+// Task that can NEVER re-enter for some other reason - a kind=review Task at
+// MaxHumanReviewRounds, one whose owned Issues have all closed, one whose MR
+// already merged - and such a Task would then reserve a live slot FOREVER and
+// silently stop the project taking any new work at all. Running stage.Unpark and
+// insisting on DeclineNoLiveRoom specifically means a permanently-stuck park
+// returns some OTHER decline code, reserves nothing, and cannot wedge the mint
+// path. The probe is discarded either way; nothing here writes.
+//
+// LiveHasRoom is passed false deliberately: the question is "would room be the
+// thing that unblocks this", so the answer has to be computed against a project
+// that has none.
+func resumptionBlockedOnRoom(ctx context.Context, c client.Client, proj *tatarav1alpha1.Project,
+	t *tatarav1alpha1.Task, activeTasks, maxOpen int, now time.Time) (bool, error) {
+
+	// The cheap structural filters first, so the Issue/MR Gets below are paid
+	// only for the handful of parks that could possibly be waiting on a slot.
+	// NeedsLiveRoom is keyed on the reason alone and deliberately
+	// over-approximates; stage.Live is the other half of liveRoomDecline's own
+	// condition (an un-park never moves state, so a park on a non-live state
+	// cannot resume into one).
+	if !NeedsLiveRoom(t.Status.ParkReason) || !stage.Live(t.Status.State) {
+		return false, nil
+	}
+	issues, err := loadTaskIssues(ctx, c, t)
+	if err != nil {
+		return false, err
+	}
+	mrs, err := loadTaskMRs(ctx, c, t)
+	if err != nil {
+		return false, err
+	}
+	decline := stage.Unpark(stage.UnparkInput{
+		Task:            t.DeepCopy(),
+		Issues:          issues,
+		MRs:             mrs,
+		ActiveTasks:     activeTasks,
+		MaxOpenTasks:    maxOpen,
+		BotLogin:        botLoginOf(proj),
+		MaxTurnsPerTask: taskMaxTurns(proj, t),
+		LiveHasRoom:     false,
+		Now:             now,
+	})
+	return decline == stage.DeclineNoLiveRoom, nil
+}
+
+// liveMintBudget is THE MISSING HALF OF THE CEILING (#570): how many NEW live
+// conversations proj may still create right now. Zero or negative means the
+// dispatcher's mint branch must hold.
+//
+// LiveHasRoom bounded RESUMPTION and nothing else - its callers are unpark.go,
+// reaper.go, ownership_redeliver.go and webhook/pending_events.go - so creation
+// was unbounded while re-entry was bounded, and the human's reply was
+// structurally the lowest-priority thing in the project. Measured on project-mtg
+// 2026-08-09 against an effective ceiling of ONE: a second Task entered a live
+// state at 11:13:35 with one already live, while two parked awaiting-human Tasks
+// holding the human's answers were refused 21 times each with
+// decline=no-live-room and went unanswered for ~55 minutes. enforceLivePodCeiling
+// could not converge it either, because evictionCandidates excludes mid-turn
+// Tasks and both live Tasks were mid-turn.
+//
+// The budget is ceiling MINUS three populations, and each term is load-bearing:
+//
+//   - live: Tasks in a live state right now. countLive's two clauses, restated
+//     over the same List rather than paying for a second one.
+//   - pending: minted Tasks still at `new`. Without this term two admit passes
+//     seconds apart both read live==0 and both mint, and a ceiling of one lands
+//     two over - the mint gate would bound nothing at the exact cadence the
+//     dispatcher actually runs at.
+//   - owed: parked resumptions blocked on the ceiling ALONE. This is the
+//     FAIRNESS term and it is the difference between fixing the count and fixing
+//     the outage. A gate that only asked "is there room" would let a fresh mint
+//     take the slot the instant a live conversation ended, and the human's reply
+//     would be declined no-live-room on the very next un-park pass - the same
+//     production shape, one slot along, because the dispatcher is watch-driven
+//     and driveUnparks is paced (driveUnparksPaced). A queued human reply
+//     therefore RESERVES its slot, and fresh work waits.
+//
+// WHAT THIS DELIBERATELY DOES NOT GATE. Not admitTicket: by the time a ticket is
+// admitted its Task is ALREADY in a live state, so gating it on the count would
+// make the Task count itself and starve forever. Not stage.Enter, and so not the
+// forward transitions driven by submit_outcome (internal/restapi/outcome.go) or
+// by triage (transition.go): the agent has already done the work by then, and a
+// transition that blocks strands it. Only CREATION is gated; everything already
+// live is left to finish.
+//
+// reader is the caller's read path for the Task List (the dispatcher passes its
+// uncached APIReader when a manager is wired, for the same reason admitTicket
+// does); c is the client the Issue/MR Gets behind the `owed` probe go through.
+func liveMintBudget(ctx context.Context, c client.Client, reader client.Reader,
+	proj *tatarav1alpha1.Project, now time.Time) (int, error) {
+
+	var tl tatarav1alpha1.TaskList
+	if err := reader.List(ctx, &tl, client.InNamespace(proj.Namespace)); err != nil {
+		return 0, fmt.Errorf("livepods: list tasks: %w", err)
+	}
+	maxOpen := proj.Spec.MaxOpenTasks
+	if maxOpen <= 0 {
+		maxOpen = 6
+	}
+	active := 0
+	for i := range tl.Items {
+		if tl.Items[i].Spec.ProjectRef == proj.Name && StageActive(&tl.Items[i]) {
+			active++
+		}
+	}
+
+	live, pending, owed := 0, 0, 0
+	for i := range tl.Items {
+		t := &tl.Items[i]
+		if t.Spec.ProjectRef != proj.Name || t.DeletionTimestamp != nil {
+			continue
+		}
+		switch {
+		case tatarav1alpha1.Parked(t):
+			// A parked Task holds no pod, so it is never `live`. It may be OWED
+			// one, which is a different question and the only one asked here.
+			blocked, err := resumptionBlockedOnRoom(ctx, c, proj, t, active, maxOpen, now)
+			if err != nil {
+				return 0, err
+			}
+			if blocked {
+				owed++
+			}
+		case stage.Live(t.Status.State):
+			live++
+		case preLive(t.Status.State):
+			pending++
+		}
+	}
+	return tatarav1alpha1.MaxLivePods(proj) - live - pending - owed, nil
 }
 
 // conversationIdleSince is the instant a conversation last saw an event, and it

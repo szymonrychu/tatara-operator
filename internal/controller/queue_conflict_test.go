@@ -124,7 +124,7 @@ func TestAdmit_RetriesOnConflict_AdmitsDespiteStaleCache(t *testing.T) {
 	r := &DispatcherReconciler{Client: cc, Scheme: k8sClient.Scheme()}
 
 	qes, tasks := listQEsTasks(t, ctx, proj.Name)
-	if _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
+	if _, _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
 		t.Fatalf("admit returned an error instead of retrying the conflicting write: %v", err)
 	}
 	if calls.Load() < 2 {

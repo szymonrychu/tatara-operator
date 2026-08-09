@@ -403,16 +403,22 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Help: "Token-budget usage as a fraction of the window limit, by project and scope (used|proactive|emergency); used is current usage, proactive/emergency are the active pause thresholds.",
 		}, []string{"project", "scope"}),
 		// Work the admission gate held back rather than admitting. reason is
-		// "token_budget"|"project_paused"|"kind_ceiling"|"pool_full"; class is the
-		// pool (normal|alert); kind is the Task kind for a per-kind account-usage
-		// hold, "" for pool-class blocks (project_paused, token_budget,
-		// pool_full). Bounded by live projects x classes x kinds x reasons; set
-		// live (not pre-seeded). pool_full (issue #440) is the ordinary
-		// concurrency cap: it is emitted at most once per pool per pass, and only
-		// when work was actually left Queued behind it.
+		// "token_budget"|"project_paused"|"kind_ceiling"|"pool_full"|"live_ceiling";
+		// class is the pool (normal|alert); kind is the Task kind for a per-kind
+		// account-usage hold and for live_ceiling, "" for pool-class blocks
+		// (project_paused, token_budget, pool_full). Bounded by live projects x
+		// classes x kinds x reasons; set live (not pre-seeded). pool_full (issue
+		// #440) is the ordinary concurrency cap: it is emitted at most once per
+		// pool per pass, and only when work was actually left Queued behind it.
+		// live_ceiling (#570) is the per-project LIVE-POD ceiling applied to the
+		// MINT path: it counts fresh Tasks the dispatcher refused to create
+		// because the project is at its live ceiling or because an owed
+		// resumption - a parked conversation holding a human's queued reply - has
+		// reserved the slot. A rate here with no matching un-park progress is the
+		// signal that the ceiling is genuinely too small for the project.
 		admissionBlockedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_admission_blocked_total",
-			Help: "QueuedEvents the dispatcher declined to admit for a pool, by project, pool class (normal|alert), Task kind (empty for pool-class blocks), and reason (token_budget|project_paused|kind_ceiling|pool_full).",
+			Help: "QueuedEvents the dispatcher declined to admit for a pool, by project, pool class (normal|alert), Task kind (empty for pool-class blocks), and reason (token_budget|project_paused|kind_ceiling|pool_full|live_ceiling).",
 		}, []string{"project", "class", "kind", "reason"}),
 		// An agent pod was spawned while one of its supporting subsystems was
 		// unavailable, so the agent runs DEGRADED rather than not at all. This is
@@ -1176,7 +1182,7 @@ func (m *OperatorMetrics) SetTokenBudgetUsedRatio(project, scope string, ratio f
 // declined to admit a pool's work for the given project, pool class
 // ("normal"|"alert"), Task kind (empty for pool-class blocks that are not tied
 // to one kind), and reason
-// ("token_budget"|"project_paused"|"kind_ceiling"|"pool_full").
+// ("token_budget"|"project_paused"|"kind_ceiling"|"pool_full"|"live_ceiling").
 func (m *OperatorMetrics) AdmissionBlocked(project, class, kind, reason string) {
 	m.admissionBlockedTotal.WithLabelValues(project, class, kind, reason).Inc()
 }

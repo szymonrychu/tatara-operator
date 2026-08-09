@@ -64,7 +64,7 @@ func TestAdmit_AlertBeforeNormal_AndCapacity(t *testing.T) {
 
 	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
 	qes, tasks := listQEsTasks(t, ctx, proj.Name)
-	if _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
+	if _, _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -111,7 +111,7 @@ func TestAdmit_PoolFull_EmitsMetricAndLog(t *testing.T) {
 
 	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Metrics: metrics}
 	qes, tasks := listQEsTasks(t, ctx, proj.Name)
-	if _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
+	if _, _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -156,7 +156,7 @@ func TestAdmit_IdempotentOnReadmit(t *testing.T) {
 
 	// First admit: creates Task, marks Admitted.
 	qes, tasks := listQEsTasks(t, ctx, proj.Name)
-	if _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
+	if _, _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
 		t.Fatalf("first admit: %v", err)
 	}
 	got := refreshQE(t, ctx, qe)
@@ -175,7 +175,7 @@ func TestAdmit_IdempotentOnReadmit(t *testing.T) {
 
 	// Second admit: Task already exists (AlreadyExists), must not create a second one.
 	qes, tasks = listQEsTasks(t, ctx, proj.Name)
-	if _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
+	if _, _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
 		t.Fatalf("second admit: %v", err)
 	}
 
@@ -531,7 +531,7 @@ func TestAdmit_PriorityOrdersAheadOfSeq(t *testing.T) {
 
 	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
 	qes, tasks := listQEsTasks(t, ctx, proj.Name)
-	if _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
+	if _, _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	assertQEAdmitted(t, ctx, webhook, true)
@@ -555,7 +555,7 @@ func TestAdmit_PriorityFIFOWithinSamePriority(t *testing.T) {
 
 	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
 	qes, tasks := listQEsTasks(t, ctx, proj.Name)
-	if _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
+	if _, _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	assertQEAdmitted(t, ctx, older, true)
@@ -585,7 +585,7 @@ func TestAdmit_IncidentAheadOf150SweepEvents(t *testing.T) {
 
 	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
 	qes, tasks := listQEsTasks(t, ctx, proj.Name)
-	if _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
+	if _, _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	assertQEAdmitted(t, ctx, incident, true)
@@ -610,7 +610,7 @@ func TestAdmit_AlertCapacity_ReservesSlotUnderSaturatedNormalPool(t *testing.T) 
 
 	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
 	qes, tasks := listQEsTasks(t, ctx, proj.Name)
-	if _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
+	if _, _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	assertQEAdmitted(t, ctx, alert, true)
@@ -640,7 +640,7 @@ func TestAdmit_Priority2StarvationReservation(t *testing.T) {
 	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
 	qes, tasks := listQEsTasks(t, ctx, proj.Name)
 	qes = agedQEs(qes, docBatch.Name, 2*time.Hour)
-	if _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
+	if _, _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	assertQEAdmitted(t, ctx, docBatch, true)
@@ -676,7 +676,7 @@ func TestAdmit_Priority2NotStarving_NoReservation(t *testing.T) {
 
 	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
 	qes, tasks := listQEsTasks(t, ctx, proj.Name)
-	if _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
+	if _, _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	assertQEAdmitted(t, ctx, p1a, true)
@@ -751,7 +751,7 @@ func TestAdmit_UncachedReader_CountsInflightDespiteStaleCache(t *testing.T) {
 	// "reconcile N": admit q1 for real via the fresh (envtest) client.
 	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), APIReader: k8sClient}
 	qes, tasks := listQEsTasks(t, ctx, proj.Name)
-	if _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
+	if _, _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	assertQEAdmitted(t, ctx, q1, true)
@@ -768,7 +768,7 @@ func TestAdmit_UncachedReader_CountsInflightDespiteStaleCache(t *testing.T) {
 	}
 	staleTasks := []tatarav1alpha1.Task{}
 
-	if _, _, err := r.admit(ctx, proj, staleQEs, staleTasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
+	if _, _, _, err := r.admit(ctx, proj, staleQEs, staleTasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	assertQEAdmitted(t, ctx, q2, false)
@@ -790,7 +790,7 @@ func TestAdmit_NoAPIReader_FallsBackToPassedSlices(t *testing.T) {
 
 	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()} // APIReader nil
 	qes, tasks := listQEsTasks(t, ctx, proj.Name)
-	if _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
+	if _, _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	assertQEAdmitted(t, ctx, q1, true)
@@ -1266,7 +1266,7 @@ func TestAdmit_IncidentMintReleasesAlertSlot_RegressionForDeadlock(t *testing.T)
 
 	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
 	qes, tasks := listQEsTasks(t, ctx, proj.Name)
-	if _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
+	if _, _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	gotMint := refreshQE(t, ctx, mint)
@@ -1308,7 +1308,7 @@ func TestAdmit_IncidentMintReleasesAlertSlot_RegressionForDeadlock(t *testing.T)
 
 	// End to end: the pod-ticket now admits (proves the whole admit() path,
 	// not just the accounting helpers, clears the deadlock).
-	if _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
+	if _, _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	gotTicket := refreshQE(t, ctx, podTicket)
@@ -1589,7 +1589,7 @@ func TestAdmit_MintGuard_NoDuplicateAfterStatusPatchCrash(t *testing.T) {
 
 	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
 	qes, tasks := listQEsTasks(t, ctx, proj.Name)
-	if _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
+	if _, _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
 		t.Fatalf("first admit: %v", err)
 	}
 	first := refreshQE(t, ctx, q)
@@ -1615,7 +1615,7 @@ func TestAdmit_MintGuard_NoDuplicateAfterStatusPatchCrash(t *testing.T) {
 	}
 
 	qes, tasks = listQEsTasks(t, ctx, proj.Name)
-	if _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
+	if _, _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
 		t.Fatalf("second admit: %v", err)
 	}
 	got := tasksMintedBy(t, ctx, q)
@@ -1649,7 +1649,7 @@ func TestAdmit_MintGuard_NewCycleMintsItsOwnTask(t *testing.T) {
 
 	q1 := mintQE(t, ctx, proj, fixedQEName, "brainstorm-", 1)
 	qes, tasks := listQEsTasks(t, ctx, proj.Name)
-	if _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
+	if _, _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
 		t.Fatalf("cycle 1 admit: %v", err)
 	}
 	firstTask := taskForQE(t, ctx, refreshQE(t, ctx, q1))
@@ -1661,7 +1661,7 @@ func TestAdmit_MintGuard_NewCycleMintsItsOwnTask(t *testing.T) {
 	q2 := mintQE(t, ctx, proj, fixedQEName, "brainstorm-", 2)
 
 	qes, tasks = listQEsTasks(t, ctx, proj.Name)
-	if _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
+	if _, _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
 		t.Fatalf("cycle 2 admit: %v", err)
 	}
 	secondTask := taskForQE(t, ctx, refreshQE(t, ctx, q2))
@@ -1687,7 +1687,7 @@ func TestAdmit_MintGuard_StaleTerminalOwnMint(t *testing.T) {
 
 	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
 	qes, tasks := listQEsTasks(t, ctx, proj.Name)
-	if _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
+	if _, _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
 		t.Fatalf("first admit: %v", err)
 	}
 	admitted := refreshQE(t, ctx, q)
@@ -1703,7 +1703,7 @@ func TestAdmit_MintGuard_StaleTerminalOwnMint(t *testing.T) {
 	}
 
 	qes, tasks = listQEsTasks(t, ctx, proj.Name)
-	requeue, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now())
+	requeue, _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now())
 	if err != nil {
 		t.Fatalf("second admit: %v", err)
 	}
@@ -1719,7 +1719,7 @@ func TestAdmit_MintGuard_StaleTerminalOwnMint(t *testing.T) {
 
 	// Third pass: a fresh, live Task.
 	qes, tasks = listQEsTasks(t, ctx, proj.Name)
-	if _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
+	if _, _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
 		t.Fatalf("third admit: %v", err)
 	}
 	fresh := taskForQE(t, ctx, refreshQE(t, ctx, q))
