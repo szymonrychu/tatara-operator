@@ -91,9 +91,10 @@ func (r *TaskReconciler) liveHandoffAndPark(ctx context.Context, proj *tatarav1a
 		if err != nil {
 			return fmt.Errorf("livepods: handoff stop on %s: %w", task.Name, err)
 		}
-		log.FromContext(ctx).Info("conversation handed off",
-			"action", "conversing_handoff", "resource_id", task.Name,
-			"cause", cause, "outcome", res.Outcome, "handoff", res.Handoff)
+		logTTLStop(ctx,
+			"conversation handed off",
+			"conversation ended with NO continuation state captured; this pod's work is unrecorded",
+			"conversing_handoff", res, "resource_id", task.Name, "cause", cause)
 		// The stop has spent the last-turn payload on a handoff note, so retire it
 		// before this Task parks or re-arms (#527). Both continuations below
 		// read-modify-write a FRESH Task, so this patch is not clobbered by them.

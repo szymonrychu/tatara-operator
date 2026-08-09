@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -218,4 +219,75 @@ func TestTTLStop_RealPayloadNoteCarriesNoLostMarker(t *testing.T) {
 	require.Equal(t, agent.TTLHandoffSynthetic, res.Handoff)
 	require.NotContains(t, h.notes(t)[0].Body, agent.SyntheticNoteLostMarker)
 	require.Contains(t, h.notes(t)[0].Body, "wired the reconciler, tests still red")
+}
+
+// AN ALREADY-GONE WRAPPER IS NOT A FORCE-DELETE, AND IT IS NOT WORTH WAITING
+// FOR.
+//
+// This is #527's 12:37:58Z event: the idle reaper deleted the pod at 12:10:19Z,
+// the TTL stop ran 27 minutes later, spent its entire handoff budget polling a
+// corpse, and reported force_deleted for a pod nobody forced - which is what the
+// alert fired on. Both halves are wrong. There is no turn to offer an absent
+// wrapper, and force-deleting an absent pod is a no-op that must not be counted
+// as a forced teardown on a Task where nothing went wrong.
+func TestTTLStop_AbsentWrapperIsNotProbedAndIsNotAForceDelete(t *testing.T) {
+	sess := &stopSession{
+		states:    []string{agent.SessionStateBusy}, // hung forever, if anyone asked
+		deleteErr: &agent.UnreachableError{},        // there is nothing to delete a session on
+	}
+	h := newTTLHarness(t, sess)
+	pod := &corev1.Pod{}
+	require.NoError(t, h.c.Get(context.Background(),
+		types.NamespacedName{Namespace: ttlNS, Name: agent.PodName(h.task)}, pod))
+	require.NoError(t, h.c.Delete(context.Background(), pod))
+	start := h.now
+
+	res, err := h.stopper.StopWithHandoff(context.Background(), h.task, h.input())
+	require.NoError(t, err)
+
+	require.Zero(t, sess.getCalls, "there is nothing to talk to: the wrapper pod is gone")
+	require.Zero(t, sess.handoffs, "an absent wrapper cannot be offered the handoff turn")
+	require.Equal(t, start, h.now, "the stop must not spend its wait budget on a corpse")
+	require.Equal(t, agent.TTLOutcomeGraceful, res.Outcome,
+		"force-deleting an absent pod is a no-op; labelling it force_deleted fires the alert on a healthy Task")
+	require.Equal(t, agent.TTLHandoffSynthetic, res.Handoff,
+		"the operator still writes what it holds, so the next pod is not left with nothing")
+	require.NotEmpty(t, h.notes(t), "the notes journal is never left empty, gone wrapper or not")
+}
+
+// The same rule on the OTHER path into a force-delete: the wrapper was there
+// when the sequence started and vanished before teardown. The escalation is
+// still a no-op, so it is still not a force-delete.
+func TestTTLStop_WrapperThatVanishesDuringTeardownIsNotAForceDelete(t *testing.T) {
+	sess := &stopSession{
+		states:     []string{agent.SessionStateReady},
+		handoffErr: &agent.HTTPError{Status: http.StatusGone},
+		deleteErr:  &agent.UnreachableError{},
+	}
+	h := newTTLHarness(t, sess)
+	sess.onDeleteSession = func() {
+		pod := &corev1.Pod{}
+		require.NoError(t, h.c.Get(context.Background(),
+			types.NamespacedName{Namespace: ttlNS, Name: agent.PodName(h.task)}, pod))
+		require.NoError(t, h.c.Delete(context.Background(), pod))
+	}
+
+	res, err := h.stopper.StopWithHandoff(context.Background(), h.task, h.input())
+	require.NoError(t, err)
+	require.Equal(t, agent.TTLOutcomeGraceful, res.Outcome)
+	require.Equal(t, agent.TTLHandoffSynthetic, res.Handoff)
+}
+
+// A read error is NOT a NotFound. "I could not tell" must run the full sequence:
+// skipping the handoff turn because the API server was briefly unreachable would
+// throw away the agent's one chance to say something.
+func TestTTLStop_UnknownPodStateRunsTheFullSequence(t *testing.T) {
+	sess := &stopSession{states: []string{agent.SessionStateBusy, agent.SessionStateReady}}
+	h := newTTLHarness(t, sess)
+	agentWrites(t, h)
+
+	res, err := h.stopper.StopWithHandoff(context.Background(), h.task, h.input())
+	require.NoError(t, err)
+	require.Equal(t, 1, sess.handoffs, "a present wrapper is still offered its handoff turn")
+	require.Equal(t, agent.TTLHandoffAgent, res.Handoff)
 }

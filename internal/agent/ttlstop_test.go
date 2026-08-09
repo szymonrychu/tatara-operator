@@ -43,6 +43,9 @@ type stopSession struct {
 	normalTurns    int
 	deleteErr      error
 	deleteSessions int
+	// onDeleteSession runs before DeleteSession returns: the wrapper going away
+	// mid-teardown.
+	onDeleteSession func()
 	// onHandoff runs after a successful SubmitHandoffTurn: the agent's side of
 	// the turn (it writes its own handoff note).
 	onHandoff func()
@@ -97,9 +100,14 @@ func (s *stopSession) GetSession(context.Context, string) (agent.SessionInfo, er
 
 func (s *stopSession) DeleteSession(context.Context, string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.deleteSessions++
-	return s.deleteErr
+	err := s.deleteErr
+	cb := s.onDeleteSession
+	s.mu.Unlock()
+	if cb != nil {
+		cb()
+	}
+	return err
 }
 
 // directNoteAppender writes notes straight onto the Task status. The production

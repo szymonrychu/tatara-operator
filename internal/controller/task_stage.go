@@ -1258,10 +1258,11 @@ func (r *TaskReconciler) stalledTurnStop(ctx context.Context, proj *tatarav1alph
 	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("stalled turn re-arm %s: %w", task.Name, err)
 	}
-	log.FromContext(ctx).Info("stalled turn stopped gracefully; handed off",
-		"action", "stalled_turn_stop", "resource_id", task.Name, "turn_id", turnID,
-		"agent_kind", agentKind, "outcome", res.Outcome, "handoff", res.Handoff,
-		"wait", StalledTurnHandoffWait.String())
+	logTTLStop(ctx,
+		"stalled turn stopped gracefully; handed off",
+		"stalled turn stopped with NO continuation state captured; this turn's work is unrecorded",
+		"stalled_turn_stop", res, "resource_id", task.Name, "turn_id", turnID,
+		"agent_kind", agentKind, "wait", StalledTurnHandoffWait.String())
 	return ctrl.Result{RequeueAfter: agentBootRequeue}, nil
 }
 
@@ -1319,10 +1320,30 @@ func (r *TaskReconciler) ttlStop(ctx context.Context, proj *tatarav1alpha1.Proje
 	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("ttl stop re-arm %s: %w", task.Name, err)
 	}
-	log.FromContext(ctx).Info("agent pod TTL-stopped; handed off",
-		"action", "agent_pod_ttl_stop", "resource_id", task.Name,
-		"agent_kind", agentKind, "outcome", res.Outcome, "handoff", res.Handoff)
+	logTTLStop(ctx,
+		"agent pod TTL-stopped; handed off",
+		"agent pod TTL-stopped with NO continuation state captured; the previous pod's work is unrecorded",
+		"agent_pod_ttl_stop", res, "resource_id", task.Name, "agent_kind", agentKind)
 	return ctrl.Result{RequeueAfter: agentBootRequeue}, nil
+}
+
+// logTTLStop logs one G.7 stop at a level and with a wording that match what
+// actually happened.
+//
+// The single line this replaces read "agent pod TTL-stopped; handed off" at INFO
+// on EVERY path, including the one where nothing whatsoever was handed off. The
+// failure mode therefore had no log signature at all: grepping the operator's
+// stdout for the #527 incident turned up two lines, both of them claiming
+// success. A stop that captured nothing is an ERROR, and it says so in words a
+// human reading Loki can act on.
+func logTTLStop(ctx context.Context, okMsg, lostMsg, action string, res agent.TTLStopResult, fields ...any) {
+	fields = append([]any{"action", action, "outcome", res.Outcome, "handoff", res.Handoff}, fields...)
+	l := log.FromContext(ctx)
+	if res.Handoff == agent.TTLHandoffNone {
+		l.Error(nil, lostMsg, fields...)
+		return
+	}
+	l.Info(okMsg, fields...)
 }
 
 // clearLastTurn retires the continuation state a G.7 stop has just spent.

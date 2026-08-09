@@ -279,6 +279,25 @@ func (s *TTLStopper) poll() time.Duration {
 // the whole mechanism exists for - but see TTLHandoffNone: non-empty is not the
 // same as useful, and the two are now told apart.
 func (s *TTLStopper) StopWithHandoff(ctx context.Context, task *tatarav1alpha1.Task, in TTLStopInput) (TTLStopResult, error) {
+	// A wrapper that is ALREADY GONE - evicted, reaped, or deleted out from under
+	// this sequence - has no turn to offer and nothing to force-delete. Probing up
+	// front is what stops the sequence spending the full 2*turnTimeout talking to
+	// a corpse and then reporting force_deleted for a pod nobody forced. That is
+	// the 12:37:58Z event in #527 exactly: the reaper deleted the pod at 12:10:19Z
+	// and the stop ran 27 minutes later against nothing.
+	//
+	// It does not close the reap-then-stop RACE - the reaper's stand-down window
+	// does that. It bounds the damage when the race is already lost, and it is the
+	// only guard on the callers that have no podGone check ahead of them
+	// (stalledTurnStop, liveHandoffAndPark).
+	if s.wrapperGone(ctx, task) {
+		handoff, err := s.writeSyntheticNote(ctx, task, in)
+		if err != nil {
+			return TTLStopResult{}, err
+		}
+		return s.record(in, TTLOutcomeGraceful, handoff), nil
+	}
+
 	hardCap := in.hardCap()
 
 	before, err := s.handoffNoteCount(ctx, task.Name)
@@ -321,6 +340,12 @@ func (s *TTLStopper) StopWithHandoff(ctx context.Context, task *tatarav1alpha1.T
 // to say whether any work survived: a Task whose agent wrote a perfect handoff
 // and whose wrapper then failed to tear down cleanly was reported as
 // force_deleted, indistinguishable from total loss (#527).
+//
+// A graceful stop that fails escalates to a force-delete, but only COUNTS as one
+// if the pod was actually still there. Force-deleting an absent pod is a no-op,
+// and reporting force_deleted for it is a fabrication that fires the alert on a
+// Task nothing went wrong for - the session call fails precisely BECAUSE the
+// wrapper is gone, so this is the common case, not an exotic one.
 func (s *TTLStopper) finish(ctx context.Context, task *tatarav1alpha1.Task, in TTLStopInput, handoff string) (TTLStopResult, error) {
 	stopErr := s.Session.DeleteSession(ctx, in.BaseURL)
 	if stopErr == nil {
@@ -329,10 +354,23 @@ func (s *TTLStopper) finish(ctx context.Context, task *tatarav1alpha1.Task, in T
 	if stopErr == nil {
 		return s.record(in, TTLOutcomeGraceful, handoff), nil
 	}
+	gone := s.wrapperGone(ctx, task)
 	if ferr := s.forceDeletePod(ctx, task); ferr != nil {
 		return TTLStopResult{}, ferr
 	}
+	if gone {
+		return s.record(in, TTLOutcomeGraceful, handoff), nil
+	}
 	return s.record(in, TTLOutcomeForceDeleted, handoff), nil
+}
+
+// wrapperGone reports whether the wrapper Pod backing this Task is already
+// absent. Only a definite NotFound counts: a read error means "unknown", and the
+// conservative answer to unknown is to run the full stop sequence.
+func (s *TTLStopper) wrapperGone(ctx context.Context, task *tatarav1alpha1.Task) bool {
+	pod := &corev1.Pod{}
+	err := s.Client.Get(ctx, types.NamespacedName{Namespace: s.Namespace, Name: PodName(task)}, pod)
+	return apierrors.IsNotFound(err)
 }
 
 // record emits the metric (when wired) and returns the result the caller logs.
