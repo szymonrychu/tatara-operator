@@ -758,10 +758,17 @@ type TaskStatus struct {
 	// only ever be RENDERED into a note, so retaining more than a note can hold
 	// buys nothing and spends the A.7 object budget.
 	//
-	// LastTurnPushedRepos is OVERWRITTEN on every turn, including with an empty
-	// list. That is the point of retaining pushedRepos on the wire at all (G.2):
-	// "the agent pushed nothing this turn" and "the agent pushed tatara-operator
-	// two turns ago" must not render as the same note.
+	// LastTurnPushedRepos is OVERWRITTEN on every turn that produced anything,
+	// including with an empty list. That is the point of retaining pushedRepos on
+	// the wire at all (G.2): "the agent pushed nothing this turn" and "the agent
+	// pushed tatara-operator two turns ago" must not render as the same note.
+	//
+	// BOTH fields hold the newest NON-EMPTY payload: a turn that produced neither
+	// a final text nor a push - state="failed" is a real wrapper state - leaves
+	// them alone rather than blanking them. Recording that emptiness would
+	// discard the newest turn that DID produce something and make the very next
+	// G.7 stop write its placeholder note, which is the loss these fields exist
+	// to prevent.
 	// +optional
 	// +kubebuilder:validation:MaxLength=4096
 	LastTurnFinalText string `json:"lastTurnFinalText,omitempty"`
