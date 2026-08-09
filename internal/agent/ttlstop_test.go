@@ -134,6 +134,8 @@ type ttlHarness struct {
 	task    *tatarav1alpha1.Task
 	now     time.Time
 	res     agent.TTLStopResult
+	// cause is the ttl|stall|eviction|idle metric label the stop reported.
+	cause string
 }
 
 func newTTLHarness(t *testing.T, sess *stopSession) *ttlHarness {
@@ -170,8 +172,9 @@ func newTTLHarness(t *testing.T, sess *stopSession) *ttlHarness {
 			h.now = h.now.Add(10 * time.Millisecond)
 			return nil
 		},
-		Record: func(_, outcome, handoff string) {
+		Record: func(_, outcome, handoff, cause string) {
 			h.res = agent.TTLStopResult{Outcome: outcome, Handoff: handoff}
+			h.cause = cause
 		},
 	}
 	return h
@@ -478,4 +481,18 @@ func TestTTLStop_ZeroMaxWaitKeepsTheTTLBound(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, agent.TTLHandoffSynthetic, res.Handoff)
 	require.NotEmpty(t, h.notes(t))
+}
+
+// The stop sequence does not probe or interrupt in this phase; these satisfy the
+// Session interface and assert nothing.
+func (s *stopSession) Probe(context.Context, string, string) (string, error) {
+	return "", agent.ErrProbeUnsupported
+}
+
+func (s *stopSession) ProbeStatus(context.Context, string, string) (agent.ProbeResult, error) {
+	return agent.ProbeResult{}, agent.ErrProbeUnsupported
+}
+
+func (s *stopSession) Interrupt(context.Context, string) error {
+	return agent.ErrProbeUnsupported
 }

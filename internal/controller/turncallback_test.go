@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -435,4 +437,202 @@ func TestTurnComplete_LogsAgentInternalIssue(t *testing.T) {
 func captureLogger(buf *bytes.Buffer) context.Context {
 	logger := zap.New(zap.WriteTo(buf), zap.UseDevMode(true))
 	return log.IntoContext(context.Background(), logger)
+}
+
+// TestPollOnce_SubagentAwareLastActivity IS THE 2095-SECOND FIX.
+//
+// The wrapper's own lastActivityAt tails only the PARENT transcript. A parent
+// blocked on a Task tool call writes nothing there for as long as its subagent
+// runs - one measured run went silent for 2095 seconds (35 minutes) with a
+// perfectly healthy agent underneath, which is past the default 1800s stall
+// window. Every signal the operator had said "dead".
+//
+// The backstop now stamps turn-last-activity-at from the LATER of the parent's
+// activity and the wrapper's lastSubagentActivityAt, so a turn waiting on its own
+// subagent is not idle.
+//
+// THE nil ROW IS THE POINT OF THE POINTER. An old wrapper omits the field, and
+// the merge must then produce the parent's value byte-for-byte - not zero, not
+// now - or this phase changes behaviour against every not-yet-rolled pod.
+func TestPollOnce_SubagentAwareLastActivity(t *testing.T) {
+	base := time.Now().UTC().Truncate(time.Second)
+	parent := base.Add(-40 * time.Minute)   // parent transcript went quiet 40m ago
+	subagent := base.Add(-30 * time.Second) // ...but the subagent wrote 30s ago
+	older := base.Add(-50 * time.Minute)
+
+	ptr := func(tt time.Time) *time.Time { return &tt }
+
+	tests := []struct {
+		name     string
+		parent   time.Time
+		subagent *time.Time
+		want     time.Time
+	}{
+		{
+			name:     "old wrapper omits the field: parent value, unchanged",
+			parent:   parent,
+			subagent: nil,
+			want:     parent,
+		},
+		{
+			name:     "subagent newer: the blind spot closes",
+			parent:   parent,
+			subagent: ptr(subagent),
+			want:     subagent,
+		},
+		{
+			name:     "parent newer: the subagent stamp must not drag activity backwards",
+			parent:   parent,
+			subagent: ptr(older),
+			want:     parent,
+		},
+		{
+			name:     "equal: either is correct, and neither may be zero",
+			parent:   parent,
+			subagent: ptr(parent),
+			want:     parent,
+		},
+		{
+			name:     "no parent activity at all: the subagent stamp alone still lands",
+			parent:   time.Time{},
+			subagent: ptr(subagent),
+			want:     subagent,
+		},
+	}
+
+	mkTaskProject(t, "p-sub", 3)
+	mkTaskRepository(t, "r-sub", "p-sub")
+
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			task := fmt.Sprintf("t-sub-%d", i)
+			turn := fmt.Sprintf("turn-sub-%d", i)
+			mkTask(t, task, "p-sub", "r-sub")
+			annotate(t, task, map[string]string{
+				annCurrentTurn:   turn,
+				annTurnStartedAt: base.Format(time.RFC3339), // recent: not timed out
+			})
+
+			fs := newFakeSession()
+			fs.getResult[turn] = agent.TurnResult{State: "running", LastActivityAt: tc.parent}
+			fs.sessionInfo.LastSubagentActivityAt = tc.subagent
+
+			cb := newCallbackServer()
+			cb.Session = fs
+			cb.PollOnce(context.Background())
+
+			want := tc.want.Format(time.RFC3339)
+			if got := getTask(t, task).Annotations[annTurnLastActivity]; got != want {
+				t.Errorf("turn-last-activity-at = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// TestPollOnce_SubagentActivityKeepsALiveTurnAlive is the same fix stated as the
+// OUTCOME rather than the annotation.
+//
+// The backstop runs every 30s, so the mechanism is per-pass: while the parent
+// transcript is silent, each pass re-bases turn-last-activity-at off the SUBAGENT
+// stamp, and the stall deadline moves with it. The fixture below is one such
+// pass, taken 1700s into a parent silence that went on to reach the measured
+// 2095s - past the project's 1800s window. Before this phase the pass would have
+// stamped the parent's 1700s-old value and the turn would have been declared
+// stalled 100 seconds later, with a healthy subagent still working.
+func TestPollOnce_SubagentActivityKeepsALiveTurnAlive(t *testing.T) {
+	mkTaskProject(t, "p-subkeep", 3)
+	mkTaskRepository(t, "r-subkeep", "p-subkeep")
+	mkTask(t, "t-subkeep", "p-subkeep", "r-subkeep")
+	setTaskPodStartedAt(t, "t-subkeep", time.Now().Add(-2*time.Hour))
+
+	// Inside the 1800s window, so the pass is not short-circuited - but only 100
+	// seconds of headroom left on a silence that runs to 2095s.
+	parentSilence := time.Now().Add(-1700 * time.Second).UTC().Truncate(time.Second)
+	annotate(t, "t-subkeep", map[string]string{
+		annCurrentTurn:      "turn-subkeep",
+		annTurnStartedAt:    parentSilence.Format(time.RFC3339),
+		annTurnLastActivity: parentSilence.Format(time.RFC3339),
+	})
+
+	subagent := time.Now().Add(-5 * time.Second).UTC().Truncate(time.Second)
+	fs := newFakeSession()
+	fs.getResult["turn-subkeep"] = agent.TurnResult{State: "running", LastActivityAt: parentSilence}
+	fs.sessionInfo.LastSubagentActivityAt = &subagent
+
+	cb := newCallbackServer()
+	cb.Session = fs
+	cb.PollOnce(context.Background())
+
+	tk := getTask(t, "t-subkeep")
+	if got := tk.Annotations[annTurnLastActivity]; got != subagent.Format(time.RFC3339) {
+		t.Fatalf("turn-last-activity-at = %q, want the subagent stamp %q",
+			got, subagent.Format(time.RFC3339))
+	}
+	// And the deadline moved with it. Stated at the FULL measured silence: 2095s
+	// of parent quiet, 1800s window.
+	fullSilence := time.Now().Add(-2095 * time.Second).UTC().Format(time.RFC3339)
+	if !turnTimedOut(fullSilence, fullSilence, 1800) {
+		t.Fatal("control is broken: 2095s of parent-only silence must exceed a 1800s window")
+	}
+	if turnTimedOut(fullSilence, tk.Annotations[annTurnLastActivity], 1800) {
+		t.Error("a turn whose subagent wrote 5s ago must not read as timed out after 2095s of PARENT silence")
+	}
+}
+
+// TestPollOnce_SubagentLookupFailureFallsBackToParent: GET /v1/session failing -
+// unreachable, 5xx, a dead wrapper - must degrade to exactly the pre-subagent
+// behaviour rather than losing the parent stamp.
+func TestPollOnce_SubagentLookupFailureFallsBackToParent(t *testing.T) {
+	mkTaskProject(t, "p-suberr", 3)
+	mkTaskRepository(t, "r-suberr", "p-suberr")
+	mkTask(t, "t-suberr", "p-suberr", "r-suberr")
+	annotate(t, "t-suberr", map[string]string{
+		annCurrentTurn:   "turn-suberr",
+		annTurnStartedAt: time.Now().UTC().Format(time.RFC3339),
+	})
+
+	parent := time.Now().Add(-3 * time.Second).UTC().Truncate(time.Second)
+	fs := newFakeSession()
+	fs.getResult["turn-suberr"] = agent.TurnResult{State: "running", LastActivityAt: parent}
+	fs.sessionErr = errors.New("wrapper unreachable")
+
+	cb := newCallbackServer()
+	cb.Session = fs
+	cb.PollOnce(context.Background())
+
+	if got := getTask(t, "t-suberr").Annotations[annTurnLastActivity]; got != parent.Format(time.RFC3339) {
+		t.Errorf("turn-last-activity-at = %q, want the parent stamp %q", got, parent.Format(time.RFC3339))
+	}
+}
+
+// TestMergeSubagentActivity is the merge in isolation, including the two rows the
+// envtest cases cannot express: both sources empty (nothing to stamp) and a
+// subagent stamp in a non-UTC zone.
+func TestMergeSubagentActivity(t *testing.T) {
+	utc := time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)
+	later := utc.Add(time.Hour)
+	ptr := func(tt time.Time) *time.Time { return &tt }
+
+	tests := []struct {
+		name     string
+		parent   time.Time
+		subagent *time.Time
+		want     time.Time
+	}{
+		{"nil subagent returns the parent verbatim", utc, nil, utc},
+		{"nil subagent on a zero parent stays zero", time.Time{}, nil, time.Time{}},
+		{"subagent later wins", utc, ptr(later), later},
+		{"subagent earlier loses", later, ptr(utc), later},
+		{"zero parent yields to any subagent stamp", time.Time{}, ptr(utc), utc},
+		{"zone does not decide it; the instant does",
+			utc, ptr(utc.Add(-time.Hour).In(time.FixedZone("far", 9*3600))), utc},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := mergeSubagentActivity(tc.parent, tc.subagent)
+			if !got.Equal(tc.want) {
+				t.Errorf("mergeSubagentActivity = %v, want %v", got, tc.want)
+			}
+		})
+	}
 }

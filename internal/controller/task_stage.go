@@ -1226,6 +1226,7 @@ func (r *TaskReconciler) stalledTurnStop(ctx context.Context, proj *tatarav1alph
 		Deadline:    now,
 		TurnTimeout: time.Duration(proj.Spec.Agent.TurnTimeoutSeconds) * time.Second,
 		MaxWait:     StalledTurnHandoffWait,
+		Cause:       agent.TTLCauseStall,
 		// #527: the same persisted continuation state ttlStop uses. A stalled turn
 		// is the case that needs it MOST - a genuinely hung wrapper never goes
 		// idle, so this caller almost always lands on the synthetic note.
@@ -1292,6 +1293,7 @@ func (r *TaskReconciler) ttlStop(ctx context.Context, proj *tatarav1alpha1.Proje
 		AgentKind:   agentKind,
 		Deadline:    deadline,
 		TurnTimeout: time.Duration(proj.Spec.Agent.TurnTimeoutSeconds) * time.Second,
+		Cause:       agent.TTLCauseTTL,
 		// The last turn-complete callback's finalText + pushedRepos, persisted onto
 		// the Task by CallbackServer.stampLastTurn. Without them the synthetic note
 		// degraded to "(none)"/"none" on EVERY synthetic path, which is what made
@@ -1430,6 +1432,11 @@ func (r *TaskReconciler) respawnLostPod(ctx context.Context, proj *tatarav1alpha
 
 	edge, terminal := stage.RecordRespawn(task, taskMaxPodRecreations(proj))
 	recreations := task.Status.Stats.PodRecreations
+	// Counted here, before the terminal branch, because stage.RecordRespawn has
+	// ALREADY spent the budget slot at this point whichever way the branch goes -
+	// and the attempt that exhausts it is the single most interesting one to the
+	// churn alert that will replace the cap.
+	obs.PodRecreation(task.Spec.ProjectRef, task.Spec.Kind)
 	if terminal {
 		log.FromContext(ctx).Info("agent pod lost; recreation budget exhausted",
 			"action", "pod_recreation_exhausted", "resource_id", task.Name,

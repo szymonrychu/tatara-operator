@@ -48,10 +48,24 @@ var agentContractMismatchTotal = prometheus.NewCounterVec(prometheus.CounterOpts
 //
 // Task.status.notes is NEVER empty after a TTL stop, on any pairing. handoff=none
 // is precisely the case where non-empty is not the same as useful.
+//
+// cause - WHY the stop ran, and it is a THIRD independent dimension:
+//
+//	ttl       - the pod reached t0. A routine, healthy rotation.
+//	stall     - a turn went silent past turnTimeoutSeconds and was stopped.
+//	eviction  - the live-pod ceiling took this pod's slot for another Task.
+//	idle      - a live conversation ran out its idle budget with no reply.
+//
+// The counter conflated all four until this phase, and the conflation makes the
+// series unreadable for the only question anyone asks of it: a project that
+// rotates pods on schedule every hour and a project whose agents keep hanging
+// produce the SAME number here. Only one of those is a problem, and the metric
+// could not say which it was looking at. The name keeps saying "ttl" because
+// renaming an emitted series is a separate decision from splitting it.
 var agentPodTTLExpiredTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Name: "operator_agent_pod_ttl_expired_total",
-	Help: "Agent pods stopped by the pod TTL stop sequence (contract G.7), by agent kind, how the pod was stopped (outcome), and how continuation state was captured (handoff).",
-}, []string{"agent_kind", "outcome", "handoff"})
+	Help: "Agent pods stopped by the pod stop sequence (contract G.7), by agent kind, how the pod was stopped (outcome), how continuation state was captured (handoff), and why the stop ran (cause: ttl|stall|eviction|idle).",
+}, []string{"agent_kind", "outcome", "handoff", "cause"})
 
 // agentContractSkew is the STATE the mismatch counter could never express.
 //
@@ -151,13 +165,13 @@ func AgentContractMismatchCounter(expected, got, image string) prometheus.Counte
 }
 
 // AgentPodTTLExpired increments operator_agent_pod_ttl_expired_total for one
-// TTL-stopped pod. outcome is graceful|force_deleted; handoff is
-// agent|synthetic|none.
-func AgentPodTTLExpired(agentKind, outcome, handoff string) {
-	agentPodTTLExpiredTotal.WithLabelValues(agentKind, outcome, handoff).Inc()
+// stopped pod. outcome is graceful|force_deleted; handoff is
+// agent|synthetic|none; cause is ttl|stall|eviction|idle.
+func AgentPodTTLExpired(agentKind, outcome, handoff, cause string) {
+	agentPodTTLExpiredTotal.WithLabelValues(agentKind, outcome, handoff, cause).Inc()
 }
 
 // AgentPodTTLExpiredCounter returns the counter for test assertions.
-func AgentPodTTLExpiredCounter(agentKind, outcome, handoff string) prometheus.Counter {
-	return agentPodTTLExpiredTotal.WithLabelValues(agentKind, outcome, handoff)
+func AgentPodTTLExpiredCounter(agentKind, outcome, handoff, cause string) prometheus.Counter {
+	return agentPodTTLExpiredTotal.WithLabelValues(agentKind, outcome, handoff, cause)
 }

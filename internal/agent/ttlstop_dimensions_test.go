@@ -291,3 +291,40 @@ func TestTTLStop_UnknownPodStateRunsTheFullSequence(t *testing.T) {
 	require.Equal(t, 1, sess.handoffs, "a present wrapper is still offered its handoff turn")
 	require.Equal(t, agent.TTLHandoffAgent, res.Handoff)
 }
+
+// TestTTLStop_CauseIsAThirdIndependentDimension.
+//
+// operator_agent_pod_ttl_expired_total counted four different events as one until
+// this label existed: a routine hourly TTL rotation, a hung agent being killed, a
+// healthy pod evicted for its slot, and a conversation nobody replied to. Only one
+// of those is a problem, and the series could not say which it was looking at.
+//
+// The empty-Cause row is load-bearing: a blank label value is a hole no query can
+// select for, so an omitted cause must default to the counter's historic meaning
+// rather than being emitted as "".
+func TestTTLStop_CauseIsAThirdIndependentDimension(t *testing.T) {
+	cases := []struct {
+		name  string
+		cause string
+		want  string
+	}{
+		{"omitted defaults to the historic meaning", "", agent.TTLCauseTTL},
+		{"ttl", agent.TTLCauseTTL, agent.TTLCauseTTL},
+		{"stall", agent.TTLCauseStall, agent.TTLCauseStall},
+		{"eviction", agent.TTLCauseEviction, agent.TTLCauseEviction},
+		{"idle", agent.TTLCauseIdle, agent.TTLCauseIdle},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newTTLHarness(t, &stopSession{})
+			in := h.input()
+			in.Cause = tc.cause
+			_, err := h.stopper.StopWithHandoff(context.Background(), h.task, in)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, h.cause)
+			// The two pre-existing dimensions are untouched by the third.
+			require.NotEmpty(t, h.res.Outcome)
+			require.NotEmpty(t, h.res.Handoff)
+		})
+	}
+}

@@ -394,3 +394,15 @@ func bundleElidedFor(t *testing.T, r *TaskReconciler, kind string) float64 {
 	}
 	return 0
 }
+
+func (s *countingSession) Probe(_ context.Context, _, _ string) (string, error) {
+	return "", agent.ErrProbeUnsupported
+}
+
+func (s *countingSession) ProbeStatus(_ context.Context, _, _ string) (agent.ProbeResult, error) {
+	return agent.ProbeResult{}, agent.ErrProbeUnsupported
+}
+
+func (s *countingSession) Interrupt(_ context.Context, _ string) error {
+	return agent.ErrProbeUnsupported
+}

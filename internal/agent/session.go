@@ -38,7 +38,83 @@ type SessionInfo struct {
 	LastActivityAt time.Time `json:"lastActivityAt"`
 	// +optional
 	ContractVersion *int `json:"contractVersion,omitempty"`
+	// LastSubagentActivityAt is the most recent line the wrapper saw in ANY
+	// <sessionDir>/subagents/agent-*.jsonl. The wrapper's own lastActivityAt tails
+	// only the PARENT transcript, and a parent waiting on a Task tool call writes
+	// nothing at all while its subagent works: one measured run went silent in the
+	// parent file for 2095 seconds (35 minutes) with a perfectly healthy agent
+	// underneath it. That is a stall by every signal the operator had.
+	//
+	// A POINTER, and this is the whole point of the field. An old wrapper omits it
+	// entirely; a plain time.Time would decode as the zero value, which reads as
+	// "no subagent activity, ever" - indistinguishable from a wrapper that reported
+	// genuine silence, and exactly the bug this exists to fix. nil means NOT
+	// REPORTED, and every consumer falls back to lastActivityAt alone.
+	// +optional
+	LastSubagentActivityAt *time.Time `json:"lastSubagentActivityAt,omitempty"`
+	// OutstandingSubagentCalls is how many Task tool calls the wrapper has seen
+	// started and not yet finished. Non-zero means the parent is legitimately
+	// blocked on a child, which is the state that produced the 2095s blind spot.
+	//
+	// A POINTER for the same reason as LastSubagentActivityAt: from an old wrapper
+	// zero would assert "no subagents running", which is a claim it never made.
+	// +optional
+	OutstandingSubagentCalls *int `json:"outstandingSubagentCalls,omitempty"`
 }
+
+// Probe lifecycle states, as reported by GET /v1/probe/{probeId}.
+//
+// The states are about DELIVERY, not about liveness directly: the wrapper writes
+// a probe into the PTY, and Claude answers it at its next TOOL-CALL BOUNDARY.
+const (
+	// ProbeStatePending: the probe was written and its queue-operation `enqueue`
+	// line was seen, with no matching `remove`. The agent has NOT picked it up.
+	// Blocked inside one long tool call looks exactly like this - the probe is
+	// buffered, not lost - so pending is "no answer yet", never "dead".
+	ProbeStatePending = "pending"
+	// ProbeStateDelivered: the enqueue was removed, so the agent consumed the
+	// probe, and has not yet produced the answer line.
+	ProbeStateDelivered = "delivered"
+	// ProbeStateAnswered: an assistant message starting with the TATARA-ALIVE
+	// marker landed after delivery. The agent is alive and the turn continues.
+	ProbeStateAnswered = "answered"
+)
+
+// ProbeResult is the wrapper's GET /v1/probe/{probeId} response.
+type ProbeResult struct {
+	// ProbeID echoes the probe this status is for.
+	ProbeID string
+	// State is one of ProbeStatePending / ProbeStateDelivered / ProbeStateAnswered.
+	State string
+	// Answer is the agent's one-sentence reply, present only once answered.
+	Answer string
+	// SentAt / DeliveredAt / AnsweredAt are zero until the corresponding
+	// transition happened.
+	SentAt, DeliveredAt, AnsweredAt time.Time
+}
+
+// Answered reports whether the agent replied to this probe.
+func (p ProbeResult) Answered() bool { return p.State == ProbeStateAnswered }
+
+// ErrProbeUnsupported is returned by Probe / ProbeStatus / Interrupt when the
+// wrapper does not serve the endpoint at all: HTTP 404 (route not mounted) or 405
+// (path exists, method does not).
+//
+// It is a SENTINEL rather than a plain HTTPError because it is the ONLY thing
+// keeping an old wrapper working byte-identically. The operator and the wrapper
+// image are pinned in different helm releases and roll independently, so
+// new-operator + old-wrapper is a guaranteed window on every train (#544 was 56
+// minutes of exactly that). A caller that sees this must fall back to the
+// pre-probe behaviour verbatim - never fail, never park, never escalate.
+//
+// One deliberate imprecision: a NEW wrapper also 404s an UNKNOWN probeId, so a
+// probe whose id the wrapper has forgotten reads as unsupported. The consequence
+// is identical either way (fall back to the pre-probe path), so the ambiguity
+// costs nothing and collapsing it keeps the fallback single-branched.
+var ErrProbeUnsupported = errors.New("agent: wrapper does not serve the stall probe endpoints")
+
+// IsProbeUnsupported reports whether err means the wrapper has no probe support.
+func IsProbeUnsupported(err error) bool { return errors.Is(err, ErrProbeUnsupported) }
 
 // The wrapper's session states (session.State in tatara-claude-code-wrapper).
 const (
@@ -71,6 +147,14 @@ func (s SessionInfo) TurnInFlight() bool { return s.State == SessionStateBusy }
 // approvingMaintainer, planNoteId and approvalCitations; `documentation` got its
 // own schema so it does not inherit them. Three independent breaking changes to
 // the agent-facing surface, so the constant moves once for all of them.
+//
+// 4 STAYS 4 ACROSS THE STALL PROBE, deliberately. /v1/probe, /v1/probe/{id} and
+// /v1/interrupt are purely ADDITIVE HTTP, and the operator maps their absence to
+// ErrProbeUnsupported and falls back verbatim - so an old wrapper is not merely
+// tolerated, it behaves byte-identically. Bumping would drag in tatara-cli
+// (internal/mcp/contract.go moves in the same shot) and burn the +-1 skew window
+// on a change that breaks nothing, leaving the next genuine break with no skew
+// room - the #544 shape with the pins swapped.
 const ContractVersion = 4
 
 // Session is the operator's view of one wrapper session. baseURL is the
@@ -88,6 +172,27 @@ type Session interface {
 	// (G.10) alongside the six pre-existing fields.
 	GetSession(ctx context.Context, baseURL string) (SessionInfo, error)
 	DeleteSession(ctx context.Context, baseURL string) error
+	// Probe asks the agent, MID-TURN, whether it is alive. It is not a turn: the
+	// wrapper writes the text straight into the PTY and never 409s, because the
+	// only moment worth asking is precisely when a turn IS in flight. Returns the
+	// probeId to poll with ProbeStatus.
+	//
+	// ErrProbeUnsupported from a wrapper that has no such endpoint.
+	Probe(ctx context.Context, baseURL, text string) (probeID string, err error)
+	// ProbeStatus reads one probe's delivery/answer state.
+	//
+	// ErrProbeUnsupported from a wrapper that has no such endpoint (and, harmlessly,
+	// from a wrapper that has forgotten this probeId - see ErrProbeUnsupported).
+	ProbeStatus(ctx context.Context, baseURL, probeID string) (ProbeResult, error)
+	// Interrupt sends ESC to the agent's PTY, which cancels the in-flight tool
+	// call synchronously (~40ms measured) while the session, sessionId, transcript
+	// and workspace all survive. It is the primitive that makes a stalled turn's
+	// handoff SUBMITTABLE: without it POST /v1/messages 409s for as long as the
+	// hung turn is in flight, which is why the stalled-turn stop almost always
+	// lands on the synthetic note today.
+	//
+	// ErrProbeUnsupported from a wrapper that has no such endpoint.
+	Interrupt(ctx context.Context, baseURL string) error
 }
 
 // ContractMismatchError is returned by AssertContractVersion when the wrapper

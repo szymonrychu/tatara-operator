@@ -2391,3 +2391,62 @@ func TestEnsureStagePod_ReviewMROpen_ProceedsNormally(t *testing.T) {
 	got := mdGetTask(t, c, "t1")
 	require.Equal(t, tatarav1alpha1.StateAwaitingReview, got.Status.State, "no finalize on an open MR")
 }
+
+// TestRespawnLostPod_CountsThePodRecreation.
+//
+// operator_pod_recreations_total is the INPUT TO THE ALERT THAT REPLACES THE CAP.
+// Today maxPodRecreations bounds a crash loop by parking the Task - a terminal a
+// human has to dig out of, with no signal at all until the budget is spent. The
+// later phase deletes that enforcement and pages on the rate instead, so the
+// counter has to be trustworthy BEFORE the cap comes out.
+//
+// Counted on the attempt that EXHAUSTS the budget too: stage.RecordRespawn has
+// already spent the slot by then, and a loop that ends in a park is exactly the
+// shape whose last attempt must not go missing from the rate.
+func TestRespawnLostPod_CountsThePodRecreation(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		recreations int
+		wantParked  bool
+	}{
+		{"within budget", 0, false},
+		{"the attempt that exhausts it", maxPodRecreations, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Now()
+			task := tsTask("lost-pod-metric", "implement", tatarav1alpha1.StateUnderImplementation, now.Add(-time.Hour))
+			pod := metav1.NewTime(now.Add(-30 * time.Minute))
+			work := metav1.NewTime(now.Add(-29 * time.Minute))
+			task.Status.PodStartedAt = &pod
+			task.Status.StateWorkStartedAt = &work
+			task.Status.Stats.PodRecreations = tc.recreations
+			proj := tsProject(3)
+			r := tsReconciler(newMirrorClient(t, proj, mdSecret(), task))
+
+			c := obs.PodRecreationCounter(task.Spec.ProjectRef, task.Spec.Kind)
+			before := testutil.ToFloat64(c)
+			if _, err := r.respawnLostPod(context.Background(), proj, task, now); err != nil {
+				t.Fatalf("respawnLostPod: %v", err)
+			}
+			if got := testutil.ToFloat64(c) - before; got != 1 {
+				t.Errorf("operator_pod_recreations_total delta = %v, want 1", got)
+			}
+			if tatarav1alpha1.Parked(mdGetTask(t, r.Client, task.Name)) != tc.wantParked {
+				t.Errorf("parked = %v, want %v", !tc.wantParked, tc.wantParked)
+			}
+		})
+	}
+}
+
+// TestTTLCauseForLiveExit maps this package's live-exit vocabulary onto the stop
+// metric's. The two are deliberately NOT one set of constants: causeIdle/
+// causeEvicted also label operator_live_closed_total, an already-emitted series,
+// and re-spelling "evicted" there would break every existing selector on it.
+func TestTTLCauseForLiveExit(t *testing.T) {
+	if got := ttlCauseForLiveExit(causeEvicted); got != agent.TTLCauseEviction {
+		t.Errorf("evicted -> %q, want %q", got, agent.TTLCauseEviction)
+	}
+	if got := ttlCauseForLiveExit(causeIdle); got != agent.TTLCauseIdle {
+		t.Errorf("idle -> %q, want %q", got, agent.TTLCauseIdle)
+	}
+}

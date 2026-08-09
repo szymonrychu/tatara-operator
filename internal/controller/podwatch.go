@@ -236,6 +236,9 @@ func (r *PodWatchReconciler) handleNotReady(ctx context.Context, pod *corev1.Pod
 	}
 	edge, terminal := stage.RecordRespawn(fresh, r.maxRecreations())
 	recreations := fresh.Status.Stats.PodRecreations
+	// See respawnLostPod: counted at the attempt, terminal included. A pod that
+	// never becomes ready is the boot-crash loop the churn alert exists for.
+	obs.PodRecreation(fresh.Spec.ProjectRef, fresh.Spec.Kind)
 	if terminal {
 		l.Info("agent pod never became ready; recreation budget exhausted, parking task",
 			"action", "pod_recreation_exhausted", "resource_id", taskName, "pod", pod.Name)

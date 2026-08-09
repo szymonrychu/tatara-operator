@@ -34,6 +34,14 @@ type fakeSession struct {
 	// sessionInfo is what GetSession returns; sessionErr overrides it.
 	sessionInfo agent.SessionInfo
 	sessionErr  error
+	// probes records every Probe call; probeErr overrides the return.
+	probes   []interjection
+	probeErr error
+	// probeStatus is what ProbeStatus returns, keyed by probeId.
+	probeStatus map[string]agent.ProbeResult
+	// interrupts records every Interrupt call; interruptErr overrides the return.
+	interrupts   []string
+	interruptErr error
 }
 
 func newFakeSession() *fakeSession {
@@ -41,7 +49,37 @@ func newFakeSession() *fakeSession {
 	return &fakeSession{
 		getResult:   map[string]agent.TurnResult{},
 		sessionInfo: agent.SessionInfo{State: agent.SessionStateReady, ContractVersion: &v},
+		probeStatus: map[string]agent.ProbeResult{},
 	}
+}
+
+func (f *fakeSession) Probe(_ context.Context, baseURL, text string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.probeErr != nil {
+		return "", f.probeErr
+	}
+	f.probes = append(f.probes, interjection{BaseURL: baseURL, Text: text})
+	return "probe-" + strconv.Itoa(len(f.probes)), nil
+}
+
+func (f *fakeSession) ProbeStatus(_ context.Context, _ string, probeID string) (agent.ProbeResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.probeErr != nil {
+		return agent.ProbeResult{}, f.probeErr
+	}
+	return f.probeStatus[probeID], nil
+}
+
+func (f *fakeSession) Interrupt(_ context.Context, baseURL string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.interruptErr != nil {
+		return f.interruptErr
+	}
+	f.interrupts = append(f.interrupts, baseURL)
+	return nil
 }
 
 func (f *fakeSession) SubmitTurn(_ context.Context, baseURL, text, callbackURL string) (string, error) {
