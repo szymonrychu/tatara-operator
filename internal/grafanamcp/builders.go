@@ -41,6 +41,9 @@ func Deployment(p *tatarav1alpha1.Project, cfg Config) *appsv1.Deployment {
 				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
 				Spec: corev1.PodSpec{
 					ImagePullSecrets: imagePullSecrets(cfg),
+					NodeSelector:     cfg.NodeSelector,
+					Tolerations:      cfg.Tolerations,
+					Affinity:         cfg.Affinity,
 					Volumes: []corev1.Volume{{
 						Name: "grafana-token",
 						VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{

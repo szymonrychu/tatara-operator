@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -68,6 +69,64 @@ func TestEndpointAndMCPURL(t *testing.T) {
 	}
 	if MCPURL("acme", "tatara") != "http://grafana-mcp-acme.tatara.svc:8000/mcp" {
 		t.Fatalf("mcp url: %s", MCPURL("acme", "tatara"))
+	}
+}
+
+// TestDeployment_NoPlacementWhenUnset asserts a zero-value Config stamps a
+// Deployment with no placement at all, so an operator deployed from the
+// cluster-agnostic chart default (rule 14) behaves exactly as it does today.
+func TestDeployment_NoPlacementWhenUnset(t *testing.T) {
+	d := Deployment(proj(), Config{Namespace: "tatara", Image: "grafana/mcp-grafana:v0.1.0"})
+	ps := d.Spec.Template.Spec
+	if ps.NodeSelector != nil {
+		t.Fatalf("nodeSelector must be nil when unset: %+v", ps.NodeSelector)
+	}
+	if ps.Tolerations != nil {
+		t.Fatalf("tolerations must be nil when unset: %+v", ps.Tolerations)
+	}
+	if ps.Affinity != nil {
+		t.Fatalf("affinity must be nil when unset: %+v", ps.Affinity)
+	}
+}
+
+// TestDeployment_AppliesScheduling asserts the cluster-specific placement the
+// deploying helmfile supplies via MCP_SCHEDULING reaches the stamped PodSpec.
+// This is the fix for two grafana-mcp Deployments landing on the CI-runner node
+// because the operator gave them no scheduling constraints at all.
+func TestDeployment_AppliesScheduling(t *testing.T) {
+	aff := &corev1.Affinity{
+		NodeAffinity: &corev1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+				NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+					MatchExpressions: []corev1.NodeSelectorRequirement{{
+						Key:      "node-role.kubernetes.io/control-plane",
+						Operator: corev1.NodeSelectorOpExists,
+					}},
+				}},
+			},
+		},
+	}
+	cfg := Config{
+		Namespace:    "tatara",
+		Image:        "grafana/mcp-grafana:v0.1.0",
+		NodeSelector: map[string]string{"kubernetes.io/os": "linux"},
+		Tolerations:  []corev1.Toleration{{Key: "dedicated", Operator: corev1.TolerationOpExists}},
+		Affinity:     aff,
+	}
+
+	ps := Deployment(proj(), cfg).Spec.Template.Spec
+	if ps.NodeSelector["kubernetes.io/os"] != "linux" {
+		t.Fatalf("nodeSelector not applied: %+v", ps.NodeSelector)
+	}
+	if len(ps.Tolerations) != 1 || ps.Tolerations[0].Key != "dedicated" {
+		t.Fatalf("tolerations not applied: %+v", ps.Tolerations)
+	}
+	if ps.Affinity == nil || ps.Affinity.NodeAffinity == nil {
+		t.Fatalf("affinity not applied: %+v", ps.Affinity)
+	}
+	terms := ps.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+	if terms[0].MatchExpressions[0].Key != "node-role.kubernetes.io/control-plane" {
+		t.Fatalf("node affinity term not applied: %+v", terms)
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"golang.org/x/mod/semver"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -59,6 +60,15 @@ type Config struct {
 	Namespace       string
 	Image           string
 	ImagePullSecret string
+	// NodeSelector, Tolerations and Affinity control placement of the stamped
+	// grafana-mcp Pods. All three are nil unless the deploying helmfile set
+	// MCP_SCHEDULING, so the chart stays cluster-agnostic (rule 14). Flat fields
+	// rather than an agent.Scheduling: internal/agent already imports this
+	// package (agent/pod.go, for MCPURL), so importing it back would be a cycle.
+	// Mirrors agent.PodConfig's own NodeSelector/Tolerations/Affinity triple.
+	NodeSelector map[string]string
+	Tolerations  []corev1.Toleration
+	Affinity     *corev1.Affinity
 }
 
 // Name returns the Deployment/Service name for a project.
