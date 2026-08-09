@@ -46,6 +46,9 @@ const (
 	annPodRecreations        = tatarav1alpha1.AnnPodRecreations
 	annTurnStartedAt         = tatarav1alpha1.AnnTurnStartedAt
 	annTurnLastActivity      = tatarav1alpha1.AnnTurnLastActivity
+	annStallProbeID          = tatarav1alpha1.AnnStallProbeID
+	annStallProbeAt          = tatarav1alpha1.AnnStallProbeAt
+	annStallProbeAttempts    = tatarav1alpha1.AnnStallProbeAttempts
 	annAgentUnreachableSince = "tatara.dev/agent-unreachable-since"
 )
 

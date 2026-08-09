@@ -23,8 +23,17 @@ import (
 // The stop now runs from the Task reconciler - which already owns the identical
 // TTL stop - rather than from the backstop, because the graceful sequence blocks
 // on real timers and the backstop is one pass over every Task in the namespace.
+//
+// THIS IS ALSO THE OLD-WRAPPER CONTRACT, and it is asserted against a wrapper
+// with no probe endpoints on purpose. The stall ladder (internal/controller/
+// stall.go) sits in front of this stop now, but a wrapper that answers 404 to
+// POST /v1/probe must reach the SAME stop with the SAME arguments it reached
+// before the ladder existed - so every assertion below is the pre-O2 assertion,
+// unchanged, and it must keep passing verbatim for as long as an unrolled
+// wrapper can exist anywhere in the fleet.
 func TestStalledTurn_StopsGracefullyAndLeavesAHandoffNote(t *testing.T) {
 	proj, task, r, sess := newConversingExitFixture(t)
+	sess.probeErr = agent.ErrProbeUnsupported
 	task.Status.State = tatarav1alpha1.StateUnderImplementation
 	task.Status.AgentKind = stage.AgentKindFor(tatarav1alpha1.StateUnderImplementation, "implement")
 

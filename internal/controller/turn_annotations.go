@@ -53,6 +53,9 @@ func clearTurnAnnotations(ctx context.Context, c client.Client, task *tatarav1al
 		delete(fresh.Annotations, tatarav1alpha1.AnnTurnStartedAt)
 		delete(fresh.Annotations, tatarav1alpha1.AnnTurnLastActivity)
 		delete(fresh.Annotations, tatarav1alpha1.AnnTurnComplete)
+		delete(fresh.Annotations, tatarav1alpha1.AnnStallProbeID)
+		delete(fresh.Annotations, tatarav1alpha1.AnnStallProbeAt)
+		delete(fresh.Annotations, tatarav1alpha1.AnnStallProbeAttempts)
 		return true
 	})
 }
@@ -70,6 +73,14 @@ func taskCarriesTurnAnnotations(t *tatarav1alpha1.Task) bool {
 		tatarav1alpha1.AnnTurnStartedAt,
 		tatarav1alpha1.AnnTurnLastActivity,
 		tatarav1alpha1.AnnTurnComplete,
+		// The stall-probe trio is pod-scoped for the same reason and clears with
+		// them: an outstanding probeId that outlives its pod names a probe no
+		// wrapper knows, and a NEW wrapper 404s an unknown probeId exactly as an
+		// OLD wrapper 404s the route - so a leftover id would downgrade the next
+		// pod to the pre-probe fallback for the rest of its life.
+		tatarav1alpha1.AnnStallProbeID,
+		tatarav1alpha1.AnnStallProbeAt,
+		tatarav1alpha1.AnnStallProbeAttempts,
 	} {
 		if _, ok := t.Annotations[k]; ok {
 			return true
