@@ -56,6 +56,11 @@ func TestRelease_IsOwnershipChecked(t *testing.T) {
 				s: s, task: task, fp: tc.ourFP, kind: "review",
 				w: httptest.NewRecorder(),
 				r: httptest.NewRequest("POST", "/tasks/t1/outcome", nil),
+				// #578 made the claim LAZY, so release is a no-op unless THIS
+				// request actually took one. The CAS below is what runs after it
+				// did, which is the invariant under test - hence the explicit flag
+				// rather than a fixture that quietly stopped exercising anything.
+				claimed: true,
 			}
 			o.release()
 

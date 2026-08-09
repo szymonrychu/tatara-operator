@@ -3433,13 +3433,15 @@ func TestOutcome_IllegalTransitionWritesNothingAndReleasesTheClaim(t *testing.T)
 // SPEC TEST 5, black-box half: a rejection never undoes a COMMITTED outcome.
 //
 // The invariant lives in release's ownership check and is asserted directly in
-// release_internal_test.go - through the handler it can only be observed as an
-// EFFECT, not as a condition. A DIFFERENT outcome's claim overwrites the
-// committed condition in the single OutcomeAccepted slot BEFORE any gate runs
-// (claim-first is the C7 ordering and must not move), so the committed
-// condition is already gone by the time release could look at it. What must
-// hold - and does - is that the committed stage, reason and note survive
-// untouched, and that the rejection is still a 409.
+// release_internal_test.go. It used to be observable through the handler only as
+// an EFFECT: a DIFFERENT outcome's claim overwrote the committed condition in the
+// single OutcomeAccepted slot BEFORE any gate ran, so the committed condition was
+// already gone by the time release could look at it, and the slot ended up EMPTY.
+//
+// #578 MADE THE CLAIM LAZY, so the condition itself now survives too: the
+// rejection 409s at the terminal gate having written nothing at all, and the
+// committed record it never touched is still there afterwards - reason and
+// fingerprint unchanged.
 func TestOutcome_RejectionNeverUndoesACommittedOutcome(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
@@ -3464,9 +3466,11 @@ func TestOutcome_RejectionNeverUndoesACommittedOutcome(t *testing.T) {
 		"a rejection must never undo the committed outcome's effect")
 	require.Equal(t, before.Status.ParkReason, after.Status.ParkReason)
 	require.Equal(t, before.Status.Notes, after.Status.Notes)
-	require.Nil(t, tatarav1alpha1.OutcomeCondition(after),
-		"the second outcome's claim clobbered the committed condition before the gate ran, "+
-			"and its release then removed the claim it owned: the slot ends up EMPTY")
+	got := tatarav1alpha1.OutcomeCondition(after)
+	require.NotNil(t, got, "#578: a 409 that never claimed cannot clobber the committed record")
+	require.Equal(t, tatarav1alpha1.OutcomeCondition(before).Reason, got.Reason)
+	require.Equal(t, tatarav1alpha1.OutcomeCondition(before).Message, got.Message,
+		"the committed outcome's fingerprint must survive a different outcome's rejection")
 }
 
 // A kind=review submit_outcome(review) against an already-MERGED PR is a 2xx
