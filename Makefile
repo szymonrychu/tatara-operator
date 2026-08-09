@@ -122,7 +122,10 @@ chart-lint:
 		for k in nodeSelector tolerations affinity topologySpreadConstraints strategy; do \
 			echo "$$out" | grep -q "^\( *\)$$k:" || { echo "chart-lint: $$k set but not rendered"; exit 1; }; \
 		done; \
-		echo "$$out" | grep -q "maxSurge: 0" || { echo "chart-lint: strategy.rollingUpdate not rendered"; exit 1; }
+		echo "$$out" | grep -q "maxSurge: 0" || { echo "chart-lint: strategy.rollingUpdate not rendered"; exit 1; }; \
+		cout="$$($(HELM_BIN) template release charts/tatara-operator -f "$$vals" -s templates/configmap.yaml)"; \
+		echo "$$cout" | grep -q 'MCP_SCHEDULING:.*node-role.kubernetes.io/control-plane' \
+			|| { echo "chart-lint: mcpScheduling set but not rendered into MCP_SCHEDULING"; exit 1; }
 	@echo "chart-lint: MCP_SCHEDULING must default to an empty JSON object"
 	@$(HELM_BIN) template release charts/tatara-operator -s templates/configmap.yaml \
 		| grep -q 'MCP_SCHEDULING: "{}"' \

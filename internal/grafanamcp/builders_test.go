@@ -130,6 +130,53 @@ func TestDeployment_AppliesScheduling(t *testing.T) {
 	}
 }
 
+// TestDeployment_PlacementIsolatedFromConfig asserts Deployment() copies
+// cfg.NodeSelector / cfg.Tolerations / cfg.Affinity onto the stamped PodSpec
+// rather than aliasing them. cfg is built once in cmd/manager/wire.go and
+// shared across every Project's reconcile via ProjectReconciler, and
+// r.Patch(..., client.Apply) decodes the server's response back into the
+// object it was given - if that object aliased the shared Config, a
+// server-side difference would write through to every other Project's
+// Deployment until the operator restarts. Mutating what Deployment() returns
+// must never be observable on the Config that produced it.
+func TestDeployment_PlacementIsolatedFromConfig(t *testing.T) {
+	aff := &corev1.Affinity{
+		NodeAffinity: &corev1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+				NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+					MatchExpressions: []corev1.NodeSelectorRequirement{{
+						Key:      "node-role.kubernetes.io/control-plane",
+						Operator: corev1.NodeSelectorOpExists,
+					}},
+				}},
+			},
+		},
+	}
+	cfg := Config{
+		Namespace:    "tatara",
+		Image:        "grafana/mcp-grafana:v0.1.0",
+		NodeSelector: map[string]string{"kubernetes.io/os": "linux"},
+		Tolerations:  []corev1.Toleration{{Key: "dedicated", Operator: corev1.TolerationOpExists}},
+		Affinity:     aff,
+	}
+
+	ps := Deployment(proj(), cfg).Spec.Template.Spec
+
+	ps.NodeSelector["kubernetes.io/os"] = "windows"
+	ps.Tolerations[0].Key = "mutated"
+	ps.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[0].MatchExpressions[0].Key = "mutated"
+
+	if cfg.NodeSelector["kubernetes.io/os"] != "linux" {
+		t.Fatalf("mutating the stamped nodeSelector leaked into cfg: %+v", cfg.NodeSelector)
+	}
+	if cfg.Tolerations[0].Key != "dedicated" {
+		t.Fatalf("mutating the stamped tolerations leaked into cfg: %+v", cfg.Tolerations)
+	}
+	if aff.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[0].MatchExpressions[0].Key != "node-role.kubernetes.io/control-plane" {
+		t.Fatalf("mutating the stamped affinity leaked into cfg: %+v", aff)
+	}
+}
+
 func TestValidateImage_RejectsBelowFloor(t *testing.T) {
 	cases := []struct {
 		image   string
