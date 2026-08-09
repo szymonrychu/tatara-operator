@@ -61,6 +61,40 @@ func TestPGCluster_DefaultsAndShape(t *testing.T) {
 		"CREATE EXTENSION IF NOT EXISTS vector")
 }
 
+// TestPGCluster_StartDelayOverridesCNPGDefault pins issue #526. spec.startDelay
+// was never set, so every Project's Postgres inherited CNPG's 3600s default.
+// CNPG derives the startup probe's failureThreshold as ceiling(startDelay/10),
+// so when an instance cannot finish startup the kubelet kills the container
+// exactly once an hour - and each kill restarts crash recovery FROM THE
+// BEGINNING. mem-mtg-pg-1 ran that loop for ~24h: 8215 probe failures, 22 kills,
+// 33 restarts, zero progress, and the `--previous` logs that would have
+// explained it were shredded hourly. A budget that guarantees an infinite
+// non-converging loop is not a budget.
+func TestPGCluster_StartDelayOverridesCNPGDefault(t *testing.T) {
+	c := memory.PGCluster(testProject("acme"), testCfg())
+
+	require.Greater(t, c.Spec.MaxStartDelay, int32(3600),
+		"spec.startDelay must be set ABOVE CNPG's 3600s default; leaving it unset "+
+			"(or at the default) makes the kubelet kill a still-recovering Postgres "+
+			"every hour and restart recovery from scratch (#526)")
+}
+
+// TestPGCluster_IdleInTransactionSessionTimeout pins the contributing half of
+// #526: the Cluster set only max_slot_wal_keep_size, with no session guardrail,
+// which is why the abandoned tatara_memory transaction behind tatara-memory#98
+// reached 20h18m instead of being reaped in minutes. tatara-memory now bounds
+// its OWN sessions (statement_timeout, idle_in_transaction_session_timeout,
+// PG_LOCK_TIMEOUT), but LightRAG's asyncpg pool sets none of these, so the guard
+// has to live on the cluster to cover every client.
+func TestPGCluster_IdleInTransactionSessionTimeout(t *testing.T) {
+	c := memory.PGCluster(testProject("acme"), testCfg())
+
+	require.Equal(t, "900000",
+		c.Spec.PostgresConfiguration.Parameters["idle_in_transaction_session_timeout"],
+		"a session idle INSIDE a transaction is always a bug; bound it at the cluster "+
+			"so it cannot pin locks and WAL for hours (#526)")
+}
+
 func pgClusterWithStorage(pgdata, wal string) *cnpgv1.Cluster {
 	c := &cnpgv1.Cluster{}
 	c.Spec.StorageConfiguration.Size = pgdata
