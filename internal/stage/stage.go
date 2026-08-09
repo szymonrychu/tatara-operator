@@ -577,6 +577,14 @@ func stampEnter(t *v1alpha1.Task, to, reason string, now time.Time) {
 	t.Status.StateEnteredAt = &stamp
 	t.Status.PodStartedAt = nil
 	t.Status.StateWorkStartedAt = nil
+	// The last turn's continuation state belongs to the state occupancy the pod
+	// clocks above were measuring (#527). Carried across an edge, the new state's
+	// G.7 TTL stop would build its synthetic handoff note out of the OLD state's
+	// final text - a clarify agent's closing message handed to an implement pod as
+	// though it were the last thing that happened. A stale note is worse than an
+	// empty one: the next agent cannot tell that it is stale.
+	t.Status.LastTurnFinalText = ""
+	t.Status.LastTurnPushedRepos = nil
 	t.Status.Stats.PodRecreations = 0
 	t.Status.StageElapsedCarrySeconds = 0
 	if Live(to) {

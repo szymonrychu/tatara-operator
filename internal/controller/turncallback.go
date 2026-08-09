@@ -423,9 +423,30 @@ func taskTokenLabels(task *tatarav1alpha1.Task) (project, repo, kind, issue, mod
 // recordUsage it does not additionally guard on annTurnComplete - a duplicate
 // callback re-persisting identical text costs one no-op write and is preferable
 // to a race that drops the state entirely.
+//
+// It records the newest NON-EMPTY payload: "this turn produced something", not
+// "this turn finished". A wholly empty payload is skipped, see below.
 func (s *CallbackServer) stampLastTurn(ctx context.Context, task *tatarav1alpha1.Task,
 	turnID, finalText string, pushedRepos []string, pushedReposKnown bool) error {
 
+	// A turn that produced NEITHER final text NOR a push carries no continuation
+	// state, and writing that emptiness destroys the newest turn that did carry
+	// some. state="failed" is a real wrapper state and arrives here with both
+	// fields empty, so the unconditional write this replaces meant one failed
+	// turn blanked the Task's continuation state and the next G.7 stop wrote the
+	// placeholder note - the exact loss this field exists to prevent, one turn
+	// later.
+	//
+	// The guard is BOTH fields, never finalText alone: a push with no closing
+	// message is still continuation state. And it lives here rather than at the
+	// call sites so it covers every caller, present and future.
+	//
+	// It does not weaken the "pushed nothing THIS turn" signal that
+	// pushedReposKnown exists for: a turn that said something and pushed nothing
+	// still clears the repos below, because its payload is not empty.
+	if finalText == "" && len(pushedRepos) == 0 {
+		return nil
+	}
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.Task{}
 		if err := s.Client.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {

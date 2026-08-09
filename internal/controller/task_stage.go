@@ -1217,7 +1217,7 @@ func (r *TaskReconciler) stalledTurnStop(ctx context.Context, proj *tatarav1alph
 		Record:               obs.AgentPodTTLExpired,
 		RecordEmptySynthetic: obs.AgentSyntheticHandoffEmpty,
 	}
-	outcome, err := stopper.StopWithHandoff(ctx, task, agent.TTLStopInput{
+	res, err := stopper.StopWithHandoff(ctx, task, agent.TTLStopInput{
 		BaseURL:     agent.BaseURL(task, task.Namespace),
 		CallbackURL: r.callbackURL(),
 		AgentKind:   agentKind,
@@ -1244,14 +1244,16 @@ func (r *TaskReconciler) stalledTurnStop(ctx context.Context, proj *tatarav1alph
 	if err := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 		fresh.Status.PodStartedAt = nil
 		fresh.Status.StateWorkStartedAt = nil
+		clearLastTurn(fresh)
 		return true
 	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("stalled turn re-arm %s: %w", task.Name, err)
 	}
-	log.FromContext(ctx).Info("stalled turn stopped gracefully; handed off",
-		"action", "stalled_turn_stop", "resource_id", task.Name, "turn_id", turnID,
-		"agent_kind", agentKind, "outcome", outcome,
-		"wait", StalledTurnHandoffWait.String())
+	logTTLStop(ctx,
+		"stalled turn stopped gracefully; handed off",
+		"stalled turn stopped with NO continuation state captured; this turn's work is unrecorded",
+		"stalled_turn_stop", res, "resource_id", task.Name, "turn_id", turnID,
+		"agent_kind", agentKind, "wait", StalledTurnHandoffWait.String())
 	return ctrl.Result{RequeueAfter: agentBootRequeue}, nil
 }
 
@@ -1297,13 +1299,14 @@ func (r *TaskReconciler) ttlStop(ctx context.Context, proj *tatarav1alpha1.Proje
 		LastFinalText: task.Status.LastTurnFinalText,
 		PushedRepos:   task.Status.LastTurnPushedRepos,
 	}
-	outcome, err := stopper.StopWithHandoff(ctx, task, in)
+	res, err := stopper.StopWithHandoff(ctx, task, in)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("ttl stop %s: %w", task.Name, err)
 	}
 	if err := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 		fresh.Status.PodStartedAt = nil
 		fresh.Status.StateWorkStartedAt = nil
+		clearLastTurn(fresh)
 		return true
 	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("ttl stop re-arm %s: %w", task.Name, err)
@@ -1313,14 +1316,57 @@ func (r *TaskReconciler) ttlStop(ctx context.Context, proj *tatarav1alpha1.Proje
 	// reason. Without it a TTL rotation that caught the pod mid-turn hands the
 	// replacement pod a Task that still claims a turn is in flight, which gags
 	// its conversation follow-up turn and disarms its idle clock until turn-0
-	// happens to overwrite the annotation.
+	// happens to overwrite the annotation (#566).
+	//
+	// TWO DIFFERENT THINGS, both retired here and neither a substitute for the
+	// other: this clears the POD-SCOPED TURN annotations, and the status patch
+	// above clears the LAST-TURN CONTINUATION STATE the stop just spent on a
+	// handoff note (#527). One says "a turn is running"; the other says "here is
+	// what the last turn produced".
 	if err := clearTurnAnnotations(ctx, r.Client, task); err != nil {
 		return ctrl.Result{}, fmt.Errorf("ttl stop turn clear %s: %w", task.Name, err)
 	}
-	log.FromContext(ctx).Info("agent pod TTL-stopped; handed off",
-		"action", "agent_pod_ttl_stop", "resource_id", task.Name,
-		"agent_kind", agentKind, "outcome", outcome)
+	logTTLStop(ctx,
+		"agent pod TTL-stopped; handed off",
+		"agent pod TTL-stopped with NO continuation state captured; the previous pod's work is unrecorded",
+		"agent_pod_ttl_stop", res, "resource_id", task.Name, "agent_kind", agentKind)
 	return ctrl.Result{RequeueAfter: agentBootRequeue}, nil
+}
+
+// logTTLStop logs one G.7 stop at a level and with a wording that match what
+// actually happened.
+//
+// The single line this replaces read "agent pod TTL-stopped; handed off" at INFO
+// on EVERY path, including the one where nothing whatsoever was handed off. The
+// failure mode therefore had no log signature at all: grepping the operator's
+// stdout for the #527 incident turned up two lines, both of them claiming
+// success. A stop that captured nothing is an ERROR, and it says so in words a
+// human reading Loki can act on.
+func logTTLStop(ctx context.Context, okMsg, lostMsg, action string, res agent.TTLStopResult, fields ...any) {
+	fields = append([]any{"action", action, "outcome", res.Outcome, "handoff", res.Handoff}, fields...)
+	l := log.FromContext(ctx)
+	if res.Handoff == agent.TTLHandoffNone {
+		l.Error(nil, lostMsg, fields...)
+		return
+	}
+	l.Info(okMsg, fields...)
+}
+
+// clearLastTurn retires the continuation state a G.7 stop has just spent.
+//
+// Every StopWithHandoff caller owes this. By the time a stop returns, the
+// payload is IN the notes journal - either the agent's own handoff note or the
+// operator's synthetic reconstruction of it - and the journal is what the next
+// pod reads. Leaving it on the status means the NEXT pod's stop re-renders the
+// SAME turn's text as though it were that pod's work, which is a worse failure
+// than the empty note #527 was filed about: an empty note is recognisably empty,
+// a stale one is confidently wrong (#527).
+//
+// stage.stampEnter does the same on every state transition. The one path that
+// deliberately does NOT is respawnLostPod; see the argument there.
+func clearLastTurn(t *tatarav1alpha1.Task) {
+	t.Status.LastTurnFinalText = ""
+	t.Status.LastTurnPushedRepos = nil
 }
 
 // turn0Marker identifies the pod turn-0 was submitted to. A respawn re-stamps
@@ -1395,6 +1441,14 @@ func (r *TaskReconciler) respawnLostPod(ctx context.Context, proj *tatarav1alpha
 		// IllegalTransitionError, and the exhaustion goes uncounted.
 		return ctrl.Result{}, r.park(ctx, proj, task, edge.Reason, now)
 	}
+	// status.lastTurn* is DELIBERATELY left standing here, unlike the structurally
+	// identical patches in ttlStop and stalledTurnStop, which clear it. What
+	// differs is what each path already did with it: those two have just SPENT it
+	// on a handoff note, so keeping it would replay one turn onto a second pod.
+	// This path writes NO note at all - a pod that vanished mid-turn produced
+	// nothing to write - so the status is the only surviving trace of the dead
+	// pod's work, and clearing it would turn a recoverable crash into guaranteed
+	// loss (#527).
 	if err := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 		fresh.Status.Stats.PodRecreations = recreations
 		fresh.Status.PodStartedAt = nil
@@ -1408,6 +1462,22 @@ func (r *TaskReconciler) respawnLostPod(ctx context.Context, proj *tatarav1alpha
 	// stops the poll backstop shouting about a stall the reconciler cannot reach:
 	// the pod clocks are nil now, so reconcilePodStage's turnTimedOut branch (and
 	// therefore stalledTurnStop) is unreachable until a replacement pod exists.
+	//
+	// THIS PATH CLEARS THE TURN ANNOTATIONS AND KEEPS THE LAST-TURN PAYLOAD, and
+	// that asymmetry is deliberate on both halves - do not "simplify" either into
+	// the other. They answer different questions about different scopes:
+	//
+	//	turn annotations (#566)  - "a turn is running in a pod". POD-SCOPED. The
+	//	                           pod is gone, so this is now a lie, and four
+	//	                           other mechanisms act on it.
+	//	status.lastTurn* (#527)  - "here is what the last turn PRODUCED". It is
+	//	                           the only surviving trace of the dead pod's
+	//	                           work, because this path writes no handoff note
+	//	                           (see the patch above), so clearing it turns a
+	//	                           recoverable crash into guaranteed loss.
+	//
+	// ttlStop and stalledTurnStop clear BOTH, for the same reason read the other
+	// way: they have already spent the payload on a handoff note.
 	if err := clearTurnAnnotations(ctx, r.Client, task); err != nil {
 		return ctrl.Result{}, fmt.Errorf("pod respawn turn clear %s: %w", task.Name, err)
 	}

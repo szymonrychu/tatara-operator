@@ -43,6 +43,9 @@ type stopSession struct {
 	normalTurns    int
 	deleteErr      error
 	deleteSessions int
+	// onDeleteSession runs before DeleteSession returns: the wrapper going away
+	// mid-teardown.
+	onDeleteSession func()
 	// onHandoff runs after a successful SubmitHandoffTurn: the agent's side of
 	// the turn (it writes its own handoff note).
 	onHandoff func()
@@ -97,9 +100,14 @@ func (s *stopSession) GetSession(context.Context, string) (agent.SessionInfo, er
 
 func (s *stopSession) DeleteSession(context.Context, string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.deleteSessions++
-	return s.deleteErr
+	err := s.deleteErr
+	cb := s.onDeleteSession
+	s.mu.Unlock()
+	if cb != nil {
+		cb()
+	}
+	return err
 }
 
 // directNoteAppender writes notes straight onto the Task status. The production
@@ -125,7 +133,7 @@ type ttlHarness struct {
 	stopper *agent.TTLStopper
 	task    *tatarav1alpha1.Task
 	now     time.Time
-	outcome string
+	res     agent.TTLStopResult
 }
 
 func newTTLHarness(t *testing.T, sess *stopSession) *ttlHarness {
@@ -162,7 +170,9 @@ func newTTLHarness(t *testing.T, sess *stopSession) *ttlHarness {
 			h.now = h.now.Add(10 * time.Millisecond)
 			return nil
 		},
-		Record: func(_, outcome string) { h.outcome = outcome },
+		Record: func(_, outcome, handoff string) {
+			h.res = agent.TTLStopResult{Outcome: outcome, Handoff: handoff}
+		},
 	}
 	return h
 }
@@ -234,10 +244,10 @@ func TestTTLStop_AgentHandoff(t *testing.T) {
 		require.NoError(t, h.c.Status().Update(context.Background(), fresh))
 	}
 
-	outcome, err := h.stopper.StopWithHandoff(context.Background(), h.task, h.input())
+	res, err := h.stopper.StopWithHandoff(context.Background(), h.task, h.input())
 	require.NoError(t, err)
-	require.Equal(t, agent.TTLOutcomeAgentHandoff, outcome)
-	require.Equal(t, agent.TTLOutcomeAgentHandoff, h.outcome, "the TTL metric must be recorded")
+	require.Equal(t, agent.TTLStopResult{Outcome: agent.TTLOutcomeGraceful, Handoff: agent.TTLHandoffAgent}, res)
+	require.Equal(t, res, h.res, "the TTL metric must be recorded on BOTH dimensions")
 
 	require.Equal(t, 1, sess.handoffs, "EXACTLY ONE handoff turn is admitted past t0")
 	require.Zero(t, sess.normalTurns, "no NORMAL turn may be submitted past t0")
@@ -261,10 +271,10 @@ func TestTTLStop_SyntheticHandoff_On410(t *testing.T) {
 	}
 	h := newTTLHarness(t, sess)
 
-	outcome, err := h.stopper.StopWithHandoff(context.Background(), h.task, h.input())
+	res, err := h.stopper.StopWithHandoff(context.Background(), h.task, h.input())
 	require.NoError(t, err)
-	require.Equal(t, agent.TTLOutcomeSyntheticHandoff, outcome)
-	require.Equal(t, agent.TTLOutcomeSyntheticHandoff, h.outcome)
+	require.Equal(t, agent.TTLStopResult{Outcome: agent.TTLOutcomeGraceful, Handoff: agent.TTLHandoffSynthetic}, res)
+	require.Equal(t, res, h.res)
 
 	notes := h.notes(t)
 	require.Len(t, notes, 1, "a 410'd handoff turn must STILL produce the synthetic note, not an empty notes")
@@ -284,9 +294,9 @@ func TestTTLStop_SyntheticHandoff_OnStuckTurn(t *testing.T) {
 	sess := &stopSession{states: []string{agent.SessionStateBusy}} // busy forever
 	h := newTTLHarness(t, sess)
 
-	outcome, err := h.stopper.StopWithHandoff(context.Background(), h.task, h.input())
+	res, err := h.stopper.StopWithHandoff(context.Background(), h.task, h.input())
 	require.NoError(t, err)
-	require.Equal(t, agent.TTLOutcomeSyntheticHandoff, outcome)
+	require.Equal(t, agent.TTLStopResult{Outcome: agent.TTLOutcomeGraceful, Handoff: agent.TTLHandoffSynthetic}, res)
 	require.Zero(t, sess.handoffs, "no handoff turn while a turn is in flight: POST /v1/messages 409s")
 	require.NotEmpty(t, h.notes(t), "Task.status.notes is NEVER empty after a TTL stop")
 }
@@ -302,10 +312,11 @@ func TestTTLStop_ForceDeleted(t *testing.T) {
 	}
 	h := newTTLHarness(t, sess)
 
-	outcome, err := h.stopper.StopWithHandoff(context.Background(), h.task, h.input())
+	res, err := h.stopper.StopWithHandoff(context.Background(), h.task, h.input())
 	require.NoError(t, err)
-	require.Equal(t, agent.TTLOutcomeForceDeleted, outcome)
-	require.Equal(t, agent.TTLOutcomeForceDeleted, h.outcome)
+	require.Equal(t, agent.TTLStopResult{Outcome: agent.TTLOutcomeForceDeleted, Handoff: agent.TTLHandoffSynthetic}, res,
+		"a force-delete says how the POD was stopped and must not erase how the handoff was captured")
+	require.Equal(t, res, h.res)
 
 	notes := h.notes(t)
 	require.NotEmpty(t, notes, "Task.status.notes is NEVER empty after a TTL stop")
@@ -317,26 +328,30 @@ func TestTTLStop_ForceDeleted(t *testing.T) {
 // TestTTLStop_NotesNeverEmpty_AllThreeOutcomes is the MANDATORY regression test.
 // Notes ARE the continuation state; a TTL stop that leaves them empty makes the
 // next pod start from nothing, redo the work, and burn maxTurns. Assert the
-// property DIRECTLY, for every one of the three outcomes, not by proxy.
+// property DIRECTLY, for every G.7 result, not by proxy.
 func TestTTLStop_NotesNeverEmpty_AllThreeOutcomes(t *testing.T) {
 	cases := []struct {
 		name       string
 		handoffErr error
 		deleteErr  error
 		agentWrote bool
-		want       string
+		want       agent.TTLStopResult
 	}{
-		{name: agent.TTLOutcomeAgentHandoff, agentWrote: true, want: agent.TTLOutcomeAgentHandoff},
 		{
-			name:       agent.TTLOutcomeSyntheticHandoff,
-			handoffErr: &agent.HTTPError{Status: http.StatusGone},
-			want:       agent.TTLOutcomeSyntheticHandoff,
+			name:       "agent handoff, graceful stop",
+			agentWrote: true,
+			want:       agent.TTLStopResult{Outcome: agent.TTLOutcomeGraceful, Handoff: agent.TTLHandoffAgent},
 		},
 		{
-			name:       agent.TTLOutcomeForceDeleted,
+			name:       "synthetic handoff, graceful stop",
+			handoffErr: &agent.HTTPError{Status: http.StatusGone},
+			want:       agent.TTLStopResult{Outcome: agent.TTLOutcomeGraceful, Handoff: agent.TTLHandoffSynthetic},
+		},
+		{
+			name:       "synthetic handoff, force-deleted",
 			handoffErr: &agent.HTTPError{Status: http.StatusBadGateway},
 			deleteErr:  &agent.UnreachableError{},
-			want:       agent.TTLOutcomeForceDeleted,
+			want:       agent.TTLStopResult{Outcome: agent.TTLOutcomeForceDeleted, Handoff: agent.TTLHandoffSynthetic},
 		},
 	}
 	require.Len(t, cases, 3, "all three G.7 outcomes must be covered")
@@ -360,12 +375,12 @@ func TestTTLStop_NotesNeverEmpty_AllThreeOutcomes(t *testing.T) {
 				}
 			}
 
-			outcome, err := h.stopper.StopWithHandoff(context.Background(), h.task, h.input())
+			res, err := h.stopper.StopWithHandoff(context.Background(), h.task, h.input())
 			require.NoError(t, err)
-			require.Equal(t, tc.want, outcome)
+			require.Equal(t, tc.want, res)
 
 			notes := h.notes(t)
-			require.NotEmpty(t, notes, "outcome %q left Task.status.notes EMPTY: the continuation state is gone", outcome)
+			require.NotEmpty(t, notes, "result %+v left Task.status.notes EMPTY: the continuation state is gone", res)
 			require.Equal(t, "handoff", notes[len(notes)-1].Kind)
 			require.NotEmpty(t, notes[len(notes)-1].Body)
 		})
@@ -384,9 +399,9 @@ func TestTTLStop_SyntheticNoteIsTruncated(t *testing.T) {
 	in := h.input()
 	in.LastFinalText = strings.Repeat("x", 9000)
 
-	outcome, err := h.stopper.StopWithHandoff(context.Background(), h.task, in)
+	res, err := h.stopper.StopWithHandoff(context.Background(), h.task, in)
 	require.NoError(t, err)
-	require.Equal(t, agent.TTLOutcomeSyntheticHandoff, outcome)
+	require.Equal(t, agent.TTLHandoffSynthetic, res.Handoff)
 
 	notes := h.notes(t)
 	require.Len(t, notes, 1)
@@ -435,9 +450,9 @@ func TestTTLStop_MaxWaitBoundsAStalledTurnStop(t *testing.T) {
 		if withMaxWait {
 			in.MaxWait = maxWait
 		}
-		outcome, err := h.stopper.StopWithHandoff(context.Background(), h.task, in)
+		res, err := h.stopper.StopWithHandoff(context.Background(), h.task, in)
 		require.NoError(t, err)
-		require.Equal(t, agent.TTLOutcomeSyntheticHandoff, outcome)
+		require.Equal(t, agent.TTLHandoffSynthetic, res.Handoff)
 		require.NotEmpty(t, h.notes(t),
 			"the whole point: the old hard teardown left NO note, so the next pod started from nothing")
 		return h.now.Sub(start)
@@ -459,8 +474,8 @@ func TestTTLStop_ZeroMaxWaitKeepsTheTTLBound(t *testing.T) {
 	in := h.input()
 	require.Zero(t, in.MaxWait)
 
-	outcome, err := h.stopper.StopWithHandoff(context.Background(), h.task, in)
+	res, err := h.stopper.StopWithHandoff(context.Background(), h.task, in)
 	require.NoError(t, err)
-	require.Equal(t, agent.TTLOutcomeSyntheticHandoff, outcome)
+	require.Equal(t, agent.TTLHandoffSynthetic, res.Handoff)
 	require.NotEmpty(t, h.notes(t))
 }

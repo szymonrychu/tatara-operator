@@ -87,13 +87,23 @@ func (r *TaskReconciler) liveHandoffAndPark(ctx context.Context, proj *tatarav1a
 			LastFinalText: task.Status.LastTurnFinalText,
 			PushedRepos:   task.Status.LastTurnPushedRepos,
 		}
-		outcome, err := stopper.StopWithHandoff(ctx, task, in)
+		res, err := stopper.StopWithHandoff(ctx, task, in)
 		if err != nil {
 			return fmt.Errorf("livepods: handoff stop on %s: %w", task.Name, err)
 		}
-		log.FromContext(ctx).Info("conversation handed off",
-			"action", "conversing_handoff", "resource_id", task.Name,
-			"cause", cause, "outcome", outcome)
+		logTTLStop(ctx,
+			"conversation handed off",
+			"conversation ended with NO continuation state captured; this pod's work is unrecorded",
+			"conversing_handoff", res, "resource_id", task.Name, "cause", cause)
+		// The stop has spent the last-turn payload on a handoff note, so retire it
+		// before this Task parks or re-arms (#527). Both continuations below
+		// read-modify-write a FRESH Task, so this patch is not clobbered by them.
+		if err := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
+			clearLastTurn(fresh)
+			return true
+		}); err != nil {
+			return fmt.Errorf("livepods: retire last-turn state on %s: %w", task.Name, err)
+		}
 	}
 
 	// THE HUMAN-GATE TEST, and it applies to BOTH causes (#561). It used to
