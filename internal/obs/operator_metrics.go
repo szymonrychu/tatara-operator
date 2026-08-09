@@ -636,6 +636,13 @@ func (m *OperatorMetrics) TurnTimeout(source string) {
 	m.turnTimeoutTotal.WithLabelValues(source).Inc()
 }
 
+// TurnTimeoutCounter returns the operator_turn_timeout_total counter for a
+// detection source, so a test can assert the ABSENCE of detections as well as
+// their presence.
+func (m *OperatorMetrics) TurnTimeoutCounter(source string) prometheus.Counter {
+	return m.turnTimeoutTotal.WithLabelValues(source)
+}
+
 // IngestJobResult increments operator_ingest_job_total for a finished Job's
 // terminal result ("success" or "failure") and ingest mode ("incremental" or
 // "full"). The mode lets alerting page only on terminal full-ingest failures: a

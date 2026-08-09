@@ -1238,16 +1238,7 @@ func (r *TaskReconciler) stalledTurnStop(ctx context.Context, proj *tatarav1alph
 	// Clear the turn so a late callback cannot resolve it, and re-arm the pod
 	// clocks so the next reconcile spawns a continuation pod - the same re-arm
 	// ttlStop does, plus the annotation clearing the old hard-teardown path owned.
-	if err := r.patchTaskAnnotations(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
-		if fresh.Annotations == nil {
-			return false
-		}
-		delete(fresh.Annotations, annCurrentTurn)
-		delete(fresh.Annotations, annTurnStartedAt)
-		delete(fresh.Annotations, annTurnLastActivity)
-		delete(fresh.Annotations, annTurnComplete)
-		return true
-	}); err != nil {
+	if err := clearTurnAnnotations(ctx, r.Client, task); err != nil {
 		return ctrl.Result{}, fmt.Errorf("stalled turn clear %s: %w", task.Name, err)
 	}
 	if err := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
@@ -1319,6 +1310,21 @@ func (r *TaskReconciler) ttlStop(ctx context.Context, proj *tatarav1alpha1.Proje
 		return true
 	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("ttl stop re-arm %s: %w", task.Name, err)
+	}
+	// The pod that was running the turn is gone (StopWithHandoff deleted it), so
+	// the turn goes with it - the same clear stalledTurnStop does, for the same
+	// reason. Without it a TTL rotation that caught the pod mid-turn hands the
+	// replacement pod a Task that still claims a turn is in flight, which gags
+	// its conversation follow-up turn and disarms its idle clock until turn-0
+	// happens to overwrite the annotation (#566).
+	//
+	// TWO DIFFERENT THINGS, both retired here and neither a substitute for the
+	// other: this clears the POD-SCOPED TURN annotations, and the status patch
+	// above clears the LAST-TURN CONTINUATION STATE the stop just spent on a
+	// handoff note (#527). One says "a turn is running"; the other says "here is
+	// what the last turn produced".
+	if err := clearTurnAnnotations(ctx, r.Client, task); err != nil {
+		return ctrl.Result{}, fmt.Errorf("ttl stop turn clear %s: %w", task.Name, err)
 	}
 	logTTLStop(ctx,
 		"agent pod TTL-stopped; handed off",
@@ -1450,6 +1456,30 @@ func (r *TaskReconciler) respawnLostPod(ctx context.Context, proj *tatarav1alpha
 		return true
 	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("record pod respawn: %w", err)
+	}
+	// The pod VANISHED - this is the "ran and disappeared mid-turn" case, so the
+	// turn died with it and nothing will ever complete it. Clearing here also
+	// stops the poll backstop shouting about a stall the reconciler cannot reach:
+	// the pod clocks are nil now, so reconcilePodStage's turnTimedOut branch (and
+	// therefore stalledTurnStop) is unreachable until a replacement pod exists.
+	//
+	// THIS PATH CLEARS THE TURN ANNOTATIONS AND KEEPS THE LAST-TURN PAYLOAD, and
+	// that asymmetry is deliberate on both halves - do not "simplify" either into
+	// the other. They answer different questions about different scopes:
+	//
+	//	turn annotations (#566)  - "a turn is running in a pod". POD-SCOPED. The
+	//	                           pod is gone, so this is now a lie, and four
+	//	                           other mechanisms act on it.
+	//	status.lastTurn* (#527)  - "here is what the last turn PRODUCED". It is
+	//	                           the only surviving trace of the dead pod's
+	//	                           work, because this path writes no handoff note
+	//	                           (see the patch above), so clearing it turns a
+	//	                           recoverable crash into guaranteed loss.
+	//
+	// ttlStop and stalledTurnStop clear BOTH, for the same reason read the other
+	// way: they have already spent the payload on a handoff note.
+	if err := clearTurnAnnotations(ctx, r.Client, task); err != nil {
+		return ctrl.Result{}, fmt.Errorf("pod respawn turn clear %s: %w", task.Name, err)
 	}
 	log.FromContext(ctx).Info("agent pod lost; respawning",
 		"action", "pod_respawn", "resource_id", task.Name, "pod_recreations", recreations)
