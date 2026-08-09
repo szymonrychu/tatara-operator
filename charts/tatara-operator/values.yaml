@@ -354,3 +354,24 @@ resources:
 
 # render+upgrade the tatara.dev CRDs as templates; set false if CRDs are managed externally
 installCRDs: true
+
+# Manager Pod placement + rollout strategy. ALL EMPTY (rule 14): the chart makes
+# no assumption about the cluster's node labels, taints, or topology, and an
+# unset value renders NOTHING at all (every one is `{{- with }}`-guarded in
+# templates/deployment.yaml). The deploying helmfile supplies the real values.
+#
+# These are the `helm create` scaffold keys (rule 5) plus topologySpreadConstraints
+# and strategy. They are rendered straight into the PodSpec/DeploymentSpec by helm
+# and never become env vars, so rule 6's "no lists in values.yaml" ConfigMap-JSON
+# rule does not apply to them - that rule governs operator RUNTIME inputs (see
+# agentScheduling / mcpScheduling above, which do become one JSON ConfigMap key).
+#
+# strategy matters when the deployer sets a REQUIRED pod anti-affinity with as
+# many replicas as it has eligible nodes: the default RollingUpdate surges 25%
+# (>= 1 extra pod), the surge pod has nowhere to land, and the rollout wedges
+# Pending. Such a deployer sets maxSurge: 0 / maxUnavailable: 1 here.
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+strategy: {}
