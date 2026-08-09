@@ -9,6 +9,11 @@ import (
 // is alive; the outcome says what came back, and the three failure values are
 // NOT interchangeable - they name three different things being wrong.
 const (
+	// StallProbeSent: a probe was written into the agent's PTY. It is the
+	// DENOMINATOR - every other value here is an outcome of a probe that was sent,
+	// so without it "nobody ever answers" and "we never asked" are the same
+	// series shape. Emitted once per attempt, at the attempt.
+	StallProbeSent = "sent"
 	// StallProbeAnswered: the agent replied with the TATARA-ALIVE marker. The turn
 	// was never stalled; it was working, or waiting on its own subagent.
 	StallProbeAnswered = "answered"
@@ -41,7 +46,7 @@ const (
 // bound.
 var stallProbeTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Name: "operator_stall_probe_total",
-	Help: "Mid-turn stall probes sent to agent wrappers, by outcome (answered, unanswered, never_delivered, unsupported, error).",
+	Help: "Mid-turn stall probes sent to agent wrappers, by outcome (sent, answered, unanswered, never_delivered, unsupported, error).",
 }, []string{"outcome"})
 
 // podRecreationsTotal counts every agent-pod recreation the operator drives, on

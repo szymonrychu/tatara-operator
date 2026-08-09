@@ -613,8 +613,25 @@ func isAgentHandoffNote(n tatarav1alpha1.Note) bool {
 // contents - it is continuation state for the next pod, not a question for a
 // person.
 func HasAgentHandoffNote(t *tatarav1alpha1.Task) bool {
+	return HasAgentHandoffNoteSince(t, time.Time{})
+}
+
+// HasAgentHandoffNoteSince is HasAgentHandoffNote scoped to notes written at or
+// after `since`, and the scoping is not a refinement - it is what makes the
+// predicate usable as "THIS pod's agent asked to be stopped".
+//
+// The notes journal is per-TASK and outlives every pod that writes to it. Every
+// graceful stop ends by putting a handoff note in it, so a CONTINUATION pod is
+// born into a Task that already carries one; a bare HasAgentHandoffNote as a
+// stop trigger would therefore kill each replacement pod the instant it started,
+// forever. Passing the current pod's start time is what confines the question to
+// the pod actually running.
+//
+// A zero `since` matches everything, which is the whole-journal question
+// HasAgentHandoffNote asks.
+func HasAgentHandoffNoteSince(t *tatarav1alpha1.Task, since time.Time) bool {
 	for _, n := range t.Status.Notes {
-		if isAgentHandoffNote(n) {
+		if isAgentHandoffNote(n) && !n.At.Time.Before(since) {
 			return true
 		}
 	}

@@ -608,6 +608,31 @@ func (s *CallbackServer) PollOnce(ctx context.Context) {
 		//
 		// Detection stays here only as the observability edge - the reconciler
 		// re-evaluates the same turnTimedOut predicate itself.
+		//
+		// THE REFRESH RUNS FIRST, AND THE ORDER IS THE POINT. This loop used to
+		// evaluate the stall predicate BEFORE the refresh below and `continue` on
+		// it, so a turn that was ALREADY past its window never got the refresh on
+		// that pass - it was judged on annotations nobody had updated. O1 made the
+		// refresh subagent-aware precisely so a healthy agent working through a
+		// subagent stops reading as silent, and the old order threw that away in
+		// the one case it was built for: an operator that restarts mid-subagent-run
+		// comes up with a stale (or absent) activity stamp, and the very first pass
+		// declares the turn stalled without ever making the call that would have
+		// contradicted it. Refreshing first costs nothing - the same two HTTP calls
+		// happen either way - and makes the verdict below decide on current data.
+		//
+		// The set of calls is UNCHANGED - the same GetTurn and GetSession this loop
+		// already made, against the same Tasks. Only their position moved. An
+		// orphaned Task (parked, or no pod) still reaches the repair below: its
+		// wrapper Service died with its pod, so the read fails and this returns
+		// false, and the repair clears the annotations so no later pass gets here
+		// at all.
+		if s.Session != nil {
+			if done := s.refreshTurnFromWrapper(ctx, task, turn); done {
+				continue
+			}
+		}
+
 		if s.isTurnTimedOut(ctx, task) {
 			// WHO IS THE DEFERRAL TARGET? The comment above says "the stage
 			// reconciler", and that is only true when the stage reconciler can
@@ -656,38 +681,58 @@ func (s *CallbackServer) PollOnce(ctx context.Context) {
 				"action", "turn_timeout", "task", task.Name, "turn_id", turn)
 			continue
 		}
-
-		if s.Session == nil {
-			continue
-		}
-		// Bound each GetTurn call so a single slow/unreachable wrapper cannot
-		// stall the entire backstop cycle (finding 4/r3).
-		getTurnCtx, cancel := context.WithTimeout(ctx, pollGetTurnTimeout)
-		tr, err := s.Session.GetTurn(getTurnCtx, agent.BaseURL(task, s.Namespace), turn)
-		cancel()
-		if err != nil {
-			continue
-		}
-		// Refresh the last-activity annotation so the stall deadline (checked on
-		// the next cycle) tracks the wrapper. The backstop owns this annotation;
-		// the reconcile path only reads it.
-		//
-		// TWO SOURCES, and the second one is why this loop now makes a second call.
-		// GET /v1/messages/{turnId} reports activity on the PARENT transcript only,
-		// and a parent blocked on a Task tool call writes nothing there while its
-		// subagent works - 2095 seconds of measured parent silence on one healthy
-		// run. GET /v1/session carries the subagent stamp, so the two are merged
-		// before stamping.
-		s.refreshLastActivity(ctx, task.Name, task.Namespace, turn,
-			tr.LastActivityAt, s.subagentActivity(ctx, agent.BaseURL(task, s.Namespace)))
-		if tr.State == "complete" || tr.State == "failed" {
-			// GET /v1/messages/{turnId} carries no pushedRepos, so this path knows
-			// the final text and NOT the repos: it must not clear what the callback
-			// recorded (#527).
-			_ = s.stampLastTurn(ctx, task, turn, tr.FinalText, nil, false)
-			_ = s.recordResult(ctx, tr, task, turn)
-		}
 	}
+}
+
+// refreshTurnFromWrapper is one Task's half of a poll pass: read the turn, stamp
+// the merged activity, and record a turn that has finished. It returns true when
+// the Task needs nothing further from this pass.
+//
+// It is a function rather than inline code because it now runs BEFORE the stall
+// verdict (see PollOnce), and the verdict has three `continue` paths of its own -
+// inlining would give the loop body two interleaved early-exit ladders.
+//
+// The local annotation write is not cosmetic. refreshLastActivity patches a
+// FRESH Task read from the API server; `task` here is the loop's cached copy and
+// would otherwise still carry the pre-refresh value when isTurnTimedOut reads it
+// microseconds later - which is the exact stale-verdict bug the reorder exists
+// to fix, reintroduced one line further down.
+func (s *CallbackServer) refreshTurnFromWrapper(ctx context.Context, task *tatarav1alpha1.Task, turn string) bool {
+	// Bound each GetTurn call so a single slow/unreachable wrapper cannot
+	// stall the entire backstop cycle (finding 4/r3).
+	getTurnCtx, cancel := context.WithTimeout(ctx, pollGetTurnTimeout)
+	tr, err := s.Session.GetTurn(getTurnCtx, agent.BaseURL(task, s.Namespace), turn)
+	cancel()
+	if err != nil {
+		return false
+	}
+	// Refresh the last-activity annotation so the stall deadline (checked below,
+	// and again by the reconciler) tracks the wrapper. The backstop owns this
+	// annotation; the reconcile path only reads it.
+	//
+	// TWO SOURCES, and the second one is why this loop now makes a second call.
+	// GET /v1/messages/{turnId} reports activity on the PARENT transcript only,
+	// and a parent blocked on a Task tool call writes nothing there while its
+	// subagent works - 2095 seconds of measured parent silence on one healthy
+	// run. GET /v1/session carries the subagent stamp, so the two are merged
+	// before stamping.
+	sub := s.subagentActivity(ctx, agent.BaseURL(task, s.Namespace))
+	s.refreshLastActivity(ctx, task.Name, task.Namespace, turn, tr.LastActivityAt, sub)
+	if merged := mergeSubagentActivity(tr.LastActivityAt, sub); !merged.IsZero() {
+		if task.Annotations == nil {
+			task.Annotations = map[string]string{}
+		}
+		task.Annotations[annTurnLastActivity] = merged.UTC().Format(time.RFC3339)
+	}
+	if tr.State == "complete" || tr.State == "failed" {
+		// GET /v1/messages/{turnId} carries no pushedRepos, so this path knows
+		// the final text and NOT the repos: it must not clear what the callback
+		// recorded (#527).
+		_ = s.stampLastTurn(ctx, task, turn, tr.FinalText, nil, false)
+		_ = s.recordResult(ctx, tr, task, turn)
+		return true
+	}
+	return false
 }
 
 // subagentActivity reads GET /v1/session for the wrapper's subagent activity
