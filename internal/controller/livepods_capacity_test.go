@@ -20,6 +20,12 @@ import (
 // liveStateTask builds a Task sitting in a LIVE state (refined - one of the three
 // stage.Live states, #521's dissolution of the old `conversing` stage into a
 // property over refined/under-implementation/awaiting-review).
+//
+// stateWorkStartedAt is stamped too, because a live conversation has a READY
+// pod: it is the pod-ready stamp, and a Task that has never had one has never
+// submitted turn 0 and so has no conversation to end (#561). A fixture that left
+// it nil would model a just-admitted Task, not a live one - see
+// justAdmittedTask in livepods_eviction_victim_test.go for that shape.
 func liveStateTask(name, project string, lastEvent time.Time) *tatarav1alpha1.Task {
 	t := &tatarav1alpha1.Task{}
 	t.Namespace = "tatara"
@@ -30,6 +36,7 @@ func liveStateTask(name, project string, lastEvent time.Time) *tatarav1alpha1.Ta
 	t.Status.AgentKind = stage.AgentKindFor(tatarav1alpha1.StateRefined, "implement")
 	t.Status.StateEnteredAt = &metav1.Time{Time: lastEvent}
 	t.Status.ConversationLastEventAt = &metav1.Time{Time: lastEvent}
+	t.Status.StateWorkStartedAt = &metav1.Time{Time: lastEvent}
 	return t
 }
 
@@ -688,6 +695,12 @@ func newLiveCapacityFixture(t *testing.T, objs ...client.Object) *ProjectReconci
 		if task.Status.PodStartedAt == nil {
 			started := metav1.NewTime(task.Status.StateEnteredAt.Time)
 			task.Status.PodStartedAt = &started
+			// The pod-ready stamp goes with it. A caller that sets PodStartedAt
+			// itself is modelling something more specific (a pod that started but
+			// never became ready) and keeps whatever it chose.
+			if task.Status.StateWorkStartedAt == nil {
+				task.Status.StateWorkStartedAt = &started
+			}
 		}
 		if task.Status.AgentKind == "" {
 			task.Status.AgentKind = stage.AgentKindFor(task.Status.State, task.Spec.Kind)
