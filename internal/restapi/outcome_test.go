@@ -3052,6 +3052,40 @@ func TestOutcome_Refine_LinkAddsAPlainOwner(t *testing.T) {
 	require.Contains(t, e.task(t, "t1").Status.IssueRefs, iss.Name)
 }
 
+// TestOutcome_Refine_LinkOnAZeroOwnerArtifactClaimsTheControllerFlag is issue
+// #536: the SECOND producer of a zero-controller-owner artifact, and the one no
+// reap is involved in.
+//
+// A zero-owner Issue is not a broken state - it is the reaper's designed hand-off
+// to the sweep, and the window before the re-mint is routinely hours wide
+// (1 h 41 m on iss-tatara-operator-526). linkArtifact was the ONLY own.AddPlainOwner
+// call site with no controller precondition of any kind, so a links[] entry
+// landing in that window wrote the artifact's FIRST and ONLY ownerRef as plain:
+// zero controller owners, B.2 rule 5 broken, the critical repair-guard alert 2.5 s
+// later. Its sibling folds[] has always paired the append with a handover in one
+// Update; links[] must never be able to leave a sole plain owner behind either.
+func TestOutcome_Refine_LinkOnAZeroOwnerArtifactClaimsTheControllerFlag(t *testing.T) {
+	orphan := issueV2("tatara-operator", 526, "", func(i *tatarav1alpha1.Issue) {
+		i.OwnerReferences = nil // the reaper dropped the last ref; the sweep has not re-minted
+	})
+	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "refine", tatarav1alpha1.StateRefined, "refine"),
+		orphan)
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"refine","payload":{"links":[{"repo":"tatara-operator","number":526}]}}`)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	iss := e.issue(t, tatarav1alpha1.IssueName("tatara-operator", 526))
+	ctrl, owned := controllerOwnerOf(iss.OwnerReferences)
+	require.True(t, owned,
+		"links[] left the artifact with a sole PLAIN owner and NO controller owner (contract B.2 rule 5)")
+	require.Equal(t, "t1", ctrl, "the linking umbrella must claim what it just took out of the sweep's hands")
+	require.Len(t, iss.OwnerReferences, 1, "the claim is ONE ownerRef, appended and promoted in one Update")
+	require.Contains(t, e.task(t, "t1").Status.IssueRefs, iss.Name)
+}
+
 // A malformed links[] entry must be caught in the TOP validation block, BEFORE
 // foldMembers deletes anything. Validating it after the fold made the rejection
 // unrecoverable: the members were already gone, so the identical retry - which

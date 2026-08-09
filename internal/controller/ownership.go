@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -374,19 +375,54 @@ func (d *StageDriver) mutateOwnerRefs(ctx context.Context, mr *tatarav1alpha1.Me
 func MutateOwnerRefs(ctx context.Context, c client.Client, mr *tatarav1alpha1.MergeRequest,
 	mutate func(fresh *tatarav1alpha1.MergeRequest) error) error {
 
-	key := client.ObjectKeyFromObject(mr)
+	return MutateArtifactOwnerRefs(ctx, c, mr, mutate)
+}
+
+// ErrOwnerRefsUnchanged is the sentinel a MutateArtifactOwnerRefs mutation
+// returns when, HAVING SEEN THE FRESH COPY, it decides there is nothing to
+// write. The helper swallows it and returns nil without issuing an Update.
+//
+// It exists because the fresh Get is what makes the decision trustworthy: a
+// caller that pre-decides on its own (possibly cached) copy and then only
+// mutates inside the loop is back to acting on stale state, which is the whole
+// defect issue #524 documents. Deciding INSIDE the mutation and bailing out
+// with this sentinel keeps the read and the decision on the same object
+// version.
+var ErrOwnerRefsUnchanged = errors.New("owner refs unchanged")
+
+// MutateArtifactOwnerRefs is MutateOwnerRefs for ANY mirrored artifact - Issue
+// as well as MergeRequest. It re-Gets obj FRESH from the server, applies mutate
+// to that fresh copy, and writes it back under RetryOnConflict; on success *obj
+// is overwritten with the server's post-write copy.
+//
+// Issue #524: the reaper's B.5 handover (releaseOwnership) was the ONE owner-ref
+// write in the tree that did not do this - it mutated a copy handed to it by the
+// controller-runtime CACHE and issued a bare Update - and it is the one that left
+// mr-tatara-operator-504 with zero controller owners. MutateOwnerRefs could not
+// be reused there because it was typed to *MergeRequest and the reaper releases
+// Issues too, so the discipline was generalised rather than duplicated.
+func MutateArtifactOwnerRefs[T any, PT interface {
+	client.Object
+	*T
+}](ctx context.Context, c client.Client, obj PT, mutate func(fresh PT) error) error {
+
+	key := client.ObjectKeyFromObject(obj)
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		var fresh tatarav1alpha1.MergeRequest
-		if err := c.Get(ctx, key, &fresh); err != nil {
+		var fresh T
+		p := PT(&fresh)
+		if err := c.Get(ctx, key, p); err != nil {
 			return err
 		}
-		if err := mutate(&fresh); err != nil {
+		if err := mutate(p); err != nil {
+			if errors.Is(err, ErrOwnerRefsUnchanged) {
+				return nil
+			}
 			return err
 		}
-		if err := c.Update(ctx, &fresh); err != nil {
+		if err := c.Update(ctx, p); err != nil {
 			return err
 		}
-		*mr = fresh
+		*obj = fresh
 		return nil
 	})
 }
