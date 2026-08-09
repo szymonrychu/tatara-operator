@@ -28,10 +28,10 @@ import (
 // per-project live-pod ceiling) is a ROUTINE mechanism rather than a rare edge
 // case, so this sequence runs often and must be correct.
 //
-// cause is "idle" or "evicted". It lands on the log line and the metric, and it
-// gates ONE behaviour (see below): an eviction is a capacity decision the
-// operator made on purpose and always parks, an idle exit is a pod that stopped
-// producing and may deserve a replacement instead.
+// cause is "idle" or "evicted". It lands on the log line and the metric and
+// gates NOTHING (#561): the pod dies and the handoff turn is offered the same
+// way for both, and the exit is chosen by what the AGENT did, not by which
+// clock or ceiling brought us here.
 //
 // AWAITING-HUMAN IS FOR TASKS THAT ACTUALLY ASKED SOMETHING. It is UnparkHuman,
 // so it resumes only on a non-bot comment - and a Task whose pod died without the
@@ -44,6 +44,12 @@ import (
 // parks exactly as before: the Task does NOT move state - park is orthogonal to
 // state (#521) - so the un-park drops it straight back into the live state it
 // was talking in.
+//
+// #557 applied that to the idle exit only and left the eviction path parking
+// unconditionally. #561 is the bill for that: seconds-old Tasks evicted by the
+// ceiling, having said nothing, each parked behind a human gate nobody knew it
+// was waiting on - the exact wreckage shape #557 named, arriving through the one
+// door #557 left open.
 func (r *TaskReconciler) liveHandoffAndPark(ctx context.Context, proj *tatarav1alpha1.Project,
 	task *tatarav1alpha1.Task, mrs []tatarav1alpha1.MergeRequest, cause string, now time.Time) error {
 
@@ -90,17 +96,31 @@ func (r *TaskReconciler) liveHandoffAndPark(ctx context.Context, proj *tatarav1a
 			"cause", cause, "outcome", outcome)
 	}
 
-	// THE HUMAN-GATE TEST. An eviction is exempt: the ceiling deliberately chose
-	// to take this pod's slot, and handing it straight back would defeat the
-	// mechanism.
-	if cause != causeEvicted {
-		asked, err := r.agentAskedSomething(ctx, task)
-		if err != nil {
-			return err
-		}
-		if !asked {
-			return r.reArmWithoutHandoff(ctx, proj, task, sp, cause, now)
-		}
+	// THE HUMAN-GATE TEST, and it applies to BOTH causes (#561). It used to
+	// exempt an eviction on the grounds that "the ceiling deliberately chose to
+	// take this pod's slot, and handing it straight back would defeat the
+	// mechanism" - but the mechanism the exemption protects is the POD teardown,
+	// which has already happened above, unconditionally, for both causes. What
+	// the exemption actually bought was a park reason, and awaiting-human is the
+	// wrong one for a Task that never asked anything: it is UnparkHuman, so it
+	// clears on a non-bot comment and on nothing else, and nobody replies to a
+	// question nobody posed. Measured in the 45 minutes before #561 was filed:
+	// 20 unpark_declined events carrying park_reason=awaiting-human, on top of
+	// 30 fabricated parks already on the books.
+	//
+	// Re-arming does not hand the slot back for free. It costs one
+	// podRecreations (stage.ReArmAfterPodLoss, which deliberately does not reset
+	// the counter), so a conversation the ceiling keeps choosing spends its
+	// budget and terminates at pod-recreation-exhausted. And it re-enters as
+	// UNSTARTED, which evictionCandidates excludes, so the very next pass picks
+	// a different victim instead of grinding this one - the loop moves, it does
+	// not spin.
+	asked, err := r.agentAskedSomething(ctx, task)
+	if err != nil {
+		return err
+	}
+	if !asked {
+		return r.reArmWithoutHandoff(ctx, proj, task, sp, cause, now)
 	}
 
 	if err := ParkTask(ctx, r.Client, sp, r.Metrics, task, stage.ReasonAwaitingHuman, now, nil); err != nil {
@@ -211,14 +231,48 @@ func LiveHasRoom(ctx context.Context, r client.Reader, proj *tatarav1alpha1.Proj
 	return len(live) < tatarav1alpha1.MaxLivePods(proj), nil
 }
 
-// conversationIdleSince is the instant a conversation last saw an event. A Task
-// with no stamp falls back to the zero time, i.e. maximally idle - it has never
-// had an event and is the least likely to be mid-exchange.
+// conversationIdleSince is the instant a conversation last saw an event, and it
+// falls back TOWARDS NOW, never towards the zero time.
+//
+// READ THE NEXT PARAGRAPH BEFORE "FIXING" THIS BACK (#561). This function used
+// to answer time.Time{} for a Task with no ConversationLastEventAt, and the doc
+// comment argued the case plainly: such a Task "has never had an event and is
+// the least likely to be mid-exchange", i.e. maximally idle. That reasoning is
+// true of an ANCIENT conversation that never got a reply, and exactly INVERTED
+// for a Task created moments ago that has not had time to produce one. The zero
+// time cannot tell the two apart, and sortByIdleThenName orders ASCENDING, so
+// the never-stamped Task sorted FIRST and the newest work in the project was
+// sacrificed before anything else. "Never had an event" is not evidence of age.
+//
+// The fallback chain is therefore three claims of NEWNESS, weakest last:
+// the conversation stamp, then the live-state entry stamp (stage.stampEnter
+// writes both, so in practice the first always exists on a live Task and this is
+// belt-and-braces), then the object's own creation instant. Only a Task carrying
+// none of the three - which the API server does not produce - can still reach
+// the zero time.
 func conversationIdleSince(t *tatarav1alpha1.Task) time.Time {
-	if t.Status.ConversationLastEventAt == nil {
-		return time.Time{}
+	if t.Status.ConversationLastEventAt != nil {
+		return t.Status.ConversationLastEventAt.Time
 	}
-	return t.Status.ConversationLastEventAt.Time
+	if t.Status.StateEnteredAt != nil {
+		return t.Status.StateEnteredAt.Time
+	}
+	return t.CreationTimestamp.Time
+}
+
+// conversationStarted reports whether this Task's CURRENT live state ever got a
+// READY pod. status.stateWorkStartedAt is the pod-ready stamp and stampEnter
+// clears it on every state entry, so a nil one means: no turn 0 was ever
+// submitted in this state, the agent has said nothing and been asked nothing.
+//
+// It is an ETERNAL FACT ABOUT THE PAST, not a snapshot - a Task does not become
+// unstarted again once it has started - so it cannot flap and cannot wedge. The
+// two ways out of it are both already bounded: the pod becomes ready (clock 2,
+// the never-Ready budget, terminates at pod-recreation-exhausted) or the Task
+// never gets one (clock 1, AdmissionStarvedBudget, terminates at
+// admission-starved).
+func conversationStarted(t *tatarav1alpha1.Task) bool {
+	return t.Status.StateWorkStartedAt != nil
 }
 
 // sortByIdleThenName orders live longest-idle first (ConversationLastEventAt
@@ -244,7 +298,42 @@ func sortByIdleThenName(live []tatarav1alpha1.Task) {
 
 // evictionCandidates returns the subset of live that may legally be chosen as
 // an eviction victim - longest-idle first, with sortByIdleThenName's exact
-// tie-break - EXCLUDING any Task with a turn in flight (stage.TurnInFlight).
+// tie-break - EXCLUDING two shapes: a Task with a turn in flight
+// (stage.TurnInFlight), and a Task whose conversation has never started
+// (conversationStarted).
+//
+// UNSTARTED IS NOT IDLE, AND THIS IS THE SHAPE THAT WAS ACTUALLY MEASURED
+// (#561). The zero-time fallback below conversationIdleSince is real but it is
+// NOT what produced the live evictions: stampEnter writes
+// ConversationLastEventAt on entry into every live state, so a live Task always
+// carries one and the nil branch is unreachable through the API server. The
+// victims were picked with a perfectly good stamp - their OWN, seconds old.
+//
+// Counted off the operator's logs for the eviction storm of 2026-08-08: 74
+// live_evicting lines, median lag from the victim's own idle_since to its
+// eviction 53.5 SECONDS, 38 of the 74 inside sixty seconds. Nothing evicted that
+// day was genuinely idle. The clearest single case, verbatim:
+//
+//	06:43:57.933  stage_transition (create) -> new     mt-r-tatara-cli-97-...
+//	06:43:57.941  stage_transition new -> awaiting-review
+//	06:43:58.339  queue_admit
+//	06:44:00.382  live_evicting  idle_since=06:43:57Z  live=4  ceiling=2
+//	06:44:00.412  conversing_handoff  cause=evicted  outcome=force_deleted
+//
+// Two and a half seconds old, never having held a turn in its life, logged as
+// "the longest-idle conversation". idle_since is its own state-entry instant,
+// because that is the only thing a Task that has never conversed HAS. Note also
+// that the mid-turn exclusion above cannot cover this: measured on the same
+// logs, the operator held ZERO turns in flight for the whole eviction window (a
+// 2.95-second cascade expired all 44 of them nine seconds before the first
+// eviction), so every live Task was a candidate and the guard had nothing to
+// exclude.
+//
+// A Task whose pod has never become ready has submitted no turn, said nothing
+// and asked nothing. Ending its conversation reclaims no warmth because there is
+// none: it destroys the newest work in the project along with the admission slot
+// the queue granted it seconds earlier, and the Task simply re-queues for the
+// pod it never got - so the ceiling is not converged either, only churned.
 //
 // EXCLUDED, NOT MERELY SORTED LAST (2026-08-07 adversarial review B4, HIGH).
 // Before this predicate existed, enforceLivePodCeiling picked its victim by
@@ -276,7 +365,7 @@ func sortByIdleThenName(live []tatarav1alpha1.Task) {
 func evictionCandidates(live []tatarav1alpha1.Task) []tatarav1alpha1.Task {
 	out := make([]tatarav1alpha1.Task, 0, len(live))
 	for i := range live {
-		if stage.TurnInFlight(&live[i]) {
+		if stage.TurnInFlight(&live[i]) || !conversationStarted(&live[i]) {
 			continue
 		}
 		out = append(out, live[i])
@@ -336,6 +425,12 @@ const livePodEvictionRequeue = 5 * time.Second
 // before this function ever sorts or picks, so a mid-turn Task cannot be
 // selected however old its idle stamp looks.
 //
+// NEVER AN UNSTARTED VICTIM EITHER (#561): the same helper excludes a Task
+// whose pod has never become ready. Mid-turn and unstarted are the two ends of
+// the same misreading - "longest idle" means neither "busy" nor "brand new" -
+// and the second one is what the 2026-08-08 logs actually caught, evicting Tasks
+// a median of 53.5 seconds old, one of them 2.45 seconds after it was created.
+//
 // A project at the ceiling with every live pod genuinely busy is left alone:
 // this only ever evicts the OVERFLOW (len(live) - ceiling Tasks), never more, so
 // a full-but-not-over project is untouched and a new conversation simply queues
@@ -392,9 +487,10 @@ func (r *ProjectReconciler) enforceLivePodCeiling(ctx context.Context, proj *tat
 		evict = maxLivePodEvictionsPerPass
 	}
 	if evict == 0 {
-		// Every overflow Task is mid-turn: there is no legal victim this
-		// pass. Not an error, not a spin - see the doc comment above.
-		log.FromContext(ctx).Info("live-pod ceiling exceeded but every overflow conversation has a turn in flight; evicting nothing this pass",
+		// Every overflow Task is mid-turn or has never started: there is no
+		// legal victim this pass. Not an error, not a spin - see the doc
+		// comment above.
+		log.FromContext(ctx).Info("live-pod ceiling exceeded but no overflow conversation is a legal victim (each is mid-turn or has never started); evicting nothing this pass",
 			"action", "live_evict_skipped", "project", proj.Name,
 			"live", len(live), "ceiling", ceiling)
 		return 0, nil
