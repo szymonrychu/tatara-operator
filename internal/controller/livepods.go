@@ -667,21 +667,41 @@ func (r *ProjectReconciler) evictionBackedOff(t *tatarav1alpha1.Task, now time.T
 // other overflow Task of the pass's eviction slot. evictFn is injected so unit
 // tests can script per-candidate failure without a real client/session; the
 // real caller's evictFn performs the actual ownedMergeRequests + handoff. It
-// returns how many candidates were actually evicted (<= want) and the first
-// error encountered, if any - callers keep returning that error for
-// observability (it is still logged at the call site) without letting it
-// short-circuit the successful evictions already performed.
+// returns how many candidates were actually evicted (<= want), the EARLIEST
+// nextEligible time among any candidate it left behind still serving a
+// backoff (zero if none), and the first error encountered, if any - callers
+// keep returning that error for observability (it is still logged at the
+// call site) without letting it short-circuit the successful evictions
+// already performed. Since the loop only ever breaks early once
+// evicted reaches `want`, an `evicted < want` return has necessarily walked
+// every candidate: nothing was skipped for lack of a look, only for a backoff
+// still in force. That is what lets the caller tell "the per-pass cap capped
+// us, and an untouched, currently-eligible candidate is waiting for the next
+// pass" (fast retry is right) apart from "every remaining legal candidate is
+// serving a backoff right now" (retrying before the earliest of those elapses
+// cannot possibly succeed).
 func (r *ProjectReconciler) attemptEvictions(candidates []tatarav1alpha1.Task, want int, now time.Time,
-	evictFn func(t *tatarav1alpha1.Task) error) (int, error) {
+	evictFn func(t *tatarav1alpha1.Task) error) (int, time.Time, error) {
 
 	var firstErr error
+	var earliestNextEligible time.Time
 	evicted := 0
+	noteBackoff := func(t *tatarav1alpha1.Task) {
+		f := r.evictionFailures[evictionFailureKey(t)]
+		if f == nil {
+			return
+		}
+		if earliestNextEligible.IsZero() || f.nextEligible.Before(earliestNextEligible) {
+			earliestNextEligible = f.nextEligible
+		}
+	}
 	for i := range candidates {
 		if evicted >= want {
 			break
 		}
 		t := &candidates[i]
 		if r.evictionBackedOff(t, now) {
+			noteBackoff(t)
 			continue
 		}
 		if err := evictFn(t); err != nil {
@@ -689,12 +709,13 @@ func (r *ProjectReconciler) attemptEvictions(candidates []tatarav1alpha1.Task, w
 			if firstErr == nil {
 				firstErr = err
 			}
+			noteBackoff(t)
 			continue
 		}
 		r.clearEvictionFailure(t)
 		evicted++
 	}
-	return evicted, firstErr
+	return evicted, earliestNextEligible, firstErr
 }
 
 // enforceLivePodCeiling parks the longest-idle live Tasks until proj is back
@@ -810,7 +831,7 @@ func (r *ProjectReconciler) enforceLivePodCeiling(ctx context.Context, proj *tat
 	// SUCCEED, `evict`; attemptEvictions may inspect more than `evict`
 	// candidates while hunting for that many successes, which is the whole
 	// point.
-	evicted, firstErr := r.attemptEvictions(candidates, evict, now, func(t *tatarav1alpha1.Task) error {
+	evicted, earliestNextEligible, firstErr := r.attemptEvictions(candidates, evict, now, func(t *tatarav1alpha1.Task) error {
 		mrs, mErr := ownedMergeRequests(ctx, r.Client, t)
 		if mErr != nil {
 			log.FromContext(ctx).Error(mErr, "livepods: load owned MRs for eviction failed",
@@ -835,13 +856,25 @@ func (r *ProjectReconciler) enforceLivePodCeiling(ctx context.Context, proj *tat
 		// still worth surfacing that SOMETHING errored this pass.
 		return 0, firstErr
 	}
-	// A fast requeue is for the per-pass CAP (or a victim still serving out an
-	// eviction-failure backoff standing in for it), not for waiting on a turn:
-	// only ask for one when idle-and-evictable overflow is still left after
-	// this pass (evicted < desiredEvict). If desiredEvict itself fell short of
-	// overflow, the rest is mid-turn Tasks that a fast retry cannot touch
-	// either - that overflow rides the level-triggered reconcile instead.
+	// A fast requeue is for the per-pass CAP, not for waiting on a turn or on a
+	// backoff: only ask for one when idle-and-evictable overflow is still left
+	// after this pass (evicted < desiredEvict). If desiredEvict itself fell
+	// short of overflow, the rest is mid-turn Tasks that a fast retry cannot
+	// touch either - that overflow rides the level-triggered reconcile
+	// instead.
 	if evicted < desiredEvict {
+		// evicted < evict (attemptEvictions' own per-pass target) can only
+		// happen if the loop walked every candidate without reaching it - see
+		// attemptEvictions' doc comment - so EVERY remaining legal candidate
+		// is serving a backoff right now and a 5s retry is certain to find
+		// the same thing. Requeue no sooner than the earliest of those
+		// backoffs actually elapsing instead of busy-polling for the rest of
+		// the window (up to evictionFailureBackoffMax, 10m, per victim).
+		if evicted < evict && !earliestNextEligible.IsZero() {
+			if wait := earliestNextEligible.Sub(now); wait > 0 {
+				return wait, nil
+			}
+		}
 		return livePodEvictionRequeue, nil
 	}
 	return 0, nil

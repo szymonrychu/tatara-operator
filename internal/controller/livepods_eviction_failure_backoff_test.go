@@ -135,14 +135,18 @@ func TestEnforceLivePodCeiling_PoisonedVictimBackoffEventuallyElapses(t *testing
 	failuresAfterPass1 := failures
 
 	// Pass 2, 5s later: still inside evictionFailureBackoffBase (30s) - must
-	// be skipped outright, not re-attempted at all. Overflow remains, so the
-	// fast per-pass requeue still applies.
+	// be skipped outright, not re-attempted at all. poisoned is the ONLY
+	// legal candidate, so the fast per-pass requeue would just rediscover the
+	// same backoff every 5s for the whole window (up to evictionFailureBackoffMax
+	// at the cap) - the requeue must instead be no sooner than poisoned's own
+	// nextEligible (t0+30s), i.e. 25s from here, not the fixed 5s.
+	wantRequeue := evictionFailureBackoffBase - 5*time.Second
 	requeue, err := r.enforceLivePodCeiling(context.Background(), proj, now.Add(5*time.Second))
 	if err != nil {
 		t.Fatalf("enforceLivePodCeiling (pass 2): %v", err)
 	}
-	if requeue != livePodEvictionRequeue {
-		t.Fatalf("requeue (pass 2) = %v, want livePodEvictionRequeue: overflow remains and a backed-off victim is worth a fast retry", requeue)
+	if requeue != wantRequeue {
+		t.Fatalf("requeue (pass 2) = %v, want %v (earliest nextEligible, not the fixed livePodEvictionRequeue): poisoned is the only candidate and busy-polling it every 5s cannot succeed before its backoff elapses", requeue, wantRequeue)
 	}
 	if failures != failuresAfterPass1 {
 		t.Fatalf("poisoned was re-attempted in pass 2 (failures %d -> %d): its backoff should have skipped the attempt entirely", failuresAfterPass1, failures)
