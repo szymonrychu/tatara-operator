@@ -88,6 +88,44 @@ func TestPodConfigFromConfig_Scheduling(t *testing.T) {
 // valid still produces the correct PodConfig - demonstrating that the
 // error-discarding double-parse (scheduling, _ := agent.ParseScheduling(...))
 // has been removed.
+// TestGrafanaConfigFromConfig_UsesParsedMCPScheduling asserts the grafana-mcp
+// builder Config takes placement from cfg.MCPSchedulingParsed (already parsed by
+// config.Load) and NOT from cfg.MCPScheduling (the raw string). A Config whose
+// raw string is malformed but whose parsed struct is populated must still yield
+// the placement - that is only true if the wiring reads the parsed field, which
+// rules out an error-discarding double-parse.
+func TestGrafanaConfigFromConfig_UsesParsedMCPScheduling(t *testing.T) {
+	parsed, err := agent.ParseScheduling(`{"nodeSelector":{"node-role.kubernetes.io/control-plane":""}}`)
+	if err != nil {
+		t.Fatalf("ParseScheduling: %v", err)
+	}
+	cfg := config.Config{
+		Namespace:           "tatara",
+		GrafanaMCPImage:     "grafana/mcp-grafana:0.17.0",
+		ImagePullSecret:     "regcred",
+		MCPScheduling:       `{not valid json at all`,
+		MCPSchedulingParsed: parsed,
+	}
+
+	gc := grafanaConfigFromConfig(cfg)
+	if gc.Namespace != "tatara" || gc.Image != "grafana/mcp-grafana:0.17.0" || gc.ImagePullSecret != "regcred" {
+		t.Fatalf("base fields not carried over: %+v", gc)
+	}
+	if _, ok := gc.NodeSelector["node-role.kubernetes.io/control-plane"]; !ok {
+		t.Fatalf("NodeSelector must come from the parsed struct: %+v", gc.NodeSelector)
+	}
+}
+
+// TestGrafanaConfigFromConfig_EmptyWhenUnset asserts an operator deployed from
+// the chart default (mcpScheduling: {}) stamps grafana-mcp Deployments with no
+// placement, i.e. exactly today's behaviour (rule 14 back-compat).
+func TestGrafanaConfigFromConfig_EmptyWhenUnset(t *testing.T) {
+	gc := grafanaConfigFromConfig(config.Config{Namespace: "tatara"})
+	if gc.NodeSelector != nil || gc.Tolerations != nil || gc.Affinity != nil {
+		t.Fatalf("placement must be nil when MCP_SCHEDULING is unset: %+v", gc)
+	}
+}
+
 func TestPodConfigFromConfig_SchedulingUsesPreParsedStruct(t *testing.T) {
 	scheduling, err := agent.ParseScheduling(`{"nodeSelector":{"env":"prod"}}`)
 	if err != nil {

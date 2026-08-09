@@ -1,6 +1,9 @@
 package grafanamcp
 
 import (
+	"maps"
+	"slices"
+
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -41,6 +44,15 @@ func Deployment(p *tatarav1alpha1.Project, cfg Config) *appsv1.Deployment {
 				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
 				Spec: corev1.PodSpec{
 					ImagePullSecrets: imagePullSecrets(cfg),
+					// Clone rather than alias: cfg is shared across every Project on
+					// ProjectReconciler, and client.Apply decodes the server's response
+					// back into whatever object we hand it. Embedding cfg's map/pointer
+					// by reference would let a server-side-applied difference write
+					// through the shared Config and leak to every other Project's
+					// Deployment until the operator restarts.
+					NodeSelector: maps.Clone(cfg.NodeSelector),
+					Tolerations:  slices.Clone(cfg.Tolerations),
+					Affinity:     cfg.Affinity.DeepCopy(),
 					Volumes: []corev1.Volume{{
 						Name: "grafana-token",
 						VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{

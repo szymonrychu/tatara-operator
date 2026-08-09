@@ -100,6 +100,36 @@ chart-lint:
 	@python3 -m json.tool charts/tatara-operator/dashboards/tatara-loop.json >/dev/null || \
 		{ echo "chart-lint: dashboards/tatara-loop.json is not valid JSON"; exit 1; }
 	$(HELM_BIN) lint charts/tatara-project -f deploy-samples/tatara-project-values.yaml
+	@echo "chart-lint: placement knobs must render NOTHING when unset (rule 14)"
+	@out="$$($(HELM_BIN) template release charts/tatara-operator -s templates/deployment.yaml)"; \
+		for k in nodeSelector tolerations affinity topologySpreadConstraints strategy; do \
+			if echo "$$out" | grep -q "^\( *\)$$k:"; then \
+				echo "chart-lint: default render emitted $$k - the chart must stay cluster-agnostic (rule 14)"; \
+				exit 1; \
+			fi; \
+		done
+	@echo "chart-lint: placement knobs must render when the deployer sets them"
+	@vals="$$(mktemp)"; trap 'rm -f "$$vals"' EXIT; \
+		printf '%s\n' \
+			'nodeSelector: {kubernetes.io/os: linux}' \
+			'tolerations: [{key: dedicated, operator: Exists, effect: NoSchedule}]' \
+			'affinity: {nodeAffinity: {requiredDuringSchedulingIgnoredDuringExecution: {nodeSelectorTerms: [{matchExpressions: [{key: node-role.kubernetes.io/control-plane, operator: Exists}]}]}}}' \
+			'topologySpreadConstraints: [{maxSkew: 1, topologyKey: kubernetes.io/hostname, whenUnsatisfiable: ScheduleAnyway, labelSelector: {matchLabels: {app.kubernetes.io/name: tatara-operator}}}]' \
+			'strategy: {type: RollingUpdate, rollingUpdate: {maxSurge: 0, maxUnavailable: 1}}' \
+			'mcpScheduling: {nodeSelector: {node-role.kubernetes.io/control-plane: ""}}' \
+			> "$$vals"; \
+		out="$$($(HELM_BIN) template release charts/tatara-operator -f "$$vals" -s templates/deployment.yaml)"; \
+		for k in nodeSelector tolerations affinity topologySpreadConstraints strategy; do \
+			echo "$$out" | grep -q "^\( *\)$$k:" || { echo "chart-lint: $$k set but not rendered"; exit 1; }; \
+		done; \
+		echo "$$out" | grep -q "maxSurge: 0" || { echo "chart-lint: strategy.rollingUpdate not rendered"; exit 1; }; \
+		cout="$$($(HELM_BIN) template release charts/tatara-operator -f "$$vals" -s templates/configmap.yaml)"; \
+		echo "$$cout" | grep -q 'MCP_SCHEDULING:.*node-role.kubernetes.io/control-plane' \
+			|| { echo "chart-lint: mcpScheduling set but not rendered into MCP_SCHEDULING"; exit 1; }
+	@echo "chart-lint: MCP_SCHEDULING must default to an empty JSON object"
+	@$(HELM_BIN) template release charts/tatara-operator -s templates/configmap.yaml \
+		| grep -q 'MCP_SCHEDULING: "{}"' \
+		|| { echo "chart-lint: MCP_SCHEDULING missing or non-empty by default"; exit 1; }
 
 rbac:
 	mkdir -p $(RBAC_GEN_DIR)

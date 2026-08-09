@@ -270,6 +270,22 @@ func podConfigFromConfig(cfg config.Config) agent.PodConfig {
 	}
 }
 
+// grafanaConfigFromConfig maps operator config to the per-Project grafana-mcp
+// builder config, including the cluster-specific placement.
+// cfg.MCPSchedulingParsed is parsed once by config.Load and stored on the Config
+// so no re-parse (and no discarded error) is needed here. Mirrors
+// podConfigFromConfig above.
+func grafanaConfigFromConfig(cfg config.Config) grafanamcp.Config {
+	return grafanamcp.Config{
+		Namespace:       cfg.Namespace,
+		Image:           cfg.GrafanaMCPImage,
+		ImagePullSecret: cfg.ImagePullSecret,
+		NodeSelector:    cfg.MCPSchedulingParsed.NodeSelector,
+		Tolerations:     cfg.MCPSchedulingParsed.Tolerations,
+		Affinity:        cfg.MCPSchedulingParsed.Affinity,
+	}
+}
+
 // secretTokenSource returns a func() (string, error) that reads the named data
 // key from the named Secret on every call via reader (the manager's uncached
 // API reader, so a rotated OAuth token is picked up without a cache watch).
@@ -417,11 +433,7 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		MemoryConfig:        memoryConfigFromConfig(cfg),
 		MemoryToken:         memoryTokens.Token,
 		OperatorURL:         cfg.OperatorURL,
-		GrafanaConfig: grafanamcp.Config{
-			Namespace:       cfg.Namespace,
-			Image:           cfg.GrafanaMCPImage,
-			ImagePullSecret: cfg.ImagePullSecret,
-		},
+		GrafanaConfig:       grafanaConfigFromConfig(cfg),
 		ReaderFor: func(provider, token string) (scm.SCMReader, error) {
 			return scm.ReaderByProvider(provider, token)
 		},
