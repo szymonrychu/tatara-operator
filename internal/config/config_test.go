@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -731,5 +732,82 @@ func TestLoad_MemoryBackupFromEnv(t *testing.T) {
 	}
 	if cfg.MemoryBackupPathPrefix != "cnpg" || cfg.MemoryBackupRetentionPolicy != "7d" {
 		t.Fatalf("prefix=%q retention=%q", cfg.MemoryBackupPathPrefix, cfg.MemoryBackupRetentionPolicy)
+	}
+}
+
+// TestLoad_MCPSchedulingDefaultEmpty asserts the grafana-mcp placement document
+// defaults to empty, so the chart stays cluster-agnostic (rule 14) and an
+// operator deployed without it stamps grafana-mcp Deployments with no placement
+// at all - exactly today's behaviour.
+func TestLoad_MCPSchedulingDefaultEmpty(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.MCPScheduling != "" {
+		t.Fatalf("MCPScheduling default = %q, want empty", cfg.MCPScheduling)
+	}
+	p := cfg.MCPSchedulingParsed
+	if p.NodeSelector != nil || p.Tolerations != nil || p.Affinity != nil {
+		t.Fatalf("MCPSchedulingParsed should be zero value when MCP_SCHEDULING is empty: %+v", p)
+	}
+}
+
+// TestLoad_MCPSchedulingParsedIntoStruct asserts Load parses MCP_SCHEDULING once
+// and stores the result, so callers never re-parse and cannot discard the error.
+func TestLoad_MCPSchedulingParsedIntoStruct(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+	t.Setenv("MCP_SCHEDULING", `{"nodeSelector":{"node-role.kubernetes.io/control-plane":""},"affinity":{"podAntiAffinity":{"preferredDuringSchedulingIgnoredDuringExecution":[{"weight":100,"podAffinityTerm":{"topologyKey":"kubernetes.io/hostname","labelSelector":{"matchLabels":{"app.kubernetes.io/name":"grafana-mcp"}}}}]}}}`)
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	p := cfg.MCPSchedulingParsed
+	if _, ok := p.NodeSelector["node-role.kubernetes.io/control-plane"]; !ok {
+		t.Fatalf("MCPSchedulingParsed.NodeSelector not populated by Load: %+v", p)
+	}
+	if p.Affinity == nil || p.Affinity.PodAntiAffinity == nil ||
+		len(p.Affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution) != 1 {
+		t.Fatalf("MCPSchedulingParsed.Affinity not populated by Load: %+v", p.Affinity)
+	}
+}
+
+// TestLoad_MCPSchedulingMalformed asserts Load fails fast on a bad document
+// rather than silently dropping placement, and names the env var in the error so
+// the operator log pinpoints the misconfigured input (same contract as
+// AGENT_SCHEDULING).
+func TestLoad_MCPSchedulingMalformed(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+	t.Setenv("MCP_SCHEDULING", `{"nodeSelector": [bad`)
+	_, err := config.Load()
+	if err == nil {
+		t.Fatal("expected error for malformed MCP_SCHEDULING, got nil")
+	}
+	if !strings.Contains(err.Error(), "MCP_SCHEDULING") {
+		t.Fatalf("error must name the env var, got: %v", err)
+	}
+}
+
+// TestLoad_MCPSchedulingUnknownField asserts DisallowUnknownFields is in force
+// via ParseScheduling, so a typo'd key in a helmfile-authored document is a loud
+// boot failure rather than silently-dropped placement. Uses a field name with no
+// case-insensitive match to any Scheduling field ("nodeselector" would silently
+// match "nodeSelector" under Go's default unmarshal fallback and not exercise
+// this path).
+func TestLoad_MCPSchedulingUnknownField(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+	t.Setenv("MCP_SCHEDULING", `{"bogusField":{"a":"b"}}`)
+	if _, err := config.Load(); err == nil {
+		t.Fatal("expected error for unknown field in MCP_SCHEDULING, got nil")
 	}
 }

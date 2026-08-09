@@ -102,11 +102,21 @@ type Config struct {
 	AgentScheduling string
 	// Scheduling is the result of parsing AgentScheduling. Populated by Load so
 	// callers never need to parse (and cannot silently discard a parse error).
-	Scheduling       agent.Scheduling
-	Namespace        string
-	LogLevel         string
-	IngressHost      string
-	IngressClassName string
+	Scheduling agent.Scheduling
+	// MCPScheduling is the cluster-specific Pod-placement JSON document
+	// (nodeSelector/tolerations/affinity) for the per-Project grafana-mcp
+	// Deployments the operator stamps. Same shape, same parser, and same
+	// fail-fast contract as AgentScheduling, and empty in the chart for the same
+	// reason (rule 14). Without it the stamped Deployments carry no placement at
+	// all, which is how two grafana-mcp pods landed on the CI-runner node.
+	MCPScheduling string
+	// MCPSchedulingParsed is the result of parsing MCPScheduling. Populated by
+	// Load so callers never re-parse (and cannot silently discard a parse error).
+	MCPSchedulingParsed agent.Scheduling
+	Namespace           string
+	LogLevel            string
+	IngressHost         string
+	IngressClassName    string
 	// IngressRewriteTarget feeds the per-Project memory Ingress's
 	// nginx.ingress.kubernetes.io/rewrite-target annotation. Empty (default) =
 	// annotation omitted (cluster-agnostic, rule 14).
@@ -573,6 +583,7 @@ func Load() (Config, error) {
 		AgentRunAsUser:           agentRunAsUser,
 		AgentFSGroup:             agentFSGroup,
 		AgentScheduling:          os.Getenv("AGENT_SCHEDULING"),
+		MCPScheduling:            os.Getenv("MCP_SCHEDULING"),
 		Namespace:                getDefault("NAMESPACE", "tatara"),
 		LogLevel:                 getDefault("LOG_LEVEL", "info"),
 		IngressHost:              os.Getenv("INGRESS_HOST"),
@@ -646,6 +657,11 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("config: AGENT_SCHEDULING: %w", err)
 	}
 	cfg.Scheduling = scheduling
+	mcpScheduling, err := agent.ParseScheduling(cfg.MCPScheduling)
+	if err != nil {
+		return Config{}, fmt.Errorf("config: MCP_SCHEDULING: %w", err)
+	}
+	cfg.MCPSchedulingParsed = mcpScheduling
 	// Fail fast on a bad operator-wide token-budget default so a misconfigured
 	// fleet baseline surfaces at startup rather than silently disabling the gate.
 	// Validate is a no-op when the budget is disabled (issue #189).
