@@ -70,6 +70,21 @@ func managerOptions(cfg config.Config, scheme *runtime.Scheme) manager.Options {
 		// rollout holds its lease through SIGTERM, so the new leader waits out
 		// the lease before it can start dispatching - part of the 7m22s
 		// alert-admission gap in issue #395.
+		//
+		// RE-DECIDED under #538 and KEPT. #538 named this the amplifier of the
+		// benign-shutdown ERROR burst: with replicaCount 3 and PDB
+		// maxUnavailable 1 the freed lease is often won by another OLD-ReplicaSet
+		// pod that is itself next in the termination order, which starts a full
+		// reconcile sweep and is SIGTERM'd ~12s later (three leaders in 27s on
+		// 2026-08-07). Turning it off was considered and REFUSED: it does not
+		// fix the ERROR lines (the LAST old leader still dies mid-sweep, and one
+		// aborted sweep is already enough to trip the >=2/1h rule), and it
+		// reinstates the #395 admission gap on every rollout - trading a real
+		// availability regression for a partial noise reduction. Nothing here can
+		// choose WHICH pod wins a released lease; that is kube-scheduler and the
+		// PDB. The defect was never the handoff, it was that an aborted reconcile
+		// was reported as a failure - fixed at the Reconcile boundary instead
+		// (controller.classifyReconcileShutdown).
 		LeaderElectionReleaseOnCancel: true,
 	}
 }

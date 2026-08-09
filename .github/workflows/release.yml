@@ -130,6 +130,8 @@ jobs:
   bump:
     needs: [tag, publish]
     runs-on: tatara-operator
+    outputs:
+      version: ${{ needs.tag.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - name: propagate version into tatara-helmfile pins
@@ -154,3 +156,99 @@ jobs:
               {"file":"helmfile.yaml.gotmpl","pattern":"(- name: project-mtg\\n(?:.*\\n)*?\\s*version: )\\S+","value_template":"\\1{{chart_version_bare}}"},
               {"file":"values/tatara-operator/common.yaml","pattern":"^(\\s*tag: )\".*\"$","value_template":"\\1\"{{image_version}}\""}
             ]
+
+  # THE FAN-OUT IS ONLY DONE WHEN THE PIN IS ON tatara-helmfile's main.
+  #
+  # Issue #512: on 2026-07-29 this cascade stopped producing anything after
+  # 12:24:53Z. Tags v1.39.5 and v1.39.6 were cut and published; no `cd: bump`
+  # commit and no bump PR ever appeared for either. `bump` reporting success is
+  # NOT evidence that a pin landed - the failure mode was the WRITER producing
+  # nothing at all - so this job reads the pin back from the forge and fails if
+  # it never arrives. Prod stayed frozen at v1.39.4 for ~9h and the first anyone
+  # heard of it was a Task burning its 2h deploy budget and discarding merged
+  # PR #509 at deploy-blocked.
+  verify-pin:
+    needs: [tag, bump]
+    runs-on: tatara-operator
+    steps:
+      - name: read the pin back from tatara-helmfile main
+        env:
+          TOKEN: ${{ secrets.TATARA_CD_TOKEN }}
+          VERSION: ${{ needs.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          : "${VERSION:?cd-release tag did not emit a version}"
+          : "${TOKEN:?TATARA_CD_TOKEN required}"
+          BARE="${VERSION#v}"
+          api() {
+            curl -sSf -H "Authorization: Bearer ${TOKEN}" \
+              -H "Accept: application/vnd.github.raw" \
+              "https://api.github.com/repos/szymonrychu/tatara-helmfile/contents/$1?ref=main"
+          }
+          # Bounded: ~10 minutes. The healthy cascade lands a bump PR in minutes;
+          # anything past this is not a slow lap, it is a fan-out that is not
+          # running, and the operator's deploy stage must not be left polling for
+          # it (deploy_stage.go's deployPinFanoutDeadline is the other half).
+          for attempt in $(seq 1 20); do
+            if api helmfile.yaml.gotmpl | grep -q "version: ${BARE}" \
+               && api values/tatara-operator/common.yaml | grep -q "tag: \"${VERSION}\""; then
+              echo "cd: ${VERSION} is pinned on tatara-helmfile main (attempt ${attempt})"
+              exit 0
+            fi
+            echo "cd: ${VERSION} not on tatara-helmfile main yet (attempt ${attempt}/20)"
+            sleep 30
+          done
+          echo "::error::CD pin fan-out did not land ${VERSION} on tatara-helmfile main within 10m."
+          echo "::error::The deploy cascade is DOWN: every task that reaches stage=deploying will"
+          echo "::error::poll a pin that does not exist until its budget parks it (issue #512)."
+          exit 1
+
+  # LOUD ON FAILURE. A red workflow run nobody looks at is what let #512 sit for
+  # ~9h, so the alarm is filed where the platform already reads: an issue on this
+  # repo, which the incident pipeline picks up. Deduped by title so a repeated
+  # failure comments rather than opening a new tracker each release.
+  fanout-alarm:
+    needs: [tag, publish, bump, verify-pin]
+    if: >-
+      always() && needs.tag.result == 'success' &&
+      (needs.bump.result != 'success' || needs.verify-pin.result != 'success')
+    runs-on: tatara-operator
+    steps:
+      - name: file the stalled CD pin fan-out
+        env:
+          TOKEN: ${{ secrets.TATARA_CD_TOKEN }}
+          VERSION: ${{ needs.tag.outputs.version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          BUMP_RESULT: ${{ needs.bump.result }}
+          VERIFY_RESULT: ${{ needs.verify-pin.result }}
+        run: |
+          set -euo pipefail
+          : "${TOKEN:?TATARA_CD_TOKEN required}"
+          TITLE="CD pin fan-out stalled: ${VERSION} is not pinned in tatara-helmfile"
+          BODY=$(printf '%s\n' \
+            "The release train cut and published \`${VERSION}\`, but the pin never reached tatara-helmfile's main." \
+            "" \
+            "- bump job: \`${BUMP_RESULT}\`" \
+            "- pin verification: \`${VERIFY_RESULT}\`" \
+            "- run: ${RUN_URL}" \
+            "" \
+            "**Nothing can deploy while this is broken.** Every task that reaches" \
+            "\`stage=deploying\` polls a pin that will never materialise. The operator now" \
+            "bounds that wait and parks at \`deploy-timeout\` (issue #512), so merged work is" \
+            "retryable rather than discarded - but it does not ship until this is repaired." \
+            "" \
+            "Fix: open the \`cd: bump tatara-operator to ${VERSION}\` PR against tatara-helmfile by hand and merge it, then find why the \`cd-release\` bump action produced nothing.")
+          existing=$(curl -sSf -H "Authorization: Bearer ${TOKEN}" \
+            "https://api.github.com/search/issues?q=$(printf '%s' "repo:${GITHUB_REPOSITORY} is:issue is:open in:title \"CD pin fan-out stalled\"" | jq -sRr @uri)" \
+            | jq -r '.items[0].number // empty')
+          if [ -n "$existing" ]; then
+            jq -n --arg b "$BODY" '{body:$b}' | curl -sSf -X POST \
+              -H "Authorization: Bearer ${TOKEN}" -H "Content-Type: application/json" \
+              -d @- "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/${existing}/comments" >/dev/null
+            echo "commented on existing fan-out tracker #${existing}"
+          else
+            jq -n --arg t "$TITLE" --arg b "$BODY" '{title:$t, body:$b}' | curl -sSf -X POST \
+              -H "Authorization: Bearer ${TOKEN}" -H "Content-Type: application/json" \
+              -d @- "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues" >/dev/null
+            echo "opened a fan-out tracker"
+          fi

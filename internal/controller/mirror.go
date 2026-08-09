@@ -354,6 +354,19 @@ func ensureMergeRequestCR(ctx context.Context, c client.Client, proj *tatarav1al
 	return nil
 }
 
+// recordMirrorSyncFailure counts one FAILED mirror sync on
+// operator_mirror_sync_total{result="error"} - unless the "failure" is the
+// manager's own shutdown cancelling the read mid-flight (#538). A rolling
+// restart aborts whatever forge reads are in flight; counting those as mirror
+// sync errors makes the mirror look broken once per rollout for a sync that
+// the next leader simply redoes.
+func recordMirrorSyncFailure(ctx context.Context, kind string, err error) {
+	if isShutdownCancellation(ctx, err) {
+		return
+	}
+	obs.MirrorSyncTotal.WithLabelValues(kind, "error").Inc()
+}
+
 // SyncIssue upserts the Issue CR from a forge issue and its thread. It makes NO
 // forge call: ext is the snapshot the caller already read on the paced,
 // rate-limited read path (C.8).
@@ -363,7 +376,7 @@ func ensureMergeRequestCR(ctx context.Context, c client.Client, proj *tatarav1al
 // carries SCM TRUTH (state/labels/comments) and nothing else.
 func SyncIssue(ctx context.Context, c client.Client, sp objbudget.Spiller, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, ext scm.Issue) error {
 	if err := ensureIssueCR(ctx, c, proj, repo, ext.Number, ext.URL); err != nil {
-		obs.MirrorSyncTotal.WithLabelValues("Issue", "error").Inc()
+		recordMirrorSyncFailure(ctx, "Issue", err)
 		return err
 	}
 	key := types.NamespacedName{Namespace: proj.Namespace, Name: tatarav1alpha1.IssueName(repo.Name, ext.Number)}
@@ -389,7 +402,7 @@ func SyncIssue(ctx context.Context, c client.Client, sp objbudget.Spiller, proj 
 		meta.SetStatusCondition(&iss.Status.Conditions, syncedCondition())
 	})
 	if err != nil {
-		obs.MirrorSyncTotal.WithLabelValues("Issue", "error").Inc()
+		recordMirrorSyncFailure(ctx, "Issue", err)
 		return fmt.Errorf("mirror: sync issue %s: %w", key.Name, err)
 	}
 	obs.MirrorSyncTotal.WithLabelValues("Issue", "ok").Inc()
@@ -405,7 +418,7 @@ func SyncIssue(ctx context.Context, c client.Client, sp objbudget.Spiller, proj 
 // is a TOCTOU hole on the repo that deploys the cluster.
 func SyncMergeRequest(ctx context.Context, c client.Client, sp objbudget.Spiller, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, ext scm.MergeRequest) error {
 	if err := ensureMergeRequestCR(ctx, c, proj, repo, ext.Number, ext.URL); err != nil {
-		obs.MirrorSyncTotal.WithLabelValues("MergeRequest", "error").Inc()
+		recordMirrorSyncFailure(ctx, "MergeRequest", err)
 		return err
 	}
 	key := types.NamespacedName{Namespace: proj.Namespace, Name: tatarav1alpha1.MergeRequestName(repo.Name, ext.Number)}
@@ -438,7 +451,7 @@ func SyncMergeRequest(ctx context.Context, c client.Client, sp objbudget.Spiller
 		meta.SetStatusCondition(&mr.Status.Conditions, syncedCondition())
 	})
 	if err != nil {
-		obs.MirrorSyncTotal.WithLabelValues("MergeRequest", "error").Inc()
+		recordMirrorSyncFailure(ctx, "MergeRequest", err)
 		return fmt.Errorf("mirror: sync mergerequest %s: %w", key.Name, err)
 	}
 	obs.MirrorSyncTotal.WithLabelValues("MergeRequest", "ok").Inc()
@@ -507,7 +520,7 @@ func syncIssueThread(ctx context.Context, c client.Client, sp objbudget.Spiller,
 	}
 	comments, err := reader.ListIssueComments(ctx, owner, name, iss.Spec.Number)
 	if err != nil {
-		obs.MirrorSyncTotal.WithLabelValues("Issue", "error").Inc()
+		recordMirrorSyncFailure(ctx, "Issue", err)
 		return fmt.Errorf("mirror: list comments for %s: %w", IssueKey(repo.Name, iss.Spec.Number), err)
 	}
 	incoming := mirrorComments("Issue", proj, comments)
@@ -518,7 +531,7 @@ func syncIssueThread(ctx context.Context, c client.Client, sp objbudget.Spiller,
 		cur.Status.LastSyncedAt = &now
 		meta.SetStatusCondition(&cur.Status.Conditions, syncedCondition())
 	}); err != nil {
-		obs.MirrorSyncTotal.WithLabelValues("Issue", "error").Inc()
+		recordMirrorSyncFailure(ctx, "Issue", err)
 		return fmt.Errorf("mirror: sync issue thread %s: %w", key.Name, err)
 	}
 	obs.MirrorSyncTotal.WithLabelValues("Issue", "ok").Inc()
@@ -545,7 +558,7 @@ func syncMergeRequestThread(ctx context.Context, c client.Client, sp objbudget.S
 		comments, err = reader.ListIssueComments(ctx, owner, name, mr.Spec.Number)
 	}
 	if err != nil {
-		obs.MirrorSyncTotal.WithLabelValues("MergeRequest", "error").Inc()
+		recordMirrorSyncFailure(ctx, "MergeRequest", err)
 		return fmt.Errorf("mirror: list comments for %s: %w", MRKey(repo.Name, mr.Spec.Number), err)
 	}
 	incoming := mirrorComments("MergeRequest", proj, comments)
@@ -556,7 +569,7 @@ func syncMergeRequestThread(ctx context.Context, c client.Client, sp objbudget.S
 		cur.Status.LastSyncedAt = &now
 		meta.SetStatusCondition(&cur.Status.Conditions, syncedCondition())
 	}); err != nil {
-		obs.MirrorSyncTotal.WithLabelValues("MergeRequest", "error").Inc()
+		recordMirrorSyncFailure(ctx, "MergeRequest", err)
 		return fmt.Errorf("mirror: sync mergerequest thread %s: %w", key.Name, err)
 	}
 	obs.MirrorSyncTotal.WithLabelValues("MergeRequest", "ok").Inc()
@@ -626,7 +639,7 @@ func SyncMergeRequestOnDemand(ctx context.Context, c client.Client, sp objbudget
 		cur.Status.LastSyncedAt = &now
 		meta.SetStatusCondition(&cur.Status.Conditions, syncedCondition())
 	}); err != nil {
-		obs.MirrorSyncTotal.WithLabelValues("MergeRequest", "error").Inc()
+		recordMirrorSyncFailure(ctx, "MergeRequest", err)
 		return fmt.Errorf("mirror: stamp live head on %s: %w", key.Name, err)
 	}
 	log.FromContext(ctx).Info("mirror: synced mergerequest to live head on demand",

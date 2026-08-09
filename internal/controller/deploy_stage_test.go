@@ -119,8 +119,10 @@ func TestDeployingWaitsForTheApply(t *testing.T) {
 	rd.tags["tatara-operator"] = "v1.4.0"
 	rd.tags["tatara-cli"] = "v0.9.1"
 	rd.runs[helmfileRepoName] = mdSuccessfulApply("apply-sha")
-	// The apply carries the operator's v1.4.0 but the cli is still pinned a version back.
-	rd.pin["main"] = mdPin("tatara-operator", "1.3.0") + mdImagePin("tatara-cli", "0.9.0")
+	// The fan-out HAS landed both pins on main (so the #512 fan-out bound is not
+	// what is in play here); the apply carries the operator's v1.4.0 but ran
+	// before the cli bump, so the cli is still applied a version back.
+	rd.pin["main"] = mdPin("tatara-operator", "1.4.0") + mdImagePin("tatara-cli", "0.9.1")
 	rd.pin["apply-sha"] = mdPin("tatara-operator", "1.4.0") + mdImagePin("tatara-cli", "0.9.0")
 	d := mdNewDriverWithReader(t, f, c, rd)
 
@@ -324,8 +326,9 @@ func TestDeployingLogsWaitingWithThePendingMRs(t *testing.T) {
 	rd.tags["tatara-operator"] = "v1.4.0"
 	rd.tags["tatara-cli"] = "v0.9.1"
 	rd.runs[helmfileRepoName] = mdSuccessfulApply("apply-sha")
-	// The apply carries the operator's v1.4.0; the cli is still a version back.
-	rd.pin["main"] = mdPin("tatara-operator", "1.3.0") + mdImagePin("tatara-cli", "0.9.0")
+	// Both pins ARE on main (the fan-out ran); the apply carries the operator's
+	// v1.4.0 and predates the cli bump, so only the cli is still undeployed.
+	rd.pin["main"] = mdPin("tatara-operator", "1.4.0") + mdImagePin("tatara-cli", "0.9.1")
 	rd.pin["apply-sha"] = mdPin("tatara-operator", "1.4.0") + mdImagePin("tatara-cli", "0.9.0")
 	d := mdNewDriverWithReader(t, f, c, rd)
 
@@ -370,7 +373,9 @@ func TestDeployingLogsWaitingWhenNoApplyRunWentGreen(t *testing.T) {
 	f := newFakeForge(t)
 	rd := mdNewReader(f)
 	rd.tags["tatara-operator"] = "v1.4.0"
-	rd.pin["main"] = mdPin("tatara-operator", "1.3.0")
+	// The pin IS on main - the fan-out ran - so this is the APPLY being broken,
+	// not the #512 fan-out stall, and the poll is the right response.
+	rd.pin["main"] = mdPin("tatara-operator", "1.4.0")
 	// rd.runs is deliberately EMPTY: no completed successful apply run exists.
 	d := mdNewDriverWithReader(t, f, c, rd)
 

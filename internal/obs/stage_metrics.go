@@ -143,3 +143,21 @@ func (m *OperatorMetrics) TaskTerminalEntry(kind, from, to, reason string) {
 	}
 	m.TaskTerminal(kind, to, reason)
 }
+
+// DeployPinFanoutStalledTotal counts merged changes whose component tag never
+// reached the tatara-helmfile main pin inside the fan-out window (#512).
+//
+// The deploying stage is pod-less and poll-driven, and until this existed a dead
+// fan-out was indistinguishable from a slow one: task
+// mt-c-tatara-operator-506 polled for 2h06m59s emitting ZERO log lines against a
+// pin nothing was going to write, then discarded merged PR #509 at
+// deploy-blocked. ANY non-zero rate here means the tag -> bump PR cascade is not
+// running and NOTHING can deploy, not just this Task.
+var DeployPinFanoutStalledTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "operator_deploy_pin_fanout_stalled_total",
+	Help: "Merged changes whose component tag never reached the tatara-helmfile main pin within the CD fan-out window. The whole delivery cascade is down, not one task.",
+}, []string{"repo"})
+
+func init() {
+	ctrlmetrics.Registry.MustRegister(DeployPinFanoutStalledTotal)
+}

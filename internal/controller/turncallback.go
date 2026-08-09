@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -219,6 +220,14 @@ func (s *CallbackServer) handleTurnComplete(w http.ResponseWriter, r *http.Reque
 		tokenDelta, usageRecorded = d, rec
 	}
 
+	// BEFORE recordResult, which stamps annTurnComplete and thereby closes the
+	// window every other guarded status write on this turn uses. The Task's
+	// continuation state has to be durable before anything can act on the turn
+	// being finished - including a TTL stop racing this callback (#527).
+	if err := s.stampLastTurn(r.Context(), task, p.TurnID, p.FinalText, p.PushedRepos, true); err != nil {
+		l.Error(err, "persist last-turn continuation state (non-fatal)", "turn_id", p.TurnID)
+	}
+
 	if err := s.recordResult(r.Context(), agent.TurnResult{
 		State: p.State, FinalText: p.FinalText, StopReason: p.StopReason, Err: p.Error,
 	}, task, p.TurnID); err != nil {
@@ -398,6 +407,69 @@ func taskTokenLabels(task *tatarav1alpha1.Task) (project, repo, kind, issue, mod
 	return
 }
 
+// stampLastTurn persists the finishing turn's continuation state - its final
+// text and the repos it pushed - onto the Task status, so the G.7 synthetic
+// handoff note has something to say (#527).
+//
+// pushedReposKnown separates "the agent pushed nothing" from "this code path
+// cannot know". The turn-complete callback carries pushedRepos and is
+// authoritative for both; the poll backstop reads GET /v1/messages/{turnId},
+// whose TurnResult has no pushedRepos field at all, so it must leave whatever
+// the callback recorded alone rather than clearing it.
+//
+// It is guarded exactly like recordResult: a callback for a turn the Task has
+// already moved past must not overwrite a newer turn's state, and a terminal
+// Task is left alone. Writing the same values twice is harmless, so unlike
+// recordUsage it does not additionally guard on annTurnComplete - a duplicate
+// callback re-persisting identical text costs one no-op write and is preferable
+// to a race that drops the state entirely.
+func (s *CallbackServer) stampLastTurn(ctx context.Context, task *tatarav1alpha1.Task,
+	turnID, finalText string, pushedRepos []string, pushedReposKnown bool) error {
+
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := s.Client.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
+			return fmt.Errorf("reload task for last-turn state: %w", err)
+		}
+		if fresh.Annotations[annCurrentTurn] != turnID {
+			return nil // stale callback: a newer turn owns the continuation state
+		}
+		if tatarav1alpha1.TaskDone(fresh) {
+			return nil
+		}
+		want := tatarav1alpha1.TruncateUTF8(finalText, tatarav1alpha1.NoteBodyMaxBytes)
+		changed := fresh.Status.LastTurnFinalText != want
+		fresh.Status.LastTurnFinalText = want
+		if pushedReposKnown {
+			repos := clampPushedRepos(pushedRepos)
+			if !slices.Equal(fresh.Status.LastTurnPushedRepos, repos) {
+				changed = true
+			}
+			fresh.Status.LastTurnPushedRepos = repos
+		}
+		if !changed {
+			return nil
+		}
+		return s.Client.Status().Update(ctx, fresh)
+	})
+}
+
+// maxLastTurnPushedRepos mirrors the CRD MaxItems on
+// status.lastTurnPushedRepos. An over-long list the API server rejects would
+// fail the whole status write, which is the failure this field exists to
+// prevent.
+const maxLastTurnPushedRepos = 20
+
+func clampPushedRepos(repos []string) []string {
+	if len(repos) == 0 {
+		return nil
+	}
+	if len(repos) > maxLastTurnPushedRepos {
+		repos = repos[:maxLastTurnPushedRepos]
+	}
+	return slices.Clone(repos)
+}
+
 // recordResult bumps the Task's turn-complete annotation to requeue its
 // reconcile, behind the stale-turn and terminal guards so a duplicate or
 // late callback cannot stamp a turn the Task has already moved past.
@@ -542,6 +614,10 @@ func (s *CallbackServer) PollOnce(ctx context.Context) {
 			s.refreshLastActivity(ctx, task.Name, task.Namespace, turn, tr.LastActivityAt.UTC().Format(time.RFC3339))
 		}
 		if tr.State == "complete" || tr.State == "failed" {
+			// GET /v1/messages/{turnId} carries no pushedRepos, so this path knows
+			// the final text and NOT the repos: it must not clear what the callback
+			// recorded (#527).
+			_ = s.stampLastTurn(ctx, task, turn, tr.FinalText, nil, false)
 			_ = s.recordResult(ctx, tr, task, turn)
 		}
 	}
