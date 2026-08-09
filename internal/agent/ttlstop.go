@@ -65,6 +65,12 @@ type TTLStopResult struct {
 	Handoff string
 }
 
+// SyntheticNoteLostMarker is the phrase a CONTENT-FREE synthetic handoff note
+// leads with. It is what the next agent reads instead of a handoff, and it is
+// the string the runbook's diagnosis step greps for, so it is a constant rather
+// than a literal buried in a format directive.
+const SyntheticNoteLostMarker = "NO CONTINUATION STATE WAS CAPTURED"
+
 // NoteKindHandoff is the Note.Kind the handoff turn asks the agent to write and
 // the operator writes for it when the agent cannot. Notes ARE the continuation
 // state: a TTL stop that leaves notes empty makes the next pod start from
@@ -478,6 +484,9 @@ func (s *TTLStopper) writeSyntheticNote(ctx context.Context, task *tatarav1alpha
 			"agent_kind", in.AgentKind, "pushed_repos", len(in.PushedRepos))
 	}
 	body := fmt.Sprintf("TTL stop. Last turn's final text: %s. Repos pushed: %s. No agent handoff was captured.", final, pushed)
+	if contentFree {
+		body = syntheticNoteLostBody()
+	}
 	n := tatarav1alpha1.Note{
 		At:    metav1.NewTime(s.now()),
 		Agent: NoteAgentOperator,
@@ -488,6 +497,27 @@ func (s *TTLStopper) writeSyntheticNote(ctx context.Context, task *tatarav1alpha
 		return "", fmt.Errorf("agent: write synthetic handoff note: %w", err)
 	}
 	return handoff, nil
+}
+
+// syntheticNoteLostBody is what the operator writes when it holds nothing to
+// hand off with.
+//
+// The note that used to land here read "TTL stop. Last turn's final text:
+// (none). Repos pushed: none. No agent handoff was captured." - which is
+// indistinguishable, to the agent reading it, from a turn that genuinely
+// produced nothing worth saying. #557 added a counter for this case but left the
+// note itself unchanged, so the operator could SEE the loss while the next agent
+// still could not: it read "(none)" as continuity, resumed from it, re-ran
+// turn-0 and re-charged maxTurnsPerTask.
+//
+// A placeholder must read as a placeholder. This one names the loss, says
+// explicitly that the previous pod's work is not recorded anywhere, and tells
+// the next agent to re-derive rather than to continue.
+func syntheticNoteLostBody() string {
+	return "TTL stop. " + SyntheticNoteLostMarker + ": the agent did not answer the handoff turn " +
+		"and the operator holds no final text and no pushed repos for the last turn. This note is a " +
+		"PLACEHOLDER, not a handoff - the work done on the previous pod is not recorded anywhere. " +
+		"Re-derive the state from the issue thread and the repos; do not read this note as continuity."
 }
 
 // maxNoteBody is the Note.Body CRD MaxLength. A long finalText must not make the

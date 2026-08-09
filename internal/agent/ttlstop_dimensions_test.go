@@ -169,3 +169,53 @@ func TestTTLStop_PartialPayloadIsStillASyntheticHandoff(t *testing.T) {
 		})
 	}
 }
+
+// A PLACEHOLDER MUST READ AS A PLACEHOLDER, TO THE AGENT AS WELL AS TO THE
+// METRIC.
+//
+// #557 added operator_agent_synthetic_handoff_empty_total for this case and left
+// the note itself alone, so the operator could see the loss while the next agent
+// still could not: the body said "Last turn's final text: (none). Repos pushed:
+// none.", which is indistinguishable from a turn that genuinely had nothing
+// worth saying. The next pod read it as continuity, resumed from it, re-ran
+// turn-0 and re-charged maxTurnsPerTask - the exact loop #527 documents.
+func TestTTLStop_ContentFreeNoteTellsTheNextAgentTheStateWasLost(t *testing.T) {
+	sess := &stopSession{
+		states:     []string{agent.SessionStateReady},
+		handoffErr: &agent.HTTPError{Status: http.StatusGone},
+	}
+	h := newTTLHarness(t, sess)
+	in := h.input()
+	in.LastFinalText, in.PushedRepos = "", nil
+
+	res, err := h.stopper.StopWithHandoff(context.Background(), h.task, in)
+	require.NoError(t, err)
+	require.Equal(t, agent.TTLHandoffNone, res.Handoff)
+
+	notes := h.notes(t)
+	require.Len(t, notes, 1, "the notes journal is never left empty, even here")
+	body := notes[0].Body
+	require.Contains(t, body, agent.SyntheticNoteLostMarker,
+		"the note must NAME the loss; the runbook greps for this exact marker")
+	require.Contains(t, body, "PLACEHOLDER, not a handoff")
+	require.Contains(t, body, "do not read this note as continuity")
+	require.NotContains(t, body, "Last turn's final text: (none)",
+		"rendering empty fields invites the next agent to resume from nothing")
+}
+
+// The marker is for the EMPTY case only. A real payload keeps the note that
+// carries it - a marker on a note that does have continuation state would train
+// the next agent to distrust the ones that matter.
+func TestTTLStop_RealPayloadNoteCarriesNoLostMarker(t *testing.T) {
+	sess := &stopSession{
+		states:     []string{agent.SessionStateReady},
+		handoffErr: &agent.HTTPError{Status: http.StatusGone},
+	}
+	h := newTTLHarness(t, sess)
+
+	res, err := h.stopper.StopWithHandoff(context.Background(), h.task, h.input())
+	require.NoError(t, err)
+	require.Equal(t, agent.TTLHandoffSynthetic, res.Handoff)
+	require.NotContains(t, h.notes(t)[0].Body, agent.SyntheticNoteLostMarker)
+	require.Contains(t, h.notes(t)[0].Body, "wired the reconciler, tests still red")
+}
