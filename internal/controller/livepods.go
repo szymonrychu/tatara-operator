@@ -87,13 +87,13 @@ func (r *TaskReconciler) liveHandoffAndPark(ctx context.Context, proj *tatarav1a
 			LastFinalText: task.Status.LastTurnFinalText,
 			PushedRepos:   task.Status.LastTurnPushedRepos,
 		}
-		outcome, err := stopper.StopWithHandoff(ctx, task, in)
+		res, err := stopper.StopWithHandoff(ctx, task, in)
 		if err != nil {
 			return fmt.Errorf("livepods: handoff stop on %s: %w", task.Name, err)
 		}
 		log.FromContext(ctx).Info("conversation handed off",
 			"action", "conversing_handoff", "resource_id", task.Name,
-			"cause", cause, "outcome", outcome)
+			"cause", cause, "outcome", res.Outcome, "handoff", res.Handoff)
 		// The stop has spent the last-turn payload on a handoff note, so retire it
 		// before this Task parks or re-arms (#527). Both continuations below
 		// read-modify-write a FRESH Task, so this patch is not clobbered by them.

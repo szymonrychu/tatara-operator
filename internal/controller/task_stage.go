@@ -1217,7 +1217,7 @@ func (r *TaskReconciler) stalledTurnStop(ctx context.Context, proj *tatarav1alph
 		Record:               obs.AgentPodTTLExpired,
 		RecordEmptySynthetic: obs.AgentSyntheticHandoffEmpty,
 	}
-	outcome, err := stopper.StopWithHandoff(ctx, task, agent.TTLStopInput{
+	res, err := stopper.StopWithHandoff(ctx, task, agent.TTLStopInput{
 		BaseURL:     agent.BaseURL(task, task.Namespace),
 		CallbackURL: r.callbackURL(),
 		AgentKind:   agentKind,
@@ -1260,7 +1260,7 @@ func (r *TaskReconciler) stalledTurnStop(ctx context.Context, proj *tatarav1alph
 	}
 	log.FromContext(ctx).Info("stalled turn stopped gracefully; handed off",
 		"action", "stalled_turn_stop", "resource_id", task.Name, "turn_id", turnID,
-		"agent_kind", agentKind, "outcome", outcome,
+		"agent_kind", agentKind, "outcome", res.Outcome, "handoff", res.Handoff,
 		"wait", StalledTurnHandoffWait.String())
 	return ctrl.Result{RequeueAfter: agentBootRequeue}, nil
 }
@@ -1307,7 +1307,7 @@ func (r *TaskReconciler) ttlStop(ctx context.Context, proj *tatarav1alpha1.Proje
 		LastFinalText: task.Status.LastTurnFinalText,
 		PushedRepos:   task.Status.LastTurnPushedRepos,
 	}
-	outcome, err := stopper.StopWithHandoff(ctx, task, in)
+	res, err := stopper.StopWithHandoff(ctx, task, in)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("ttl stop %s: %w", task.Name, err)
 	}
@@ -1321,7 +1321,7 @@ func (r *TaskReconciler) ttlStop(ctx context.Context, proj *tatarav1alpha1.Proje
 	}
 	log.FromContext(ctx).Info("agent pod TTL-stopped; handed off",
 		"action", "agent_pod_ttl_stop", "resource_id", task.Name,
-		"agent_kind", agentKind, "outcome", outcome)
+		"agent_kind", agentKind, "outcome", res.Outcome, "handoff", res.Handoff)
 	return ctrl.Result{RequeueAfter: agentBootRequeue}, nil
 }
 

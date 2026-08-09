@@ -19,22 +19,51 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
-// The three TTL stop outcomes (contract G.7), the values of the outcome label
-// on operator_agent_pod_ttl_expired_total. Task.status.notes is NEVER empty
-// after ANY of them - either the agent wrote its handoff, or the operator wrote
-// a synthetic one from the last turn's finalText + pushedRepos.
+// A G.7 TTL stop reports TWO INDEPENDENT FACTS, on two labels of
+// operator_agent_pod_ttl_expired_total. They shared one label until #527, and
+// the conflation is why ~19 days of silent work loss went unnoticed: finish()
+// overwrote the capture fact with the stop fact on any teardown error, so
+// synthetic_handoff was structurally unreachable and never once recorded over
+// 30 days, while force_deleted - the value the alert fired on - could equally
+// mean "the agent handed off perfectly and the wrapper was slow to die".
+//
+// TTLOutcome* answers: HOW WAS THE POD STOPPED?
 const (
-	// TTLOutcomeAgentHandoff: the agent answered the handoff turn and wrote a
-	// kind=handoff note of its own.
-	TTLOutcomeAgentHandoff = "agent_handoff"
-	// TTLOutcomeSyntheticHandoff: the handoff turn was refused (410/409/5xx) or
-	// never landed; the operator wrote the synthetic note and the pod stopped
-	// cleanly.
-	TTLOutcomeSyntheticHandoff = "synthetic_handoff"
-	// TTLOutcomeForceDeleted: as synthetic_handoff, and the pod had to be
-	// force-deleted (the graceful session stop failed, or the hard cap fired).
+	// TTLOutcomeGraceful: the wrapper session closed and the pod came down on its
+	// own (or was already gone). Says NOTHING about whether a handoff was
+	// captured.
+	TTLOutcomeGraceful = "graceful"
+	// TTLOutcomeForceDeleted: the graceful stop failed against a pod that was
+	// still there, so it was deleted with a zero grace period. Says NOTHING about
+	// whether a handoff was captured.
 	TTLOutcomeForceDeleted = "force_deleted"
 )
+
+// TTLHandoff* answers: HOW WAS THE CONTINUATION STATE CAPTURED? This is the
+// dimension that decides whether work was lost, and the only one an alert on
+// work loss can be built from.
+const (
+	// TTLHandoffAgent: the agent answered the handoff turn and wrote a
+	// kind=handoff note of its own. Continuity intact.
+	TTLHandoffAgent = "agent"
+	// TTLHandoffSynthetic: the handoff turn was refused (410/409/5xx), never
+	// landed, or the wrapper was already gone; the operator wrote the note itself
+	// from the last turn's finalText + pushedRepos. Continuity degraded but real.
+	TTLHandoffSynthetic = "synthetic"
+	// TTLHandoffNone: as synthetic, and the operator held NOTHING to write - no
+	// finalText, no pushedRepos. The note that lands is a placeholder saying so.
+	// THIS is the silent work loss, and it is the bucket to alert on.
+	TTLHandoffNone = "none"
+)
+
+// TTLStopResult is one stop, reported on both dimensions.
+type TTLStopResult struct {
+	// Outcome is graceful | force_deleted: how the POD was stopped.
+	Outcome string
+	// Handoff is agent | synthetic | none: how the CONTINUATION STATE was
+	// captured.
+	Handoff string
+}
 
 // NoteKindHandoff is the Note.Kind the handoff turn asks the agent to write and
 // the operator writes for it when the agent cannot. Notes ARE the continuation
@@ -183,7 +212,7 @@ type TTLStopper struct {
 	Namespace string
 	// Record is the operator_agent_pod_ttl_expired_total hook
 	// (obs.AgentPodTTLExpired). Optional.
-	Record func(agentKind, outcome string)
+	Record func(agentKind, outcome, handoff string)
 	// RecordEmptySynthetic is the operator_agent_synthetic_handoff_empty_total
 	// hook (obs.AgentSyntheticHandoffEmpty): a synthetic note was written with NO
 	// continuation state to put in it, which is the #527 failure. Optional.
@@ -223,8 +252,8 @@ func (s *TTLStopper) poll() time.Duration {
 	return TTLPollInterval
 }
 
-// StopWithHandoff runs the G.7 stop sequence and returns the outcome
-// (agent_handoff | synthetic_handoff | force_deleted).
+// StopWithHandoff runs the G.7 stop sequence and returns how the pod was
+// stopped and, independently, how the continuation state was captured.
 //
 //	t0 = podStartedAt + agentPodTTLSeconds
 //
@@ -240,14 +269,15 @@ func (s *TTLStopper) poll() time.Duration {
 //	   force-delete the pod.
 //	5. The pod is stopped; the caller frees the slot and rolls up the stats.
 //
-// The Task's notes are non-empty on return in ALL THREE outcomes. That is the
-// property the whole mechanism exists for.
-func (s *TTLStopper) StopWithHandoff(ctx context.Context, task *tatarav1alpha1.Task, in TTLStopInput) (string, error) {
+// The Task's notes are non-empty on return in EVERY case. That is the property
+// the whole mechanism exists for - but see TTLHandoffNone: non-empty is not the
+// same as useful, and the two are now told apart.
+func (s *TTLStopper) StopWithHandoff(ctx context.Context, task *tatarav1alpha1.Task, in TTLStopInput) (TTLStopResult, error) {
 	hardCap := in.hardCap()
 
 	before, err := s.handoffNoteCount(ctx, task.Name)
 	if err != nil {
-		return "", err
+		return TTLStopResult{}, err
 	}
 
 	// Step 2: wait out the in-flight turn, bounded by turnTimeoutSeconds and by
@@ -263,38 +293,48 @@ func (s *TTLStopper) StopWithHandoff(ctx context.Context, task *tatarav1alpha1.T
 		if serr == nil {
 			deadline := earliest(s.now().Add(in.waitBound()), hardCap)
 			if s.waitHandoffNote(ctx, task.Name, before, deadline) {
-				return s.finish(ctx, task, in, TTLOutcomeAgentHandoff)
+				return s.finish(ctx, task, in, TTLHandoffAgent)
 			}
 		}
 	}
 
-	// Step 4: the operator writes the handoff the agent could not.
-	if err := s.writeSyntheticNote(ctx, task, in); err != nil {
-		return "", err
+	// Step 4: the operator writes the handoff the agent could not. It reports
+	// which capture dimension it actually achieved - a note built from nothing is
+	// not a synthetic handoff, it is a placeholder.
+	handoff, err := s.writeSyntheticNote(ctx, task, in)
+	if err != nil {
+		return TTLStopResult{}, err
 	}
-	return s.finish(ctx, task, in, TTLOutcomeSyntheticHandoff)
+	return s.finish(ctx, task, in, handoff)
 }
 
-// finish stops the pod and records the outcome. A graceful stop that fails - or
-// an outcome reached past the hard cap - escalates to a force-delete, which is
-// its own outcome. The synthetic note has already landed by then, so notes are
-// non-empty in that case too.
-func (s *TTLStopper) finish(ctx context.Context, task *tatarav1alpha1.Task, in TTLStopInput, outcome string) (string, error) {
-	if err := s.Session.DeleteSession(ctx, in.BaseURL); err != nil {
-		if ferr := s.forceDeletePod(ctx, task); ferr != nil {
-			return "", ferr
-		}
-		outcome = TTLOutcomeForceDeleted
-	} else if err := DeleteWrapper(ctx, s.Client, s.Namespace, task); err != nil {
-		if ferr := s.forceDeletePod(ctx, task); ferr != nil {
-			return "", ferr
-		}
-		outcome = TTLOutcomeForceDeleted
+// finish stops the pod and records the result. It decides the STOP dimension and
+// ONLY the stop dimension: handoff is passed through untouched.
+//
+// It used to overwrite it, and that is precisely how the metric lost the ability
+// to say whether any work survived: a Task whose agent wrote a perfect handoff
+// and whose wrapper then failed to tear down cleanly was reported as
+// force_deleted, indistinguishable from total loss (#527).
+func (s *TTLStopper) finish(ctx context.Context, task *tatarav1alpha1.Task, in TTLStopInput, handoff string) (TTLStopResult, error) {
+	stopErr := s.Session.DeleteSession(ctx, in.BaseURL)
+	if stopErr == nil {
+		stopErr = DeleteWrapper(ctx, s.Client, s.Namespace, task)
 	}
+	if stopErr == nil {
+		return s.record(in, TTLOutcomeGraceful, handoff), nil
+	}
+	if ferr := s.forceDeletePod(ctx, task); ferr != nil {
+		return TTLStopResult{}, ferr
+	}
+	return s.record(in, TTLOutcomeForceDeleted, handoff), nil
+}
+
+// record emits the metric (when wired) and returns the result the caller logs.
+func (s *TTLStopper) record(in TTLStopInput, outcome, handoff string) TTLStopResult {
 	if s.Record != nil {
-		s.Record(in.AgentKind, outcome)
+		s.Record(in.AgentKind, outcome, handoff)
 	}
-	return outcome, nil
+	return TTLStopResult{Outcome: outcome, Handoff: handoff}
 }
 
 // forceDeletePod deletes the wrapper Pod with a zero grace period. A pod whose
@@ -403,25 +443,33 @@ func HasAgentHandoffNote(t *tatarav1alpha1.Task) bool {
 // writeSyntheticNote is G.7 step 4: the operator's own handoff note, built from
 // the last turn's final text and the repos the agent pushed. It is the ONLY
 // thing standing between a TTL stop and an empty notes journal.
-func (s *TTLStopper) writeSyntheticNote(ctx context.Context, task *tatarav1alpha1.Task, in TTLStopInput) error {
+//
+// It returns the HANDOFF dimension it achieved. EITHER field alone is real
+// continuation state - a push with no closing message still tells the next pod
+// where the work went - so only an entirely empty payload is TTLHandoffNone.
+func (s *TTLStopper) writeSyntheticNote(ctx context.Context, task *tatarav1alpha1.Task, in TTLStopInput) (string, error) {
 	pushed := "none"
 	if len(in.PushedRepos) > 0 {
 		pushed = strings.Join(in.PushedRepos, ", ")
 	}
 	final := strings.TrimSpace(in.LastFinalText)
+	handoff := TTLHandoffSynthetic
+	contentFree := final == "" && len(in.PushedRepos) == 0
 	if final == "" {
 		final = "(none)"
+	}
+	if contentFree {
+		handoff = TTLHandoffNone
 		// LOUD, because for ~19 days this was the ONLY thing this function ever
 		// wrote and nothing said so: the note satisfied the non-empty-notes
 		// invariant while carrying zero continuation state, the next pod resumed
 		// from nothing, re-ran turn-0 and re-charged maxTurnsPerTask, and the Task
-		// looked healthy throughout (#527). A note that resolves to "(none)" is
-		// the failure this whole path exists to prevent, not a success.
+		// looked healthy throughout (#527).
 		//
-		// It is a counter rather than an ERROR line on purpose: it happens once
-		// per stop, it is a RATE that matters (a Task whose very first turn never
-		// completed legitimately has no last-turn state), and a counter is what an
-		// alert can express.
+		// The counter is KEPT alongside handoff="none", which is now the primary
+		// signal: it predates the label split, tatara-observability may still be
+		// selecting it, and retiring an emitted series is a separate decision from
+		// adding a better one.
 		if s.RecordEmptySynthetic != nil {
 			s.RecordEmptySynthetic(in.AgentKind)
 		}
@@ -437,9 +485,9 @@ func (s *TTLStopper) writeSyntheticNote(ctx context.Context, task *tatarav1alpha
 		Body:  truncateNoteBody(body),
 	}
 	if err := s.Notes.AppendNote(ctx, task.Name, n); err != nil {
-		return fmt.Errorf("agent: write synthetic handoff note: %w", err)
+		return "", fmt.Errorf("agent: write synthetic handoff note: %w", err)
 	}
-	return nil
+	return handoff, nil
 }
 
 // maxNoteBody is the Note.Body CRD MaxLength. A long finalText must not make the
