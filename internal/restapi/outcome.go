@@ -303,21 +303,31 @@ func (s *Server) postOutcome(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// IDEMPOTENCY FIRST, before the terminal-stage and kind gates, and CLAIMED
-	// atomically before any forge/child-mint side effect (C7): the handler runs
-	// on every replica, so a stale top-of-handler read of a stamped-only-at-commit
-	// fingerprint admits two concurrent identical POSTs straight through to the
-	// same forge write / child-mint / ReviewRounds increment. The claim is a
-	// LEASE: claimOutcomeFingerprint re-Gets the Task fresh and, under
-	// RetryOnConflict, reports whether the fingerprint is COMMITTED (replay),
-	// claimed and IN FLIGHT on another replica (409 retry), or free/orphaned (it
-	// stamps and we proceed). A TTL-stopped pod's retry of a COMMITTED outcome
-	// must not 409 the Task into failure - and by the time it retries, both
-	// status.stage and status.agentKind have moved on, so both gates below would
-	// refuse it.
+	// IDEMPOTENCY FIRST, but as a READ-ONLY PEEK (issue #578). The replay and
+	// in-flight verdicts have to be reached before anything else runs - a
+	// TTL-stopped pod's retry of a COMMITTED outcome must not 409 the Task into
+	// failure - but reaching them costs a Get, not a write.
+	//
+	// THE CLAIM WRITE IS LAZY AND LIVES IN o.claim(). It used to be taken HERE,
+	// above the terminal/parked/kind gates, above the payload decode and above
+	// every kind handler's read-only validation block - so EVERY 4xx this
+	// endpoint can produce mutated status.conditions first and failed second.
+	// `release()` undid it, which made the NET effect nil, but the write was
+	// observable: an agent that task_get'd between the claim and the release saw
+	// OutcomeAccepted=True for an outcome it had just been told was refused,
+	// concluded the write had landed, and (with the wrapper's mandatory retry
+	// directive on top) re-submitted until maxPodRecreations was spent. release()
+	// is also best-effort, so a failed one leaves the bogus claim until the TTL.
+	//
+	// The claim-first ordering's own contract is "claimed atomically before any
+	// forge/child-mint SIDE EFFECT (C7)". Validation is not a side effect, so the
+	// claim does not have to precede it - only the execution phase. Concurrency
+	// is unchanged: two identical POSTs both peek free, both validate (idempotent,
+	// no writes), and the atomic CAS inside o.claim() still lets exactly one win;
+	// the loser re-Gets a fresh bare claim inside the TTL and is told to retry.
 	fp := outcomeFingerprint(env.Kind, env.Payload)
 	key := types.NamespacedName{Namespace: s.ns, Name: name}
-	task, state, err := claimOutcomeFingerprint(ctx, s.c, key, fp, s.now())
+	task, state, err := peekOutcomeClaim(ctx, s.c, key, fp, s.now())
 	if err != nil {
 		writeClientErr(w, err)
 		return
@@ -336,9 +346,9 @@ func (s *Server) postOutcome(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// oc is built BEFORE the two gates so both can release the claim they hold:
-	// they run before any kind handler and stamp nothing, so they are class B.
-	// oc.proj is nil until the lookup below; neither gate reads it.
+	// oc is built BEFORE the two gates. They run before any kind handler and
+	// stamp nothing, and now they also run before the claim, so they write
+	// NOTHING at all. oc.proj is nil until the lookup below; neither gate reads it.
 	oc := &outcomeCtx{s: s, w: w, r: r, task: task, fp: fp, kind: env.Kind}
 	if tatarav1alpha1.TaskDone(task) {
 		oc.conflict("task is done", "terminal-stage")
@@ -455,17 +465,59 @@ const (
 	claimInFlight
 )
 
+// classifyOutcomeClaim decides which of the three states t's OutcomeAccepted
+// condition represents for fingerprint fp. It is the ONE definition of that
+// verdict, shared by the read-only peek and the atomic claim so the two can
+// never drift.
+//
+// A condition for a DIFFERENT fingerprint, or none at all, is claimWon - as is
+// an ORPHANED STUB (a bare claim older than OutcomeClaimTTL, left by a process
+// that died between its claim and its commit).
+func classifyOutcomeClaim(t *tatarav1alpha1.Task, fp string, now time.Time) outcomeClaimState {
+	cond := tatarav1alpha1.OutcomeCondition(t)
+	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Message != fp {
+		return claimWon
+	}
+	if cond.Reason != tatarav1alpha1.OutcomeReasonClaimed {
+		return claimCommitted
+	}
+	if now.Sub(cond.LastTransitionTime.Time) < tatarav1alpha1.OutcomeClaimTTL {
+		return claimInFlight
+	}
+	return claimWon
+}
+
+// peekOutcomeClaim READS the Task and classifies the claim, WRITING NOTHING
+// (issue #578). It is what runs at the top of postOutcome so that the replay
+// and in-flight verdicts are still reached before anything else, without the
+// endpoint mutating status.conditions for a request it is about to 4xx.
+func peekOutcomeClaim(ctx context.Context, c client.Client, key types.NamespacedName,
+	fp string, now time.Time) (*tatarav1alpha1.Task, outcomeClaimState, error) {
+	fresh := &tatarav1alpha1.Task{}
+	if err := c.Get(ctx, key, fresh); err != nil {
+		return nil, claimWon, err
+	}
+	return fresh, classifyOutcomeClaim(fresh, fp, now), nil
+}
+
 // claimOutcomeFingerprint atomically claims fp against a FRESH re-read of the
 // Task, before any forge/child-mint side effect (C7), and reports which of the
 // three states it found.
 //
-// THE CLAIM-FIRST ORDERING IS LOAD-BEARING AND MUST NOT MOVE. The handler runs on
-// every replica, so a stale top-of-handler read of a stamped-only-at-commit
-// fingerprint admits two concurrent identical POSTs straight through to the same
-// forge write / child-mint / ReviewRounds increment. Optimistic concurrency lets
-// exactly one of two concurrent identical POSTs win the Update; the loser now
-// reads back a fresh bare claim and is told to RETRY (409) rather than being
-// answered 200 with nothing done.
+// THE CLAIM MUST PRECEDE EVERY SIDE EFFECT AND MUST NOT PRECEDE VALIDATION
+// (issue #578). The handler runs on every replica, so a stale read of a
+// stamped-only-at-commit fingerprint admits two concurrent identical POSTs
+// straight through to the same forge write / child-mint / ReviewRounds
+// increment - hence the atomic CAS here. Optimistic concurrency lets exactly one
+// of two concurrent identical POSTs win the Update; the loser reads back a fresh
+// bare claim and is told to RETRY (409) rather than being answered 200 with
+// nothing done.
+//
+// What it may NOT do is run above the validation, which is what it did until
+// #578: validation performs no side effect, so nothing is protected by claiming
+// ahead of it, and every 4xx below became a mutate-then-fail. Callers reach this
+// through outcomeCtx.claim(), at the boundary between a handler's read-only
+// validation block and its execution phase.
 //
 // The claim is a LEASE, not a tombstone: Reason carries claimed-vs-committed and
 // LastTransitionTime carries the expiry, both on fields that already existed.
@@ -474,26 +526,16 @@ func claimOutcomeFingerprint(ctx context.Context, c client.Client, key types.Nam
 	fresh := &tatarav1alpha1.Task{}
 	state := claimWon
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		state = claimWon
 		if err := c.Get(ctx, key, fresh); err != nil {
 			return err
 		}
-		if cond := tatarav1alpha1.OutcomeCondition(fresh); cond != nil &&
-			cond.Status == metav1.ConditionTrue && cond.Message == fp {
-			switch {
-			case cond.Reason != tatarav1alpha1.OutcomeReasonClaimed:
-				state = claimCommitted
-				return nil
-			case now.Sub(cond.LastTransitionTime.Time) < tatarav1alpha1.OutcomeClaimTTL:
-				state = claimInFlight
-				return nil
-			}
-			// An ORPHANED STUB: the process died between the claim and the commit,
-			// so no release ever ran. RE-CLAIM it - refresh LastTransitionTime and
-			// fall through. Two replicas racing the re-claim is safe: one wins the
-			// Update, the other conflicts, re-Gets, sees a claim younger than the
-			// TTL and answers claimInFlight.
+		if state = classifyOutcomeClaim(fresh, fp, now); state != claimWon {
+			return nil
 		}
+		// Free, or an ORPHANED STUB we RE-CLAIM by refreshing LastTransitionTime.
+		// Two replicas racing the re-claim is safe: one wins the Update, the other
+		// conflicts, re-Gets, sees a claim younger than the TTL and answers
+		// claimInFlight.
 		setCondition(fresh, metav1.Condition{
 			Type:               outcomeAcceptedCondition,
 			Status:             metav1.ConditionTrue,
@@ -515,6 +557,48 @@ type outcomeCtx struct {
 	proj *tatarav1alpha1.Project
 	fp   string
 	kind string
+	// claimed records whether THIS request holds the fingerprint claim. It is
+	// false through the whole read-only validation phase (#578), which is what
+	// makes every 4xx this endpoint produces a pure no-write rejection, and what
+	// makes release() a no-op on those paths - there is nothing to release.
+	claimed bool
+}
+
+// claim takes the atomic fingerprint claim at the boundary between a handler's
+// read-only validation block and its execution phase, and reports whether the
+// caller may proceed. It is idempotent within a request.
+//
+// EVERY SIDE EFFECT MUST SIT BEHIND IT: forge writes, child mints, mirror
+// writes, spec writes, and commit (which calls it as a backstop, so no execution
+// path can commit unclaimed). A false return means the response has ALREADY been
+// written - a replay 200 or an in-flight 409 that only became visible now,
+// between the peek and here - and the caller must return immediately.
+func (o *outcomeCtx) claim() bool {
+	if o.claimed {
+		return true
+	}
+	ctx := o.r.Context()
+	key := types.NamespacedName{Namespace: o.s.ns, Name: o.task.Name}
+	fresh, state, err := claimOutcomeFingerprint(ctx, o.s.c, key, o.fp, o.s.now())
+	if err != nil {
+		writeClientErr(o.w, err)
+		return false
+	}
+	switch state {
+	case claimCommitted:
+		o.s.log.InfoContext(ctx, "restapi: outcome replay accepted as a no-op",
+			append(reqLogFields(o.r), "action", "submit_outcome", "task", o.task.Name, "kind", o.kind)...)
+		writeJSON(o.w, http.StatusOK, toTaskDTO(*fresh))
+		return false
+	case claimInFlight:
+		obs.RestOutcomeRejectedTotal.WithLabelValues(o.kind, "claim-in-flight").Inc()
+		o.s.log.InfoContext(ctx, "restapi: an identical outcome is in flight on another replica; asking the caller to retry",
+			append(reqLogFields(o.r), "action", "submit_outcome", "task", o.task.Name, "kind", o.kind)...)
+		writeError(o.w, http.StatusConflict, "outcome in flight, retry")
+		return false
+	}
+	o.claimed = true
+	return true
 }
 
 // release drops OUR claim so an identical retry RE-VALIDATES immediately
@@ -550,6 +634,14 @@ type outcomeCtx struct {
 // then expires as an orphaned stub after the TTL, which is the same self-heal a
 // crashed process gets.
 func (o *outcomeCtx) release() {
+	// NOTHING TO RELEASE ON THE VALIDATION PATHS (#578). The claim is taken
+	// lazily, at the validation/execution boundary, so a rejection that fires
+	// before it never wrote anything - and must not go anywhere near the
+	// condition, which at that point can only be some OTHER request's.
+	if !o.claimed {
+		return
+	}
+	o.claimed = false
 	ctx := o.r.Context()
 	key := types.NamespacedName{Namespace: o.s.ns, Name: o.task.Name}
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -608,6 +700,13 @@ func (o *outcomeCtx) decode(payload []byte, v any) bool {
 // the closure to size the write and again on every conflict retry, so an emit
 // inside it would be inflated 2-3x.
 func (o *outcomeCtx) commit(mutate func(*tatarav1alpha1.Task) error) bool {
+	// THE CLAIM BACKSTOP (#578). commit is the one thing every kind handler's
+	// execution phase ends in, so claiming here guarantees no outcome is ever
+	// committed unclaimed even if a handler forgot the explicit claim before its
+	// first forge write. Idempotent: a handler that already claimed pays nothing.
+	if !o.claim() {
+		return false
+	}
 	ctx := o.r.Context()
 	s := o.s
 	key := types.NamespacedName{Namespace: s.ns, Name: o.task.Name}
@@ -741,11 +840,24 @@ func mrTerminalStates(mrs []tatarav1alpha1.MergeRequest) (states []string, allTe
 	return states, len(openMRs(mrs)) == 0
 }
 
-// terminalNoop answers a review submit_outcome whose review target already went
-// terminal with an explicit 2xx no-op (never a silent success: the body and the
-// log both name the discard). The claim is released as any pre-execution class-B
-// path is - nothing committed - so an identical retry re-validates and no-ops
-// again, instead of the doomed 400 that respawn-looped the pod.
+// terminalNoop answers a submit_outcome whose MRs already went terminal with an
+// explicit 2xx no-op (never a silent success: the body and the log both name the
+// discard). Nothing is committed and, since #578, nothing was ever claimed, so
+// an identical retry re-validates and no-ops again.
+//
+// IT IS A 2xx BECAUSE THE PRECONDITION IS ABOUT THE FORGE, NOT THE PAYLOAD
+// (#578). "Every MR you own already merged or closed" is not something the agent
+// can correct and resubmit: the identical request can never succeed, so a 4xx is
+// a category error - it says "you sent something wrong, fix it and retry" when
+// the truthful answer is "there is nothing left to attach this to, stop". The
+// wrapper's outcome re-prompt reads an is_error tool result and re-issues a
+// MANDATORY retry directive, which is how the doomed 400 became a
+// pod-recreation loop rather than one wasted call.
+//
+// THE ENDPOINT DOES NOT FINALIZE - the CONVERGENT RECONCILER-SIDE finalize does
+// (terminalMREdge / ownMRsShippedEdge in internal/controller/reviewpost.go,
+// wired at reconcileClocks and the pre-dispatch guard). This only stops the pod
+// re-submitting; the Task retires on its own next pass.
 func (o *outcomeCtx) terminalNoop(states []string) {
 	o.release()
 	ctx := o.r.Context()
@@ -915,21 +1027,28 @@ func (o *outcomeCtx) implement(p implementPayload) {
 	repos := ownedMRRepos(open)
 	switch {
 	case len(repos) == 0:
-		if o.task.Spec.Kind == "review" {
-			if states, term := mrTerminalStates(mrs); term {
-				o.terminalNoop(states)
-				return
-			}
-			over, err := controller.TaskTakenOver(ctx, s.c, o.task)
-			if err != nil {
-				writeClientErr(o.w, err)
-				return
-			}
-			if over {
-				o.takenOverNoop()
-				return
-			}
+		// THE CARVE-OUTS ARE KIND-AGNOSTIC (#578). They were gated on
+		// spec.kind=review until a kind=issue Task whose own MR had merged out of
+		// band fell straight through to the 400 below and respawn-looped on it.
+		// Nothing about "every MR this task owns already reached a terminal forge
+		// state" is specific to a review Task - see terminalNoop.
+		if states, term := mrTerminalStates(mrs); term {
+			o.terminalNoop(states)
+			return
 		}
+		over, err := controller.TaskTakenOver(ctx, s.c, o.task)
+		if err != nil {
+			writeClientErr(o.w, err)
+			return
+		}
+		if over {
+			o.takenOverNoop()
+			return
+		}
+		// STILL A 400, and legitimately so: the Task owns NO MR at all (an empty
+		// set is not terminal). That IS an agent error - it said it submitted code
+		// and opened nothing - and unlike the terminal case, a retry AFTER opening
+		// an MR genuinely succeeds.
 		o.bad("action=submitted but this task owns no open MR", "no-open-mr")
 		return
 	case len(repos) == 1:
@@ -952,6 +1071,12 @@ func (o *outcomeCtx) implement(p implementPayload) {
 			o.bad("mergeOrder does not cover repo "+repo, "merge-order-coverage")
 			return
 		}
+	}
+
+	// VALIDATION ENDS HERE, EXECUTION BEGINS (#578): every 400 above wrote
+	// nothing, and everything below mutates.
+	if !o.claim() {
+		return
 	}
 
 	// changeSignificance is written to EVERY owned MR's status.significance. It
@@ -1111,21 +1236,30 @@ func (o *outcomeCtx) review(p reviewPayload) {
 	}
 	open := openMRs(all)
 	if len(open) == 0 {
-		if o.task.Spec.Kind == "review" {
-			if states, term := mrTerminalStates(all); term {
-				o.terminalNoop(states)
-				return
-			}
-			over, err := controller.TaskTakenOver(ctx, s.c, o.task)
-			if err != nil {
-				writeClientErr(o.w, err)
-				return
-			}
-			if over {
-				o.takenOverNoop()
-				return
-			}
+		// THE CARVE-OUTS ARE KIND-AGNOSTIC (#578). THIS IS THE SITE THAT BURNED
+		// mt-i-mtg-decks-22: a kind=ISSUE Task runs an agentKind=REVIEW pod at
+		// awaiting-review (stage.AgentKindFor keys awaiting-review on the STATE,
+		// not spec.kind), so when its own MR merged out of band and a human
+		// comment woke it, spec.kind was "issue", the review-only gate did not
+		// apply, and it hit the hard 400 - three times in one turn, across seven
+		// pod runs and three pod recreations, each one re-taking the claim it had
+		// just been told failed.
+		if states, term := mrTerminalStates(all); term {
+			o.terminalNoop(states)
+			return
 		}
+		over, err := controller.TaskTakenOver(ctx, s.c, o.task)
+		if err != nil {
+			writeClientErr(o.w, err)
+			return
+		}
+		if over {
+			o.takenOverNoop()
+			return
+		}
+		// Still a 400 when the Task owns NO MR at all: an empty set is not
+		// terminal, and that shape is a mint/binding fault the operator repairs
+		// (intake.go repairMRBinding), after which the identical retry succeeds.
 		o.bad("this task owns no open MR", "no-open-mr")
 		return
 	}
@@ -1226,6 +1360,14 @@ func (o *outcomeCtx) review(p reviewPayload) {
 			})
 			return
 		}
+	}
+
+	// VALIDATION ENDS HERE, EXECUTION BEGINS (#578). The head-moved branch above
+	// deliberately stays UNCLAIMED: it stamps nothing on the Task, its mirror
+	// resync is idempotent, and its 409 is guidance the agent acts on rather than
+	// a claim anyone waits out.
+	if !o.claim() {
+		return
 	}
 
 	// PERSIST THE INTENT, and only the intent (C.5.3 phase 1). The MergeRequest
@@ -1396,6 +1538,10 @@ func (o *outcomeCtx) gate(p implementPayload) {
 			writeClientErr(o.w, err)
 			return
 		}
+		// VALIDATION ENDS HERE, EXECUTION BEGINS (#578).
+		if !o.claim() {
+			return
+		}
 		for i := range issues {
 			if err := s.queueIssueClose(ctx, o.proj, &issues[i], o.task.Name, p.Reason); err != nil {
 				writeClientErr(o.w, err)
@@ -1486,6 +1632,12 @@ func (o *outcomeCtx) gate(p implementPayload) {
 		// was dead after its one turn, so parking was the only way to hold the
 		// work. That is no longer true.
 		o.refuseGate(reason, p.ApprovingMaintainer)
+		return
+	}
+
+	// VALIDATION ENDS HERE, EXECUTION BEGINS (#578). Every refuseGate above is a
+	// 200 that writes nothing, and verifyApprovalScope is read-only.
+	if !o.claim() {
 		return
 	}
 
@@ -1959,6 +2111,11 @@ func (o *outcomeCtx) brainstorm(p brainstormPayload) {
 		return
 	}
 
+	// VALIDATION ENDS HERE, EXECUTION BEGINS (#578).
+	if !o.claim() {
+		return
+	}
+
 	if p.Action == "skip" || p.Action == "exhausted" {
 		// A skip stamps NOTHING: it is "nothing this cycle", it is transient, and
 		// it has no scheduling consequence at all. Only exhausted - "nothing worth
@@ -2181,6 +2338,22 @@ func (o *outcomeCtx) incident(p incidentPayload) {
 		return
 	}
 
+	// comment_issue's TARGET is validated up here, in the read-only block, and
+	// not where it is consumed (#578). Its two rejections are 400s and the
+	// alertRules spec merge below is a mutation, so resolving the target after
+	// the merge made this the one incident path that could mutate and then 4xx.
+	// incidentComment re-resolves; both reads are cached Gets.
+	if p.Action == "comment_issue" {
+		if _, _, ok := o.commentTarget(p); !ok {
+			return
+		}
+	}
+
+	// VALIDATION ENDS HERE, EXECUTION BEGINS (#578).
+	if !o.claim() {
+		return
+	}
+
 	// alertRules are merged into Task.spec.alertRules; spec is
 	// operator-writable and agent-unwritable, and this is the operator writing.
 	if err := s.updateTaskSpec(ctx, o.task.Name, func(t *tatarav1alpha1.Task) {
@@ -2322,13 +2495,17 @@ func (o *outcomeCtx) incident(p incidentPayload) {
 // carry an incident rule-key or group-key label, so an incident agent (which has
 // no issue_write tool) can comment ONLY on a tracker the platform created, never
 // an arbitrary human thread. The operator posts under the bot identity.
-func (o *outcomeCtx) incidentComment(p incidentPayload) {
+// commentTarget resolves and VALIDATES action=comment_issue's target, writing
+// nothing. It is read-only so it can run in the caller's validation phase,
+// BEFORE the alertRules spec merge (#578): its two rejections are 400s, and a
+// 400 must never follow a mutation.
+func (o *outcomeCtx) commentTarget(p incidentPayload) (*tatarav1alpha1.Repository, *tatarav1alpha1.Issue, bool) {
 	ctx := o.r.Context()
 	s := o.s
 	repo, err := s.repoCR(ctx, o.proj.Name, p.Comment.Repo)
 	if err != nil {
 		writeClientErr(o.w, err)
-		return
+		return nil, nil, false
 	}
 	var iss tatarav1alpha1.Issue
 	issName := tatarav1alpha1.IssueName(repo.Name, p.Comment.Number)
@@ -2342,12 +2519,26 @@ func (o *outcomeCtx) incidentComment(p incidentPayload) {
 	// the same fault back through file_issue and re-filed it repeatedly.
 	if err := s.c.Get(ctx, types.NamespacedName{Namespace: s.ns, Name: issName}, &iss); err != nil {
 		o.bad("comment target issue is not present in the operator's mirror", "not-mirrored")
-		return
+		return nil, nil, false
 	}
 	if iss.Labels[queue.LabelAlertRuleKey] == "" && iss.Labels[queue.LabelAlertGroupKey] == "" {
 		o.bad("comment target is not a tracked incident issue", "not-a-tracker")
+		return nil, nil, false
+	}
+	return repo, &iss, true
+}
+
+func (o *outcomeCtx) incidentComment(p incidentPayload) {
+	ctx := o.r.Context()
+	s := o.s
+	// Re-resolved rather than threaded down from the caller's validation pass:
+	// two cheap cached Gets, against which the alternative is a second parameter
+	// list that can silently go stale.
+	repo, issp, ok := o.commentTarget(p)
+	if !ok {
 		return
 	}
+	iss := *issp
 	ref := issueRef(repo, p.Comment.Number)
 	// Fix 7 (#400): rate-limit the SCM WRITE, not the outcome itself. The
 	// decision reads the Issue snapshot already fetched above (iss); the

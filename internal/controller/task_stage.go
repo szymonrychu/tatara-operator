@@ -102,23 +102,28 @@ func (r *TaskReconciler) reconcileClocks(ctx context.Context, proj *tatarav1alph
 
 	l := log.FromContext(ctx)
 
-	// EXTERNAL-TERMINAL FINALIZE (fixes #33). A kind=review Task sitting IN
-	// reviewing whose owned PR was merged/closed by a human has NO legal outcome:
-	// submit_outcome 400s "no open MR", the claim releases, the idle pod is reaped
-	// and respawned, and it re-reviews the terminal PR until the 4h budget parks it.
-	// This runs UNCONDITIONALLY - it must fire even when no outcome ever committed
-	// (so no handoffCondition is armed), which is exactly the #33 shape - and it
-	// reuses terminalMREdge so this path, the pre-dispatch guard and reviewAdvanceEdge
-	// can never disagree with each other.
-	if task.Status.State == tatarav1alpha1.StateAwaitingReview && task.Spec.Kind == "review" {
+	// EXTERNAL-TERMINAL FINALIZE (fixes #33; widened past kind=review by #578). A
+	// Task sitting at awaiting-review whose owned PRs were merged/closed by a
+	// human has NO legal outcome: submit_outcome answered "no open MR", the idle
+	// pod was reaped and respawned, and it re-reviewed the terminal PR until the
+	// budget parked it. This runs UNCONDITIONALLY - it must fire even when no
+	// outcome ever committed (so no handoffCondition is armed), which is exactly
+	// the #33 shape - and it reuses the shared externalTerminalEdge so this path,
+	// the pre-dispatch guard and reviewAdvanceEdge can never disagree.
+	//
+	// THE KIND GATE MOVED INTO THE EDGE RESOLUTION (#578). It used to sit here,
+	// which is what left a kind=issue Task at awaiting-review - running an
+	// agentKind=review pod, because AgentKindFor keys that state on the STATE -
+	// with no finalize at all once its own MR merged out of band.
+	if task.Status.State == tatarav1alpha1.StateAwaitingReview {
 		mrs, mrErr := ownedMergeRequests(ctx, r.mrReader(), task)
 		if mrErr != nil {
 			return ctrl.Result{}, true, mrErr
 		}
-		if edge, ok := terminalMREdge(task, mrs); ok {
-			l.Info("review task finalized: every owned MR reached a terminal forge state externally",
+		if edge, ok := externalTerminalEdge(task, mrs); ok {
+			l.Info("task finalized at awaiting-review: every owned MR reached a terminal forge state externally",
 				"action", "review_finalize_terminal_mr", "resource_id", task.Name,
-				"to", edge.To, "reason", edge.Reason)
+				"kind", task.Spec.Kind, "to", edge.To, "reason", edge.Reason)
 			return ctrl.Result{}, true, r.enter(ctx, proj, task, mrs, edge.To, edge.Reason, now)
 		}
 		// TAKEN-OVER PARENT FINALIZE (the takeover sibling of the #33 shape). A
@@ -1578,21 +1583,24 @@ func (r *TaskReconciler) ensureStagePod(ctx context.Context, proj *tatarav1alpha
 		return true, nil
 	}
 
-	// PRE-DISPATCH EXTERNAL-TERMINAL GUARD (fixes #33 at the source). Before
-	// building a review pod, if every owned MR already reached a terminal forge
-	// state, finalize the Task pod-lessly and spawn NOTHING: re-reviewing a
-	// merged/closed PR can only 400 on submit_outcome and respawn-loop. Reuses
-	// terminalMREdge so this can never disagree with reconcileClocks or
-	// reviewAdvanceEdge.
-	if task.Spec.Kind == "review" {
+	// PRE-DISPATCH EXTERNAL-TERMINAL GUARD (fixes #33 at the source; widened past
+	// kind=review by #578). Before building a review pod, if every owned MR
+	// already reached a terminal forge state, finalize the Task pod-lessly and
+	// spawn NOTHING: re-reviewing a merged/closed PR can only no-op on
+	// submit_outcome and respawn-loop. Reuses externalTerminalEdge so this can
+	// never disagree with reconcileClocks or reviewAdvanceEdge.
+	//
+	// The awaiting-review disjunct is what covers a NON-review Task, whose review
+	// pod is dispatched from that state (AgentKindFor keys it on the state).
+	if task.Spec.Kind == "review" || task.Status.State == tatarav1alpha1.StateAwaitingReview {
 		mrs, mrErr := ownedMergeRequests(ctx, r.mrReader(), task)
 		if mrErr != nil {
 			return false, mrErr
 		}
-		if edge, ok := terminalMREdge(task, mrs); ok {
+		if edge, ok := externalTerminalEdge(task, mrs); ok {
 			log.FromContext(ctx).Info("review pod not spawned: every owned MR reached a terminal forge state externally",
 				"action", "review_finalize_terminal_mr", "resource_id", task.Name,
-				"to", edge.To, "reason", edge.Reason)
+				"kind", task.Spec.Kind, "to", edge.To, "reason", edge.Reason)
 			if err := r.enter(ctx, proj, task, mrs, edge.To, edge.Reason, time.Now()); err != nil {
 				return false, err
 			}
