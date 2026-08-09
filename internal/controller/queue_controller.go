@@ -337,9 +337,12 @@ func patchQueuedEventStatus(ctx context.Context, c client.Client, q *tatarav1alp
 // pool; head-of-line blocking accepted). Wired in Task 8 Reconcile.
 // Returns requeue=true when a stale terminal Task was deleted so Reconcile can
 // signal a prompt re-attempt via ctrl.Result{RequeueAfter: time.Second}.
+// heldOnLiveCeiling is set when a MINT was held by the per-project live-pod
+// ceiling (#570): like a pool_full hold it leaves the event Queued and burns no
+// slot, and the caller folds it into the same waiting/blockedPoll backstop.
 func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.Project,
 	qes []tatarav1alpha1.QueuedEvent, tasks []tatarav1alpha1.Task,
-	d budget.Decision, cfg budget.Config, sub budget.Subscription, now time.Time) (requeue bool, heldOnUsage bool, err error) {
+	d budget.Decision, cfg budget.Config, sub budget.Subscription, now time.Time) (requeue bool, heldOnUsage bool, heldOnLiveCeiling bool, err error) {
 
 	// Full project pause (contract B.7: maxConcurrentAgents=0 is the kill
 	// switch and must create NO agent work at all, not fall back to
@@ -362,7 +365,7 @@ func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.P
 				"action", "project_paused_skip", "project", proj.Name, "repo", q.Spec.RepositoryRef,
 				"resource_id", q.Name, "class", q.Spec.Class, "kind", q.Spec.Kind, "reason", "max_concurrent_agents_zero")
 		}
-		return false, false, nil
+		return false, false, false, nil
 	}
 
 	// Uncached inflight recount (contract B.7 fix M28): when an APIReader is
@@ -376,7 +379,7 @@ func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.P
 		var lerr error
 		inflightQEs, inflightTasks, lerr = r.listProjectVia(ctx, r.APIReader, proj)
 		if lerr != nil {
-			return false, false, lerr
+			return false, false, false, lerr
 		}
 	}
 
@@ -387,7 +390,44 @@ func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.P
 	// disabled) mode keeps the wholesale per-pool short-circuit unchanged.
 	subscription := cfg.Enabled && cfg.Mode == budget.ModeClaudeSubscription
 
+	// THE LIVE-POD CEILING, ON THE CREATION SIDE (#570). mintBudget is how many
+	// NEW live conversations this project may still create; it is HOISTED (one
+	// answer for the whole pass, both pools) and SPENT as this pass actually
+	// mints, the same budget-not-boolean discipline driveUnparks' liveRoomBudget
+	// uses and for the same reason: a boolean computed once and reused for every
+	// event in a burst bounds nothing.
+	//
+	// It is computed LAZILY, on the first event that would actually Create a
+	// Task, so no comment, ticket, or already-minted adoption pays for
+	// liveMintBudget's List. -1 means "not computed yet".
+	//
+	// ONE budget across BOTH pools is what keeps the alert pool's priority
+	// intact under the new gate: admitPool runs alert before normal and spends
+	// from the same number, so when a project has exactly one live slot left an
+	// incident takes it and proactive work waits - the same ordering the pool
+	// capacities already encode, now also true of the live ceiling.
+	mintBudget := -1
+	liveRoomFor := func(ctx context.Context) (int, error) {
+		if mintBudget >= 0 {
+			return mintBudget, nil
+		}
+		reader := client.Reader(r.Client)
+		if r.APIReader != nil {
+			reader = r.APIReader
+		}
+		b, err := liveMintBudget(ctx, r.Client, reader, proj, now)
+		if err != nil {
+			return 0, err
+		}
+		mintBudget = b
+		return mintBudget, nil
+	}
+
 	admitPool := func(class string, cap int) error {
+		// One line per pool per pass, not one per held event: a project sitting
+		// at its ceiling with a deep queue would otherwise reproduce the #496
+		// log storm the pool_full path was fixed for.
+		ceilingLogged := false
 		queued := make([]*tatarav1alpha1.QueuedEvent, 0)
 		for i := range qes {
 			if qes[i].Spec.Class == class && isQueued(qes[i].Status.State) {
@@ -522,6 +562,30 @@ func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.P
 					return err
 				}
 				if existing == nil {
+					// THE GATE, and it sits HERE rather than at the top of the
+					// mint branch on purpose: an event whose Task already exists
+					// (the #443 adoption above) is not creating anything, is
+					// already counted by liveMintBudget, and holding it would
+					// strand a Task that has already been paid for. Only a
+					// genuine Create is gated.
+					room, roomErr := liveRoomFor(ctx)
+					if roomErr != nil {
+						return roomErr
+					}
+					if room <= 0 {
+						heldOnLiveCeiling = true
+						if r.Metrics != nil {
+							r.Metrics.AdmissionBlocked(proj.Name, class, q.Spec.Kind, "live_ceiling")
+						}
+						if !ceilingLogged {
+							ceilingLogged = true
+							log.FromContext(ctx).Info("queue: mint held, project is at its live-pod ceiling (an owed resumption reserves a slot); the event stays queued",
+								"action", "admission_blocked", "project", proj.Name, "class", class,
+								"reason", "live_ceiling", "resource_id", q.Name, "kind", q.Spec.Kind,
+								"ceiling", tatarav1alpha1.MaxLivePods(proj))
+						}
+						continue // leave Queued; no slot burned
+					}
 					task, buildErr := queue.BuildTaskFromQueuedEvent(q, proj, r.Scheme)
 					if buildErr != nil {
 						return buildErr
@@ -540,6 +604,13 @@ func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.P
 						// Leave Queued; requeue. Slot not consumed (inflight derives from Admitted).
 						return createErr
 					}
+					// SPEND the live-mint budget: a Task that will become live now
+					// exists because of this pass, and the NEXT mint in the same
+					// pass must see the remaining room rather than the room the
+					// pass started with. liveMintBudget's own `pending` term only
+					// catches this across passes; within one pass the spend is
+					// what bounds a burst.
+					mintBudget--
 				}
 				if queueTaskDone(existing) {
 					// The Task this event owns is DEAD (a named mint colliding with a
@@ -578,12 +649,12 @@ func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.P
 	}
 
 	if err := admitPool(tatarav1alpha1.QueueClassAlert, proj.AlertCapacity()); err != nil {
-		return false, heldOnUsage, err
+		return false, heldOnUsage, heldOnLiveCeiling, err
 	}
 	if err := admitPool(tatarav1alpha1.QueueClassNormal, proj.QueueCapacity()); err != nil {
-		return false, heldOnUsage, err
+		return false, heldOnUsage, heldOnLiveCeiling, err
 	}
-	return requeue, heldOnUsage, nil
+	return requeue, heldOnUsage, heldOnLiveCeiling, nil
 }
 
 // ticketVerdict is what admitTicket decided about an admission ticket.
@@ -789,7 +860,7 @@ func (r *DispatcherReconciler) doReconcile(ctx context.Context, req ctrl.Request
 		sub = r.Usage.Get().Subscription()
 	}
 	decision := budget.Evaluate(budgetCfg, proj.BudgetWindowState(), sub, time.Now())
-	requeue, heldOnUsage, err := r.admit(ctx, &proj, qes, tasks, decision, budgetCfg, sub, time.Now())
+	requeue, heldOnUsage, heldOnLiveCeiling, err := r.admit(ctx, &proj, qes, tasks, decision, budgetCfg, sub, time.Now())
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -856,7 +927,16 @@ func (r *DispatcherReconciler) doReconcile(ctx context.Context, req ctrl.Request
 	if heldOnUsage {
 		return ctrl.Result{RequeueAfter: r.usageRequeueAfter()}, nil
 	}
-	if waiting {
+	// A live-ceiling mint hold (#570) is the same SHAPE as a pool_full hold -
+	// work left Queued behind a capacity bound - so it rides the same backstop
+	// and the same fallback poll rather than inventing a third requeue policy.
+	// Everything that can change the answer already wakes admission: a live
+	// conversation ending and a park un-parking are both Task writes, and the
+	// Task carries queue.LabelQueuedEvent, so Watches(&Task{}, mapTaskToQE)
+	// fires; the leader-only backstop re-enqueues a per-pool representative
+	// unconditionally on top of that. blockedPoll is the belt for a wiring with
+	// no backstop at all.
+	if waiting || heldOnLiveCeiling {
 		if d := r.blockedPoll(); d > 0 {
 			return ctrl.Result{RequeueAfter: d}, nil
 		}
