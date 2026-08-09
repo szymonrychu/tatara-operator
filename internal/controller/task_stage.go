@@ -1253,6 +1253,7 @@ func (r *TaskReconciler) stalledTurnStop(ctx context.Context, proj *tatarav1alph
 	if err := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 		fresh.Status.PodStartedAt = nil
 		fresh.Status.StateWorkStartedAt = nil
+		clearLastTurn(fresh)
 		return true
 	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("stalled turn re-arm %s: %w", task.Name, err)
@@ -1313,6 +1314,7 @@ func (r *TaskReconciler) ttlStop(ctx context.Context, proj *tatarav1alpha1.Proje
 	if err := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 		fresh.Status.PodStartedAt = nil
 		fresh.Status.StateWorkStartedAt = nil
+		clearLastTurn(fresh)
 		return true
 	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("ttl stop re-arm %s: %w", task.Name, err)
@@ -1321,6 +1323,23 @@ func (r *TaskReconciler) ttlStop(ctx context.Context, proj *tatarav1alpha1.Proje
 		"action", "agent_pod_ttl_stop", "resource_id", task.Name,
 		"agent_kind", agentKind, "outcome", outcome)
 	return ctrl.Result{RequeueAfter: agentBootRequeue}, nil
+}
+
+// clearLastTurn retires the continuation state a G.7 stop has just spent.
+//
+// Every StopWithHandoff caller owes this. By the time a stop returns, the
+// payload is IN the notes journal - either the agent's own handoff note or the
+// operator's synthetic reconstruction of it - and the journal is what the next
+// pod reads. Leaving it on the status means the NEXT pod's stop re-renders the
+// SAME turn's text as though it were that pod's work, which is a worse failure
+// than the empty note #527 was filed about: an empty note is recognisably empty,
+// a stale one is confidently wrong (#527).
+//
+// stage.stampEnter does the same on every state transition. The one path that
+// deliberately does NOT is respawnLostPod; see the argument there.
+func clearLastTurn(t *tatarav1alpha1.Task) {
+	t.Status.LastTurnFinalText = ""
+	t.Status.LastTurnPushedRepos = nil
 }
 
 // turn0Marker identifies the pod turn-0 was submitted to. A respawn re-stamps
@@ -1395,6 +1414,14 @@ func (r *TaskReconciler) respawnLostPod(ctx context.Context, proj *tatarav1alpha
 		// IllegalTransitionError, and the exhaustion goes uncounted.
 		return ctrl.Result{}, r.park(ctx, proj, task, edge.Reason, now)
 	}
+	// status.lastTurn* is DELIBERATELY left standing here, unlike the structurally
+	// identical patches in ttlStop and stalledTurnStop, which clear it. What
+	// differs is what each path already did with it: those two have just SPENT it
+	// on a handoff note, so keeping it would replay one turn onto a second pod.
+	// This path writes NO note at all - a pod that vanished mid-turn produced
+	// nothing to write - so the status is the only surviving trace of the dead
+	// pod's work, and clearing it would turn a recoverable crash into guaranteed
+	// loss (#527).
 	if err := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 		fresh.Status.Stats.PodRecreations = recreations
 		fresh.Status.PodStartedAt = nil
