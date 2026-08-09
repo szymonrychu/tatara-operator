@@ -158,6 +158,29 @@ type ProjectReconciler struct {
 	// same as memoryUnhealthyCycles.
 	memoryApplyTransientSince map[string]time.Time
 
+	// evictionFailures records, per victim Task (namespace/name),
+	// enforceLivePodCeiling's own eviction-attempt failures (#564) so a victim
+	// whose eviction just errored is SKIPPED, not re-picked, until its backoff
+	// elapses - letting the pass fall through to the next-best candidate
+	// instead of spending its one eviction slot on the same poisoned victim
+	// every single pass forever. Keyed by types.NamespacedName rather than UID:
+	// a Task's UID is assigned by the API server and this map must work
+	// identically against a fake client in tests that never populate one:
+	// two distinct un-UID'd Tasks would otherwise collide on the same
+	// zero-value key and each be treated as the other's backoff. The (narrow)
+	// cost is a deleted-and-recreated Task of the same name inheriting a stale
+	// backoff record instead of starting clean - bounded by
+	// evictionFailureBackoffMax and self-healing, so it costs a few minutes of
+	// eviction delay at worst, never a stuck state. In-memory and not a
+	// status/annotation marker: it resets on operator restart, which is
+	// acceptable because eviction only ever runs on the leader
+	// (MaxConcurrentReconciles=1, one leader replica), so a restart just means
+	// the backoff resets to zero rather than churning the API server with a
+	// write on every failed attempt. Read/written only on the serialised
+	// reconcile path (MaxConcurrentReconciles=1); no mutex required, same as
+	// memoryUnhealthyCycles.
+	evictionFailures map[types.NamespacedName]*evictionFailure
+
 	// ToolSurfaceHTTP is the client used by updateToolSurfaceProbe to probe the
 	// operator-write tool backend. Nil falls back to a short-timeout
 	// default; tests inject an httptest-backed client.

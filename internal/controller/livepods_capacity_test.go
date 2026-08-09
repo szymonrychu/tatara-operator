@@ -10,6 +10,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
@@ -642,9 +643,23 @@ type capacityHandoffSession struct {
 	client    client.Client
 	namespace string
 	byBaseURL map[string]string // baseURL -> task name
+	// failFor, when non-nil, makes SubmitHandoffTurn return the mapped error
+	// for that TASK NAME every time it is called - a #564 test hook. This is
+	// deliberately separate from fakeSession.submitErr, which is one error
+	// shared by every base URL the fixture's single session serves: #564's
+	// defect only shows up when ONE victim errors while ITS SIBLINGS in the
+	// same pass succeed, which submitErr cannot express.
+	failFor map[string]error
 }
 
 func (s *capacityHandoffSession) SubmitHandoffTurn(ctx context.Context, baseURL, text, callbackURL string) (string, error) {
+	if s.failFor != nil {
+		if name, ok := s.byBaseURL[baseURL]; ok {
+			if err, ok := s.failFor[name]; ok {
+				return "", err
+			}
+		}
+	}
 	id, err := s.fakeSession.SubmitHandoffTurn(ctx, baseURL, text, callbackURL)
 	if err != nil {
 		return "", err
@@ -683,6 +698,17 @@ func (s *capacityHandoffSession) SubmitHandoffTurn(ctx context.Context, baseURL,
 // this task exists to catch.
 func newLiveCapacityFixture(t *testing.T, objs ...client.Object) *ProjectReconciler {
 	t.Helper()
+	return newLiveCapacityFixtureIntercepted(t, interceptor.Funcs{}, objs...)
+}
+
+// newLiveCapacityFixtureIntercepted is newLiveCapacityFixture with the fake
+// client built through newMirrorClientIntercepted instead of newMirrorClient,
+// so a #564 test can fail ONE candidate's eviction attempt (e.g. its
+// ownedMergeRequests List) deterministically without the capacityHandoffSession
+// wrapper - which cannot express "this pass's List call fails, the next
+// pass's does not" - being able to reach.
+func newLiveCapacityFixtureIntercepted(t *testing.T, funcs interceptor.Funcs, objs ...client.Object) *ProjectReconciler {
+	t.Helper()
 
 	built := make([]client.Object, 0, len(objs)+2)
 	built = append(built, objs...)
@@ -710,7 +736,7 @@ func newLiveCapacityFixture(t *testing.T, objs ...client.Object) *ProjectReconci
 	}
 	built = append(built, mdSecret())
 
-	c := newMirrorClient(t, built...)
+	c := newMirrorClientIntercepted(t, funcs, built...)
 	reg := prometheus.NewRegistry()
 	metrics := obs.NewOperatorMetrics(reg)
 	sess := &capacityHandoffSession{

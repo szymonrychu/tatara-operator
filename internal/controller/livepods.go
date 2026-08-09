@@ -6,6 +6,7 @@ import (
 	"sort"
 	"time"
 
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -573,6 +574,129 @@ const maxLivePodEvictionsPerPass = 1
 // than waiting for whatever cadence next triggers this Project's reconcile.
 const livePodEvictionRequeue = 5 * time.Second
 
+// evictionFailureBackoffBase / evictionFailureBackoffMax bound the backoff a
+// victim earns each time ITS OWN eviction attempt errors (#564). Without this,
+// a Task whose eviction keeps failing (an unreachable wrapper, a patch race, a
+// stale MR list) is still the LONGEST-IDLE candidate on the very next pass -
+// evictionCandidates has no memory of the failure - so it gets picked again,
+// and again, spending the pass's one eviction slot on the same victim forever
+// while every other overflow Task sits untouched. Recording the failure and
+// skipping the victim until nextEligible lets the pass fall through to the
+// next-best candidate instead. The backoff is exponential (doubling per
+// consecutive failure) and capped, so a transient failure clears itself
+// without a human touching anything, and a permanently-poisoned victim is
+// retried eventually rather than banned forever.
+const (
+	evictionFailureBackoffBase = 30 * time.Second
+	evictionFailureBackoffMax  = 10 * time.Minute
+)
+
+// evictionFailure is the in-memory record enforceLivePodCeiling keeps per
+// victim namespace/name (ProjectReconciler.evictionFailures) across passes. It
+// is deliberately in-memory rather than a status/annotation marker: eviction
+// only ever runs on the leader (ProjectReconciler's MaxConcurrentReconciles=1,
+// one leader replica across the 3-replica deployment), so there is exactly one
+// place this needs to live, and an operator restart clearing it just resets
+// the backoff to zero - a lesser cost than a status write on every failed
+// attempt.
+type evictionFailure struct {
+	count        int
+	nextEligible time.Time
+}
+
+// evictionFailureKey is how ProjectReconciler.evictionFailures is keyed: a
+// Task's namespace/name rather than its UID, so the map behaves identically
+// whether the Task came from the real API server (which assigns a UID) or a
+// test's fake client (which does not, and would otherwise collide every
+// un-UID'd Task onto the same zero-value key).
+func evictionFailureKey(t *tatarav1alpha1.Task) types.NamespacedName {
+	return types.NamespacedName{Namespace: t.Namespace, Name: t.Name}
+}
+
+// evictionBackoffAfter returns how long a victim should be skipped after its
+// count'th consecutive eviction failure (count is the count AFTER this
+// failure, so count==1 is the first). Doubles from evictionFailureBackoffBase,
+// capped at evictionFailureBackoffMax.
+func evictionBackoffAfter(count int) time.Duration {
+	d := evictionFailureBackoffBase
+	for i := 1; i < count; i++ {
+		if d >= evictionFailureBackoffMax {
+			return evictionFailureBackoffMax
+		}
+		d *= 2
+	}
+	if d > evictionFailureBackoffMax {
+		d = evictionFailureBackoffMax
+	}
+	return d
+}
+
+// recordEvictionFailure notes that t's eviction attempt just errored, bumping
+// its consecutive-failure count and pushing its backoff out from now.
+func (r *ProjectReconciler) recordEvictionFailure(t *tatarav1alpha1.Task, now time.Time) {
+	if r.evictionFailures == nil {
+		r.evictionFailures = map[types.NamespacedName]*evictionFailure{}
+	}
+	key := evictionFailureKey(t)
+	f := r.evictionFailures[key]
+	if f == nil {
+		f = &evictionFailure{}
+		r.evictionFailures[key] = f
+	}
+	f.count++
+	f.nextEligible = now.Add(evictionBackoffAfter(f.count))
+}
+
+// clearEvictionFailure forgets any failure record for t: its most recent
+// eviction attempt succeeded, so it owes no more backoff.
+func (r *ProjectReconciler) clearEvictionFailure(t *tatarav1alpha1.Task) {
+	delete(r.evictionFailures, evictionFailureKey(t))
+}
+
+// evictionBackedOff reports whether t is still serving out a backoff earned by
+// a previous failed eviction attempt.
+func (r *ProjectReconciler) evictionBackedOff(t *tatarav1alpha1.Task, now time.Time) bool {
+	f, ok := r.evictionFailures[evictionFailureKey(t)]
+	return ok && now.Before(f.nextEligible)
+}
+
+// attemptEvictions tries, in candidate order, to evict up to `want` Tasks,
+// skipping any still serving a backoff (evictionBackedOff) and recording a
+// failure (with backoff) for any whose evictFn errors rather than stopping the
+// pass there (#564) - so ONE permanently-erroring victim cannot starve every
+// other overflow Task of the pass's eviction slot. evictFn is injected so unit
+// tests can script per-candidate failure without a real client/session; the
+// real caller's evictFn performs the actual ownedMergeRequests + handoff. It
+// returns how many candidates were actually evicted (<= want) and the first
+// error encountered, if any - callers keep returning that error for
+// observability (it is still logged at the call site) without letting it
+// short-circuit the successful evictions already performed.
+func (r *ProjectReconciler) attemptEvictions(candidates []tatarav1alpha1.Task, want int, now time.Time,
+	evictFn func(t *tatarav1alpha1.Task) error) (int, error) {
+
+	var firstErr error
+	evicted := 0
+	for i := range candidates {
+		if evicted >= want {
+			break
+		}
+		t := &candidates[i]
+		if r.evictionBackedOff(t, now) {
+			continue
+		}
+		if err := evictFn(t); err != nil {
+			r.recordEvictionFailure(t, now)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		r.clearEvictionFailure(t)
+		evicted++
+	}
+	return evicted, firstErr
+}
+
 // enforceLivePodCeiling parks the longest-idle live Tasks until proj is back
 // under its ceiling, each through the handoff-turn sequence. It runs from the
 // project reconcile rather than from the webhook so it is LEADER-ONLY and
@@ -676,17 +800,22 @@ func (r *ProjectReconciler) enforceLivePodCeiling(ctx context.Context, proj *tat
 		return 0, nil
 	}
 
-	var firstErr error
-	for i := 0; i < evict; i++ {
-		t := &candidates[i]
+	// #564: a candidate that errors is handed to attemptEvictions, which
+	// records the failure (with backoff) and moves on to the NEXT candidate
+	// within this same pass rather than stopping here - so ONE
+	// permanently-erroring victim (evictionCandidates re-picks the same
+	// longest-idle Task every pass; nothing before #564 remembered it had just
+	// failed) can no longer starve the pass's one eviction slot forever. The
+	// per-pass cap (maxLivePodEvictionsPerPass) still bounds how many
+	// SUCCEED, `evict`; attemptEvictions may inspect more than `evict`
+	// candidates while hunting for that many successes, which is the whole
+	// point.
+	evicted, firstErr := r.attemptEvictions(candidates, evict, now, func(t *tatarav1alpha1.Task) error {
 		mrs, mErr := ownedMergeRequests(ctx, r.Client, t)
 		if mErr != nil {
 			log.FromContext(ctx).Error(mErr, "livepods: load owned MRs for eviction failed",
 				"action", "live_evict_error", "resource_id", t.Name, "project", proj.Name)
-			if firstErr == nil {
-				firstErr = mErr
-			}
-			continue
+			return mErr
 		}
 		log.FromContext(ctx).Info("live-pod ceiling reached; evicting the longest-idle conversation",
 			"action", "live_evicting", "resource_id", t.Name, "project", proj.Name,
@@ -695,20 +824,24 @@ func (r *ProjectReconciler) enforceLivePodCeiling(ctx context.Context, proj *tat
 		if eErr := r.Tasks.liveHandoffAndPark(ctx, proj, t, mrs, causeEvicted, now); eErr != nil {
 			log.FromContext(ctx).Error(eErr, "livepods: eviction failed",
 				"action", "live_evict_error", "resource_id", t.Name, "project", proj.Name)
-			if firstErr == nil {
-				firstErr = eErr
-			}
+			return eErr
 		}
-	}
+		return nil
+	})
 	if firstErr != nil {
+		// Returned for observability (the caller's reconcile-error path/metric)
+		// even though attemptEvictions may already have evicted the next-best
+		// candidate above - the error does not undo that progress, it is just
+		// still worth surfacing that SOMETHING errored this pass.
 		return 0, firstErr
 	}
-	// A fast requeue is for the per-pass CAP, not for waiting on a turn: only
-	// ask for one when idle-and-evictable overflow is still left after this
-	// pass's cap (evict < desiredEvict). If desiredEvict itself fell short of
+	// A fast requeue is for the per-pass CAP (or a victim still serving out an
+	// eviction-failure backoff standing in for it), not for waiting on a turn:
+	// only ask for one when idle-and-evictable overflow is still left after
+	// this pass (evicted < desiredEvict). If desiredEvict itself fell short of
 	// overflow, the rest is mid-turn Tasks that a fast retry cannot touch
 	// either - that overflow rides the level-triggered reconcile instead.
-	if evict < desiredEvict {
+	if evicted < desiredEvict {
 		return livePodEvictionRequeue, nil
 	}
 	return 0, nil
