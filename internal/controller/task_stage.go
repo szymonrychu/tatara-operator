@@ -1238,16 +1238,7 @@ func (r *TaskReconciler) stalledTurnStop(ctx context.Context, proj *tatarav1alph
 	// Clear the turn so a late callback cannot resolve it, and re-arm the pod
 	// clocks so the next reconcile spawns a continuation pod - the same re-arm
 	// ttlStop does, plus the annotation clearing the old hard-teardown path owned.
-	if err := r.patchTaskAnnotations(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
-		if fresh.Annotations == nil {
-			return false
-		}
-		delete(fresh.Annotations, annCurrentTurn)
-		delete(fresh.Annotations, annTurnStartedAt)
-		delete(fresh.Annotations, annTurnLastActivity)
-		delete(fresh.Annotations, annTurnComplete)
-		return true
-	}); err != nil {
+	if err := clearTurnAnnotations(ctx, r.Client, task); err != nil {
 		return ctrl.Result{}, fmt.Errorf("stalled turn clear %s: %w", task.Name, err)
 	}
 	if err := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
@@ -1316,6 +1307,15 @@ func (r *TaskReconciler) ttlStop(ctx context.Context, proj *tatarav1alpha1.Proje
 		return true
 	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("ttl stop re-arm %s: %w", task.Name, err)
+	}
+	// The pod that was running the turn is gone (StopWithHandoff deleted it), so
+	// the turn goes with it - the same clear stalledTurnStop does, for the same
+	// reason. Without it a TTL rotation that caught the pod mid-turn hands the
+	// replacement pod a Task that still claims a turn is in flight, which gags
+	// its conversation follow-up turn and disarms its idle clock until turn-0
+	// happens to overwrite the annotation.
+	if err := clearTurnAnnotations(ctx, r.Client, task); err != nil {
+		return ctrl.Result{}, fmt.Errorf("ttl stop turn clear %s: %w", task.Name, err)
 	}
 	log.FromContext(ctx).Info("agent pod TTL-stopped; handed off",
 		"action", "agent_pod_ttl_stop", "resource_id", task.Name,
@@ -1402,6 +1402,14 @@ func (r *TaskReconciler) respawnLostPod(ctx context.Context, proj *tatarav1alpha
 		return true
 	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("record pod respawn: %w", err)
+	}
+	// The pod VANISHED - this is the "ran and disappeared mid-turn" case, so the
+	// turn died with it and nothing will ever complete it. Clearing here also
+	// stops the poll backstop shouting about a stall the reconciler cannot reach:
+	// the pod clocks are nil now, so reconcilePodStage's turnTimedOut branch (and
+	// therefore stalledTurnStop) is unreachable until a replacement pod exists.
+	if err := clearTurnAnnotations(ctx, r.Client, task); err != nil {
+		return ctrl.Result{}, fmt.Errorf("pod respawn turn clear %s: %w", task.Name, err)
 	}
 	log.FromContext(ctx).Info("agent pod lost; respawning",
 		"action", "pod_respawn", "resource_id", task.Name, "pod_recreations", recreations)

@@ -169,6 +169,15 @@ func (r *TaskReconciler) reArmWithoutHandoff(ctx context.Context, proj *tatarav1
 	}); err != nil {
 		return fmt.Errorf("livepods: re-arm %s after a handoff-less pod: %w", task.Name, err)
 	}
+	// stage.ReArmAfterPodLoss nils the pod clocks and nothing else - annotations
+	// are not among its three documented stamps, and they could not be: it is a
+	// pure status mutation in a package that cannot write metadata. This is the
+	// non-park exit added by #561/#563, so ParkTask's clear does not cover it and
+	// the turn of the pod that just ended would otherwise ride into the
+	// replacement pod.
+	if err := clearTurnAnnotations(ctx, r.Client, task); err != nil {
+		return fmt.Errorf("livepods: clear the turn of the ended pod on %s: %w", task.Name, err)
+	}
 	l := log.FromContext(ctx)
 	if exhausted {
 		l.Info("pod ended with no agent handoff and the recreation budget is spent; parking",

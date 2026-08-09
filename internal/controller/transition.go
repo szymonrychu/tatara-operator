@@ -325,6 +325,22 @@ func ParkTask(ctx context.Context, c client.Client, sp objbudget.Spiller, m *obs
 		return err
 	}
 
+	// STEP 2b, and it belongs to step 2: the turn annotations are POD-scoped
+	// (see turn_annotations.go), so the same call that takes the pod down retires
+	// the turn that was running in it. Park is the natural owner - the turn is
+	// over by definition - and this is THE park choke point, so every park in the
+	// operator gets it: awaiting-human, the live-pod eviction, pod-recreation
+	// exhausted, admission-starved, the podwatch failure paths, all of them.
+	//
+	// It is NOT sufficient on its own, and the reason is the idempotence guard at
+	// the top of this function. A park whose status write lands but whose
+	// teardown fails is re-driven as an already-parked Task and returns before it
+	// reaches here - the same hole repairParkedWithLivePod exists to plug for the
+	// pod itself. PollOnce carries the matching backstop for these annotations.
+	if err := clearTurnAnnotations(ctx, c, task); err != nil {
+		return fmt.Errorf("stage: clear turn annotations on parked task %s: %w", key.Name, err)
+	}
+
 	l.Info("task parked",
 		"action", "task_parked", "resource_id", task.Name, "task", task.Name,
 		"state", from, "park_reason", reason, "kind", task.Spec.Kind)
