@@ -78,18 +78,60 @@ func alertRuleName(a GrafanaAlert) string {
 	return a.GroupKey
 }
 
+// alertCategory returns the alert's "category" label when EVERY firing
+// instance in this evaluation agrees on its value; "" when instances disagree
+// or none carries it. It reads each alert item's OWN Labels
+// (GrafanaAlertItem.Labels) and never GrafanaAlert.CommonLabels: CommonLabels
+// is the INTERSECTION of whatever instances co-fire in one Grafana evaluation,
+// so a key derived from it can flip presence/absence run to run purely
+// because a co-firing member joined or dropped out, even though the rule
+// itself hasn't changed (#398 - see TestIncidentDedupKey's member-set-churn
+// case, and the real "category=tool_error co-fired with category=other under
+// one alertname" evidence on #398 itself). Checking unanimity across the
+// actual per-item labels sidesteps that: the common case - the same category
+// recurring alone - always agrees and always resolves, so its dedup key is
+// stable; only a genuinely mixed batch (distinct categories co-firing at once)
+// falls back to "", which is no worse than pre-fix behaviour (project+rule
+// only) and leaves that rare, ambiguous case to the incident agent's own
+// investigation (which is fed every alert item's full label set).
+func alertCategory(a GrafanaAlert) string {
+	var category string
+	for i, it := range a.Alerts {
+		c := it.Labels["category"]
+		if c == "" {
+			return ""
+		}
+		if i == 0 {
+			category = c
+		} else if c != category {
+			return ""
+		}
+	}
+	return category
+}
+
 // incidentDedupKey is the rule identity of a firing alert: project + alert
-// rule name only. It deliberately does NOT hash CommonLabels: CommonLabels is
-// the intersection of whatever instances co-fire in one Grafana evaluation, so
-// its member set churns run to run (an instance joins or drops out) even
-// though the rule itself hasn't changed - hashing it made the key unstable and
-// bypassed the open tracker, re-spawning a fresh investigation on every
-// churn (#398). Same project + same rule -> same key, always. 16 hex chars of
-// sha256. alertname falls back to the raw groupKey only when the alertname
-// label is absent (via alertRuleName).
+// rule name, plus the per-item "category" label when every co-firing instance
+// agrees on it (see alertCategory). It deliberately does NOT hash
+// CommonLabels: CommonLabels is the intersection of whatever instances
+// co-fire in one Grafana evaluation, so its member set churns run to run (an
+// instance joins or drops out) even though the rule itself hasn't changed -
+// hashing it made the key unstable and bypassed the open tracker,
+// re-spawning a fresh investigation on every churn (#398). Category is
+// included because, unlike CommonLabels, it is genuinely stable per
+// recurrence: a same-rule alert firing for an unrelated root cause (a
+// different category) is NOT the same incident and must not collapse onto
+// one tracker (tatara-operator#523) - the category value is read per-item
+// (alertCategory), not from CommonLabels, so it does not inherit the #398
+// churn. 16 hex chars of sha256. alertname falls back to the raw groupKey
+// only when the alertname label is absent (via alertRuleName).
 func incidentDedupKey(a GrafanaAlert, project string) string {
 	name := alertRuleName(a)
-	h := sha256.Sum256([]byte(project + "\x00" + name))
+	key := project + "\x00" + name
+	if cat := alertCategory(a); cat != "" {
+		key += "\x00category=" + cat
+	}
+	h := sha256.Sum256([]byte(key))
 	return hex.EncodeToString(h[:])[:16]
 }
 
