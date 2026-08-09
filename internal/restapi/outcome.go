@@ -291,7 +291,7 @@ func (s *Server) postOutcome(w http.ResponseWriter, r *http.Request) {
 
 	var env outcomeEnvelope
 	if err := decodeJSON(r, w, &env); err != nil {
-		writeDecodeError(w, r, err)
+		s.writeDecodeError(w, r, err)
 		return
 	}
 	if env.Kind == "" {
@@ -591,7 +591,7 @@ func (o *outcomeCtx) conflict(msg string, reason string) {
 func (o *outcomeCtx) decode(payload []byte, v any) bool {
 	if err := decodeStrict(payload, v); err != nil {
 		o.release()
-		writeDecodeError(o.w, o.r, err)
+		o.s.writeDecodeError(o.w, o.r, err)
 		return false
 	}
 	return true

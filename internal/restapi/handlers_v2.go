@@ -338,7 +338,7 @@ func (s *Server) postNote(w http.ResponseWriter, r *http.Request) {
 
 	var req noteReq
 	if err := decodeJSON(r, w, &req); err != nil {
-		writeDecodeError(w, r, err)
+		s.writeDecodeError(w, r, err)
 		return
 	}
 	switch req.Kind {
@@ -1042,7 +1042,7 @@ func (s *Server) issueWrite(w http.ResponseWriter, r *http.Request) {
 
 	var req issueWriteReq
 	if err := decodeJSON(r, w, &req); err != nil {
-		writeDecodeError(w, r, err)
+		s.writeDecodeError(w, r, err)
 		return
 	}
 	if req.Repo == "" {
@@ -1433,7 +1433,7 @@ func (s *Server) mrWrite(w http.ResponseWriter, r *http.Request) {
 
 	var req mrWriteReq
 	if err := decodeJSON(r, w, &req); err != nil {
-		writeDecodeError(w, r, err)
+		s.writeDecodeError(w, r, err)
 		return
 	}
 	if req.Repo == "" {

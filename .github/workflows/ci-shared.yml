@@ -85,6 +85,19 @@ on:
         type: boolean
         required: false
         default: true
+      enable-image-verify:
+        description: >-
+          Run the `image-verify` job: the pull_request-time, non-publishing
+          compile of the Dockerfile (#556). Default true for EVERY repo,
+          including the ones that set enable-image false - that input exists
+          only so two jobs never push the same immutable Harbor tag, and this
+          job pushes nothing, so it does not conflict with a caller-owned
+          `image` job. Set false only for a repo whose image needs build-args
+          this workflow cannot supply (more than the single image-build-arg),
+          and say which in the caller.
+        type: boolean
+        required: false
+        default: true
 
 # Single source of truth for the tool versions that used to be copy-pasted
 # inline in every repo. Bump here once.
@@ -217,6 +230,105 @@ jobs:
               helm template release "$dir" ${CHART_RENDER_ARGS} >/dev/null
             fi
           done
+
+  # The merge gate's Dockerfile compile (#556). Everything above this job is
+  # driven by mise against .mise.toml, so before it existed NOTHING on the
+  # pull_request path built the Dockerfile: the image was first compiled after
+  # merge, on main. A Go bump that raised go.mod and .mise.toml but left the
+  # builder tag behind passed all six gate jobs and then failed every image
+  # build on main with `go.mod requires go >= 1.26.3 (running go 1.25.12;
+  # GOTOOLCHAIN=local)`. Three repos shipped that in one wave and were
+  # unreleasable for ten days - release.yml is on: workflow_run gated
+  # conclusion == 'success', so a red main means no image, no tag, no release.
+  #
+  # Why the whole build and not a static pin check: the pin was one instance.
+  # A renamed base image, a dropped apk package, a moved COPY source or a new
+  # import needing a C library in the builder all break the same artifact and
+  # none of them are visible to a check that only compares version strings.
+  #
+  # Why it runs on every PR rather than on a path filter: a path filter over
+  # Dockerfile/go.mod/.mise.toml would catch the Go-pin class and miss the
+  # rest, because a Dockerfile breaks from source changes too. The runner is a
+  # self-hosted in-cluster ARC runner (no billed GitHub minutes) and buildkitd
+  # keeps its layer cache on a Ceph PVC shared with the push builds, so an
+  # unchanged `go mod download` layer is a cache hit and the marginal work on a
+  # typical PR is the COPY + go build layer.
+  #
+  # Cost controls that ARE applied: needs [build], so a PR that does not even
+  # compile in Go never reaches buildkitd; no checkout at all, so no clone (the
+  # build context is remote); and NO EXPORTER, so not one byte of the result is
+  # serialised or transferred, while the executed steps still land in
+  # buildkitd's cache for the post-merge push build to reuse.
+  #
+  # DO NOT "fix" the missing --output by adding type=cacheonly. buildkitd here
+  # is moby/buildkit v0.18.2 (rootless) and its exporter registry has no such
+  # name - it answers `exporter "cacheonly" could not be found` and the job
+  # reds on every PR in every consuming repo. Probed against the live daemon on
+  # 2026-08-09: cacheonly ABSENT; tar, image, local and oci all present. tar
+  # and oci stream the whole image to the CLIENT (dest= is client-side), which
+  # is real in-cluster traffic per PR for no benefit here. Omitting --output
+  # entirely still evaluates the full graph and still exits non-zero on a
+  # failing step - verified end to end against this repo's own Dockerfile:
+  # a builder pinned below go.mod exits 1 with
+  # `go: go.mod requires go >= 1.26.3 (running go 1.25.12; GOTOOLCHAIN=local)`,
+  # which is the exact break #556 is about.
+  image-verify:
+    needs: [build]
+    # smoke and chart-validate are deliberately NOT depended on: neither can
+    # affect whether the Dockerfile compiles, and waiting on them would only
+    # add latency to every green PR.
+    if: >-
+      ${{ github.event_name == 'pull_request' && inputs.enable-image-verify }}
+    runs-on: ${{ inputs.runner-label }}
+    steps:
+      - name: install buildctl
+        run: |
+          curl -sSfL "https://github.com/moby/buildkit/releases/download/v${BUILDKIT_VERSION}/buildkit-v${BUILDKIT_VERSION}.linux-amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local bin/buildctl
+      - name: compile the Dockerfile (no push)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.event.repository.name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          IMAGE_BUILD_ARG: ${{ inputs.image-build-arg }}
+        run: |
+          set -euo pipefail
+          BUILDKITD_ADDR="tcp://buildkitd.arc-runners:1234"
+
+          : "${GITHUB_TOKEN:?GITHUB_TOKEN required}"
+          : "${PR_NUMBER:?PR_NUMBER required}"
+
+          extra=()
+          if [ -n "${IMAGE_BUILD_ARG:-}" ]; then
+            extra+=(--opt "build-arg:${IMAGE_BUILD_ARG}")
+          fi
+
+          # Same remote git context and same GIT_AUTH_TOKEN frontend secret as
+          # the push `image` job below. A build from a local checkout would
+          # exercise neither the private clone nor the token path, so it would
+          # certify a build that is not the one that runs after merge. The ref
+          # is refs/pull/N/merge - the merge result GitHub already publishes,
+          # i.e. exactly the tree that is about to land on main.
+          #
+          # VERSION is the PR number, not `git describe`: it needs no clone and
+          # it is stable across pushes to the same PR, so the ldflags layer
+          # stays a cache hit when only unrelated files move.
+          #
+          # NO --output ON PURPOSE - see the block above the job. buildkit
+          # solves the whole graph and exports nothing, so every stage runs and
+          # a failing step still exits non-zero, with zero bytes serialised and
+          # no exporter that could later be edited into a push.
+          buildctl --addr "$BUILDKITD_ADDR" build \
+            --frontend dockerfile.v0 \
+            --opt context="https://github.com/szymonrychu/${REPO}.git#refs/pull/${PR_NUMBER}/merge" \
+            --opt filename=Dockerfile \
+            --opt build-arg:VERSION="pr-${PR_NUMBER}" \
+            --opt build-arg:COMMIT="${GITHUB_SHA:0:7}" \
+            --opt build-arg:DATE="1970-01-01T00:00:00Z" \
+            "${extra[@]}" \
+            --secret id=GIT_AUTH_TOKEN,env=GITHUB_TOKEN
+
+          echo "buildkit: Dockerfile compiled for PR #${PR_NUMBER}; nothing published"
 
   image:
     needs: [build, smoke, chart-validate]
