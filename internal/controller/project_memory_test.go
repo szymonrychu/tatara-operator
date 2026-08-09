@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -615,6 +616,49 @@ func TestReconcileMemory_ProvisioningSinceClearedOnReady(t *testing.T) {
 	got := waitMemoryPhase(t, p.Name, "Ready")
 	if got.Status.Memory.ProvisioningSince != nil {
 		t.Fatalf("ProvisioningSince = %v, want nil once Ready", got.Status.Memory.ProvisioningSince)
+	}
+}
+
+// TestFailMemoryStampsProvisioningSince guards issue #525's second half: a
+// stack pinned in phase Failed otherwise has no non-Ready clock at all (Ready
+// clears ProvisioningSince, and the stamp block at project_memory.go:626-627 is
+// unreachable on the failMemory path since it only runs while still reconciling
+// toward Provisioning/Degraded), so ingestGateMaskDelay could never elapse and
+// the deadlock would persist for that phase. failMemory must stamp
+// ProvisioningSince itself when it is nil.
+func TestFailMemoryStampsProvisioningSince(t *testing.T) {
+	r := newMemoryReconciler()
+	now := metav1.NewTime(time.Now())
+	p := &tataradevv1alpha1.Project{
+		Status: tataradevv1alpha1.ProjectStatus{
+			Memory: &tataradevv1alpha1.MemoryStatus{
+				Phase:      "Ready",
+				ReadySince: &now,
+			},
+		},
+	}
+
+	if err := r.failMemory(p, "ApplyError", errors.New("boom")); err == nil {
+		t.Fatalf("failMemory returned nil error")
+	}
+	if p.Status.Memory.Phase != "Failed" {
+		t.Fatalf("Phase = %q, want Failed", p.Status.Memory.Phase)
+	}
+	if p.Status.Memory.ProvisioningSince == nil {
+		t.Fatalf("ProvisioningSince not stamped on failMemory: a stack pinned in Failed would have no " +
+			"non-Ready clock, so ingestGateMaskDelay could never elapse")
+	}
+
+	// A second failMemory call must not re-stamp an already-set ProvisioningSince,
+	// or a stack that keeps failing would reset its own clock every pass and the
+	// mask delay would never elapse.
+	backdated := metav1.NewTime(time.Now().Add(-30 * time.Minute))
+	p.Status.Memory.ProvisioningSince = &backdated
+	if err := r.failMemory(p, "ApplyError", errors.New("boom again")); err == nil {
+		t.Fatalf("failMemory returned nil error")
+	}
+	if !p.Status.Memory.ProvisioningSince.Time.Equal(backdated.Time) {
+		t.Fatalf("ProvisioningSince = %v, want unchanged %v", p.Status.Memory.ProvisioningSince.Time, backdated.Time)
 	}
 }
 

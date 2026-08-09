@@ -103,10 +103,12 @@ func assignmentFor(agentKind string, task *tatarav1alpha1.Task, proj *tatarav1al
 	// the memory tools. Only when recall is actually unavailable: a healthy turn
 	// must not be told to expect failures it will not see.
 	//
-	// DISABLED and DEGRADED are different appendices on purpose. Degraded says
-	// "report it once, then carry on" because a down stack IS a platform problem;
-	// saying that on a project configured without memory produced one bogus
-	// internal-issue alert per turn (tatara-operator#523).
+	// DISABLED and DEGRADED are different appendices on purpose, though neither
+	// instructs a report_internal_issue call: DISABLED is deliberate config, not
+	// a fault, so there is nothing to report; DEGRADED is a real platform fault
+	// but one already tracked and alerted on upstream, so a fresh per-turn
+	// report would only manufacture duplicate internal-issue alerts
+	// (tatara-operator#523).
 	switch {
 	case tatarav1alpha1.MemoryDisabled(proj):
 		b.WriteString(promptguidance.MemoryDisabledGuidance)

@@ -757,6 +757,18 @@ func ensureMemoryStatus(p *tataradevv1alpha1.Project) *tataradevv1alpha1.MemoryS
 // nil-guard is needed here.
 func (r *ProjectReconciler) failMemory(p *tataradevv1alpha1.Project, reason string, err error) error {
 	p.Status.Memory.Phase = "Failed"
+	// Failed is a non-Ready phase and must carry the same "non-Ready since" clock
+	// the other two do. It does not get one from the stamp block in
+	// reconcileMemory: every failMemory caller returns immediately, so that block
+	// is only ever reached on the Failed->Provisioning recovery edge (where it
+	// correctly re-stamps). Reaching Ready clears ProvisioningSince, so without
+	// this a stack that went Ready->Failed has no clock at all, and issue #525's
+	// ingestGateMaskDelay could never elapse for that phase. Stamp only when nil:
+	// a stack that keeps failing must not reset its own clock every pass.
+	if p.Status.Memory.ProvisioningSince == nil {
+		now := metav1.Now()
+		p.Status.Memory.ProvisioningSince = &now
+	}
 	meta.SetStatusCondition(&p.Status.Conditions, metav1.Condition{
 		Type:               "MemoryReady",
 		Status:             metav1.ConditionFalse,
