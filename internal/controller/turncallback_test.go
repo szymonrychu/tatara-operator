@@ -636,3 +636,52 @@ func TestMergeSubagentActivity(t *testing.T) {
 		})
 	}
 }
+
+// THE REFRESH MUST HAPPEN BEFORE THE VERDICT, AND THIS IS THE CASE THAT PROVES IT.
+//
+// This loop used to evaluate the stall predicate FIRST and `continue` on it, so a
+// turn that was ALREADY past its window never got the activity refresh on that
+// pass - it was judged on annotations nobody had updated. O1 taught the refresh to
+// read the subagent transcripts precisely so a healthy agent working through a
+// subagent stops reading as silent, and the old order discarded that in the one
+// case it was built for: an operator that restarts mid-subagent-run comes up with a
+// stale (or absent) turn-last-activity-at, and its very first pass declares the
+// turn stalled without ever making the call that would have contradicted it.
+//
+// The fixture is exactly that restart: the turn's anchors are 40 minutes old
+// against a 1800s window (so the OLD order short-circuits before any HTTP call),
+// while the wrapper's subagent wrote 5 seconds ago.
+func TestPollOnce_RefreshesBeforeJudgingAnAlreadyTimedOutTurn(t *testing.T) {
+	mkTaskProject(t, "p-reorder", 3)
+	mkTaskRepository(t, "r-reorder", "p-reorder")
+	mkTask(t, "t-reorder", "p-reorder", "r-reorder")
+	setTaskPodStartedAt(t, "t-reorder", time.Now().Add(-2*time.Hour))
+
+	stale := time.Now().Add(-40 * time.Minute).UTC().Truncate(time.Second)
+	annotate(t, "t-reorder", map[string]string{
+		annCurrentTurn:      "turn-reorder",
+		annTurnStartedAt:    stale.Format(time.RFC3339),
+		annTurnLastActivity: stale.Format(time.RFC3339),
+	})
+	if !turnTimedOut(stale.Format(time.RFC3339), stale.Format(time.RFC3339), 1800) {
+		t.Fatal("control is broken: 40 minutes of silence must exceed a 1800s window")
+	}
+
+	subagent := time.Now().Add(-5 * time.Second).UTC().Truncate(time.Second)
+	fs := newFakeSession()
+	fs.getResult["turn-reorder"] = agent.TurnResult{State: "running", LastActivityAt: stale}
+	fs.sessionInfo.LastSubagentActivityAt = &subagent
+
+	cb := newCallbackServer()
+	cb.Session = fs
+	cb.PollOnce(context.Background())
+
+	got := getTask(t, "t-reorder").Annotations[annTurnLastActivity]
+	if got != subagent.Format(time.RFC3339) {
+		t.Fatalf("turn-last-activity-at = %q, want the subagent stamp %q: the pass that found the turn "+
+			"already past its window skipped the refresh that would have cleared it", got, subagent.Format(time.RFC3339))
+	}
+	if turnTimedOut(stale.Format(time.RFC3339), got, 1800) {
+		t.Error("after the refresh the turn must no longer read as timed out")
+	}
+}

@@ -18,7 +18,32 @@ const (
 	// streaming turn is not killed as if it were hung; it is absent until the
 	// first backstop GetTurn, and consumers fall back to turn-started-at.
 	AnnTurnLastActivity = "tatara.dev/turn-last-activity-at"
-	AnnPodRecreations   = "tatara.dev/pod-recreations"
+	// AnnStallProbeID is the wrapper's probeId for the stall probe currently
+	// outstanding against the in-flight turn, and its presence IS "a probe is in
+	// flight". Empty means the next inactivity verdict starts a fresh ladder.
+	//
+	// POD-SCOPED like the four turn annotations above, and cleared with them: a
+	// probe belongs to ONE turn inside ONE wrapper pod, and a probeId that
+	// outlived its pod names a probe no wrapper has ever heard of - which the new
+	// wrapper answers with a 404, i.e. indistinguishable from "this wrapper has no
+	// probe support at all" (see agent.ErrProbeUnsupported). Leaving it behind
+	// would silently downgrade the next pod to the pre-probe path.
+	AnnStallProbeID = "tatara.dev/stall-probe-id"
+	// AnnStallProbeAt is the RFC3339 timestamp the outstanding probe was sent at.
+	// The grace window (Project.spec.agent.stallProbeGraceSeconds) is measured
+	// from it, not from the turn anchor: the probe is delivered at the agent's
+	// next TOOL-CALL BOUNDARY, so the clock that matters starts when we asked.
+	AnnStallProbeAt = "tatara.dev/stall-probe-at"
+	// AnnStallProbeAttempts is how many probes this stall episode has sent,
+	// including the outstanding one. It has to be persisted rather than derived:
+	// the ladder spans reconciles minutes apart and the operator is free to
+	// restart between any two of them, and an attempt count that resets on
+	// restart is an escalation that never arrives.
+	//
+	// Reset (deleted) whenever the probe annotations are cleared - an ANSWERED
+	// probe ends the episode, so the next stall starts from attempt 1.
+	AnnStallProbeAttempts = "tatara.dev/stall-probe-attempts"
+	AnnPodRecreations     = "tatara.dev/pod-recreations"
 	// AnnReviewHeadBranch carries the PR/MR head (source) branch on a review Task
 	// so its pod checks out the PR head read-only and can run/test it (issue #114
 	// decision 4). The review agent never pushes (its TASK_BRANCH stays empty).

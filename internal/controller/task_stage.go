@@ -1027,6 +1027,17 @@ func (r *TaskReconciler) reconcilePodStage(ctx context.Context, proj *tatarav1al
 			}
 			return r.respawnLostPod(ctx, proj, task, now)
 		}
+		// THE AGENT ASKED TO BE STOPPED, so stop it - now, not when some clock next
+		// comes round. A handoff note written by THIS pod's agent with no turn in
+		// flight is the agent saying it is done talking and has left everything the
+		// next pod needs; until this branch existed the pod then sat there holding a
+		// concurrency slot until the pod TTL, the conversation idle budget or the
+		// idle reaper happened to notice, up to hours later. See agentAskedToBeStopped
+		// for why both guards are load-bearing. Ahead of the TTL and stall checks
+		// because it is the one stop that needs no evidence-gathering at all.
+		if r.agentAskedToBeStopped(task) {
+			return r.stopAfterAgentHandoff(ctx, proj, task, agentKind, now)
+		}
 		// G.7 TTL STOP (fix I5). A pod past t0 = podStartedAt + agentPodTTLSeconds is
 		// GRACEFULLY stopped: the agent gets ONE handoff turn, else the operator
 		// writes a synthetic handoff note - so status.notes is NEVER empty after a
@@ -1035,16 +1046,22 @@ func (r *TaskReconciler) reconcilePodStage(ctx context.Context, proj *tatarav1al
 		if agent.TTLExpired(proj, task, now) {
 			return r.ttlStop(ctx, proj, task, agentKind, now)
 		}
-		// A STALLED TURN gets the SAME graceful stop as a TTL rotation. It used to
-		// get the opposite: the poll backstop deleted the session, the Pod and the
-		// Service outright, so a Task whose first turn stalled was handed back to
-		// the stage machine with an EMPTY notes journal - the next pod started from
-		// nothing and redid the work, and anything the agent had written but not
-		// pushed died with the workspace. Live: an mtg-decks implement agent lost a
-		// decklist, a meta capture and an hour of sim runs to this, twice.
-		if turnTimedOut(task.Annotations[annTurnStartedAt],
-			task.Annotations[annTurnLastActivity], proj.Spec.Agent.TurnTimeoutSeconds) {
-			return r.stalledTurnStop(ctx, proj, task, agentKind, now)
+		// INACTIVITY NO LONGER MEANS "KILL THE TURN"; IT MEANS "ASK THE AGENT".
+		//
+		// This used to be a single `turnTimedOut -> stalledTurnStop` branch, and its
+		// only input was silence - which a healthy agent produces just as readily as
+		// a wedged one (O1's measured case: 2095 seconds of parent-transcript
+		// silence with a perfectly healthy subagent underneath). reconcileStall
+		// probes the agent instead and only escalates when it cannot or will not
+		// answer; an ANSWER lets the turn continue with no bound at all. A wrapper
+		// with no probe endpoints falls straight back to the stalledTurnStop call
+		// this branch used to make, verbatim. See internal/controller/stall.go.
+		//
+		// handled=false means the stall machinery had nothing to do (the turn is
+		// inside its window), so ordinary stage work continues below exactly as it
+		// did before this phase.
+		if res, handled, err := r.reconcileStall(ctx, proj, task, agentKind, now); handled || err != nil {
+			return res, err
 		}
 	}
 
