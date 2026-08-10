@@ -655,8 +655,14 @@ func TestBuildPod_ExtraVolumesMountsSidecarsInit(t *testing.T) {
 	require.Equal(t, "sidecar", pod.Spec.Containers[1].Name)
 }
 
+// "By default" now means: no Project extras AND the operator-wide workspace-PVC
+// switch off, which is how the chart ships it. Both volume lists must still be
+// empty, so a cluster that has not opted in gets byte-for-byte the pod it got
+// before the workspace feature existed. The mounted case is covered by
+// pod_workspace_test.go.
 func TestBuildPod_NoExtras_EmptyByDefault(t *testing.T) {
 	proj, repo, task, cfg := sampleInputs()
+	require.False(t, cfg.WorkspacePVCEnabled, "the operator-wide switch defaults off")
 	pod := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg)
 	require.Empty(t, pod.Spec.Volumes)
 	require.Empty(t, pod.Spec.InitContainers)

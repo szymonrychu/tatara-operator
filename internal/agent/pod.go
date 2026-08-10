@@ -104,7 +104,29 @@ type PodConfig struct {
 	// FSGroup, when non-nil, sets the pod-level SecurityContext fsGroup so
 	// mounted-volume ownership matches the runtime group (the same fix the CI
 	// runners needed for Ceph RBD). Nil means no pod-level SecurityContext.
+	//
+	// It is REQUIRED for the workspace PVC, not merely nice to have: a fresh
+	// CephFS subvolume is root:root mode 0755 and the agent runs as uid 10001,
+	// so without it the first clone fails on permission denied - and with the
+	// pod-recreation ceiling gone, that is a 24h respawn loop.
 	FSGroup *int64
+
+	// FSGroupChangePolicy is the pod-level securityContext.fsGroupChangePolicy.
+	// Empty means DefaultFSGroupChangePolicy (OnRootMismatch), which is the value
+	// this operator actually needs: the CephFS CSI driver reports
+	// fsGroupPolicy: File, so kubelet recursively chowns the WHOLE volume on
+	// EVERY mount. On a Go build cache (51k inodes measured) that stall costs
+	// more than the cache saves, and OnRootMismatch reduces it to a single stat
+	// of the volume root once the first mount has set it. Only set this
+	// explicitly to deviate.
+	FSGroupChangePolicy string
+
+	// WorkspacePVCEnabled is the OPERATOR-WIDE switch for the persistent agent
+	// workspace. It defaults OFF so the CRD, the controller and the chart can
+	// land before a single PVC is created anywhere; the rollout flips it. It is
+	// ANDed with the per-Project spec.workspace.enabled escape hatch - see
+	// WorkspacePVCEnabled.
+	WorkspacePVCEnabled bool
 
 	// NodeSelector, Tolerations and Affinity control Pod placement. All three
 	// are cluster-specific and must be supplied by the helmfile, not baked into
@@ -786,6 +808,14 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		)
 	}
 
+	// mise deletes a downloaded archive once it has installed it, which would
+	// make the mise-downloads cache permanently empty. Only meaningful when that
+	// cache is actually mounted.
+	workspaceVolumes, workspaceMounts := workspaceVolumesAndMounts(project, task, cfg)
+	if CachePVCEnabled(project, cfg) {
+		env = append(env, corev1.EnvVar{Name: "MISE_ALWAYS_KEEP_DOWNLOAD", Value: "1"})
+	}
+
 	// Operator-supplied extra envs are appended LAST, after every variable the
 	// operator itself sets, so a stray extra named like a required variable
 	// (e.g. TATARA_TASK) cannot silently shadow it -- the later duplicate in a
@@ -798,11 +828,15 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 	}
 
 	wrapper := corev1.Container{
-		Name:         "wrapper",
-		Image:        project.Spec.Agent.Image,
-		Env:          env,
-		EnvFrom:      project.Spec.Agent.ExtraEnvsFrom,
-		VolumeMounts: project.Spec.Agent.ExtraVolumeMounts,
+		Name:    "wrapper",
+		Image:   project.Spec.Agent.Image,
+		Env:     env,
+		EnvFrom: project.Spec.Agent.ExtraEnvsFrom,
+		// The operator's own mounts are PREPENDED to the Project's extras, for
+		// the same first-wins reason the env block appends the extras last: an
+		// extraVolumeMount aimed at /workspace must not be able to shadow the
+		// workspace PVC.
+		VolumeMounts: append(workspaceMounts, project.Spec.Agent.ExtraVolumeMounts...),
 		Ports:        []corev1.ContainerPort{{ContainerPort: wrapperPort}},
 		Resources:    buildResourceRequirements(cfg),
 		// On a non-zero exit the kubelet captures the tail of the container's
@@ -840,7 +874,7 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 			Affinity:         cfg.Affinity,
 			SecurityContext:  buildPodSecurityContext(cfg),
 			InitContainers:   project.Spec.Agent.ExtraInitContainers,
-			Volumes:          project.Spec.Agent.ExtraVolumes,
+			Volumes:          append(workspaceVolumes, project.Spec.Agent.ExtraVolumes...),
 			Containers:       containers,
 		},
 	}
@@ -938,14 +972,26 @@ func buildSecurityContext(cfg PodConfig) *corev1.SecurityContext {
 	return sc
 }
 
+// DefaultFSGroupChangePolicy is applied whenever an fsGroup is configured and
+// PodConfig.FSGroupChangePolicy is empty - which includes a chart value pruned
+// or never set. See PodConfig.FSGroupChangePolicy for why the recursive default
+// ("Always") is unacceptable on the workspace/cache volumes.
+const DefaultFSGroupChangePolicy = corev1.FSGroupChangeOnRootMismatch
+
 // buildPodSecurityContext returns a pod-level SecurityContext carrying FSGroup
-// when configured, else nil (no constraint). FSGroup is pod-scoped, not
-// container-scoped, so it lives here rather than in buildSecurityContext.
+// and its change policy when configured, else nil (no constraint). Both are
+// pod-scoped, not container-scoped, so they live here rather than in
+// buildSecurityContext. No FSGroup means no SecurityContext at all: a change
+// policy with no fsGroup to apply is meaningless.
 func buildPodSecurityContext(cfg PodConfig) *corev1.PodSecurityContext {
 	if cfg.FSGroup == nil {
 		return nil
 	}
-	return &corev1.PodSecurityContext{FSGroup: cfg.FSGroup}
+	policy := DefaultFSGroupChangePolicy
+	if cfg.FSGroupChangePolicy != "" {
+		policy = corev1.PodFSGroupChangePolicy(cfg.FSGroupChangePolicy)
+	}
+	return &corev1.PodSecurityContext{FSGroup: cfg.FSGroup, FSGroupChangePolicy: &policy}
 }
 
 // kindProfiles maps an AGENT kind to its profile value, shared by both

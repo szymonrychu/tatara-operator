@@ -145,6 +145,78 @@ func (s *CallbackServer) ReapOrphans(ctx context.Context) {
 			s.Metrics.OrphanReaped("orphan service")
 		}
 	}
+
+	// Third pass: the per-TASK workspace PVCs, modelled on the Service pass.
+	// The Task ownerRef cascade covers the ordinary case, but not the two this
+	// pass exists for: a claim whose Task was reaped before the ownerRef could
+	// fire (or before this feature shipped), and a claim whose terminal delete
+	// in enterStage failed transiently and would otherwise never be retried.
+	//
+	// The per-PROJECT cache PVC is NOT in this selector - it carries
+	// ComponentAgentCache, not ComponentAgent - which is deliberate: it has no
+	// Task, so a pass that could see it would read it as an orphan and delete
+	// the shared build cache on its very first sweep.
+	var pvcs corev1.PersistentVolumeClaimList
+	if err := s.Client.List(ctx, &pvcs,
+		client.InNamespace(s.Namespace),
+		client.MatchingLabels(agent.WrapperPodSelector()),
+	); err != nil {
+		l.Error(err, "reaper: list workspace pvcs")
+		return
+	}
+	for i := range pvcs.Items {
+		if ctx.Err() != nil {
+			return
+		}
+		pvc := &pvcs.Items[i]
+		reason, orphan := workspacePVCOrphanReason(pvc, tasks, grace)
+		if !orphan {
+			continue
+		}
+		del := pvc.DeepCopy()
+		if err := s.Client.Delete(ctx, del); err != nil && !apierrors.IsNotFound(err) {
+			l.Error(err, "reaper: delete orphan workspace pvc",
+				"action", "reap_orphan_workspace_pvc", "resource_id", pvc.Name,
+				"task", pvc.Labels[agent.LabelTask], "reason", reason)
+			s.Metrics.ReapDeleteError("persistentvolumeclaim")
+		} else {
+			l.Info("reaped orphan workspace pvc",
+				"action", "reap_orphan_workspace_pvc", "resource_id", pvc.Name,
+				"task", pvc.Labels[agent.LabelTask], "reason", reason)
+			s.Metrics.OrphanReaped(reason)
+		}
+	}
+}
+
+// workspacePVCOrphanReason decides whether a per-Task workspace PVC should be
+// reaped and why. A claim is an orphan when its task label names a Task that is
+// absent from the already-built tasks map, or one that reached a terminal
+// outcome. Everything else - including a PARKED Task - keeps its volume: a
+// parked Task can unpark and resume onto the work it holds.
+//
+// Creation grace, for exactly the reason the Pod and Service passes carry one:
+// ensureWorkspacePVC creates the claim before the pod, and a claim created
+// microseconds before its Task propagates through the cache must not be reaped
+// out from under the pod that is about to mount it.
+func workspacePVCOrphanReason(pvc *corev1.PersistentVolumeClaim,
+	tasks map[string]*tatarav1alpha1.Task, grace time.Duration) (string, bool) {
+
+	if time.Since(pvc.CreationTimestamp.Time) < grace {
+		return "", false
+	}
+	taskName := pvc.Labels[agent.LabelTask]
+	if taskName == "" {
+		// Unlabelled: cannot correlate, leave it for a human.
+		return "", false
+	}
+	task, ok := tasks[taskName]
+	if !ok {
+		return "orphan workspace pvc: task gone", true
+	}
+	if tatarav1alpha1.TaskIsTerminalOutcome(task.Status.State) {
+		return "orphan workspace pvc: task terminal", true
+	}
+	return "", false
 }
 
 // orphanReason decides whether a wrapper pod should be reaped and why. It returns

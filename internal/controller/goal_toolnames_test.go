@@ -40,7 +40,7 @@ func TestGoalBuildersNameOnlyRealTools(t *testing.T) {
 		task.Spec.ProjectRef = "proj-x"
 		proj := &tatarav1alpha1.Project{}
 		proj.Name = "proj-x"
-		goals["assignmentFor("+kind+")"] = assignmentFor(kind, task, proj)
+		goals["assignmentFor("+kind+")"] = assignmentFor(kind, task, proj, false)
 	}
 
 	for name, goal := range goals {

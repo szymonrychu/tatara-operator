@@ -213,7 +213,28 @@ agentRunAsNonRoot: false
 # When agentRunAsNonRoot is true this MUST be the image's numeric uid; the chart
 # fail-renders otherwise (see _helpers.tpl). The wrapper image is uid 10001.
 agentRunAsUser: ""
-agentFsGroup: ""
+# agentFsGroup is NOT a cluster fact and so is NOT left empty (contrast
+# agentRunAsUser above): it is the wrapper IMAGE's gid, and the persistent agent
+# workspace does not work without it. A freshly provisioned CephFS subvolume is
+# root:root mode 0755 and the agent runs as uid 10001, so an empty fsGroup means
+# buildPodSecurityContext returns nil, the volume mounts unwritable, and the
+# first clone dies on permission denied - which, with the pod-recreation ceiling
+# gone, is a 24h respawn loop.
+agentFsGroup: "10001"
+# fsGroupChangePolicy is NOT optional on this platform. The CephFS CSI driver
+# reports fsGroupPolicy: File, so with the Kubernetes default ("Always") the
+# kubelet recursively chowns the WHOLE volume on EVERY mount; on a Go build
+# cache (51k inodes measured) that stall costs more than the cache saves.
+# OnRootMismatch checks the volume root only. Empty falls back to the same value
+# in Go (agent.DefaultFSGroupChangePolicy); set "Always" only to deviate.
+agentFsGroupChangePolicy: "OnRootMismatch"
+# The OPERATOR-WIDE switch for the persistent agent workspace: a per-Task
+# ReadWriteMany PVC at /workspace plus a per-project build-cache PVC. It DEFAULTS
+# OFF so the CRD, the controller and this chart can land before a single PVC is
+# created anywhere; the rollout flips it on separately. The per-project
+# spec.workspace.enabled field is ANDed with it, and is the escape hatch for one
+# bad project rather than the whole fleet.
+agentWorkspacePvcEnabled: false
 
 # agentScheduling is the cluster-specific Pod placement for spawned agent pods
 # (nodeSelector / tolerations / affinity). Rule 6 list-shaped data: rendered into

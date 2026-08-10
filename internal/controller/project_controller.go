@@ -13,6 +13,7 @@ import (
 	cnpgv1 "github.com/cloudnative-pg/cloudnative-pg/api/v1"
 	"github.com/prometheus/client_golang/prometheus"
 	tataradevv1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/grafanamcp"
 	"github.com/szymonrychu/tatara-operator/internal/memory"
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
@@ -111,6 +112,13 @@ type ProjectReconciler struct {
 	// stacks for what must behave as one stopper. Nil (a test that never drives
 	// the ceiling) is never dereferenced.
 	Tasks *TaskReconciler
+
+	// PodConfig carries the operator-level agent settings this reconcile needs -
+	// today only the namespace and the operator-wide workspace switch, for the
+	// per-PROJECT build-cache PVC. It is the SAME value wire.go hands the
+	// TaskReconciler, so the two can never disagree about whether the workspace
+	// feature is on.
+	PodConfig agent.PodConfig
 
 	// GaugeRecomputeInterval controls how often the cluster-wide gauge scans
 	// (updateMemoryStackCounts + updateIssueStateCounts) run. Defaults to
@@ -313,6 +321,15 @@ func (r *ProjectReconciler) doReconcile(ctx context.Context, req ctrl.Request) (
 	})
 
 	requeueAfter, memErr := r.reconcileMemory(ctx, &project)
+
+	// The per-PROJECT agent build-cache volume. It sits beside the memory stack
+	// because it has the same lifetime: owned by the Project, shared by every
+	// Task, and cascade-deleted with the Project. Non-blocking like the grafana
+	// reconcile below - a cache that cannot be provisioned must not stop the
+	// Project reconcile; the Task-side Bound gate is what keeps pods off it.
+	if cacheErr := r.ensureCachePVC(ctx, &project); cacheErr != nil {
+		l.Error(cacheErr, "build-cache PVC reconcile failed (non-blocking)", "resource_id", project.Name)
+	}
 
 	grafanaRequeueAfter, grafErr := r.reconcileGrafanaMCP(ctx, &project)
 	if grafErr != nil {

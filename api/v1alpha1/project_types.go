@@ -475,6 +475,120 @@ type AgentSpec struct {
 	PromptAppendByKind map[string]string `json:"promptAppendByKind,omitempty"`
 }
 
+// WorkspaceSpec configures the PERSISTENT agent workspace: a per-Task volume
+// mounted at /workspace plus a per-PROJECT build-cache volume.
+//
+// It exists because /workspace was the container's writable layer, which is
+// both VOLATILE and UNBOUNDED. Volatile cost 6 minutes of already-committed
+// agent work to a single OOMKill; unbounded means nothing guarantees a node has
+// room for every repo a project clones and builds. A quota-backed volume fixes
+// both at once. It is NOT a speed feature: a resumed repo costs about 5.1s
+// against 2.4s for a fresh depth-1 clone, so the workspace volume itself is a
+// small latency COST that is accepted deliberately. The WIN is the build
+// caches - a cold `go build ./...` measured 30.9s against 5.5s warm, and a
+// -race test-binary compile 29.1s against 4.0s, many times per turn.
+type WorkspaceSpec struct {
+	// Enabled gates BOTH volumes and every mount they carry.
+	//
+	// It is an OPERATIONAL ESCAPE HATCH, not a tuning knob: set it false to take
+	// one project back to the old ephemeral-overlay behaviour when a rollout of
+	// this feature goes wrong, and then take it out again. Nothing about normal
+	// operation should ever set it.
+	//
+	// It is a *bool with deliberately NO kubebuilder:default so nil is
+	// distinguishable from an explicit false: nil (the state of every Project
+	// written before this field existed, and of every Project that never mentions
+	// spec.workspace) and true both mean ENABLED - the same rationale as
+	// MemorySpec.Enabled. Read it through Project.WorkspaceEnabled - never
+	// open-code the nil check.
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
+	// StorageClass is PINNED rather than left to the cluster default, and that is
+	// the whole point of the field having a default at all. The workspace is
+	// mounted ReadWriteMany; if the cluster default silently changed to an RBD
+	// (block) class, every PVC this operator creates would be RWO and every
+	// respawn onto a different node would stall in Multi-Attach until the old
+	// pod's volume detached. Naming the CephFS class makes that impossible to
+	// happen by accident.
+	// +kubebuilder:default="rook-ceph-rwx"
+	// +optional
+	StorageClass string `json:"storageClass,omitempty"`
+	// Size is the per-Task workspace request. On CephFS this is a subvolume
+	// QUOTA, not a preallocation: the pool is charged only for what is actually
+	// written, so this bounds a runaway clone/build rather than reserving 10Gi
+	// per Task up front.
+	// +kubebuilder:default="10Gi"
+	// +optional
+	Size string `json:"size,omitempty"`
+	// CacheEnabled gates the per-PROJECT build-cache volume independently of the
+	// workspace itself. Same tri-state semantics as Enabled: nil means on. Read
+	// it through Project.WorkspaceCacheEnabled.
+	// +optional
+	CacheEnabled *bool `json:"cacheEnabled,omitempty"`
+	// CacheSize is the per-PROJECT cache request, and the same CephFS quota
+	// caveat as Size applies. It is larger than Size because it is shared across
+	// every Task in the project and holds whole toolchain caches (tatara-operator
+	// alone measured ~2.4GB GOCACHE plus ~630MB GOMODCACHE).
+	// +kubebuilder:default="50Gi"
+	// +optional
+	CacheSize string `json:"cacheSize,omitempty"`
+}
+
+// Defaults for an empty, absent or PRUNED spec.workspace. They are declared as
+// kubebuilder markers above AND as Go constants here on purpose, following
+// internal/memory: a CRD default only applies if the LIVE CRD carries the
+// field, and a field the live CRD does not know is pruned to "" on the way in.
+// The accessors below are the single read path and they close that gap.
+const (
+	DefaultWorkspaceStorageClass = "rook-ceph-rwx"
+	DefaultWorkspaceSize         = "10Gi"
+	DefaultWorkspaceCacheSize    = "50Gi"
+)
+
+// WorkspaceEnabled reports whether p gets a persistent workspace volume.
+// nil spec.workspace, or a spec.workspace with enabled unset, means enabled.
+func (p *Project) WorkspaceEnabled() bool {
+	if p == nil || p.Spec.Workspace == nil {
+		return true
+	}
+	return BoolVal(p.Spec.Workspace.Enabled, true)
+}
+
+// WorkspaceCacheEnabled reports whether p gets the shared build-cache volume.
+func (p *Project) WorkspaceCacheEnabled() bool {
+	if p == nil || p.Spec.Workspace == nil {
+		return true
+	}
+	return BoolVal(p.Spec.Workspace.CacheEnabled, true)
+}
+
+// WorkspaceStorageClass is the StorageClass both workspace volumes are
+// provisioned from, falling back to DefaultWorkspaceStorageClass.
+func WorkspaceStorageClass(p *Project) string {
+	if p == nil || p.Spec.Workspace == nil || p.Spec.Workspace.StorageClass == "" {
+		return DefaultWorkspaceStorageClass
+	}
+	return p.Spec.Workspace.StorageClass
+}
+
+// WorkspaceSize is the per-Task workspace request, falling back to
+// DefaultWorkspaceSize.
+func WorkspaceSize(p *Project) string {
+	if p == nil || p.Spec.Workspace == nil || p.Spec.Workspace.Size == "" {
+		return DefaultWorkspaceSize
+	}
+	return p.Spec.Workspace.Size
+}
+
+// WorkspaceCacheSize is the per-Project cache request, falling back to
+// DefaultWorkspaceCacheSize.
+func WorkspaceCacheSize(p *Project) string {
+	if p == nil || p.Spec.Workspace == nil || p.Spec.Workspace.CacheSize == "" {
+		return DefaultWorkspaceCacheSize
+	}
+	return p.Spec.Workspace.CacheSize
+}
+
 // ModelFor resolves the model for the given AGENT kind (brainstorm, incident,
 // clarify, refine, review, documentation, implement) - NOT the Task origin
 // kind (fix H9). ModelByKind is keyed on the agent kind; a missing or empty
@@ -956,6 +1070,8 @@ type ProjectSpec struct {
 	Agent AgentSpec `json:"agent,omitempty"`
 	// +optional
 	Memory *MemorySpec `json:"memory,omitempty"`
+	// +optional
+	Workspace *WorkspaceSpec `json:"workspace,omitempty"`
 	// +optional
 	Scm *ScmSpec `json:"scm,omitempty"`
 	// +optional

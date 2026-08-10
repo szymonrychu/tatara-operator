@@ -1442,7 +1442,7 @@ func (r *TaskReconciler) renderBundle(ctx context.Context, proj *tatarav1alpha1.
 		Events:          task.Status.PendingEvents,
 		Notes:           task.Status.Notes,
 		ProposalHistory: history,
-		Assignment:      assignmentFor(agentKind, task, proj),
+		Assignment:      assignmentFor(agentKind, task, proj, agent.WorkspacePVCEnabled(proj, r.PodConfig)),
 		MaxBundleBytes:  proj.Spec.MaxBundleBytes,
 		Metrics:         r.BundleMetrics,
 	})
@@ -1746,6 +1746,30 @@ func (r *TaskReconciler) ensureStagePod(ctx context.Context, proj *tatarav1alpha
 	if err := agent.ValidatePodSecretRefs(proj, r.PodConfig); err != nil {
 		return false, err
 	}
+	// The workspace sizes are per-PROJECT CRD strings, so they are validated here
+	// rather than at config load, and with ParseQuantity rather than MustParse: a
+	// typo in one Project's spec must not panic the reconcile hot path for every
+	// Project. Only asked when the feature is actually on for this Project -
+	// numbers nothing reads must not be able to fail a spawn.
+	if agent.WorkspacePVCEnabled(proj, r.PodConfig) {
+		if err := agent.ValidateWorkspaceQuantities(proj); err != nil {
+			return false, err
+		}
+	}
+
+	// THE POD MUST NOT BE CREATED UNTIL ITS VOLUMES ARE BOUND. Taking the
+	// skipped path instead of building a pod is what makes an unprovisionable
+	// volume cost ZERO pods rather than ~288 a day through handleNotReady's
+	// respawn (the pod-recreation ceiling is gone). ensureWorkspacePVC bounds
+	// the wait itself and parks the Task if the volume never binds.
+	wsReady, err := r.ensureWorkspacePVC(ctx, proj, task)
+	if err != nil {
+		return false, err
+	}
+	if !wsReady {
+		return true, nil
+	}
+
 	repos, err := r.projectRepos(ctx, proj)
 	if err != nil {
 		return false, err

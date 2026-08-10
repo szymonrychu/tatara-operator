@@ -262,6 +262,8 @@ func podConfigFromConfig(cfg config.Config) agent.PodConfig {
 		RunAsNonRoot:           cfg.AgentRunAsNonRoot,
 		RunAsUser:              cfg.AgentRunAsUser,
 		FSGroup:                cfg.AgentFSGroup,
+		FSGroupChangePolicy:    cfg.AgentFSGroupChangePolicy,
+		WorkspacePVCEnabled:    cfg.AgentWorkspacePVCEnabled,
 		NodeSelector:           cfg.Scheduling.NodeSelector,
 		Tolerations:            cfg.Scheduling.Tolerations,
 		Affinity:               cfg.Scheduling.Affinity,
@@ -443,6 +445,10 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		SpillerFor: spillerFor,
 		Seq:        seq,
 		Tasks:      taskReconciler,
+		// The SAME PodConfig the TaskReconciler gets, so the per-project
+		// build-cache PVC this reconcile provisions can never disagree with the
+		// pod that mounts it about whether the feature is on.
+		PodConfig: podConfigFromConfig(cfg),
 	}).SetupWithManager(mgr); err != nil {
 		return nil, fmt.Errorf("setup ProjectReconciler: %w", err)
 	}

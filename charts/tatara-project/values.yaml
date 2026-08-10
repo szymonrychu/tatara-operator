@@ -69,6 +69,23 @@ nameOverride: ""
 #     #     derived data and is rebuilt by re-ingesting after a re-enable.
 #     memory:
 #       enabled: false
+#     # The persistent agent workspace: a per-Task ReadWriteMany PVC mounted at
+#     # /workspace, plus a per-PROJECT build-cache PVC. ON by default: omit the
+#     # block entirely and both are provisioned (subject to the operator-wide
+#     # agentWorkspacePvcEnabled switch in the tatara-operator chart).
+#     #
+#     # enabled:false is an OPERATIONAL ESCAPE HATCH for a bad rollout, not a
+#     # tuning knob - it takes this one project back to the volatile container
+#     # overlay. storageClass is PINNED rather than inherited from the cluster
+#     # default because the workspace must be ReadWriteMany; a default that
+#     # silently became an RBD class would stall every respawn in Multi-Attach.
+#     # size/cacheSize are CephFS subvolume QUOTAS, not preallocations.
+#     workspace:
+#       enabled: true
+#       storageClass: rook-ceph-rwx
+#       size: 10Gi
+#       cacheEnabled: true
+#       cacheSize: 50Gi
 project: {}
 
 # Repository CRs enrolled in the Project. projectRef is auto-bound to

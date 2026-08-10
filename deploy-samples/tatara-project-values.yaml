@@ -63,6 +63,12 @@ project:
       pgInstances: 1
       pgStorage: 10Gi
       neo4jStorage: 10Gi
+    workspace:
+      enabled: true
+      storageClass: rook-ceph-rwx
+      size: 10Gi
+      cacheEnabled: true
+      cacheSize: 50Gi
     scm:
       provider: github
       owner: szymonrychu

@@ -22,7 +22,7 @@ func TestAssignmentFor_MemoryDegradedGuidance(t *testing.T) {
 		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "proj", Kind: "implement", Goal: "g"},
 	}
 
-	degraded := assignmentFor(stage.AgentImplement, task, &tatarav1alpha1.Project{})
+	degraded := assignmentFor(stage.AgentImplement, task, &tatarav1alpha1.Project{}, false)
 	if !strings.Contains(degraded, promptguidance.MemoryDegradedGuidance) {
 		t.Fatalf("degraded project: MemoryDegradedGuidance missing from the assignment:\n%s", degraded)
 	}
@@ -39,7 +39,7 @@ func TestAssignmentFor_MemoryDegradedGuidance(t *testing.T) {
 	healthy := &tatarav1alpha1.Project{}
 	readySince := metav1.NewTime(time.Now().Add(-(tatarav1alpha1.MemoryReadyStabilizationWindow + time.Minute)))
 	healthy.Status.Memory = &tatarav1alpha1.MemoryStatus{Phase: "Ready", ReadySince: &readySince}
-	ok := assignmentFor(stage.AgentImplement, task, healthy)
+	ok := assignmentFor(stage.AgentImplement, task, healthy, false)
 	if strings.Contains(ok, promptguidance.MemoryDegradedGuidance) {
 		t.Fatalf("stably-ready project must NOT carry the degraded appendix:\n%s", ok)
 	}
