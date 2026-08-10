@@ -28,7 +28,7 @@ func TestAssignmentFor_PromptAppendByKind(t *testing.T) {
 		"review": "REVIEW_TEXT",
 	}
 
-	got := assignmentFor(stage.AgentReview, task, proj)
+	got := assignmentFor(stage.AgentReview, task, proj, false)
 
 	jobIdx := strings.Index(got, "## Your job")
 	wildcardIdx := strings.Index(got, "WILDCARD_TEXT")
@@ -41,7 +41,7 @@ func TestAssignmentFor_PromptAppendByKind(t *testing.T) {
 	}
 
 	emptyProj := &tatarav1alpha1.Project{}
-	gotEmpty := assignmentFor(stage.AgentReview, task, emptyProj)
+	gotEmpty := assignmentFor(stage.AgentReview, task, emptyProj, false)
 	if strings.Contains(gotEmpty, "WILDCARD_TEXT") || strings.Contains(gotEmpty, "REVIEW_TEXT") {
 		t.Fatalf("empty project must append nothing: %q", gotEmpty)
 	}

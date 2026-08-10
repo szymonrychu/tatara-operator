@@ -25,8 +25,8 @@ func TestAssignmentImplementCitationRuleFollowsAutoApprove(t *testing.T) {
 		Spec: tatarav1alpha1.ProjectSpec{AutoApproveTataraProposals: true},
 	}
 
-	gotOff := assignmentFor(stage.AgentImplement, task, off)
-	gotOn := assignmentFor(stage.AgentImplement, task, on)
+	gotOff := assignmentFor(stage.AgentImplement, task, off, false)
+	gotOn := assignmentFor(stage.AgentImplement, task, on, false)
 
 	const omitRule = "Omit the approving_maintainer field AND the approval_citations field TOGETHER"
 	if strings.Contains(gotOff, omitRule) {
@@ -106,7 +106,7 @@ func TestAssignmentSkillsDirectiveUsesAgentKind(t *testing.T) {
 				},
 			}
 
-			assignment := assignmentFor(tt.agentKind, task, &tatarav1alpha1.Project{})
+			assignment := assignmentFor(tt.agentKind, task, &tatarav1alpha1.Project{}, false)
 
 			// Assignment must contain the required skill for this agent kind
 			if !strings.Contains(assignment, tt.requiredSkill) {
@@ -144,7 +144,7 @@ func TestAssignmentFor_ResumedBranchMergeIsFirstAction(t *testing.T) {
 	const rule = "resolving that merge is your FIRST action"
 
 	for _, kind := range []string{stage.AgentImplement, stage.AgentDocumentation} {
-		got := assignmentFor(kind, task, &tatarav1alpha1.Project{})
+		got := assignmentFor(kind, task, &tatarav1alpha1.Project{}, false)
 		if !strings.Contains(got, rule) {
 			t.Errorf("kind %q pushes code and must carry the resumed-branch merge rule", kind)
 		}
@@ -156,7 +156,7 @@ func TestAssignmentFor_ResumedBranchMergeIsFirstAction(t *testing.T) {
 	for _, kind := range []string{
 		stage.AgentBrainstorm, stage.AgentIncident, stage.AgentRefine, stage.AgentReview,
 	} {
-		got := assignmentFor(kind, task, &tatarav1alpha1.Project{})
+		got := assignmentFor(kind, task, &tatarav1alpha1.Project{}, false)
 		if strings.Contains(got, rule) {
 			t.Errorf("kind %q pushes no code and must not carry the resumed-branch merge rule", kind)
 		}

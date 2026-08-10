@@ -45,6 +45,7 @@ spec:
     #     image: busybox
     #     command: ['sh', '-c', 'sleep infinity']
   memory: {pgInstances: 1, pgStorage: 10Gi, neo4jStorage: 10Gi}
+  workspace: {enabled: true, storageClass: rook-ceph-rwx, size: 10Gi, cacheEnabled: true, cacheSize: 50Gi}
   # PAT-based activation (no bot account / no Project board). botLogin == the PAT
   # owner. No `board`, so issueScan covers per-repo issues only (the Repository CRs
   # below). mergePolicy/prReactionScope/approvalLabel default.

@@ -6207,6 +6207,71 @@ spec:
               triggerLabel:
                 default: tatara
                 type: string
+              workspace:
+                description: |-
+                  WorkspaceSpec configures the PERSISTENT agent workspace: a per-Task volume
+                  mounted at /workspace plus a per-PROJECT build-cache volume.
+
+                  It exists because /workspace was the container's writable layer, which is
+                  both VOLATILE and UNBOUNDED. Volatile cost 6 minutes of already-committed
+                  agent work to a single OOMKill; unbounded means nothing guarantees a node has
+                  room for every repo a project clones and builds. A quota-backed volume fixes
+                  both at once. It is NOT a speed feature: a resumed repo costs about 5.1s
+                  against 2.4s for a fresh depth-1 clone, so the workspace volume itself is a
+                  small latency COST that is accepted deliberately. The WIN is the build
+                  caches - a cold `go build ./...` measured 30.9s against 5.5s warm, and a
+                  -race test-binary compile 29.1s against 4.0s, many times per turn.
+                properties:
+                  cacheEnabled:
+                    description: |-
+                      CacheEnabled gates the per-PROJECT build-cache volume independently of the
+                      workspace itself. Same tri-state semantics as Enabled: nil means on. Read
+                      it through Project.WorkspaceCacheEnabled.
+                    type: boolean
+                  cacheSize:
+                    default: 50Gi
+                    description: |-
+                      CacheSize is the per-PROJECT cache request, and the same CephFS quota
+                      caveat as Size applies. It is larger than Size because it is shared across
+                      every Task in the project and holds whole toolchain caches (tatara-operator
+                      alone measured ~2.4GB GOCACHE plus ~630MB GOMODCACHE).
+                    type: string
+                  enabled:
+                    description: |-
+                      Enabled gates BOTH volumes and every mount they carry.
+
+                      It is an OPERATIONAL ESCAPE HATCH, not a tuning knob: set it false to take
+                      one project back to the old ephemeral-overlay behaviour when a rollout of
+                      this feature goes wrong, and then take it out again. Nothing about normal
+                      operation should ever set it.
+
+                      It is a *bool with deliberately NO kubebuilder:default so nil is
+                      distinguishable from an explicit false: nil (the state of every Project
+                      written before this field existed, and of every Project that never mentions
+                      spec.workspace) and true both mean ENABLED - the same rationale as
+                      MemorySpec.Enabled. Read it through Project.WorkspaceEnabled - never
+                      open-code the nil check.
+                    type: boolean
+                  size:
+                    default: 10Gi
+                    description: |-
+                      Size is the per-Task workspace request. On CephFS this is a subvolume
+                      QUOTA, not a preallocation: the pool is charged only for what is actually
+                      written, so this bounds a runaway clone/build rather than reserving 10Gi
+                      per Task up front.
+                    type: string
+                  storageClass:
+                    default: rook-ceph-rwx
+                    description: |-
+                      StorageClass is PINNED rather than left to the cluster default, and that is
+                      the whole point of the field having a default at all. The workspace is
+                      mounted ReadWriteMany; if the cluster default silently changed to an RBD
+                      (block) class, every PVC this operator creates would be RWO and every
+                      respawn onto a different node would stall in Multi-Attach until the old
+                      pod's volume detached. Naming the CephFS class makes that impossible to
+                      happen by accident.
+                    type: string
+                type: object
             required:
             - scmSecretRef
             type: object

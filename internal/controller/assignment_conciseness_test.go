@@ -25,7 +25,7 @@ func TestAssignmentFor_ConcisenessGuidance(t *testing.T) {
 		stage.AgentBrainstorm, stage.AgentIncident,
 		stage.AgentRefine, stage.AgentImplement, stage.AgentReview, stage.AgentDocumentation,
 	} {
-		got := assignmentFor(kind, task, &tatarav1alpha1.Project{})
+		got := assignmentFor(kind, task, &tatarav1alpha1.Project{}, false)
 		if !strings.Contains(got, promptguidance.ConcisenessGuidance) {
 			t.Fatalf("kind %q: ConcisenessGuidance missing from assignment:\n%s", kind, got)
 		}

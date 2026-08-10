@@ -64,3 +64,23 @@ wrapper clones and installs alongside the baked `tatara-agent-skills`), and
 per-kind assignment prompt, keyed by agent kind plus a `"*"` wildcard). This
 chart renders the spec verbatim, so it gains any future CRD field
 automatically.
+
+### Persistent agent workspace
+
+`project.spec.workspace` configures the per-Task workspace volume (a
+ReadWriteMany PVC mounted at `/workspace`) and the per-project build-cache
+volume. Both are ON by default, subject to the operator-wide
+`agentWorkspacePvcEnabled` switch in the `tatara-operator` chart.
+
+| Field | Default | Notes |
+|---|---|---|
+| `enabled` | `true` | Operational escape hatch for a bad rollout, not a tuning knob. `false` returns this project to the volatile container overlay. |
+| `storageClass` | `rook-ceph-rwx` | Pinned, not inherited: the workspace must be RWX, and a cluster default that became an RBD class would stall every respawn in Multi-Attach. |
+| `size` | `10Gi` | A CephFS subvolume quota, not a preallocation. |
+| `cacheEnabled` | `true` | The shared GOCACHE/GOMODCACHE/pip/npm/mise-downloads volume. |
+| `cacheSize` | `50Gi` | Also a quota. Shared by every Task in the project. |
+
+`~/.cache/pre-commit` deliberately rides the per-TASK volume rather than the
+shared cache: a pre-commit hook environment killed mid-install is left half
+populated with no marker and is silently reused, so isolating it bounds the
+blast radius to one Task.

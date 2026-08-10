@@ -26,7 +26,7 @@ func TestAssignmentFor_MemoryDisabledGuidanceIsNotTheDegradedOne(t *testing.T) {
 	proj.Spec.Memory = &tatarav1alpha1.MemorySpec{Enabled: &fa}
 	proj.Status.Memory = &tatarav1alpha1.MemoryStatus{Phase: tatarav1alpha1.MemoryPhaseDisabled}
 
-	got := assignmentFor(stage.AgentImplement, task, proj)
+	got := assignmentFor(stage.AgentImplement, task, proj, false)
 
 	if strings.Contains(got, promptguidance.MemoryDegradedGuidance) {
 		t.Fatalf("a memory-DISABLED project was handed the DEGRADED appendix:\n%s", got)
@@ -61,7 +61,7 @@ func TestAssignmentFor_EnabledButDownStillGetsDegradedGuidance(t *testing.T) {
 	proj := &tatarav1alpha1.Project{}
 	proj.Status.Memory = &tatarav1alpha1.MemoryStatus{Phase: "Provisioning"}
 
-	got := assignmentFor(stage.AgentImplement, task, proj)
+	got := assignmentFor(stage.AgentImplement, task, proj, false)
 	if !strings.Contains(got, promptguidance.MemoryDegradedGuidance) {
 		t.Fatalf("an enabled-but-not-ready project lost its degraded appendix:\n%s", got)
 	}

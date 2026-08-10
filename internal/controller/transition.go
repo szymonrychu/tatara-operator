@@ -250,6 +250,22 @@ func enterStage(ctx context.Context, c client.Client, sp objbudget.Spiller, m *o
 		}
 	}
 
+	// The Task's PERSISTENT WORKSPACE volume, and this is a SEPARATE `if` on
+	// purpose - never fold it into the block above, however tempting the shared
+	// condition looks.
+	//
+	// That block also runs for a PARK, and ParkTask tears the pod down by the
+	// same reasoning. Parked Tasks are roughly two thirds of the live
+	// population and a parked Task can UNPARK AND RESUME, so deleting its
+	// workspace would destroy exactly the committed work this volume exists to
+	// keep. Only a TERMINAL OUTCOME ({done, rejected}) retires it: a Task that
+	// reached one will never run another pod.
+	if tatarav1alpha1.TaskIsTerminalOutcome(to) {
+		if err := deleteWorkspacePVC(ctx, c, key.Namespace, task); err != nil {
+			return err
+		}
+	}
+
 	l.Info("state transition",
 		"action", "stage_transition", "resource_id", task.Name, "task", task.Name,
 		"from", from, "to", to, "state_reason", reason, "kind", task.Spec.Kind)

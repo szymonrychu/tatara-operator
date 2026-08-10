@@ -94,6 +94,17 @@ type Config struct {
 	AgentRunAsNonRoot  bool
 	AgentRunAsUser     *int64
 	AgentFSGroup       *int64
+	// AgentFSGroupChangePolicy is the pod-level securityContext
+	// fsGroupChangePolicy. Empty falls back to agent.DefaultFSGroupChangePolicy
+	// (OnRootMismatch), which is what the CephFS-backed workspace/cache volumes
+	// need: that driver reports fsGroupPolicy: File, so the Kubernetes default
+	// recursively chowns the whole volume on every mount.
+	AgentFSGroupChangePolicy string
+	// AgentWorkspacePVCEnabled is the operator-wide switch for the persistent
+	// agent workspace (per-Task workspace PVC + per-project build-cache PVC). It
+	// defaults FALSE so the feature can land before any volume is created; the
+	// per-Project spec.workspace.enabled field is ANDed with it.
+	AgentWorkspacePVCEnabled bool
 	// AgentScheduling is the cluster-specific Pod-placement JSON document
 	// (nodeSelector/tolerations/affinity) for spawned agent Pods. Delivered as a
 	// single ConfigMap key (rule 6 list-shaped data), kept empty in the chart so
@@ -499,6 +510,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	agentWorkspacePVCEnabled, err := getBoolDefault("AGENT_WORKSPACE_PVC_ENABLED", false)
+	if err != nil {
+		return Config{}, err
+	}
 	tokenBudgetEnabled, err := getBoolDefault("TOKEN_BUDGET_ENABLED", false)
 	if err != nil {
 		return Config{}, err
@@ -582,6 +597,8 @@ func Load() (Config, error) {
 		AgentRunAsNonRoot:        agentRunAsNonRoot,
 		AgentRunAsUser:           agentRunAsUser,
 		AgentFSGroup:             agentFSGroup,
+		AgentFSGroupChangePolicy: os.Getenv("AGENT_FS_GROUP_CHANGE_POLICY"),
+		AgentWorkspacePVCEnabled: agentWorkspacePVCEnabled,
 		AgentScheduling:          os.Getenv("AGENT_SCHEDULING"),
 		MCPScheduling:            os.Getenv("MCP_SCHEDULING"),
 		Namespace:                getDefault("NAMESPACE", "tatara"),

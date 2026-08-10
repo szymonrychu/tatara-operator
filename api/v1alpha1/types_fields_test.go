@@ -63,6 +63,27 @@ func TestNewFields_JSONRoundTrip(t *testing.T) {
 			},
 			want: `"skillsRef":"v1.2.3"`,
 		},
+		{
+			name: "WorkspaceSpec json keys camelCase",
+			marshal: func() ([]byte, error) {
+				tr := true
+				return json.Marshal(WorkspaceSpec{
+					Enabled:      &tr,
+					StorageClass: "rook-ceph-rwx",
+					Size:         "10Gi",
+					CacheEnabled: &tr,
+					CacheSize:    "50Gi",
+				})
+			},
+			want: `"enabled":true,"storageClass":"rook-ceph-rwx","size":"10Gi","cacheEnabled":true,"cacheSize":"50Gi"`,
+		},
+		{
+			name: "ProjectSpec.Workspace json key workspace",
+			marshal: func() ([]byte, error) {
+				return json.Marshal(ProjectSpec{Workspace: &WorkspaceSpec{Size: "1Gi"}})
+			},
+			want: `"workspace":{"size":"1Gi"}`,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

@@ -116,6 +116,8 @@ AGENT_MEMORY_LIMIT: {{ .Values.agentMemoryLimit | quote }}
 AGENT_RUN_AS_NON_ROOT: {{ .Values.agentRunAsNonRoot | quote }}
 AGENT_RUN_AS_USER: {{ .Values.agentRunAsUser | quote }}
 AGENT_FS_GROUP: {{ .Values.agentFsGroup | quote }}
+AGENT_FS_GROUP_CHANGE_POLICY: {{ .Values.agentFsGroupChangePolicy | quote }}
+AGENT_WORKSPACE_PVC_ENABLED: {{ .Values.agentWorkspacePvcEnabled | quote }}
 {{/* List-shaped placement (rule 6): one JSON document key, empty default keeps the chart cluster-agnostic (rule 14). */}}
 AGENT_SCHEDULING: {{ .Values.agentScheduling | toJson | quote }}
 {{/* Same rule-6 single-JSON-document shape for the operator-stamped grafana-mcp Deployments. */}}
