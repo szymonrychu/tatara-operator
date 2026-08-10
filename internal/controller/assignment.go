@@ -148,6 +148,19 @@ func implementCitationRule(proj *tatarav1alpha1.Project) string {
 		"other is refused. the plan_note_id field is ALWAYS required.\n\n"
 }
 
+// resumedBranchMergeRule is stated by every agent kind that pushes code, and it
+// is stated UNCONDITIONALLY. The operator cannot know at assignment time
+// whether the remote task branch already exists - it never runs ls-remote,
+// agent.TaskBranch is a pure function of the Task spec, and no SCM interface
+// exposes branch existence - so the conditional fact comes from the wrapper,
+// which resumes the branch and reports the outcome in the injected CLAUDE.md.
+// The wrapper stopped treating an unresolvable base merge as a boot failure
+// (tatara-claude-code-wrapper: bootstrap-conflict-not-fatal); this sentence is
+// the other half of that contract, the one that makes it the agent's job.
+const resumedBranchMergeRule = "If your CLAUDE.md reports that the task branch was RESUMED and its merge with " +
+	"the base branch is unresolved, resolving that merge is your FIRST action: finish it and commit it before " +
+	"you read or write any other code. The tree you were given is stale by exactly the changes that conflicted.\n\n"
+
 // agentJob is the per-kind job description: what the agent does this turn, and
 // the ONE MCP tool it must call to end its stage. Every agent kind ends its stage
 // by calling submit_outcome - the agent never writes status.stage, and a stage
@@ -237,6 +250,7 @@ func agentJob(agentKind string, proj *tatarav1alpha1.Project) string {
 			"is cloned under `/workspace/<name>`; change whichever of them the issue needs. Your " +
 			"commits are pushed to the task branch at the end of each turn and each changed repo gets " +
 			"its own PR - never commit to a default branch.\n\n" +
+			resumedBranchMergeRule +
 			"DO NOT REWRITE THE PLAN NOTE AFTER APPROVAL. The operator hashed it at grant and " +
 			"re-checks the hash when you submit; a plan swapped after approval sends you back to the " +
 			"gate. Amend it BEFORE you ask, or ask again afterwards.\n\n" +
@@ -264,6 +278,7 @@ func agentJob(agentKind string, proj *tatarav1alpha1.Project) string {
 			"This is the NIGHTLY DOCUMENTATION BATCH. It covers every Task delivered since the last " +
 			"batch (listed in the goal above). Update the documentation repo for whichever of them are " +
 			"doc-relevant, in ONE pull request, and no-op on the ones that are not.\n\n" +
+			resumedBranchMergeRule +
 			"`submit_outcome(kind=documentation, action=submitted, ...)` when the docs PR is open, or " +
 			"`action=declined` when nothing delivered was doc-relevant. `declined` is a correct answer."
 

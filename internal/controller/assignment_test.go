@@ -120,3 +120,45 @@ func TestAssignmentSkillsDirectiveUsesAgentKind(t *testing.T) {
 		})
 	}
 }
+
+// TestAssignmentFor_ResumedBranchMergeIsFirstAction pins the turn-0 half of the
+// "a bootstrap merge conflict is the agent's job, not a boot failure" contract
+// (tatara-claude-code-wrapper: bootstrap-conflict-not-fatal).
+//
+// The operator cannot make this rule conditional: it has no way to know at
+// assignment time whether the remote task branch already exists. There is no
+// ls-remote anywhere in it, agent.TaskBranch is a pure function of the Task
+// spec, and no SCM interface exposes branch existence. So the operator states
+// the rule unconditionally and the wrapper supplies the conditional fact in the
+// injected CLAUDE.md.
+//
+// Only the kinds that push code carry it. A brainstorm/incident/refine/review
+// agent has no task branch to reconcile (review checks its target out read-only
+// and never pushes), so the sentence would be noise there.
+func TestAssignmentFor_ResumedBranchMergeIsFirstAction(t *testing.T) {
+	task := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "t-resume"},
+		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "proj", Kind: "implement", Goal: "g"},
+	}
+
+	const rule = "resolving that merge is your FIRST action"
+
+	for _, kind := range []string{stage.AgentImplement, stage.AgentDocumentation} {
+		got := assignmentFor(kind, task, &tatarav1alpha1.Project{})
+		if !strings.Contains(got, rule) {
+			t.Errorf("kind %q pushes code and must carry the resumed-branch merge rule", kind)
+		}
+		if !strings.Contains(got, "RESUMED") {
+			t.Errorf("kind %q: the rule must name the resumed state the wrapper reports", kind)
+		}
+	}
+
+	for _, kind := range []string{
+		stage.AgentBrainstorm, stage.AgentIncident, stage.AgentRefine, stage.AgentReview,
+	} {
+		got := assignmentFor(kind, task, &tatarav1alpha1.Project{})
+		if strings.Contains(got, rule) {
+			t.Errorf("kind %q pushes no code and must not carry the resumed-branch merge rule", kind)
+		}
+	}
+}
