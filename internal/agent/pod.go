@@ -404,10 +404,14 @@ func shortSourceHeadSHA(t *tatarav1alpha1.Task) string {
 	return sha[:7]
 }
 
-// TaskBranch is the deterministic work branch all of the operator write-back,
-// the turn prompts, and the wrapper agree on. When the Task carries an issue/PR
-// number it is tatara/<kind>-<number>-<slug>; a documentation Task (SHA-keyed,
-// no Number) is tatara/docs-<short-sha>; otherwise tatara/task-<task-name>.
+// TaskBranch is the deterministic work branch the operator write-back and the
+// wrapper agree on. It reaches the wrapper as the TASK_BRANCH env var (see
+// branchEnvValues) and is compared against a merge request's head branch by the
+// sweep and the reaper. It is NOT in the turn prompts: no assignment names it,
+// and the only branch string turn-0 carries is a merge request's own head
+// branch attribute. When the Task carries an issue/PR number the branch is
+// tatara/<kind>-<number>-<slug>; a documentation Task (SHA-keyed, no Number) is
+// tatara/docs-<short-sha>; otherwise tatara/task-<task-name>.
 func TaskBranch(t *tatarav1alpha1.Task) string {
 	if t.Spec.Source != nil && t.Spec.Source.Number > 0 {
 		base := fmt.Sprintf("tatara/%s-%d", branchKind(t), t.Spec.Source.Number)
