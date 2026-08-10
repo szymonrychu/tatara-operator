@@ -215,7 +215,7 @@ func (d *StageDriver) DrainPendingReview(ctx context.Context, mr *tatarav1alpha1
 	// STEP 6: THE BELT. reviewing -> implementing fires IMMEDIATELY, and the
 	// mirror sweep is HOURLY: without this note a next implement pod whose mirror
 	// append lost a race has no idea what to fix, re-submits, burns
-	// maxReviewRounds and dies at parked(review-loop-exhausted).
+	// review rounds with no new findings in them.
 	if task != nil && len(pr.Findings) > 0 {
 		if err := d.appendOperatorNote(ctx, proj, task,
 			reviewBeltNote(repo.Name, mr.Spec.Number, pr)); err != nil {
@@ -335,7 +335,7 @@ func (d *StageDriver) advanceAfterReview(ctx context.Context, proj *tatarav1alph
 			mrs[i] = *fresh.DeepCopy()
 		}
 	}
-	edge, ready := reviewAdvanceEdge(task, mrs, maxReviewRounds(proj))
+	edge, ready := reviewAdvanceEdge(task, mrs)
 	if !ready {
 		return nil
 	}
@@ -527,8 +527,7 @@ func TaskTakenOver(ctx context.Context, c client.Reader, task *tatarav1alpha1.Ta
 	return true, nil
 }
 
-func reviewAdvanceEdge(task *tatarav1alpha1.Task, mrs []tatarav1alpha1.MergeRequest,
-	maxRounds int) (stage.Edge, bool) {
+func reviewAdvanceEdge(task *tatarav1alpha1.Task, mrs []tatarav1alpha1.MergeRequest) (stage.Edge, bool) {
 	// A merged/closed MR can no longer be reviewed, so a stale pendingReview must
 	// not veto finalization: check the external-terminal edge BEFORE the
 	// pendingReview-owed gate below.
@@ -554,20 +553,16 @@ func reviewAdvanceEdge(task *tatarav1alpha1.Task, mrs []tatarav1alpha1.MergeRequ
 		// human's PR is a HUMAN action.
 		return stage.Edge{To: stage.ParkTarget, Reason: stage.ReasonAwaitingHuman}, true
 	case needsChanges:
-		edge, _ := stage.RequestChanges(task, mrs, maxRounds)
+		edge, _ := stage.RequestChanges(task)
 		return edge, true
 	default:
 		return stage.Edge{To: tatarav1alpha1.StateMerged}, true
 	}
 }
 
-// maxReviewRounds is the project's request_changes cap, defaulting to 3.
-func maxReviewRounds(proj *tatarav1alpha1.Project) int {
-	if proj.Spec.Agent.MaxReviewRounds > 0 {
-		return proj.Spec.Agent.MaxReviewRounds
-	}
-	return 3
-}
+// maxReviewRounds is DELETED (O3). It was the last reader of
+// Project.spec.agent.maxReviewRounds, whose cap parked review-loop-exhausted and
+// killed implement/review pairs that were converging.
 
 // DrainPendingComments is the SAME SHAPE as the review post, for
 // mr_write(comment|reply) and issue_write(comment|edit|close): the requestId

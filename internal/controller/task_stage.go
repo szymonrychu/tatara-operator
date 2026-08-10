@@ -51,26 +51,11 @@ const (
 	admissionRequeue = 5 * time.Minute
 )
 
-// defaultMaxTurnsPerTask is contract A.6's LIFETIME turn backstop across every
-// pod of a Task, used when neither the Task nor the Project sets one.
-const defaultMaxTurnsPerTask = 300
-
-func taskMaxTurns(proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task) int {
-	if task.Spec.MaxTurnsPerTask > 0 {
-		return task.Spec.MaxTurnsPerTask
-	}
-	if proj != nil && proj.Spec.Agent.MaxTurnsPerTask > 0 {
-		return proj.Spec.Agent.MaxTurnsPerTask
-	}
-	return defaultMaxTurnsPerTask
-}
-
-func taskMaxPodRecreations(proj *tatarav1alpha1.Project) int {
-	if proj != nil && proj.Spec.Agent.MaxPodRecreations > 0 {
-		return proj.Spec.Agent.MaxPodRecreations
-	}
-	return maxPodRecreations
-}
+// taskMaxTurns and taskMaxPodRecreations are DELETED (O3). They were the last
+// readers of Project.spec.agent.maxTurnsPerTask / .maxPodRecreations, which are
+// now Deprecated fields with zero readers: the ceilings they fed parked working
+// agents, and what replaced them is stage.ResidencyCapAll (24h, a constant) plus
+// the operator_pod_recreations_total churn alert.
 
 // projectPaused is Project.spec.maxConcurrentAgents == 0, the kill switch. It
 // disarms CLOCK 1 (and the pod-less `approved` stage's admission budget, which is
@@ -184,7 +169,7 @@ func (r *TaskReconciler) reconcileClocks(ctx context.Context, proj *tatarav1alph
 		// EnterStage refuses a redundant X->X - so a race with the MR reconciler's
 		// own advance costs at most one illegal-edge counter, never a double
 		// transition.
-		if edge, ready := reviewAdvanceEdge(task, mrs, maxReviewRounds(proj)); ready {
+		if edge, ready := reviewAdvanceEdge(task, mrs); ready {
 			// The SAME red-CI gate the edge-triggered advance applies (issue #476),
 			// and it FAILS OPEN here for a sharper reason than it does there: this
 			// block runs BEFORE the HandoffDeadline below and BEFORE stage.ArmedClock,
@@ -761,10 +746,10 @@ func clockRequeue(clock string, remaining time.Duration) time.Duration {
 	return cap
 }
 
-// reconcileCaps enforces the F.4 exits every POD stage carries on top of its
-// clocks: the lifetime turn budget, the pod-recreation budget, and the
-// pod-stopped-with-no-outcome park. Pod-less stages carry none (stage.BudgetExit
-// returns nothing for them).
+// reconcileCaps enforces what is LEFT of the F.4 exits every POD stage carries
+// on top of its clocks: the pod-stopped-with-no-outcome park, and nothing else.
+// O3 deleted the lifetime turn budget and the pod-recreation budget. Pod-less
+// stages carry none (stage.BudgetExit returns nothing for them).
 func (r *TaskReconciler) reconcileCaps(ctx context.Context, proj *tatarav1alpha1.Project,
 	task *tatarav1alpha1.Task, now time.Time) (handled bool, err error) {
 
@@ -782,7 +767,7 @@ func (r *TaskReconciler) reconcileCaps(ctx context.Context, proj *tatarav1alpha1
 		stopped = gone
 	}
 
-	edge, ok := stage.BudgetExit(task, taskMaxTurns(proj, task), taskMaxPodRecreations(proj), stopped)
+	edge, ok := stage.BudgetExit(task, stopped)
 	if !ok {
 		return false, nil
 	}
@@ -800,14 +785,13 @@ func (r *TaskReconciler) reconcileCaps(ctx context.Context, proj *tatarav1alpha1
 	// occupancy of this stage is nil there too, so a re-entered reviewing Task
 	// carries no suppression from the last round.
 	//
-	// The turn budget is NOT suppressed: it is not a pod-liveness cap, and
-	// BudgetExit checks it first, so a Task over maxTurnsPerTask still fails here.
-	//
 	// handled=false lets the flow fall through to reconcilePodStage, whose own B2
 	// guard returns the poll requeue. The handoff deadline stays armed and bounds
 	// the suppression in the other direction.
-	if handoffCondition(task) != nil &&
-		(edge.Reason == stage.ReasonNoOutcome || edge.Reason == stage.ReasonPodRecreationExhausted) {
+	//
+	// no-outcome is the ONLY reason BudgetExit can return since O3, so the
+	// pod-recreation-exhausted arm this condition used to carry is gone with it.
+	if handoffCondition(task) != nil && edge.Reason == stage.ReasonNoOutcome {
 		log.FromContext(ctx).Info("state budget exit suppressed: the outcome is committed and the handoff is in flight",
 			"action", "cap_suppressed_committed_outcome", "resource_id", task.Name,
 			"state", task.Status.State, "pod_recreations", task.Status.Stats.PodRecreations,
@@ -819,8 +803,9 @@ func (r *TaskReconciler) reconcileCaps(ctx context.Context, proj *tatarav1alpha1
 		"action", "stage_budget_exit", "resource_id", task.Name, "state", task.Status.State,
 		"turns", task.Status.Stats.Turns, "pod_recreations", task.Status.Stats.PodRecreations,
 		"pod_stopped_no_outcome", stopped, "to", edge.To, "park_reason", edge.Reason)
-	// Every BudgetExit edge parks: they are all exhaustion outcomes, and an
-	// exhaustion outcome stalls the Task where it is rather than moving it.
+	// The BudgetExit edge parks: a pod that ran and vanished without an outcome
+	// stalls the Task where it is rather than moving it. no-outcome is UnparkTimer,
+	// so this is a re-drivable stall, not a terminal.
 	return true, r.park(ctx, proj, task, edge.Reason, now)
 }
 
@@ -1446,30 +1431,26 @@ func (r *TaskReconciler) renderBundle(ctx context.Context, proj *tatarav1alpha1.
 	return out, nil
 }
 
-// respawnLostPod handles a pod that RAN and is gone. It burns one podRecreations;
-// the terminal, once the budget is spent, is park(pod-recreation-exhausted).
-// pod-not-ready is NOT a park reason and appears nowhere.
+// respawnLostPod handles a pod that RAN and is gone. It burns one podRecreations
+// and ALWAYS respawns: O3 deleted maxPodRecreations, so there is no terminal
+// here any more and park(pod-recreation-exhausted) is no longer reachable from
+// this path. pod-not-ready is NOT a park reason and appears nowhere either.
+//
+// THE COUNT STAYS. stats.podRecreations feeds operator_pod_recreations_total,
+// which is the input to the churn alert that replaced the cap
+// (sum by (project) (increase(...[1h])) > 6, critical). A crash loop is now
+// bounded only by the 24h stage.ResidencyCapAll; the alert is what makes it
+// visible before then.
+//
+// proj and now are retained in the signature for call-site symmetry with the
+// other pod-lifecycle handlers; nothing in here reads them any more.
 func (r *TaskReconciler) respawnLostPod(ctx context.Context, proj *tatarav1alpha1.Project,
 	task *tatarav1alpha1.Task, now time.Time) (ctrl.Result, error) {
 
-	edge, terminal := stage.RecordRespawn(task, taskMaxPodRecreations(proj))
+	_, _ = proj, now
+	stage.RecordRespawn(task)
 	recreations := task.Status.Stats.PodRecreations
-	// Counted here, before the terminal branch, because stage.RecordRespawn has
-	// ALREADY spent the budget slot at this point whichever way the branch goes -
-	// and the attempt that exhausts it is the single most interesting one to the
-	// churn alert that will replace the cap.
 	obs.PodRecreation(task.Spec.ProjectRef, task.Spec.Kind)
-	if terminal {
-		log.FromContext(ctx).Info("agent pod lost; recreation budget exhausted",
-			"action", "pod_recreation_exhausted", "resource_id", task.Name,
-			"pod_recreations", recreations)
-		// Through the PARK CHOKE POINT, exactly as podwatch.go's handleNotReady
-		// does at the twin site: stage.RecordRespawn's terminal edge is a PARK
-		// (#521 deleted `failed`), and stage.Enter refuses stage.ParkTarget by
-		// design. Handing it the raw edge turns an exhausted budget into an
-		// IllegalTransitionError, and the exhaustion goes uncounted.
-		return ctrl.Result{}, r.park(ctx, proj, task, edge.Reason, now)
-	}
 	// status.lastTurn* is DELIBERATELY left standing here, unlike the structurally
 	// identical patches in ttlStop and stalledTurnStop, which clear it. What
 	// differs is what each path already did with it: those two have just SPENT it

@@ -43,9 +43,10 @@ import (
 //
 // It also runs the G.10 contract handshake at pod-ready, BEFORE turn-0, and it
 // enforces CLOCK 2: a pod that never becomes Ready within PodReadyTimeout
-// RESPAWNS (it does NOT fail the Task); the terminal, once maxPodRecreations is
-// spent, is failed(pod-recreation-exhausted). pod-not-ready is not a reason and
-// never was.
+// RESPAWNS (it does NOT fail the Task). Since O3 there is NO terminal on that
+// loop - maxPodRecreations is gone - so it runs to the 24h residency dead-man
+// switch and is watched by the operator_pod_recreations_total alert instead.
+// pod-not-ready is not a reason and never was.
 //
 // It is ADDITIVE: it acts only on Tasks that carry status.stage (the new model).
 // A legacy phase-driven Task is left entirely to TaskReconciler.
@@ -53,8 +54,6 @@ type PodWatchReconciler struct {
 	client.Client
 	Session   agent.Session
 	Namespace string
-	// MaxPodRecreations bounds CLOCK 2 respawns. Zero means maxPodRecreations.
-	MaxPodRecreations int
 	// Metrics carries the D1 terminal counter. Both of this reconciler's terminal
 	// entries - failed(pod-recreation-exhausted) and failed(agent-contract-mismatch)
 	// - go through the EnterStage choke point, so neither can go uncounted.
@@ -125,13 +124,6 @@ func podStart(pod *corev1.Pod) time.Time {
 		return pod.Status.StartTime.Time
 	}
 	return pod.CreationTimestamp.Time
-}
-
-func (r *PodWatchReconciler) maxRecreations() int {
-	if r.MaxPodRecreations > 0 {
-		return r.MaxPodRecreations
-	}
-	return maxPodRecreations
 }
 
 // The body is doReconcile; this wrapper is the #538 shutdown-cancellation
@@ -216,8 +208,12 @@ func (r *PodWatchReconciler) doReconcile(ctx context.Context, req ctrl.Request) 
 
 // handleNotReady is the CLOCK 2 breach handler. It mirrors handleBootCrash
 // verbatim: a pod that never becomes Ready within PodReadyTimeout RESPAWNS,
-// burning one podRecreations. It does NOT fail the Task. The terminal, once the
-// budget is spent, is failed(pod-recreation-exhausted).
+// burning one podRecreations. It does NOT fail the Task, and since O3 it has no
+// terminal at all - maxPodRecreations is deleted, so a boot-crash loop runs
+// until the 24h stage.ResidencyCapAll dead-man switch. THIS IS THE WORST CASE
+// O3 accepted explicitly: at the PodReadyTimeout cycle that is on the order of
+// a few hundred pods, and the compensating control is the
+// operator_pod_recreations_total churn alert, not a cap.
 //
 // The deadline check is bootDeadlineExceeded, which anchors on
 // pod.Status.StartTime so image-pull and scheduling latency do not consume the
@@ -234,22 +230,12 @@ func (r *PodWatchReconciler) handleNotReady(ctx context.Context, pod *corev1.Pod
 	if fresh.Status.State == "" || fresh.Status.StateWorkStartedAt != nil {
 		return ctrl.Result{}, nil
 	}
-	edge, terminal := stage.RecordRespawn(fresh, r.maxRecreations())
+	stage.RecordRespawn(fresh)
 	recreations := fresh.Status.Stats.PodRecreations
-	// See respawnLostPod: counted at the attempt, terminal included. A pod that
-	// never becomes ready is the boot-crash loop the churn alert exists for.
+	// See respawnLostPod: counted at every attempt. A pod that never becomes ready
+	// is the boot-crash loop the churn alert exists for, and with the cap deleted
+	// this counter is the ONLY thing that makes it visible.
 	obs.PodRecreation(fresh.Spec.ProjectRef, fresh.Spec.Kind)
-	if terminal {
-		l.Info("agent pod never became ready; recreation budget exhausted, parking task",
-			"action", "pod_recreation_exhausted", "resource_id", taskName, "pod", pod.Name)
-		// Through the PARK CHOKE POINT: it stamps the tuple, tears the pod down,
-		// and counts the park. stage.RecordRespawn's terminal edge is a PARK
-		// (#521 deleted `failed`), so EnterStage would refuse it - doing this with
-		// a raw Status().Update, as it once did, is exactly how the exhaustion
-		// went uncounted.
-		return ctrl.Result{}, ParkTask(ctx, r.Client, r.spillerForTask(ctx, fresh), r.Metrics,
-			fresh, edge.Reason, time.Now(), nil)
-	}
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		cur := &tatarav1alpha1.Task{}
 		if err := r.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: taskName}, cur); err != nil {

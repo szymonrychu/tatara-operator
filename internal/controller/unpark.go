@@ -194,7 +194,6 @@ func ApplyUnpark(ctx context.Context, c client.Client, reader client.Reader, pro
 	if err != nil {
 		return false, DeclineNone, err
 	}
-	maxTurns := taskMaxTurns(proj, task)
 	botLogin := botLoginOf(proj)
 
 	getter := reader
@@ -227,15 +226,14 @@ func ApplyUnpark(ctx context.Context, c client.Client, reader client.Reader, pro
 		// omit any more (step C deleted it), so parked(identity-unverified) can
 		// only clear the flag or decline, never grant anything.
 		code := stage.Unpark(stage.UnparkInput{
-			Task:            fresh,
-			Issues:          issues,
-			MRs:             mrs,
-			ActiveTasks:     activeTasks,
-			MaxOpenTasks:    maxOpen,
-			BotLogin:        botLogin,
-			MaxTurnsPerTask: maxTurns,
-			LiveHasRoom:     liveHasRoom,
-			Now:             now,
+			Task:         fresh,
+			Issues:       issues,
+			MRs:          mrs,
+			ActiveTasks:  activeTasks,
+			MaxOpenTasks: maxOpen,
+			BotLogin:     botLogin,
+			LiveHasRoom:  liveHasRoom,
+			Now:          now,
 		})
 		// DeclineRetryBudgetSpent RE-PARKED the Task with a blocked reason, so its
 		// status HAS changed and must be persisted even though nothing un-parked.
@@ -333,11 +331,154 @@ func (r *ProjectReconciler) driveUnparksPaced(ctx context.Context, proj *tatarav
 	if err := r.driveUnparks(ctx, proj, now); err != nil {
 		return 0, err
 	}
+	// The O3 migration rides the SAME pacing, deliberately: it is a full-namespace
+	// sweep over parked Tasks and it must not run at Reconcile()'s cadence for the
+	// same tatara-operator#368 reason driveUnparks must not. It is also
+	// self-limiting - every Task it touches is stamped and never seen again - so
+	// after the first pass or two it is a no-op scan.
+	if err := r.driveRetiredUnparks(ctx, proj, now); err != nil {
+		return 0, err
+	}
 	if r.lastDriveUnparks == nil {
 		r.lastDriveUnparks = map[string]time.Time{}
 	}
 	r.lastDriveUnparks[proj.Name] = now
 	return interval, nil
+}
+
+// RetiredParkMigrationWindow is the age cutoff on the O3 retired-park migration.
+// A Task parked LONGER than this is left alone.
+//
+// The migration exists to release Tasks a deleted ceiling stalled, not to
+// resurrect a backlog. Old wreckage is genuinely dead work: its issue has moved
+// on, its branch has rotted, and un-parking it means minting a pod that reads a
+// stale bundle and burns tokens rediscovering that. 48h is chosen against
+// ParkRetention (7d): anything older is already most of the way to being reaped
+// and should finish aging out rather than wake up.
+const RetiredParkMigrationWindow = 48 * time.Hour
+
+// driveRetiredUnparks is the O3 MIGRATION, and it is a one-shot sweep dressed as
+// a reconciler loop.
+//
+// Three park reasons - turn-budget-exhausted, review-loop-exhausted and
+// pod-recreation-exhausted - were written by ceilings this release deleted.
+// Every Task carrying one was stalled by a rule that no longer exists, so it is
+// released ONCE, in place, with its clocks re-armed (stage.UnparkRetiredPark).
+//
+// EXACTLY ONCE PER TASK, IDEMPOTENT FOREVER. The latch is the
+// tatara.dev/retired-park-migrated ANNOTATION, and the ordering is: stamp the
+// annotation FIRST (a metadata patch), then un-park (a status write). Stamping
+// first means the failure mode of a crash between the two is a Task that stays
+// parked and is never retried - visible, inert, and fixable by hand. Stamping
+// second would make it a Task that un-parks on every single pass forever, which
+// is a token-burning loop the annotation exists to prevent. Where the two orders
+// disagree, prefer the one that fails closed.
+//
+// It re-parks nothing and re-migrates nothing. A Task released here that later
+// parks turn-budget-exhausted again (it cannot from this build, but an older
+// replica mid-rollout can write one) keeps its annotation and is skipped.
+func (r *ProjectReconciler) driveRetiredUnparks(ctx context.Context, proj *tatarav1alpha1.Project, now time.Time) error {
+	var tl tatarav1alpha1.TaskList
+	if err := r.List(ctx, &tl, client.InNamespace(proj.Namespace)); err != nil {
+		return fmt.Errorf("unpark: list tasks for the retired-park migration: %w", err)
+	}
+	l := log.FromContext(ctx)
+	var firstErr error
+	for i := range tl.Items {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		t := &tl.Items[i]
+		if t.Spec.ProjectRef != proj.Name || !tatarav1alpha1.Parked(t) {
+			continue
+		}
+		class, ok := stage.UnparkClassFor(t.Status.ParkReason)
+		if !ok || class != stage.UnparkRetired {
+			continue
+		}
+		if _, done := t.Annotations[tatarav1alpha1.AnnRetiredParkMigrated]; done {
+			continue
+		}
+		// THE 48h CUTOFF. parkedAt falls back to stateEnteredAt for a Task parked
+		// by a build predating the field, and to the zero time for one with
+		// neither - which reads as "parked forever ago" and is therefore SKIPPED.
+		// That is the safe direction: an unmigrated Task ages out at ParkRetention
+		// exactly as it did before this release.
+		reason := t.Status.ParkReason
+		if age := now.Sub(parkedAt(t)); age > RetiredParkMigrationWindow {
+			l.Info("retired park left to age out: parked longer than the migration window",
+				"action", "retired_park_skipped", "resource_id", t.Name,
+				"reason", reason, "parked_hours", int(age.Hours()))
+			continue
+		}
+		if err := r.stampRetiredParkMigrated(ctx, t, now); err != nil {
+			l.Error(err, "unpark: stamp the retired-park migration latch",
+				"action", "retired_park_error", "resource_id", t.Name, "reason", reason)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if err := r.applyRetiredUnpark(ctx, t, now); err != nil {
+			l.Error(err, "unpark: release a retired park",
+				"action", "retired_park_error", "resource_id", t.Name, "reason", reason)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		l.Info("released a park written by a retired ceiling",
+			"action", "retired_park_unparked", "resource_id", t.Name,
+			"reason", reason, "state", t.Status.State, "project", proj.Name)
+		r.Metrics.TaskUnparked(reason, obs.UnparkClassRetired)
+	}
+	return firstErr
+}
+
+// stampRetiredParkMigrated writes the once-only latch. It is a METADATA patch,
+// not a status write: the two subresources are independent, so this cannot be
+// lost by the status update that follows it, and it survives every later status
+// mutation the Task goes through.
+func (r *ProjectReconciler) stampRetiredParkMigrated(ctx context.Context, t *tatarav1alpha1.Task, now time.Time) error {
+	patch := client.MergeFrom(t.DeepCopy())
+	if t.Annotations == nil {
+		t.Annotations = map[string]string{}
+	}
+	t.Annotations[tatarav1alpha1.AnnRetiredParkMigrated] = now.UTC().Format(time.RFC3339)
+	if err := r.Patch(ctx, t, patch); err != nil {
+		return fmt.Errorf("unpark: stamp %s on %s: %w", tatarav1alpha1.AnnRetiredParkMigrated, t.Name, err)
+	}
+	return nil
+}
+
+// applyRetiredUnpark persists stage.UnparkRetiredPark under optimistic
+// concurrency, re-reading through the UNCACHED APIReader for the same cache-lag
+// reason ApplyUnpark does, and re-checking the park under the retry so a Task
+// another writer moved in the meantime is left alone rather than force-cleared.
+func (r *ProjectReconciler) applyRetiredUnpark(ctx context.Context, t *tatarav1alpha1.Task, now time.Time) error {
+	getter := client.Reader(r.APIReader)
+	if getter == nil {
+		getter = r.Client
+	}
+	key := client.ObjectKeyFromObject(t)
+	want := t.Status.ParkReason
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := getter.Get(ctx, key, fresh); err != nil {
+			return err
+		}
+		if !tatarav1alpha1.Parked(fresh) || fresh.Status.ParkReason != want {
+			return nil // raced past this park; the latch is stamped, so never retried
+		}
+		if err := stage.UnparkRetiredPark(fresh, now); err != nil {
+			return err
+		}
+		if err := r.Status().Update(ctx, fresh); err != nil {
+			return err
+		}
+		*t = *fresh
+		return nil
+	})
 }
 
 // NeedsLiveRoom reports whether a park with this reason could resume a LIVE

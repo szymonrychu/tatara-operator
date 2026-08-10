@@ -91,6 +91,19 @@ func tsReconciler(c client.Client) *TaskReconciler {
 	}
 }
 
+// tsWorkingReconciler is tsReconciler with a session that ACCEPTS a turn. It is
+// for the O3 tests, whose whole point is that the Task keeps working: a panicking
+// session proves a Task never runs an agent, and proving the opposite needs a
+// session that lets it.
+func tsWorkingReconciler(c client.Client) *TaskReconciler {
+	return &TaskReconciler{
+		Client:    c,
+		Metrics:   obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		Session:   newFakeSession(),
+		PodConfig: tsPodConfig(),
+	}
+}
+
 // tsPodConfig carries the two secret names ValidatePodSecretRefs demands. Every
 // fixture that reaches a pod stage needs it now that memory readiness no longer
 // holds an un-spawned Task short of the pod build.
@@ -379,6 +392,16 @@ func residencyTask(state string, now time.Time, entered time.Duration) *tatarav1
 	return tk
 }
 
+// residencyClient seeds the fixture WITH ITS POD. O3 dropped the recreation gate
+// from BudgetExit's podStoppedNoOutcome arm, so a live-state Task whose pod
+// object is absent now parks no-outcome on the very first pass - which would
+// mask every residency assertion below with the wrong park reason. A residency
+// test is about the ABSOLUTE clock on a Task whose pod is up and fine.
+func residencyClient(t *testing.T, proj *tatarav1alpha1.Project, tk *tatarav1alpha1.Task) client.Client {
+	t.Helper()
+	return newMirrorClient(t, proj, mdSecret(), tk, tsReadyPod(tk))
+}
+
 // THE ONE GENUINE REGRESSION in promoting liveness to a property, and its
 // mandatory mitigation. A live state arms the IDLE clock, so a chatty
 // under-implementation Task resets its deadline on every human comment and the
@@ -386,14 +409,14 @@ func residencyTask(state string, now time.Time, entered time.Duration) *tatarav1
 // bound, restored as a separate check.
 func TestReconcileClocks_ResidencyExceededParksALiveStateWhoseIdleClockKeepsResetting(t *testing.T) {
 	now := time.Now()
-	tk := residencyTask(tatarav1alpha1.StateUnderImplementation, now, 7*time.Hour)
+	tk := residencyTask(tatarav1alpha1.StateUnderImplementation, now, 25*time.Hour)
 	proj := tsProject(3)
-	c := newMirrorClient(t, proj, mdSecret(), tk)
+	c := residencyClient(t, proj, tk)
 
 	got := tsReconcile(t, tsReconciler(c), proj, tk, now)
 
 	if !tatarav1alpha1.Parked(got) {
-		t.Fatal("7h in under-implementation with a fresh idle clock did NOT park: the residency backstop is not wired")
+		t.Fatal("25h in under-implementation with a fresh idle clock did NOT park: the residency dead-man switch is not wired")
 	}
 	if got.Status.ParkReason != stage.ReasonStageDeadline {
 		t.Fatalf("parkReason = %q, want %q", got.Status.ParkReason, stage.ReasonStageDeadline)
@@ -408,30 +431,50 @@ func TestReconcileClocks_ResidencyExceededParksALiveStateWhoseIdleClockKeepsRese
 // a silently-working agent to a deadline.
 func TestReconcileClocks_ResidencyFiresOnAnAgentThatNeverStopsWorking(t *testing.T) {
 	now := time.Now()
-	tk := residencyTask(tatarav1alpha1.StateUnderImplementation, now, 7*time.Hour)
+	tk := residencyTask(tatarav1alpha1.StateUnderImplementation, now, 25*time.Hour)
 	tk.Annotations = map[string]string{tatarav1alpha1.AnnCurrentTurn: "turn-1"}
 	proj := tsProject(3)
-	c := newMirrorClient(t, proj, mdSecret(), tk)
+	c := residencyClient(t, proj, tk)
 
 	got := tsReconcile(t, tsReconciler(c), proj, tk, now)
 
 	if !tatarav1alpha1.Parked(got) || got.Status.ParkReason != stage.ReasonStageDeadline {
-		t.Fatalf("parked=%v reason=%q, want parked/%s: an agent mid-turn at 7h is past the 6h cap and residency is its only bound",
+		t.Fatalf("parked=%v reason=%q, want parked/%s: an agent mid-turn at 25h is past the 24h cap and residency is its only bound",
 			tatarav1alpha1.Parked(got), got.Status.ParkReason, stage.ReasonStageDeadline)
+	}
+}
+
+// AND A SEVEN-HOUR RUN SURVIVES. The old under-implementation cap was 6h, which
+// is where a long healthy coding run died. This is the O3 half of the pair: the
+// dead-man switch still exists, it is just no longer a work budget in disguise.
+func TestReconcileClocks_ResidencyDoesNotFireOnALongHealthyRun(t *testing.T) {
+	now := time.Now()
+	tk := residencyTask(tatarav1alpha1.StateUnderImplementation, now, 7*time.Hour)
+	tk.Annotations = map[string]string{tatarav1alpha1.AnnCurrentTurn: "turn-1"}
+	proj := tsProject(3)
+	c := residencyClient(t, proj, tk)
+
+	// A WORKING reconciler: the point of the test is that the Task keeps going,
+	// and a panicking session cannot express that.
+	got := tsReconcile(t, tsWorkingReconciler(c), proj, tk, now)
+
+	if tatarav1alpha1.Parked(got) {
+		t.Fatalf("parked at %q: 7h of implement work is a long job, and the 6h cap that killed it is deleted",
+			got.Status.ParkReason)
 	}
 }
 
 func TestReconcileClocks_ResidencyIsCumulativeAcrossAParkRoundTrip(t *testing.T) {
 	now := time.Now()
 	tk := residencyTask(tatarav1alpha1.StateUnderImplementation, now, time.Hour)
-	tk.Status.StageElapsedCarrySeconds = int((5*time.Hour + 30*time.Minute).Seconds())
+	tk.Status.StageElapsedCarrySeconds = int((23*time.Hour + 30*time.Minute).Seconds())
 	proj := tsProject(3)
-	c := newMirrorClient(t, proj, mdSecret(), tk)
+	c := residencyClient(t, proj, tk)
 
 	got := tsReconcile(t, tsReconciler(c), proj, tk, now)
 
 	if !tatarav1alpha1.Parked(got) {
-		t.Fatal("6h30m of CUMULATIVE residency exceeds the 6h cap; buying a fresh cap per re-entry is the unbounded-loop shape #480 killed")
+		t.Fatal("24h30m of CUMULATIVE residency exceeds the 24h cap; buying a fresh cap per re-entry is the unbounded-loop shape #480 killed")
 	}
 	if got.Status.ParkReason != stage.ReasonStageDeadline {
 		t.Fatalf("parkReason = %q, want %q", got.Status.ParkReason, stage.ReasonStageDeadline)
@@ -440,14 +483,14 @@ func TestReconcileClocks_ResidencyIsCumulativeAcrossAParkRoundTrip(t *testing.T)
 
 func TestReconcileClocks_ResidencyDoesNotFireUnderTheCap(t *testing.T) {
 	now := time.Now()
-	tk := residencyTask(tatarav1alpha1.StateUnderImplementation, now, 5*time.Hour)
+	tk := residencyTask(tatarav1alpha1.StateUnderImplementation, now, 23*time.Hour)
 	proj := tsProject(3)
-	c := newMirrorClient(t, proj, mdSecret(), tk)
+	c := residencyClient(t, proj, tk)
 
-	got := tsReconcile(t, tsReconciler(c), proj, tk, now)
+	got := tsReconcile(t, tsWorkingReconciler(c), proj, tk, now)
 
 	if tatarav1alpha1.Parked(got) {
-		t.Fatalf("5h is UNDER the 6h cap and parked anyway, reason %q: the backstop must not be a hair trigger",
+		t.Fatalf("23h is UNDER the 24h cap and parked anyway, reason %q: the backstop must not be a hair trigger",
 			got.Status.ParkReason)
 	}
 }
@@ -473,11 +516,11 @@ func TestReconcileClocks_ResidencyDoesNotApplyToOperatorDrivenStates(t *testing.
 // the switch shreds it anyway, at stage-deadline, which never un-parks.
 func TestReconcileClocks_ResidencyIsExemptWhileTheProjectIsPaused(t *testing.T) {
 	now := time.Now()
-	tk := residencyTask(tatarav1alpha1.StateAwaitingReview, now, 8*time.Hour)
+	tk := residencyTask(tatarav1alpha1.StateAwaitingReview, now, 25*time.Hour)
 	proj := tsProject(0) // maxConcurrentAgents == 0 is the pause
-	c := newMirrorClient(t, proj, mdSecret(), tk)
+	c := residencyClient(t, proj, tk)
 
-	got := tsReconcile(t, tsReconciler(c), proj, tk, now)
+	got := tsReconcile(t, tsWorkingReconciler(c), proj, tk, now)
 
 	if tatarav1alpha1.Parked(got) {
 		t.Fatalf("a PAUSED project parked an awaiting-review Task at %q. stage-deadline is UnparkNever, so this is the pause kill switch acting as a backlog shredder",
@@ -489,12 +532,12 @@ func TestReconcileClocks_ResidencyIsExemptWhileTheProjectIsPaused(t *testing.T) 
 // takes the pod down, and the park clock (ParkRetention) owns it from there.
 func TestReconcileClocks_ResidencyDoesNotFireOnAnAlreadyParkedTask(t *testing.T) {
 	now := time.Now()
-	tk := residencyTask(tatarav1alpha1.StateUnderImplementation, now, 7*time.Hour)
+	tk := residencyTask(tatarav1alpha1.StateUnderImplementation, now, 25*time.Hour)
 	parkedAt := metav1.NewTime(now.Add(-time.Hour))
 	tk.Status.ParkReason = stage.ReasonAwaitingHuman
 	tk.Status.ParkedAt = &parkedAt
 	proj := tsProject(3)
-	c := newMirrorClient(t, proj, mdSecret(), tk)
+	c := residencyClient(t, proj, tk)
 
 	got := tsReconcile(t, tsReconciler(c), proj, tk, now)
 
@@ -504,36 +547,43 @@ func TestReconcileClocks_ResidencyDoesNotFireOnAnAlreadyParkedTask(t *testing.T)
 	}
 }
 
-// THE FIFTH ParkTarget APPLIER. stage.RecordRespawn's terminal edge is a PARK
-// (#521 deleted the `failed` stage), so an applier that hands edge.To straight
-// to stage.Enter gets an IllegalTransitionError instead of a park - and the
-// recreation budget it just spent goes uncounted. podwatch.go's handleNotReady
-// is the exact twin of this site and was converted; this one was missed.
-func TestRespawnLostPod_AnExhaustedRecreationBudgetParksInsteadOfErroring(t *testing.T) {
+// somePodRecreations is "this Task has respawned a few times already". It used
+// to be the maxPodRecreations constant, which O3 deleted: no gate anywhere reads
+// a recreation count now, so the value is no longer load-bearing and the tests
+// below assert that explicitly.
+const somePodRecreations = 3
+
+// O3: A RECREATION COUNT NO LONGER TERMINATES ANYTHING. This test used to assert
+// that an exhausted budget parked pod-recreation-exhausted through the park choke
+// point. There is no budget, so the Task respawns at ten recreations exactly as
+// it does at one - and the counter still advances, because it is the churn
+// alert's only input.
+func TestRespawnLostPod_TenRecreationsStillRespawns(t *testing.T) {
 	now := time.Now()
 	task := tsTask("lost-pod", "implement", tatarav1alpha1.StateUnderImplementation, now.Add(-time.Hour))
 	pod := metav1.NewTime(now.Add(-30 * time.Minute))
 	work := metav1.NewTime(now.Add(-29 * time.Minute))
 	task.Status.PodStartedAt = &pod
 	task.Status.StateWorkStartedAt = &work
-	// One more burn tips it over: RecordRespawn increments FIRST, then compares.
-	task.Status.Stats.PodRecreations = maxPodRecreations
+	task.Status.Stats.PodRecreations = 10
 	proj := tsProject(3)
 	r := tsReconciler(newMirrorClient(t, proj, mdSecret(), task))
 
 	if _, err := r.respawnLostPod(context.Background(), proj, task, now); err != nil {
-		t.Fatalf("respawnLostPod: %v: the terminal edge is stage.ParkTarget and stage.Enter refuses it by design", err)
+		t.Fatalf("respawnLostPod: %v", err)
 	}
 
 	got := mdGetTask(t, r.Client, task.Name)
-	if !tatarav1alpha1.Parked(got) {
-		t.Fatal("an exhausted recreation budget did not park the Task")
+	if tatarav1alpha1.Parked(got) {
+		t.Fatalf("parked at %q: O3 deleted maxPodRecreations, so 10 recreations must still respawn",
+			got.Status.ParkReason)
 	}
-	if got.Status.ParkReason != stage.ReasonPodRecreationExhausted {
-		t.Fatalf("parkReason = %q, want %q", got.Status.ParkReason, stage.ReasonPodRecreationExhausted)
+	if got.Status.Stats.PodRecreations != 11 {
+		t.Fatalf("podRecreations = %d, want 11: the count feeds the churn alert and must not stop with the cap",
+			got.Status.Stats.PodRecreations)
 	}
-	if got.Status.State != tatarav1alpha1.StateUnderImplementation {
-		t.Fatalf("state = %q, want unchanged: a park does not move the Task", got.Status.State)
+	if got.Status.PodStartedAt != nil || got.Status.StateWorkStartedAt != nil {
+		t.Fatal("the pod clocks must be nil so a replacement pod re-stamps them")
 	}
 }
 
@@ -559,37 +609,42 @@ func TestPodNotReadyIsNotAStageReason(t *testing.T) {
 // THE CAPS (F.4).
 // ---------------------------------------------------------------------------
 
-func TestTurnBudgetExhausted(t *testing.T) {
+// O3: A 400-TURN TASK IS A LONG JOB, NOT A STALLED ONE. This used to park
+// turn-budget-exhausted at 300; the ceiling is deleted and the Task keeps working.
+func TestFourHundredTurnsDoesNotPark(t *testing.T) {
 	now := time.Now()
 	task := tsTask("burner", "implement", tatarav1alpha1.StateUnderImplementation, now.Add(-time.Minute))
 	podAt := metav1.NewTime(now.Add(-time.Minute))
 	workAt := metav1.NewTime(now.Add(-30 * time.Second))
 	task.Status.PodStartedAt = &podAt
 	task.Status.StateWorkStartedAt = &workAt
-	task.Status.Stats.Turns = defaultMaxTurnsPerTask
+	task.Status.Stats.Turns = 400
 	proj := tsProject(3)
 	c := newMirrorClient(t, proj, mdSecret(), task, tsReadyPod(task))
 
-	got := tsReconcile(t, tsReconciler(c), proj, task, now)
+	got := tsReconcile(t, tsWorkingReconciler(c), proj, task, now)
 
-	if got.Status.State != tatarav1alpha1.StateUnderImplementation || !tatarav1alpha1.Parked(got) ||
-		got.Status.ParkReason != stage.ReasonTurnBudgetExhausted {
-		t.Fatalf("state=%q parked=%v reason=%q, want under-implementation/parked/turn-budget-exhausted",
-			got.Status.State, tatarav1alpha1.Parked(got), got.Status.ParkReason)
+	if tatarav1alpha1.Parked(got) {
+		t.Fatalf("parked at %q: 400 turns must not terminate a Task after O3", got.Status.ParkReason)
+	}
+	if got.Status.State != tatarav1alpha1.StateUnderImplementation {
+		t.Fatalf("state = %q, want under-implementation", got.Status.State)
 	}
 }
 
-// A pod that RAN and vanished with no outcome, with the recreation budget spent,
-// parks at no-outcome. A pod that never ran (podStartedAt == nil - the admission
-// queue) is NOT this, and that distinction is the whole of the V6-1 fix.
-func TestPodStoppedWithNoOutcomeParksOnlyWhenTheBudgetIsSpent(t *testing.T) {
+// A pod that RAN and vanished with no outcome parks at no-outcome, and since O3
+// it does so with NO recreation gate: podStoppedNoOutcome is a fact about this
+// Task right now, not a count of how much it has done. A pod that never ran
+// (podStartedAt == nil - the admission queue) is NOT this, and that distinction
+// is the whole of the V6-1 fix.
+func TestPodStoppedWithNoOutcomeParksWithNoRecreationGate(t *testing.T) {
 	now := time.Now()
 	task := tsTask("lost", "implement", tatarav1alpha1.StateUnderImplementation, now.Add(-time.Hour))
 	podAt := metav1.NewTime(now.Add(-30 * time.Minute))
 	workAt := metav1.NewTime(now.Add(-29 * time.Minute))
 	task.Status.PodStartedAt = &podAt
 	task.Status.StateWorkStartedAt = &workAt
-	task.Status.Stats.PodRecreations = maxPodRecreations
+	task.Status.Stats.PodRecreations = 0
 	proj := tsProject(3)
 	// No Pod object: the pod is GONE.
 	c := newMirrorClient(t, proj, mdSecret(), task)
@@ -614,8 +669,7 @@ func TestPodStoppedWithNoOutcomeParksOnlyWhenTheBudgetIsSpent(t *testing.T) {
 // parked(awaiting-human): the human fixes their own PR.
 func TestRequestChangesOnAReviewTaskParksAwaitingHuman(t *testing.T) {
 	task := tsTask("rev", "review", tatarav1alpha1.StateAwaitingReview, time.Now())
-	mr := mdMR(task, "tatara-operator", 9)
-	edge, ok := stage.RequestChanges(task, []tatarav1alpha1.MergeRequest{*mr}, 3)
+	edge, ok := stage.RequestChanges(task)
 	if !ok {
 		t.Fatal("RequestChanges returned no edge")
 	}
@@ -1221,10 +1275,10 @@ func tsReviewTaskWithOutcome(reason string, recreations int, at time.Time) *tata
 func TestReconcile_CommittedOutcomeSuppressesRespawnAndCaps(t *testing.T) {
 	ctx := context.Background()
 	now := time.Unix(1000, 0)
-	// podRecreations == maxPodRecreations, so today's BudgetExit parks it
-	// no-outcome the moment the pod is seen gone.
+	// The pod is seen gone with no outcome, so BudgetExit would park it
+	// no-outcome were the committed-outcome suppression not in the way.
 	task := tsReviewTaskWithOutcome(tatarav1alpha1.OutcomeReasonFor(stage.AgentReview),
-		maxPodRecreations, now.Add(-time.Minute))
+		somePodRecreations, now.Add(-time.Minute))
 	proj := tsProject(3)
 	c := newMirrorClient(t, proj, mdSecret(), task) // no Pod object -> podGone == true
 	r := tsReconciler(c)
@@ -1242,9 +1296,9 @@ func TestReconcile_CommittedOutcomeSuppressesRespawnAndCaps(t *testing.T) {
 		t.Fatalf("stage = %q(%s), want reviewing: a committed outcome must not be terminated by a pod-liveness cap",
 			got.Status.State, got.Status.ParkReason)
 	}
-	if got.Status.Stats.PodRecreations != maxPodRecreations {
+	if got.Status.Stats.PodRecreations != somePodRecreations {
 		t.Fatalf("podRecreations = %d, want %d: no recreation may be burned",
-			got.Status.Stats.PodRecreations, maxPodRecreations)
+			got.Status.Stats.PodRecreations, somePodRecreations)
 	}
 	var pods corev1.PodList
 	if err := c.List(ctx, &pods, client.InNamespace(mdNS)); err != nil {
@@ -1263,7 +1317,7 @@ func TestReconcile_CommittedOutcomeSuppressesRespawnAndCaps(t *testing.T) {
 func TestReconcile_BareClaimIsStillFullySubjectToTheCaps(t *testing.T) {
 	now := time.Unix(1000, 0)
 	task := tsReviewTaskWithOutcome(tatarav1alpha1.OutcomeReasonClaimed,
-		maxPodRecreations, now.Add(-time.Minute))
+		somePodRecreations, now.Add(-time.Minute))
 	proj := tsProject(3)
 	c := newMirrorClient(t, proj, mdSecret(), task)
 	r := tsReconciler(c)
@@ -1844,7 +1898,7 @@ func TestReconcile_CommittedOutcomeWithNoDrainParksHandoffStalled(t *testing.T) 
 	t.Run("a BARE CLAIM never arms the handoff deadline", func(t *testing.T) {
 		// It has no handoff to wait for. It is a failed-validation stub and the
 		// ordinary caps own it.
-		task := tsReviewTaskWithOutcome(tatarav1alpha1.OutcomeReasonClaimed, maxPodRecreations, base)
+		task := tsReviewTaskWithOutcome(tatarav1alpha1.OutcomeReasonClaimed, somePodRecreations, base)
 		proj := tsProject(3)
 		r := tsReconciler(newMirrorClient(t, proj, mdSecret(), task))
 
@@ -2181,7 +2235,7 @@ func TestReconcile_ReviewHandoffReDrivesTheDroppedAdvance(t *testing.T) {
 func TestReconcile_CapsSuppressionIsScopedToTheStagesOwnAgentKind(t *testing.T) {
 	now := time.Unix(1000, 0)
 	task := tsReviewTaskWithOutcome(tatarav1alpha1.OutcomeReasonFor(stage.AgentImplement),
-		maxPodRecreations, now.Add(-time.Minute))
+		somePodRecreations, now.Add(-time.Minute))
 	task.Spec.Kind = stage.AgentImplement
 	proj := tsProject(3)
 	r := tsReconciler(newMirrorClient(t, proj, mdSecret(), task)) // no Pod object -> podGone
@@ -2202,7 +2256,7 @@ func TestReconcile_CapsSuppressionIsScopedToTheStagesOwnAgentKind(t *testing.T) 
 func TestReconcile_CapsSuppressionIsScopedToTheCurrentStageOccupancy(t *testing.T) {
 	base := time.Unix(1000, 0)
 	task := tsReviewTaskWithOutcome(tatarav1alpha1.OutcomeReasonFor(stage.AgentReview),
-		maxPodRecreations, base)
+		somePodRecreations, base)
 	reEntered := metav1.NewTime(base.Add(time.Hour))
 	ran := metav1.NewTime(base.Add(time.Hour + time.Minute))
 	task.Status.StateEnteredAt = &reEntered
@@ -2221,33 +2275,28 @@ func TestReconcile_CapsSuppressionIsScopedToTheCurrentStageOccupancy(t *testing.
 
 // The B2 suppression is scoped to the two POD-LIVENESS caps by REASON, and that
 // reason clause is the only thing holding the line. The TURN BUDGET is not a
-// pod-liveness cap - it reads stats.turns, which a committed outcome says nothing
-// about - and BudgetExit checks it FIRST, so a Task over maxTurnsPerTask must
-// still fail here even with this occupancy's own review outcome committed and the
-// handoff genuinely in flight.
-//
-// Drop the reason clause from reconcileCaps' guard (leaving a bare
-// `handoffCondition(task) != nil`) and a runaway agent that committed an outcome
-// buys itself an unbounded turn budget for the whole handoff window. Every other
-// caps test uses a Task with no committed outcome, so none of them enters the
-// guard at all and none of them would notice.
-func TestReconcile_CapsSuppressionDoesNotCoverTheTurnBudget(t *testing.T) {
+// O3 INVERTED THIS TEST, and the inversion is the whole point of the phase. The
+// turn budget it used to protect is DELETED, so a Task at 400 turns with a live
+// pod has no BudgetExit left to trip at all - suppressed or not. What survives is
+// the assertion that the B2 guard does not manufacture a park of its own.
+func TestReconcile_ATaskAtFourHundredTurnsWithALivePodIsNotParked(t *testing.T) {
 	now := time.Unix(1000, 0)
 	// THIS occupancy's own review outcome, committed at stageEnteredAt: the
-	// handoff condition is armed, so the guard IS entered.
+	// handoff condition is armed, so the B2 guard IS entered.
 	task := tsReviewTaskWithOutcome(tatarav1alpha1.OutcomeReasonFor(stage.AgentReview), 0, now)
-	task.Status.Stats.Turns = defaultMaxTurnsPerTask
+	task.Status.Stats.Turns = 400
 	proj := tsProject(3)
-	// A LIVE, Ready pod: podGone is false, so no-outcome cannot fire and the turn
-	// budget is the only exit BudgetExit can be reporting.
+	// A LIVE, Ready pod: podGone is false, so no-outcome cannot fire either.
 	r := tsReconciler(newMirrorClient(t, proj, mdSecret(), task, tsReadyPod(task)))
 
 	got := tsReconcile(t, r, proj, task, now.Add(time.Minute))
 
-	if got.Status.State != tatarav1alpha1.StateAwaitingReview || !tatarav1alpha1.Parked(got) ||
-		got.Status.ParkReason != stage.ReasonTurnBudgetExhausted {
-		t.Fatalf("state=%q parked=%v reason=%q, want awaiting-review/parked/turn-budget-exhausted: the B2 guard suppresses the POD-LIVENESS caps only, "+
-			"never the lifetime turn budget", got.Status.State, tatarav1alpha1.Parked(got), got.Status.ParkReason)
+	if tatarav1alpha1.Parked(got) {
+		t.Fatalf("parked at %q: neither the deleted turn budget nor the B2 guard may park a working Task",
+			got.Status.ParkReason)
+	}
+	if got.Status.State != tatarav1alpha1.StateAwaitingReview {
+		t.Fatalf("state = %q, want awaiting-review", got.Status.State)
 	}
 }
 
@@ -2278,7 +2327,7 @@ func TestHandoffCondition_FailsClosedWithNoStageStamp(t *testing.T) {
 
 	t.Run("so the caps apply normally", func(t *testing.T) {
 		task := tsReviewTaskWithOutcome(tatarav1alpha1.OutcomeReasonFor(stage.AgentReview),
-			maxPodRecreations, base)
+			somePodRecreations, base)
 		task.Status.StateEnteredAt = nil
 		proj := tsProject(3)
 		r := tsReconciler(newMirrorClient(t, proj, mdSecret(), task)) // no Pod object -> podGone
@@ -2394,23 +2443,18 @@ func TestEnsureStagePod_ReviewMROpen_ProceedsNormally(t *testing.T) {
 
 // TestRespawnLostPod_CountsThePodRecreation.
 //
-// operator_pod_recreations_total is the INPUT TO THE ALERT THAT REPLACES THE CAP.
-// Today maxPodRecreations bounds a crash loop by parking the Task - a terminal a
-// human has to dig out of, with no signal at all until the budget is spent. The
-// later phase deletes that enforcement and pages on the rate instead, so the
-// counter has to be trustworthy BEFORE the cap comes out.
-//
-// Counted on the attempt that EXHAUSTS the budget too: stage.RecordRespawn has
-// already spent the slot by then, and a loop that ends in a park is exactly the
-// shape whose last attempt must not go missing from the rate.
+// operator_pod_recreations_total IS THE ALERT THAT REPLACED THE CAP. O3 deleted
+// the enforcement, so this counter is now the ONLY thing that makes a crash loop
+// visible before the 24h residency dead-man switch - it has to fire on every
+// attempt, at every recreation count, and it must never park.
 func TestRespawnLostPod_CountsThePodRecreation(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		recreations int
 		wantParked  bool
 	}{
-		{"within budget", 0, false},
-		{"the attempt that exhausts it", maxPodRecreations, true},
+		{"first respawn", 0, false},
+		{"deep into a crash loop", 12, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			now := time.Now()

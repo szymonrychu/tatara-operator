@@ -29,6 +29,25 @@ const (
 	UnparkHuman
 	// UnparkTimer: a backoff retry drives it, BOUNDED BY A COUNTER.
 	UnparkTimer
+	// UnparkRetired is a MIGRATION CLASS, and it is deliberately not one of the
+	// three behavioural ones. Its members are parks written by a ceiling that no
+	// longer exists: turn-budget-exhausted, review-loop-exhausted and
+	// pod-recreation-exhausted. Every Task carrying one was stalled by a rule
+	// O3 deleted, so leaving them to age out at ParkRetention would spend the
+	// full seven days punishing them for a policy that is gone.
+	//
+	// EXACTLY ONCE, EVER. The driver (controller.driveRetiredUnparks) stamps
+	// tatara.dev/retired-park-migrated before it un-parks and skips anything
+	// already stamped, so this class is a one-shot sweep and not a fourth
+	// re-entry rule. A Task that re-parks for some other reason afterwards is
+	// handled by that reason's own class, not by this one.
+	//
+	// stage.Unpark does NOT have an arm for these reasons and must not grow one:
+	// it would turn a migration into a permanent retry loop. Unpark treats them
+	// exactly as it treats UnparkNever (DeclineNoReentry), which is also what
+	// keeps the reaper's unparkFires probe honest - an un-migrated leftover still
+	// ages out at ParkRetention rather than being held alive forever.
+	UnparkRetired
 )
 
 // unparkClasses is total over ParkReasons and that totality is asserted.
@@ -49,7 +68,7 @@ const (
 //
 // UnparkTimer is therefore the three reasons that carry a real bound today:
 // merge-timeout (MergeReentries), deploy-timeout (DeployReentries) and
-// no-outcome (parkedFromState gate plus maxTurnsPerTask).
+// no-outcome (parkedFromState gate).
 var unparkClasses = map[string]UnparkClass{
 	// A human's comment. These are the four that were comment-driven before.
 	ReasonBacklogSweep:       UnparkHuman,
@@ -62,17 +81,24 @@ var unparkClasses = map[string]UnparkClass{
 	ReasonDeployTimeout: UnparkTimer,
 	ReasonNoOutcome:     UnparkTimer,
 
+	// A ONE-SHOT MIGRATION. The ceiling that wrote each of these is deleted, so
+	// the park is a verdict from a policy that no longer exists. See
+	// UnparkRetired. The three constants and the task_types.go ParkReason enum
+	// members STAY: removing an enum member breaks validation on the next status
+	// write of EVERY object already carrying it, including the ones this
+	// migration is about to touch.
+	ReasonTurnBudgetExhausted:    UnparkRetired,
+	ReasonReviewLoopExhausted:    UnparkRetired,
+	ReasonPodRecreationExhausted: UnparkRetired,
+
 	// Nobody. These are exhaustion terminals and ex-`failed` reasons:
 	// re-entering one would escape its own cap one lap at a time.
 	ReasonStageDeadline:          UnparkNever,
 	ReasonNameTooLong:            UnparkNever,
 	ReasonImplementDeclined:      UnparkNever,
-	ReasonReviewLoopExhausted:    UnparkNever,
 	ReasonReviewPostRefused:      UnparkNever,
 	ReasonMergeBlocked:           UnparkNever,
 	ReasonDeployBlocked:          UnparkNever,
-	ReasonTurnBudgetExhausted:    UnparkNever,
-	ReasonPodRecreationExhausted: UnparkNever,
 	ReasonHeadMoving:             UnparkNever,
 	ReasonCIRed:                  UnparkNever,
 	ReasonCIBlocked:              UnparkNever,
@@ -210,5 +236,40 @@ func UnparkTakeover(t *v1alpha1.Task, to string, now time.Time) error {
 	}
 	clearPark(t)
 	stampEnter(t, to, "", now)
+	return nil
+}
+
+// UnparkRetiredPark is the O3 MIGRATION un-park, and it is a takeover in
+// everything but name: the operator - not a human, not a timer, not a re-entry
+// rule - decides that this park is void because the ceiling that wrote it has
+// been deleted. Like UnparkTakeover it bypasses Unpark's re-entry rules
+// entirely; unlike UnparkTakeover it does NOT move State, because there is
+// nothing wrong with where the Task is. Park is orthogonal to state (#521), so
+// clearing the flag drops the Task straight back into the live state it was
+// working in.
+//
+// It refuses any reason outside UnparkRetired. That is the whole safety
+// argument: the three reasons in that class are the ONLY parks O3 invalidated,
+// and a caller that could point this at awaiting-human or merge-blocked would be
+// laundering an arbitrary park through a migration.
+//
+// It does NOT stamp the tatara.dev/retired-park-migrated annotation. internal/
+// stage is a pure status-mutating package and cannot write metadata; the
+// once-only guarantee is the CALLER's (controller.driveRetiredUnparks), which
+// stamps before it writes and skips anything already stamped.
+//
+// reArm, not stampEnter: same stamps as every other un-park, no state change, no
+// reason change, and StageElapsedCarrySeconds PRESERVED - so the 24h residency
+// dead-man switch stays cumulative across the migration and a Task that had
+// already burned 20 hours does not buy a fresh day by being un-parked.
+func UnparkRetiredPark(t *v1alpha1.Task, now time.Time) error {
+	class, ok := UnparkClassFor(t.Status.ParkReason)
+	if !ok || class != UnparkRetired {
+		return fmt.Errorf("retired un-park requires a retired-ceiling parkReason, got %q", t.Status.ParkReason)
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	reArm(t, now)
 	return nil
 }

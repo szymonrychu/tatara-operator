@@ -469,7 +469,7 @@ func SyncMergeRequest(ctx context.Context, c client.Client, sp objbudget.Spiller
 // reviewing -> implementing fires immediately - so the next implement pod's
 // turn-0 bundle is rendered from a mirror that does NOT contain the findings it
 // is supposed to be fixing. The agent has no idea what to fix, re-submits, hits
-// maxReviewRounds and dies at parked(review-loop-exhausted), on EVERY
+// review rounds carrying no new findings, on EVERY
 // changes-requested cycle, for the first hour after every review.
 //
 // The append is a set-union on externalId, so a crash between the forge post and

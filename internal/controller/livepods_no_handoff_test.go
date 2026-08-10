@@ -10,7 +10,6 @@ import (
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
-	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
 // idleExitNoAgentHandoff arranges the fixture so the wrapper REFUSES the G.7
@@ -89,16 +88,18 @@ func TestIdleExitWithoutAgentHandoffReArmsInsteadOfFakingAHumanGate(t *testing.T
 	}
 }
 
-// TestIdleExitWithoutAgentHandoffParksOnceTheRecreationBudgetIsSpent: the re-arm
-// is BOUNDED. Repeated pod death must terminate, and pod-recreation-exhausted is
-// already the right terminal for it.
-func TestIdleExitWithoutAgentHandoffParksOnceTheRecreationBudgetIsSpent(t *testing.T) {
+// O3 REMOVED THE BOUND ON THIS RE-ARM. It used to terminate at
+// pod-recreation-exhausted once the budget was spent; there is no budget, so a
+// pod that keeps dying keeps getting replaced until the 24h residency cap. The
+// reaper's live-conversation stand-down and the churn alert are what keep that
+// from becoming a 30-minute rotation loop.
+func TestIdleExitWithoutAgentHandoffReArmsAtAnyRecreationCount(t *testing.T) {
 	proj, task, r := idleExitNoAgentHandoff(t)
 	// Persisted, not just set in memory: the re-arm re-reads the Task through
-	// patchTaskStatus, so an in-memory-only budget would not be seen.
-	task.Status.Stats.PodRecreations = taskMaxPodRecreations(proj)
+	// patchTaskStatus, so an in-memory-only count would not be seen.
+	task.Status.Stats.PodRecreations = 12
 	if err := r.Status().Update(context.Background(), task); err != nil {
-		t.Fatalf("seed the spent recreation budget: %v", err)
+		t.Fatalf("seed the recreation count: %v", err)
 	}
 
 	if _, _, err := r.reconcileClocks(context.Background(), proj, task, time.Now()); err != nil {
@@ -109,10 +110,10 @@ func TestIdleExitWithoutAgentHandoffParksOnceTheRecreationBudgetIsSpent(t *testi
 	if err := r.Get(context.Background(), objectKeyOf(task), fresh); err != nil {
 		t.Fatalf("get task: %v", err)
 	}
-	if !tatarav1alpha1.Parked(fresh) {
-		t.Fatal("a Task that has burned its whole recreation budget must terminate, not re-arm again")
+	if tatarav1alpha1.Parked(fresh) {
+		t.Fatalf("parked at %q: the recreation ceiling is deleted", fresh.Status.ParkReason)
 	}
-	if fresh.Status.ParkReason != stage.ReasonPodRecreationExhausted {
-		t.Fatalf("park reason = %s, want %s", fresh.Status.ParkReason, stage.ReasonPodRecreationExhausted)
+	if fresh.Status.Stats.PodRecreations != 13 {
+		t.Fatalf("podRecreations = %d, want 13", fresh.Status.Stats.PodRecreations)
 	}
 }
