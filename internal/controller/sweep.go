@@ -260,6 +260,37 @@ func (m *Minter) resolveLiveMROwner(ctx context.Context, proj *tatarav1alpha1.Pr
 	return m.resolveLiveOwner(ctx, proj, cr, activity)
 }
 
+// terminalOwnerReleasable reports whether a controller owner of cr that EXISTS
+// but has FINISHED (api/v1alpha1.TaskDone) may have its ownerRef released by
+// resolveLiveOwner.
+//
+// IT IS THE REAPER'S OWN RULE, restated at the seam that reads it.
+// releaseOwnership (B.5) already drops a terminal Task's ref from an Issue
+// mirror on exactly this condition - "an OPEN issue must be re-mintable RIGHT
+// NOW", fix H13 - and its log line already says "the next sweep re-mints and
+// adopts the artifact". So this is not a new policy; it is the same policy
+// applied where the wedge is actually observed, instead of only when the owner
+// is finally deleted.
+//
+// A CLOSED mirror keeps its owner. IsOrphanIssue clause (a) skips it anyway, so
+// releasing would mint nothing, and the ref is load-bearing there: a retained
+// declined brainstorm proposal is stored as a CLOSED mirror deliberately kept
+// owned by its rejected Task so it CASCADES with it (DeclinedProposalRetention).
+// Dropping that ref would leak a zero-owner CR nothing ever collects.
+//
+// THE MERGEREQUEST ARM IS DELIBERATELY EXCLUDED, and not by oversight. The
+// reaper's MR rule is a DIFFERENT predicate - drop only when step 4 will not
+// close the PR (!ourMR) AND the PR is still open - and the orphaning branch
+// carries humanReviewRounds forward onto the successor BEFORE it drops. A copy
+// of the issue rule here would re-adopt a bot MR the platform is about to
+// close, and would silently reset a contributor's review-round count. Giving
+// the MR arm its release means porting ourMR and carryHumanReviewRounds to this
+// seam, which is a different change with a different blast radius.
+func terminalOwnerReleasable(cr client.Object) bool {
+	iss, ok := cr.(*tatarav1alpha1.Issue)
+	return ok && iss.Status.State != "closed"
+}
+
 // resolveLiveOwner answers IsOrphanIssue clause (b): who controller-owns cr AND
 // still exists. It returns "" when nobody does.
 //
@@ -279,6 +310,30 @@ func (m *Minter) resolveLiveMROwner(ctx context.Context, proj *tatarav1alpha1.Pr
 // exist, the reaper cascade would reason about it, and ourMR would key on it.
 // Dropping it also lets THIS SAME PASS mint, because the very next call is
 // IsOrphanIssue with liveOwner="".
+//
+// THE TERMINAL BRANCH IS THE SAME DEFECT ONE STATE OVER. #521 taught this
+// function that a ref must resolve to a Task that EXISTS; it did not teach it
+// that the Task must still be able to WORK. A Task that exists and is `done`
+// passed every check and was reported as the owner - and that is not a race, it
+// is a durable steady state, because reapDelivered releases NOTHING (unlike the
+// rejected arm, which calls releaseTerminal on every tick) and only ever drops
+// the ref by deleting the Task, which the doc-reference gate can defer forever.
+// Worse, releaseOwnership hands the flag to the OLDEST SURVIVING owner and
+// "surviving" meant "exists", so each reap passed the deed to the next dead
+// groomer while the daily refine cron appended a fresh one. mtg-decks#14 and
+// #16 sat OPEN for twelve days behind three `done` refine Tasks, the maintainer
+// asked twice, and the only symptom was one INFO line per pass:
+// sweep_skip_issue reason=issue_owned. Comment-driven un-park cannot help - it
+// wakes an EXISTING parked Task, and there was none.
+//
+// It DROPS rather than ignores, for the #521 reason above and for one more that
+// is specific to it: the mint that follows calls ownIssueForTask, which REFUSES
+// to adopt an Issue carrying a different controller owner ("already has
+// controller owner"). An in-memory ignore would turn the silent skip into a
+// hard per-item sweep error on every pass.
+//
+// Both branches are bounded by the SAME two rules that make this safe: the Get
+// is uncached, and a transient error is never read as absence.
 //
 // It lives HERE and not in internal/own because that package is memory-only by
 // its own package doc: every function except RepairZeroController mutates an
@@ -315,17 +370,29 @@ func (m *Minter) resolveLiveOwner(ctx context.Context, proj *tatarav1alpha1.Proj
 		}
 		var task tatarav1alpha1.Task
 		err := m.reader().Get(ctx, types.NamespacedName{Namespace: cr.GetNamespace(), Name: name}, &task)
-		if err == nil {
-			return name, nil
-		}
-		if !apierrors.IsNotFound(err) {
+		if err != nil && !apierrors.IsNotFound(err) {
 			return "", fmt.Errorf("sweep: resolve owner task %q of %s: %w", name, cr.GetName(), err)
+		}
+		// exists is the DISCRIMINATOR between the two branches, and both are read
+		// BEFORE the write: dropStaleOwner mirrors fresh refs onto cr and settles
+		// nothing about the Task.
+		exists := err == nil
+		releasing := exists && tatarav1alpha1.TaskDone(&task) && terminalOwnerReleasable(cr)
+		if exists && !releasing {
+			return name, nil
 		}
 		dropped, derr := m.dropStaleOwner(ctx, cr, name)
 		if derr != nil {
 			return "", derr
 		}
-		if dropped {
+		switch {
+		case dropped && releasing:
+			obs.SweepTerminalOwnerReleasedTotal.WithLabelValues(proj.Name, activity).Inc()
+			log.FromContext(ctx).Info("sweep: released a controller ownerRef held by a Task that has finished; the issue is mintable again",
+				"action", "sweep_terminal_owner_released", "resource_id", cr.GetName(),
+				"activity", activity, "project", proj.Name, "terminal_owner", name,
+				"owner_kind", task.Spec.Kind, "owner_state", task.Status.State)
+		case dropped:
 			obs.SweepStaleOwnerRepairedTotal.WithLabelValues(proj.Name, activity).Inc()
 			log.FromContext(ctx).Info("sweep: dropped a controller ownerRef naming a Task that no longer exists; the artifact is mintable again",
 				"action", "sweep_stale_owner_repaired", "resource_id", cr.GetName(),

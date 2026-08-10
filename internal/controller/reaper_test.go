@@ -1822,3 +1822,70 @@ func TestReapDeletesBranchWhenOnlyTerminalTasksMapToIt(t *testing.T) {
 		t.Fatalf("DeleteBranch calls = %v, want exactly [%s]", w.deleted, branch)
 	}
 }
+
+// TestReapNeverHandsTheDeedToATerminalHeir is the reaper half of the
+// mtg-decks#14 wedge, and it is what turned a transient stale ref into a
+// PERMANENT one.
+//
+// releaseOwnership hands the controller flag to own.OldestSurvivingOwner, and
+// "surviving" was built as "the Task object exists". So every reap of a
+// finished owner promoted the next FINISHED owner, and the artifact was never
+// dropped for the sweep - while the daily refine cron appended a fresh
+// candidate heir faster than retention removed them. Three `done` groomer Tasks
+// held one OPEN issue for twelve days out of nothing but correct-looking
+// handovers.
+//
+// A Task that has finished cannot act on what it inherits and cannot be woken,
+// so it is not an heir. With no eligible heir and an OPEN issue, B.5's own rule
+// applies: DROP the ref and let the sweep re-mint and adopt.
+func TestReapNeverHandsTheDeedToATerminalHeir(t *testing.T) {
+	ctx := context.Background()
+	proj := reapProject("termheir")
+	repo := reapRepo("termheir", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
+
+	dying := reapTask("termheir", "refine-a", "refine",
+		tatarav1alpha1.StateRejected, "", time.Now().Add(-2*time.Hour))
+	dying.Status.IssueRefs = []string{tatarav1alpha1.IssueName(repo.Name, 14)}
+	// The candidate heir: it EXISTS, it is older by ownerRef order, and it has
+	// finished. An existence-only survivor test promotes it.
+	finishedHeir := reapTask("termheir", "refine-b", "refine",
+		tatarav1alpha1.StateDone, "", time.Now().Add(-time.Hour))
+
+	iss := &tatarav1alpha1.Issue{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: tatarav1alpha1.IssueName(repo.Name, 14), Namespace: testNS,
+			Annotations: map[string]string{AnnTerminalCommented: "refine-a"},
+			OwnerReferences: []metav1.OwnerReference{
+				reapOwnerRef("refine-a", true),
+				reapOwnerRef("refine-b", false),
+			},
+		},
+		Spec: tatarav1alpha1.IssueSpec{RepositoryRef: repo.Name, Number: 14, ProjectRef: "termheir"},
+	}
+	iss.Status.State = "open"
+
+	c := newMirrorClient(t, proj, repo, reapSecret(), dying, finishedHeir, iss)
+	r := reapReconciler(c, &reapWriter{
+		comment:  func(string, string) error { return nil },
+		addLabel: func(string, string) error { return nil },
+	})
+
+	if err := r.ReapTerminal(ctx, proj); err != nil {
+		t.Fatalf("ReapTerminal: %v", err)
+	}
+
+	got := getIssueCR(t, c, iss.Name)
+	if name, ok := own.ControllerOwner(got); ok {
+		t.Fatalf("the deed was handed to %q, a Task that has already finished; the issue is wedged for another retention window", name)
+	}
+	for _, ref := range got.OwnerReferences {
+		if ref.Name == "refine-a" {
+			t.Fatal("the dying owner's ref survived the release")
+		}
+	}
+	// The finished sibling keeps its PLAIN ref: it holds the GC open (B.1) and
+	// dropping it is not this path's business. What it must not hold is the deed.
+	if len(got.OwnerReferences) != 1 || got.OwnerReferences[0].Name != "refine-b" {
+		t.Fatalf("owner refs after release = %+v, want exactly the finished sibling as a PLAIN owner", got.OwnerReferences)
+	}
+}

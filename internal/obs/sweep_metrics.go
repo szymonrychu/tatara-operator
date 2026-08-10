@@ -128,6 +128,40 @@ var SweepStaleOwnerRepairedTotal = prometheus.NewCounterVec(prometheus.CounterOp
 	Help: "Issue/MergeRequest mirrors whose controller ownerRef named a non-existent Task and was dropped, by project and activity (contract B.2/B.4, issue #521).",
 }, []string{"project", "activity"})
 
+// SweepTerminalOwnerReleasedTotal counts OPEN Issue mirrors whose controller
+// ownerRef named a Task that EXISTS but has FINISHED (state done or rejected),
+// and which the intake funnel therefore released by dropping the ref.
+//
+// IT IS A SEPARATE SERIES FROM SweepStaleOwnerRepairedTotal ON PURPOSE, and the
+// reason is that the two have different expected shapes and different runbooks.
+// A tombstone ref is a fact about GC ordering: the counter above is documented
+// as "a single burst, then flat forever", and a sustained rate on it means a
+// reap that is not handing over ownership. A terminal-owner release means a Task
+// that is not this issue's work took - and kept - the deed: the live case was
+// three `done` backlog-groomer Tasks holding mtg-decks#14 for twelve days
+// through the refine outcome's links[] claim. A sustained rate here points at
+// THAT path, not at B.5. Folding the two together would have cost the #521
+// counter its "flat forever" property, which is the only thing that makes it
+// alertable.
+//
+// THIS COUNTER IS THE VISIBILITY HALF OF THE FIX, and it is not decoration. The
+// defect it names ran for twelve days behind ONE line of
+// `sweep_skip_issue reason=issue_owned` at INFO, on a path whose deadman
+// (SweepOrphanStrandedSeconds) is structurally blind to it: the issue HAD a
+// resolvable owner, so it was never stranded. A log line is not a control -
+// that is the whole lesson of #521 - and the operator's controllers log through
+// logr, which offers INFO and ERROR and no WARN in between. So the alertable
+// artifact is this counter, and the log line beside it carries owner_kind and
+// owner_state so a non-zero rate names the offending Task KIND without a
+// kubectl.
+//
+// Steady state after a backlog drains is ZERO. Alert on a sustained rate, not
+// on a single release: one release per wedged artifact is the fix working.
+var SweepTerminalOwnerReleasedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "operator_sweep_terminal_owner_released_total",
+	Help: "Open Issue mirrors whose controller ownerRef named a Task that exists but is terminal (done|rejected) and was released, by project and activity (contract B.2/B.4/B.5).",
+}, []string{"project", "activity"})
+
 // SweepOrphanStrandedSeconds is the sweep's DEADMAN, and it exists because the
 // only sweep alert before it was a LIVENESS heartbeat
 // (SweepLastSuccessTimestamp), which reported green for 19 hours while five
@@ -334,6 +368,7 @@ func SeedSweepErrorsForProject(project string) {
 	seedLabels(skip, []string{project}, sweepActivities, sweepSkipReasons)
 	for _, activity := range sweepActivities {
 		SweepStaleOwnerRepairedTotal.WithLabelValues(project, activity)
+		SweepTerminalOwnerReleasedTotal.WithLabelValues(project, activity)
 	}
 	// MintOutcomeTotal carries NO project label, so this is process-global and
 	// idempotent - seeded here rather than in init() only because this is where
@@ -351,6 +386,7 @@ func init() {
 		SweepErrorsTotal,
 		SweepSkippedTotal,
 		SweepStaleOwnerRepairedTotal,
+		SweepTerminalOwnerReleasedTotal,
 		MintOutcomeTotal,
 		SweepOrphanStrandedSeconds,
 	)
