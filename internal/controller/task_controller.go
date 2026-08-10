@@ -287,10 +287,21 @@ func (r *TaskReconciler) reconcileStage(ctx context.Context, project *tatarav1al
 		return ctrl.Result{Requeue: handled}, err
 	}
 
+	// PARKED EXTERNAL-TERMINAL FINALIZE. A park waits on something; an owned MR
+	// reaching a terminal forge state is the world moving on, which makes the
+	// wait pointless. Runs BEFORE the early return below because that return is
+	// the actual defect - it fires for every parked Task, so reconcileClocks'
+	// finalize was never even evaluated for one. Terminal outcomes only; see
+	// reconcileParkedExternalTerminal.
+	if handled, err := r.reconcileParkedExternalTerminal(ctx, project, task, now); err != nil || handled {
+		return ctrl.Result{}, err
+	}
+
 	// The REAPER owns a done Task (B.6). This reconciler never deletes one and
 	// never resurrects one; a PARKED Task's only exits are the narrow re-entry
 	// rules, which stage.Unpark applies from the webhook and the sweep - plus the
-	// parked binding repair above, the one narrow self-heal that may run first.
+	// parked binding repair above and the external-terminal finalize, the two
+	// narrow self-heals that may run first.
 	if tatarav1alpha1.TaskDone(task) || tatarav1alpha1.Parked(task) {
 		return ctrl.Result{}, nil
 	}

@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 
+	"golang.org/x/time/rate"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -26,6 +27,30 @@ import (
 type TerminalIssueReleaser interface {
 	ReleaseTerminalIssues(ctx context.Context, task *tatarav1alpha1.Task) error
 }
+
+// terminalIssueForgeLimit paces the CHOKE POINT's forge writes, process-wide.
+//
+// It exists for a burst this change can actually produce: 32 review Tasks were
+// measured sitting parked with a merged MR, and the parked external-terminal
+// finalize transitions every one of them in a single drain of the work queue.
+// Each still-open owned Issue costs a comment plus a label, and 64 content-
+// creating calls in a few seconds is squarely inside GitHub's secondary
+// rate-limit territory - which would degrade not just this work but every other
+// forge write the operator makes, including merges.
+//
+// 1/s sustained with a burst of 5 drains that worst case in about half a minute
+// and is far under any published secondary limit. The measured population
+// actually costs ZERO forge calls (a review Task owns MergeRequests, not
+// Issues, so the release returns before it resolves a writer at all), so this
+// is insurance against the shape rather than the observed case.
+//
+// DEFERRAL IS NOT FAILURE, and this adds no new failure mode: the reap pass
+// runs the identical sequence blocking, with retries, on every terminal Task,
+// and is the documented backstop for a release this path does not complete. The
+// reaper is deliberately NOT limited - it is the path that must converge, its
+// forge errors already requeue with backoff, and that behaviour predates this
+// change.
+var terminalIssueForgeLimit = rate.NewLimiter(rate.Limit(1), 5)
 
 // TerminalReleaser is the one implementation, and it is deliberately NOT a
 // second copy of releaseTerminal.
@@ -54,6 +79,16 @@ type TerminalReleaser struct {
 	Client  client.Client
 	SCMFor  func(provider string) (scm.SCMWriter, error)
 	Metrics *obs.OperatorMetrics
+	// Limiter overrides terminalIssueForgeLimit. Tests set it to prove the
+	// deferral; production leaves it nil.
+	Limiter *rate.Limiter
+}
+
+func (tr *TerminalReleaser) limiter() *rate.Limiter {
+	if tr.Limiter != nil {
+		return tr.Limiter
+	}
+	return terminalIssueForgeLimit
 }
 
 // ReleaseTerminalIssues posts the notice and stamps the label on every open
@@ -98,6 +133,16 @@ func (tr *TerminalReleaser) ReleaseTerminalIssues(ctx context.Context, task *tat
 
 	for i := range open {
 		iss := &open[i]
+		// PACED, and a denial STOPS the loop rather than skipping one issue: the
+		// remaining issues are owed to the reaper either way, and continuing would
+		// spend the next token on this same Task instead of leaving it for another.
+		if !tr.limiter().Allow() {
+			obs.TerminalIssueReleasedTotal.WithLabelValues(task.Status.State, obs.TerminalIssueReleaseDeferred).Inc()
+			log.FromContext(ctx).Info("terminal issue release paced; the reap pass still owes it",
+				"action", "terminal_issue_park_deferred", "resource_id", task.Name,
+				"state", task.Status.State, "kind", task.Spec.Kind, "remaining", len(open)-i)
+			return nil
+		}
 		var repo tatarav1alpha1.Repository
 		if err := tr.Client.Get(ctx, client.ObjectKey{Namespace: task.Namespace, Name: iss.Spec.RepositoryRef}, &repo); err != nil {
 			return fmt.Errorf("terminal: get repository %s: %w", iss.Spec.RepositoryRef, err)
@@ -119,7 +164,25 @@ func (tr *TerminalReleaser) ReleaseTerminalIssues(ctx context.Context, task *tat
 // does.
 type EnterOption func(*enterOpts)
 
-type enterOpts struct{ terminal TerminalIssueReleaser }
+type enterOpts struct {
+	terminal TerminalIssueReleaser
+	// mrTerminal lets THIS transition clear a park, in the same status write as
+	// the state. Set only by WithParkClearedForMRTerminal.
+	mrTerminal bool
+}
+
+// WithParkClearedForMRTerminal lets a transition to a TERMINAL outcome proceed
+// on a PARKED Task, clearing the park in the SAME status write.
+//
+// It exists for one shape: every owned MergeRequest reached a terminal forge
+// state while the Task sat parked. See stage.UnparkForMRTerminal for why a park
+// must not survive that, and for the guards that keep this from becoming a
+// general park bypass - the option only ARMS the attempt, and internal/stage
+// still refuses anything that is not a terminal outcome carrying an
+// external-terminal reason.
+func WithParkClearedForMRTerminal() EnterOption {
+	return func(o *enterOpts) { o.mrTerminal = true }
+}
 
 // WithTerminalIssueRelease wires the B.6 terminal treatment into this
 // transition. Pass it wherever the caller can reach an SCM writer; the reap

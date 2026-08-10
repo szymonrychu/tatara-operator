@@ -166,6 +166,17 @@ func enterStage(ctx context.Context, c client.Client, sp objbudget.Spiller, m *o
 		if mutate != nil {
 			mutate(t)
 		}
+		if eo.mrTerminal {
+			// THE SAME MUTATION AGAIN, and for the mirror-image reason the park
+			// below is: the un-park and the terminal state reach the API server as
+			// ONE status write, so no window exists in which this Task is live,
+			// un-parked and non-terminal. BEFORE Enter, not after - Enter is what
+			// refuses a parked Task. internal/stage holds every guard; this only
+			// arms the attempt.
+			if enterErr = stage.UnparkForMRTerminal(t, to, reason); enterErr != nil {
+				return
+			}
+		}
 		enterErr = stage.Enter(t, mrs, to, reason, now)
 		if enterErr == nil && parkReason != "" {
 			// THE SAME MUTATION, so the state and the park reach the API server
@@ -244,6 +255,11 @@ func enterStage(ctx context.Context, c client.Client, sp objbudget.Spiller, m *o
 	// and the cleared clocks without a re-Get.
 	if mutate != nil {
 		mutate(task)
+	}
+	if eo.mrTerminal {
+		if err := stage.UnparkForMRTerminal(task, to, reason); err != nil {
+			return fmt.Errorf("stage: un-park %s(%s) in memory: %w", to, reason, err)
+		}
 	}
 	if err := stage.Enter(task, mrs, to, reason, now); err != nil {
 		return fmt.Errorf("stage: enter %s(%s) in memory: %w", to, reason, err)
