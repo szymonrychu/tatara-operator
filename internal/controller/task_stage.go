@@ -87,6 +87,15 @@ func (r *TaskReconciler) reconcileClocks(ctx context.Context, proj *tatarav1alph
 
 	l := log.FromContext(ctx)
 
+	// THE CI HOLD (PR B, gate site 2). It runs FIRST, ahead of every other clock,
+	// for the same reason the handoff deadline runs ahead of the three: a held
+	// Task has an accepted outcome and a suppressed pod, and every clock below
+	// would be measuring a stage whose agent is already finished. It always
+	// reports handled, so nothing downstream ever sees a held Task.
+	if task.Status.CIWaitSince != nil {
+		return r.reconcileCIWait(ctx, proj, task, now)
+	}
+
 	// EXTERNAL-TERMINAL FINALIZE (fixes #33; widened past kind=review by #578). A
 	// Task sitting at awaiting-review whose owned PRs were merged/closed by a
 	// human has NO legal outcome: submit_outcome answered "no open MR", the idle
@@ -129,6 +138,33 @@ func (r *TaskReconciler) reconcileClocks(ctx context.Context, proj *tatarav1alph
 					"to", tatarav1alpha1.StateRejected, "reason", stage.ReasonMRTakenOver)
 				return ctrl.Result{}, true, r.enter(ctx, proj, task, mrs,
 					tatarav1alpha1.StateRejected, stage.ReasonMRTakenOver, now)
+			}
+		}
+		// THE RED-CI GATE AT AWAITING-REVIEW (PR B, gate site 3). Until now the
+		// gate fired only on edge.To == merged, so a pipeline that went red while
+		// a review pod was reading the diff cost the whole review round before
+		// anything noticed. It bounces here instead, to the agent that can fix it.
+		//
+		// THE MIRROR IS THE TRIGGER, THE FORGE IS THE VERDICT. This block runs on
+		// every awaiting-review reconcile - a 30s requeue - so a live read here
+		// unconditionally would be one forge call per reviewing Task per 30s. The
+		// mirror's ciStatus is what PR A made real (webhook stamp plus a 5m
+		// backstop), so it costs nothing to consult and only a mirror that says
+		// RED pays for ciRedAtReviewedHead's live confirmation.
+		//
+		// IT FAILS OPEN on a read error, like every non-merging site: the merge
+		// corridor re-reads within 60s and is the gate that must hold.
+		if ciMirrorVerdict(mrs) == ciVerdictRed {
+			red, cerr := ciRedAtReviewedHead(ctx, r.Client, r.SCMFor, r.Metrics, proj, mrs)
+			switch {
+			case cerr != nil:
+				l.Error(cerr, "review: the mirror reports RED but live CI could not be read; leaving the task at awaiting-review (the merging gate re-checks every 60s)",
+					"action", "ci_red_check_failed", "resource_id", task.Name, "kind", task.Spec.Kind)
+			case red != nil:
+				l.Info("ci gate: the checks went RED while the task sat at awaiting-review; bouncing it back to the agent",
+					"action", "ci_red_at_review", "resource_id", task.Name, "kind", task.Spec.Kind,
+					"repo", red.Spec.RepositoryRef, "pr", red.Spec.Number)
+				return ctrl.Result{}, true, enterCIRed(ctx, r.Client, r.spiller(proj), r.Metrics, task, mrs, red, now)
 			}
 		}
 	}
@@ -391,6 +427,81 @@ func enqueueDeployTimeoutComment(ctx context.Context, c client.Client, sp objbud
 			"action", "deploy_timeout_comment", "resource_id", task.Name, "issue", key.Name, "repos", repos)
 	}
 	return nil
+}
+
+// reconcileCIWait resolves THE CI HOLD (PR B, gate site 2): the implement
+// outcome was accepted, the code is pushed, and the advance to awaiting-review
+// was held because CI at the pushed head had not answered yet.
+//
+// IT HAS EXACTLY THREE EXITS AND ALL THREE CLEAR THE HOLD. That totality is the
+// design requirement, not a nicety: a hold nothing clears is a Task stranded
+// with a suppressed pod and an accepted outcome, which is a worse failure than
+// the dirty PR the hold exists to prevent.
+//
+//   - RED -> the enterCIRed bounce. The Task is already at
+//     under-implementation, so the transition is a self-edge no-op and what
+//     actually happens is the operator note, the re-entry counter and the
+//     un-suppressed pod. It ALSO revokes the OutcomeAccepted condition, and that
+//     is load-bearing: the acceptance was conditional and the condition failed,
+//     and an agent that fixes CI and resubmits a byte-identical payload would
+//     otherwise hash to the same fingerprint and be answered with a replay 200
+//     that advances nothing.
+//   - CLEAR -> awaiting-review, the transition /outcome would have made.
+//   - CIWaitDeadline -> awaiting-review anyway. FAIL OPEN, because that is
+//     precisely the pre-PR-B behaviour: a forge that stops delivering CI events
+//     costs a bounded wait, never a stranded Task. Gate site 3 still bounces the
+//     Task if the pipeline reports red later.
+//
+// THE TRIGGER IS THE MIRROR, refreshed by PR A's webhook stamp and its 5m
+// CIRefreshCadenceActive backstop - which is armed here precisely because the
+// hold does NOT park the Task. A mirror that says RED is confirmed live before
+// anything destructive happens; a live read that fails or disagrees keeps
+// holding, bounded by the deadline above.
+func (r *TaskReconciler) reconcileCIWait(ctx context.Context, proj *tatarav1alpha1.Project,
+	task *tatarav1alpha1.Task, now time.Time) (ctrl.Result, bool, error) {
+
+	l := log.FromContext(ctx)
+	mrs, err := ownedMergeRequests(ctx, r.mrReader(), task)
+	if err != nil {
+		return ctrl.Result{}, true, err
+	}
+	clearHold := func(t *tatarav1alpha1.Task) { t.Status.CIWaitSince = nil }
+	held := now.Sub(task.Status.CIWaitSince.Time)
+
+	if ciMirrorVerdict(mrs) == ciVerdictRed {
+		red, cerr := ciRedAtReviewedHead(ctx, r.Client, r.SCMFor, r.Metrics, proj, mrs)
+		switch {
+		case cerr != nil:
+			l.Error(cerr, "ci hold: the mirror reports RED but live CI could not be read; still holding",
+				"action", "ci_wait_check_failed", "resource_id", task.Name, "held", held.String())
+		case red != nil:
+			l.Info("ci hold: the checks went RED at the pushed head; the accepted submission is revoked and the agent runs again",
+				"action", "ci_wait_red", "resource_id", task.Name, "repo", red.Spec.RepositoryRef,
+				"pr", red.Spec.Number, "held", held.String())
+			return ctrl.Result{}, true, enterCIRedWith(ctx, r.Client, r.spiller(proj), r.Metrics,
+				task, mrs, red, now, func(t *tatarav1alpha1.Task) {
+					clearHold(t)
+					meta.RemoveStatusCondition(&t.Status.Conditions, tatarav1alpha1.ConditionOutcomeAccepted)
+				})
+		}
+	} else if ciMirrorVerdict(mrs) == ciVerdictClear {
+		l.Info("ci hold: the checks are green at the pushed head; releasing the submission to review",
+			"action", "ci_wait_green", "resource_id", task.Name, "held", held.String())
+		return ctrl.Result{}, true, EnterStage(ctx, r.Client, r.spiller(proj), r.Metrics, task, mrs,
+			tatarav1alpha1.StateAwaitingReview, "", now, clearHold)
+	}
+
+	if held >= tatarav1alpha1.CIWaitDeadline {
+		l.Info("ci hold: no CI verdict arrived within the deadline; releasing the submission to review anyway",
+			"action", "ci_wait_deadline", "resource_id", task.Name, "held", held.String(),
+			"deadline", tatarav1alpha1.CIWaitDeadline.String())
+		return ctrl.Result{}, true, EnterStage(ctx, r.Client, r.spiller(proj), r.Metrics, task, mrs,
+			tatarav1alpha1.StateAwaitingReview, "", now, clearHold)
+	}
+	// The webhook stamp wakes this Task through Owns(&MergeRequest{}) and the
+	// backstop re-reads every 5m; the poll is only the belt for a delivery and a
+	// backstop that BOTH went missing.
+	return ctrl.Result{RequeueAfter: stageRequeue}, true, nil
 }
 
 // reconcileMRBindingBackstop is issue #381 bug B part 2: a Source-bearing

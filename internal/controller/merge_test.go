@@ -62,7 +62,11 @@ type fakeForge struct {
 	closeHook func()
 
 	// call counters / recorders.
-	postReviewCalls       int
+	postReviewCalls int
+	// prStateCalls counts GetPRState. The PR B gate at awaiting-review runs on
+	// every reconcile, so "did it read the forge at all" is the assertion that
+	// keeps the mirror-as-trigger design from silently becoming a live poll.
+	prStateCalls          int
 	listReviewCommentCall int
 	mergeCalls            int
 	mergedRepos           []string
@@ -123,6 +127,7 @@ func (f *fakeForge) GetPRHead(_ context.Context, _, _ string, number int) (strin
 }
 
 func (f *fakeForge) GetPRState(_ context.Context, _, _ string, number int) (scm.PRState, error) {
+	f.prStateCalls++
 	if f.prStateErr != nil {
 		return scm.PRState{}, f.prStateErr
 	}
