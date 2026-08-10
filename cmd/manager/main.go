@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"os"
 
@@ -108,14 +109,30 @@ func buildManager(cfg config.Config, scheme *runtime.Scheme) (manager.Manager, e
 	return ctrl.NewManager(restConfig(), managerOptions(cfg, scheme))
 }
 
-func run(ctx context.Context) error {
+// setupLogging installs the process-wide logger and is the ONLY caller of
+// ctrl.SetLogger in this binary.
+//
+// That "only" is load-bearing, not stylistic. controller-runtime's root logger
+// is a delegating sink whose promise is nil'd by the first Fulfill
+// (pkg/log/deleg.go:79,194), so a second ctrl.SetLogger is a silent no-op. Until
+// #579 this binary called it twice - once with an unconfigured bootstrap logger
+// from main(), then again here - which meant every dependency-emitted line
+// (controller-runtime, klog, client-go through the reconcile-scoped contextual
+// logger) went to the BOOTSTRAP logger: LOG_LEVEL never applied to them, and
+// wrapping only this logger would have shipped a no-op fix.
+func setupLogging(w io.Writer, level slog.Level, gate *obs.ShutdownGate) *slog.Logger {
+	logger := obs.NewLogger(w, level, gate)
+	slog.SetDefault(logger)
+	ctrl.SetLogger(slogToLogr(logger))
+	return logger
+}
+
+func run(ctx context.Context, gate *obs.ShutdownGate) error {
 	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
-	logger := obs.NewLogger(os.Stdout, obs.ParseLevel(cfg.LogLevel))
-	slog.SetDefault(logger)
-	ctrl.SetLogger(slogToLogr(logger))
+	logger := setupLogging(os.Stdout, obs.ParseLevel(cfg.LogLevel), gate)
 	mgr, err := buildManager(cfg, newScheme())
 	if err != nil {
 		return err
@@ -161,11 +178,24 @@ func run(ctx context.Context) error {
 }
 
 func main() {
-	bootstrap := obs.NewLogger(os.Stdout, slog.LevelInfo)
+	// Built before the signal context exists and armed straight after, so the gate
+	// is live for the whole process lifetime including a shutdown that arrives
+	// during startup.
+	gate := obs.NewShutdownGate()
+	// Covers the window before config.Load() succeeds, and the terminal line
+	// below. Gated like the configured logger, because mgr.Start can return a
+	// cancellation-derived error on a normal drain and that exit line is an ERROR
+	// on exactly the shutdown path this change exists to quieten. A grace-period
+	// overrun wraps context.DeadlineExceeded, not Canceled, so it keeps its ERROR.
+	// It deliberately does NOT call ctrl.SetLogger - see setupLogging.
+	bootstrap := obs.NewLogger(os.Stdout, slog.LevelInfo, gate)
 	slog.SetDefault(bootstrap)
-	ctrl.SetLogger(slogToLogr(bootstrap))
-	if err := run(ctrl.SetupSignalHandler()); err != nil {
-		bootstrap.Error("manager exited with error", slog.String("error", err.Error()))
+	ctx := ctrl.SetupSignalHandler()
+	gate.Arm(ctx)
+	if err := run(ctx, gate); err != nil {
+		// slog.Any, not err.Error(): the downgrade predicate needs the live error
+		// to run errors.Is against. The rendered JSON is the same string.
+		bootstrap.Error("manager exited with error", slog.Any("error", err))
 		os.Exit(1)
 	}
 }

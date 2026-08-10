@@ -7,8 +7,16 @@ import (
 )
 
 // NewLogger returns a JSON-format slog.Logger writing to w at the given level.
-func NewLogger(w io.Writer, level slog.Level) *slog.Logger {
-	h := slog.NewJSONHandler(w, &slog.HandlerOptions{Level: level})
+//
+// gate may be nil (bootstrap, tests), in which case the handler is the bare
+// JSON handler. When non-nil, the handler is wrapped so ERROR records that a
+// dependency emits during the process's own shutdown can be re-levelled - see
+// shutdown_log.go.
+func NewLogger(w io.Writer, level slog.Level, gate *ShutdownGate) *slog.Logger {
+	var h slog.Handler = slog.NewJSONHandler(w, &slog.HandlerOptions{Level: level})
+	if gate != nil {
+		h = &shutdownDowngradeHandler{inner: h, gate: gate}
+	}
 	return slog.New(h)
 }
 

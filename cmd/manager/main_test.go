@@ -90,7 +90,7 @@ func TestRestConfig_QPSBurst(t *testing.T) {
 // via obs.NewLogger, slog.Default() emits JSON records (not the stdlib text
 // handler). This guards hard rule 11: all log output must be JSON on stdout.
 func TestSlogDefaultIsJSONAfterRun(t *testing.T) {
-	logger := obs.NewLogger(io.Discard, slog.LevelInfo)
+	logger := obs.NewLogger(io.Discard, slog.LevelInfo, nil)
 	slog.SetDefault(logger)
 	got := slog.Default()
 	if got == nil {
