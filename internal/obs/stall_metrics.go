@@ -64,14 +64,51 @@ var stallProbeTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 // which is a per-project rate, and a task label would put one series per Task in
 // the fleet behind a counter that only ever moves during a fault.
 //
+// reason is the THIRD dimension, and it is what makes the alert actionable. The
+// runbook for "Operator agent pod recreation loop" instructs the operator to
+// split by recreation path - an OOMKill loop wants a memory limit raised, a boot
+// timeout wants an image or a probe looked at, and a handoff-less live pod wants
+// neither - and until this label existed that split was simply not in the data.
+// Its cardinality is bounded by the RecreationReason* set below.
+//
 // Counted at the ATTEMPT, not at success, and counted even on the attempt that
 // exhausts the budget: the runaway shape this pages on is N attempts per hour,
 // and a loop that terminates in a park is exactly the shape whose last attempt
 // must not go missing.
 var podRecreationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Name: "operator_pod_recreations_total",
-	Help: "Agent pod recreations driven by the operator (pod lost, pod never ready, or a live pod that ended with no agent handoff), by project and Task kind.",
-}, []string{"project", "kind"})
+	Help: "Agent pod recreations driven by the operator (pod lost, pod never ready, or a live pod that ended with no agent handoff), by project, Task kind and termination reason.",
+}, []string{"project", "kind", "reason"})
+
+// RecreationReason* is the closed set of values on the `reason` label of
+// operator_pod_recreations_total: WHY the operator had to recreate the pod.
+//
+// CrashLoopBackOff is deliberately absent. Agent pods run RestartPolicy: Never
+// (internal/agent/pod.go), so the kubelet never restarts a wrapper and the state
+// is unreachable; emitting a value nothing can ever produce would put a
+// permanently-zero series behind every project.
+const (
+	// RecreationReasonPodGone: the Pod object was NotFound. Evicted, reaped,
+	// deleted by hand, or its node went away.
+	RecreationReasonPodGone = "PodGone"
+	// RecreationReasonOOMKilled: the kernel OOM killer took the container out for
+	// exceeding its memory limit. The workspace died with it.
+	RecreationReasonOOMKilled = "OOMKilled"
+	// RecreationReasonContainerExited: a container terminated with a non-zero exit
+	// code for some reason other than an OOM kill.
+	RecreationReasonContainerExited = "ContainerExited"
+	// RecreationReasonPodFailed: the Pod reached phase Failed with no terminated
+	// container status to attribute it to (e.g. a node-pressure eviction the
+	// kubelet recorded on the Pod alone).
+	RecreationReasonPodFailed = "PodFailed"
+	// RecreationReasonBootTimeout: the pod existed but never became Ready within
+	// PodReadyTimeout. CLOCK 2.
+	RecreationReasonBootTimeout = "BootTimeout"
+	// RecreationReasonNoHandoff: a LIVE conversation's pod ended without the agent
+	// writing a handoff note, so the Task was re-armed with a replacement pod
+	// rather than parked.
+	RecreationReasonNoHandoff = "NoHandoff"
+)
 
 func init() {
 	ctrlmetrics.Registry.MustRegister(stallProbeTotal, podRecreationsTotal)
@@ -88,11 +125,12 @@ func StallProbeCounter(outcome string) prometheus.Counter {
 }
 
 // PodRecreation increments operator_pod_recreations_total for one recreation.
-func PodRecreation(project, kind string) {
-	podRecreationsTotal.WithLabelValues(project, kind).Inc()
+// reason is one of the RecreationReason* values.
+func PodRecreation(project, kind, reason string) {
+	podRecreationsTotal.WithLabelValues(project, kind, reason).Inc()
 }
 
 // PodRecreationCounter returns the counter for test assertions.
-func PodRecreationCounter(project, kind string) prometheus.Counter {
-	return podRecreationsTotal.WithLabelValues(project, kind)
+func PodRecreationCounter(project, kind, reason string) prometheus.Counter {
+	return podRecreationsTotal.WithLabelValues(project, kind, reason)
 }

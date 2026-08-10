@@ -679,6 +679,18 @@ func (s *TTLStopper) writeSyntheticNote(ctx context.Context, task *tatarav1alpha
 	if contentFree {
 		body = syntheticNoteLostBody()
 	}
+	// AN OOMKILLED POD GETS A DIFFERENT NOTE, because the generic one is not merely
+	// unhelpful there - it is misleading. An OOM kill can never produce an agent
+	// handoff (waitIdle errors on the dead session endpoint, so turnCleared is
+	// false and SubmitHandoffTurn is never reached), and the pod's workspace was
+	// EPHEMERAL: it died with the container. The next agent reads the surviving
+	// earlier note, is told a branch and a commit exist, goes looking for them on
+	// the remote, and finds nothing - which is exactly what happened on
+	// imp-mtg-mtg-decks-i37. Name the kill and tell it to verify.
+	if at, ok := s.oomKilledAt(ctx, task); ok {
+		body = OOMKilledNoteBody(at) +
+			fmt.Sprintf(" Last turn's final text: %s. Repos pushed: %s.", final, pushed)
+	}
 	n := tatarav1alpha1.Note{
 		At:    metav1.NewTime(s.now()),
 		Agent: NoteAgentOperator,
@@ -711,6 +723,53 @@ func syntheticNoteLostBody() string {
 		"PLACEHOLDER, not a handoff - the work done on the previous pod is not recorded anywhere. " +
 		"Re-derive the state from the issue thread and the repos; do not read this note as continuity."
 }
+
+// OOMKilledNoteMarker is the phrase an OOM-kill handoff note leads with, for the
+// same reason SyntheticNoteLostMarker is a constant: it is what the next agent
+// reads instead of a handoff, and the runbook greps for it.
+const OOMKilledNoteMarker = "PREVIOUS POD WAS OOMKILLED"
+
+// OOMKilledNoteBody is the handoff note for a pod the kernel took out for
+// exceeding its memory limit.
+//
+// It says the two things the generic placeholder cannot. First, WHY there is no
+// agent handoff: an OOMKilled wrapper is unreachable, so the handoff turn was
+// never even offered. Second, and this is the one that costs real work: the
+// pod's workspace was ephemeral and died with it, so a branch or commit named in
+// an EARLIER note may never have reached the remote. Without that, the next agent
+// treats the surviving note as fact and hunts for a commit that does not exist.
+//
+// Exported because the respawn path in internal/controller writes it too - the
+// pod-unusable detection now catches most OOM kills before any stop sequence gets
+// to run, and the warning has to land on whichever path gets there first.
+func OOMKilledNoteBody(at time.Time) string {
+	return OOMKilledNoteMarker + ": the previous pod was killed at " + at.UTC().Format(time.RFC3339) +
+		" for exceeding its memory limit, so no agent handoff could be written. Its workspace was " +
+		"ephemeral and died with it: any branch or commit named in an earlier note may never have " +
+		"reached the remote. Verify every branch and commit against the remote before assuming the " +
+		"prior work exists, and do not attempt to recover local state from the dead pod."
+}
+
+// oomKilledAt reports when the Task's wrapper Pod was OOMKilled, reading the
+// kubelet's terminated-container state off the Pod object. RestartPolicy: Never
+// means the corpse is still there to be read. A missing pod, an unreadable one,
+// or any other termination reason reports false.
+func (s *TTLStopper) oomKilledAt(ctx context.Context, task *tatarav1alpha1.Task) (time.Time, bool) {
+	pod := &corev1.Pod{}
+	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: s.Namespace, Name: PodName(task)}, pod); err != nil {
+		return time.Time{}, false
+	}
+	for _, cs := range pod.Status.ContainerStatuses {
+		if t := cs.State.Terminated; t != nil && t.Reason == ReasonOOMKilled {
+			return t.FinishedAt.Time, true
+		}
+	}
+	return time.Time{}, false
+}
+
+// ReasonOOMKilled is the kubelet's ContainerStateTerminated.Reason for a
+// container the kernel OOM killer took out. k8s.io/api exports no symbol for it.
+const ReasonOOMKilled = "OOMKilled"
 
 // maxNoteBody is the Note.Body CRD MaxLength. A long finalText must not make the
 // synthetic note unwritable - an over-long note that the API server rejects is

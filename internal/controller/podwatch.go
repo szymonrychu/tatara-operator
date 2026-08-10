@@ -206,14 +206,19 @@ func (r *PodWatchReconciler) doReconcile(ctx context.Context, req ctrl.Request) 
 	return ctrl.Result{}, nil
 }
 
-// handleNotReady is the CLOCK 2 breach handler. It mirrors handleBootCrash
-// verbatim: a pod that never becomes Ready within PodReadyTimeout RESPAWNS,
-// burning one podRecreations. It does NOT fail the Task, and since O3 it has no
-// terminal at all - maxPodRecreations is deleted, so a boot-crash loop runs
-// until the 24h stage.ResidencyCapAll dead-man switch. THIS IS THE WORST CASE
-// O3 accepted explicitly: at the PodReadyTimeout cycle that is on the order of
-// a few hundred pods, and the compensating control is the
-// operator_pod_recreations_total churn alert, not a cap.
+// handleNotReady is the CLOCK 2 breach handler: a pod that never becomes Ready
+// within PodReadyTimeout RESPAWNS, burning one podRecreations. It does NOT fail
+// the Task, and since O3 it has no terminal at all - maxPodRecreations is
+// deleted, so a boot-crash loop runs until the 24h stage.ResidencyCapAll
+// dead-man switch. THIS IS THE WORST CASE O3 accepted explicitly: at the
+// PodReadyTimeout cycle that is on the order of a few hundred pods, and the
+// compensating control is the operator_pod_recreations_total churn alert, not a
+// cap.
+//
+// It is a DEADLINE, not a crash detector. A pod that dies AFTER becoming Ready
+// is not this function's - the early return below hands it to the reconciler's
+// podUnusable check (internal/controller/task_stage.go), which reads phase and
+// container termination.
 //
 // The deadline check is bootDeadlineExceeded, which anchors on
 // pod.Status.StartTime so image-pull and scheduling latency do not consume the
@@ -234,8 +239,9 @@ func (r *PodWatchReconciler) handleNotReady(ctx context.Context, pod *corev1.Pod
 	recreations := fresh.Status.Stats.PodRecreations
 	// See respawnLostPod: counted at every attempt. A pod that never becomes ready
 	// is the boot-crash loop the churn alert exists for, and with the cap deleted
-	// this counter is the ONLY thing that makes it visible.
-	obs.PodRecreation(fresh.Spec.ProjectRef, fresh.Spec.Kind)
+	// this counter is the ONLY thing that makes it visible. BootTimeout is the one
+	// reason this site can ever report: it is CLOCK 2 and nothing else.
+	obs.PodRecreation(fresh.Spec.ProjectRef, fresh.Spec.Kind, obs.RecreationReasonBootTimeout)
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		cur := &tatarav1alpha1.Task{}
 		if err := r.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: taskName}, cur); err != nil {
@@ -419,9 +425,9 @@ func StampStageWorkStartedAt(ctx context.Context, c client.Client, namespace, ta
 
 // SetupWithManager registers the pod-clock watch. It is a SECOND controller on
 // Pods, deliberately: TaskReconciler's Owns(&corev1.Pod{}) must keep firing on
-// every Pod event (handleBootCrash reads Failed/CrashLoopBackOff there), so this
-// watch cannot be folded into it behind a Ready predicate without disarming the
-// legacy boot machinery.
+// every Pod event - that is what wakes the reconciler on a pod that DIED, for
+// podUnusable to classify - so this watch cannot be folded into it behind a Ready
+// predicate without losing those events.
 func (r *PodWatchReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("podclocks").
