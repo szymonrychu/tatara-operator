@@ -1865,6 +1865,10 @@ func TestOutcome_Brainstorm_ProposeSpawnsAGateTaskPerProposal(t *testing.T) {
 	for i := range tasks.Items {
 		if tasks.Items[i].Spec.Kind == "implement" {
 			gateTasks++
+			// The gate Task is minted PARKED on a flag-off project: nobody has
+			// engaged with the proposal yet, so it must not cost a pod.
+			require.Equal(t, tatarav1alpha1.StateNew, tasks.Items[i].Spec.InitialState)
+			require.Equal(t, stage.ReasonBacklogSweep, tasks.Items[i].Spec.InitialParkReason)
 		}
 	}
 	require.Equal(t, 2, gateTasks)
@@ -1878,6 +1882,35 @@ func TestOutcome_Brainstorm_ProposeSpawnsAGateTaskPerProposal(t *testing.T) {
 		require.True(t, *issues.Items[i].OwnerReferences[0].Controller)
 		require.NotEqual(t, "t1", issues.Items[i].OwnerReferences[0].Name)
 	}
+}
+
+// The mint park is the MIRROR of the approval carve-out, so a project that has
+// autoApproveTataraProposals ON keeps today's behaviour byte for byte: the gate
+// Task mints UN-parked, triage routes it to `refined`, and the agent that runs
+// there is granted by autoApproveApplies without a maintainer comment.
+func TestOutcome_Brainstorm_ProposedGateTaskIsLiveWhenAutoApproveIsOn(t *testing.T) {
+	proj := projectV2("tatara")
+	proj.Spec.AutoApproveTataraProposals = true
+	e := buildV2(t, v2Opts{}, proj, scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StateRefined, "brainstorm"))
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"brainstorm","payload":{
+	  "action":"propose","proposals":[
+	    {"repo":"tatara-operator","title":"one","body":"b","kind":"bug"}]}}`)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var tasks tatarav1alpha1.TaskList
+	require.NoError(t, e.c.List(context.Background(), &tasks, client.InNamespace(ns)))
+	gateTasks := 0
+	for i := range tasks.Items {
+		if tasks.Items[i].Spec.Kind == "implement" {
+			gateTasks++
+			require.Equal(t, tatarav1alpha1.StateNew, tasks.Items[i].Spec.InitialState)
+			require.Empty(t, tasks.Items[i].Spec.InitialParkReason,
+				"the flag ON must mint the gate Task un-parked, exactly as before")
+		}
+	}
+	require.Equal(t, 1, gateTasks)
 }
 
 // The brainstorm propose path stamps the tatara-proposed-by:brainstorm marker on

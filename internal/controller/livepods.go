@@ -122,8 +122,9 @@ func (r *TaskReconciler) liveHandoffAndPark(ctx context.Context, proj *tatarav1a
 	//
 	// Re-arming does not hand the slot back for free. It costs one
 	// podRecreations (stage.ReArmAfterPodLoss, which deliberately does not reset
-	// the counter), so a conversation the ceiling keeps choosing spends its
-	// budget and terminates at pod-recreation-exhausted. And it re-enters as
+	// the counter) and O3 deleted the terminal that used to sit at the end of that
+	// budget, so the churn is now bounded by the 24h residency cap and WATCHED by
+	// the operator_pod_recreations_total alert rather than capped. It re-enters as
 	// UNSTARTED, which evictionCandidates excludes, so the very next pass picks
 	// a different victim instead of grinding this one - the loop moves, it does
 	// not spin.
@@ -179,17 +180,23 @@ func (r *TaskReconciler) agentAskedSomething(ctx context.Context, task *tatarav1
 
 // reArmWithoutHandoff is the non-park exit: the pod ended without the agent
 // saying anything, so the Task gets a replacement pod rather than a fabricated
-// human gate. The pod-recreation budget bounds it, and spending that budget
-// terminates at parked(pod-recreation-exhausted) - which is the correct terminal
-// for repeated pod death and already carries no re-entry.
+// human gate.
+//
+// IT IS NOW UNBOUNDED EXCEPT BY THE 24h RESIDENCY CAP. It used to terminate at
+// parked(pod-recreation-exhausted) once the pod-recreation budget was spent; O3
+// deleted that budget, so an abandoned conversation whose pod keeps ending
+// without a handoff will re-arm until residency fires. Two things keep that
+// honest and BOTH are load-bearing: the idle-reap stand-down in reaper.go (an
+// abandoned conversation inside its ConversationIdle budget is not reaped, so
+// the 30-minute idle churn that would otherwise drive this loop cannot start),
+// and the operator_pod_recreations_total alert at 6/h.
 func (r *TaskReconciler) reArmWithoutHandoff(ctx context.Context, proj *tatarav1alpha1.Project,
 	task *tatarav1alpha1.Task, sp objbudget.Spiller, cause string, now time.Time) error {
 
-	var exhausted bool
+	_ = sp
 	if err := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
-		_, terminal := stage.ReArmAfterPodLoss(fresh, taskMaxPodRecreations(proj), now)
-		exhausted = terminal
-		return !terminal
+		stage.ReArmAfterPodLoss(fresh, now)
+		return true
 	}); err != nil {
 		return fmt.Errorf("livepods: re-arm %s after a handoff-less pod: %w", task.Name, err)
 	}
@@ -206,16 +213,6 @@ func (r *TaskReconciler) reArmWithoutHandoff(ctx context.Context, proj *tatarav1
 		return fmt.Errorf("livepods: clear the turn of the ended pod on %s: %w", task.Name, err)
 	}
 	l := log.FromContext(ctx)
-	if exhausted {
-		l.Info("pod ended with no agent handoff and the recreation budget is spent; parking",
-			"action", "live_rearm_exhausted", "resource_id", task.Name, "cause", cause,
-			"pod_recreations", task.Status.Stats.PodRecreations)
-		if err := ParkTask(ctx, r.Client, sp, r.Metrics, task,
-			stage.ReasonPodRecreationExhausted, now, nil); err != nil {
-			return fmt.Errorf("livepods: park %s after the recreation budget: %w", task.Name, err)
-		}
-		return nil
-	}
 	l.Info("pod ended with no agent handoff; re-arming for a replacement pod instead of waiting on a human",
 		"action", "live_rearm_no_handoff", "resource_id", task.Name, "cause", cause,
 		"state", task.Status.State, "project", task.Spec.ProjectRef)
@@ -328,15 +325,14 @@ func resumptionBlockedOnRoom(ctx context.Context, c client.Client, proj *tatarav
 		return false, err
 	}
 	decline := stage.Unpark(stage.UnparkInput{
-		Task:            t.DeepCopy(),
-		Issues:          issues,
-		MRs:             mrs,
-		ActiveTasks:     activeTasks,
-		MaxOpenTasks:    maxOpen,
-		BotLogin:        botLoginOf(proj),
-		MaxTurnsPerTask: taskMaxTurns(proj, t),
-		LiveHasRoom:     false,
-		Now:             now,
+		Task:         t.DeepCopy(),
+		Issues:       issues,
+		MRs:          mrs,
+		ActiveTasks:  activeTasks,
+		MaxOpenTasks: maxOpen,
+		BotLogin:     botLoginOf(proj),
+		LiveHasRoom:  false,
+		Now:          now,
 	})
 	return decline == stage.DeclineNoLiveRoom, nil
 }

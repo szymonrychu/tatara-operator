@@ -153,10 +153,14 @@ func TestResidencyExceededBoundsEveryLiveState(t *testing.T) {
 		state string
 		cap   time.Duration
 	}{
-		{v1alpha1.StateRefined, 24 * time.Hour},
-		{v1alpha1.StateUnderImplementation, 6 * time.Hour},
-		{v1alpha1.StateAwaitingReview, 4 * time.Hour},
+		// O3: ALL THREE ARE 24h. The 6h/4h caps were the last two clocks that
+		// killed working agents on a proxy for "stuck", and "no feature should
+		// exceed 24h ever" is the platform invariant that replaced them.
+		{v1alpha1.StateRefined, stage.ResidencyCapAll},
+		{v1alpha1.StateUnderImplementation, stage.ResidencyCapAll},
+		{v1alpha1.StateAwaitingReview, stage.ResidencyCapAll},
 	} {
+		require.Equal(t, 24*time.Hour, tc.cap, "the ONE surviving ceiling is 24h for %s", tc.state)
 		under := task(tc.state)
 		under.Status.StateEnteredAt = ptrTime(now.Add(-tc.cap + time.Minute))
 		under.Status.StateWorkStartedAt = ptrTime(now.Add(-tc.cap + time.Minute))
@@ -173,9 +177,16 @@ func TestResidencyExceededIsCumulativeAcrossAParkRoundTrip(t *testing.T) {
 	tk := task(v1alpha1.StateUnderImplementation)
 	tk.Status.StateEnteredAt = ptrTime(now.Add(-1 * time.Hour))
 	tk.Status.StateWorkStartedAt = ptrTime(now.Add(-1 * time.Hour))
-	tk.Status.StageElapsedCarrySeconds = int((5*time.Hour + 30*time.Minute).Seconds())
+	tk.Status.StageElapsedCarrySeconds = int((23*time.Hour + 30*time.Minute).Seconds())
 	require.True(t, stage.ResidencyExceeded(tk, now),
-		"6h30m of cumulative residency exceeds the 6h under-implementation cap")
+		"24h30m of cumulative residency exceeds the 24h cap")
+
+	// The park round trip must not launder the carry into a fresh day.
+	under := task(v1alpha1.StateUnderImplementation)
+	under.Status.StateEnteredAt = ptrTime(now.Add(-1 * time.Hour))
+	under.Status.StateWorkStartedAt = ptrTime(now.Add(-1 * time.Hour))
+	under.Status.StageElapsedCarrySeconds = int((22 * time.Hour).Seconds())
+	require.False(t, stage.ResidencyExceeded(under, now), "23h cumulative is still inside the cap")
 }
 
 // B3. RESIDENCY MUST NOT CHARGE ADMISSION-QUEUE TIME. A live-state Task that
@@ -336,13 +347,20 @@ func TestArmedClock_AnUnparseableTurnCompleteStampFallsBackToTheConversation(t *
 // turn in flight forever is invisible to the first and caught by the second, so
 // disarming the idle clock cannot let an agent run without a deadline.
 func TestASilentlyWorkingAgentIsBoundedByResidencyNotByTheIdleClock(t *testing.T) {
-	tk := live(v1alpha1.StateUnderImplementation, 7*time.Hour)
+	tk := live(v1alpha1.StateUnderImplementation, 25*time.Hour)
 	tk.Annotations = map[string]string{v1alpha1.AnnCurrentTurn: "turn-1"}
 
 	clock, _, _, _ := stage.ArmedClock(tk, false)
 	require.Equal(t, stage.ClockNone, clock, "the idle clock must not touch a working agent")
 	require.True(t, stage.ResidencyExceeded(tk, now),
-		"7h in under-implementation is past the 6h absolute cap: residency is the bound that fires")
+		"25h in under-implementation is past the 24h absolute cap: residency is the bound that fires")
+
+	// A SEVEN-HOUR CODING RUN IS NOT A STALL. It used to park here at the old 6h
+	// under-implementation cap, and that was the ceiling O3 exists to delete.
+	sevenHours := live(v1alpha1.StateUnderImplementation, 7*time.Hour)
+	sevenHours.Annotations = map[string]string{v1alpha1.AnnCurrentTurn: "turn-1"}
+	require.False(t, stage.ResidencyExceeded(sevenHours, now),
+		"a 7h implement run must survive: the 6h cap is deleted")
 
 	// And BELOW the cap neither fires, which is what makes them a pair rather
 	// than a duplicate: there is exactly one live deadline at any moment.

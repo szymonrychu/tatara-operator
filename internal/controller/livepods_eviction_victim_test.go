@@ -325,18 +325,19 @@ func TestEvictionWithAnAgentHandoffStillParks(t *testing.T) {
 	}
 }
 
-// TestEvictionWithoutAgentHandoffParksOnceTheRecreationBudgetIsSpent is the
-// BOUND. Repeated eviction of the same conversation must terminate, and
-// pod-recreation-exhausted is already the right terminal for it - the re-arm
-// deliberately does not reset podRecreations, so the loop is finite by
-// construction.
-func TestEvictionWithoutAgentHandoffParksOnceTheRecreationBudgetIsSpent(t *testing.T) {
+// O3 REMOVED THIS BOUND, AND THAT IS THE ACCEPTED RISK. Repeated eviction of the
+// same conversation used to terminate at pod-recreation-exhausted; there is no
+// recreation ceiling left, so it re-arms every time and the loop is bounded only
+// by the 24h residency dead-man switch, with
+// sum by (project) (increase(operator_pod_recreations_total[1h])) > 6 as the
+// compensating control. The count must therefore keep advancing.
+func TestEvictionWithoutAgentHandoffReArmsEvenDeepIntoTheRecreationCount(t *testing.T) {
 	now := time.Now()
 	proj := evictionCeilingProject(1)
 
 	survivor := liveStateTask("survivor", "infrastructure", now.Add(-1*time.Minute))
 	victim := liveStateTask("victim", "infrastructure", now.Add(-40*time.Minute))
-	victim.Status.Stats.PodRecreations = taskMaxPodRecreations(proj)
+	victim.Status.Stats.PodRecreations = 12
 
 	r := newLiveCapacityFixture(t, proj, survivor, victim)
 	refuseHandoff(t, r)
@@ -349,10 +350,11 @@ func TestEvictionWithoutAgentHandoffParksOnceTheRecreationBudgetIsSpent(t *testi
 	if err := r.Get(context.Background(), objectKeyOf(victim), &got); err != nil {
 		t.Fatalf("get victim: %v", err)
 	}
-	if !tatarav1alpha1.Parked(&got) {
-		t.Fatal("a Task that has burned its whole recreation budget must terminate, not re-arm again")
+	if tatarav1alpha1.Parked(&got) {
+		t.Fatalf("parked at %q: pod-recreation-exhausted is not reachable after O3", got.Status.ParkReason)
 	}
-	if got.Status.ParkReason != stage.ReasonPodRecreationExhausted {
-		t.Fatalf("park reason = %q, want %q", got.Status.ParkReason, stage.ReasonPodRecreationExhausted)
+	if got.Status.Stats.PodRecreations != 13 {
+		t.Fatalf("podRecreations = %d, want 13: the churn alert's input must keep advancing",
+			got.Status.Stats.PodRecreations)
 	}
 }

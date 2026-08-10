@@ -60,6 +60,22 @@ func (s *CallbackServer) ReapOrphans(ctx context.Context) {
 		tasks[taskList.Items[i].Name] = &taskList.Items[i]
 	}
 
+	// Projects, one List, for the SAME reason as the Task List above: the idle
+	// backstop's live-conversation stand-down needs each Task's project
+	// conversationIdleMinutes, and a per-pod Get would multiply that by the pod
+	// count on every reaper pass. A List error is NOT fatal - the map stays empty,
+	// every lookup misses, and ConversationIdle(nil) yields ConversationIdleDefault
+	// (60m), which is the same answer for every project that has not overridden it.
+	projects := make(map[string]*tatarav1alpha1.Project)
+	var projectList tatarav1alpha1.ProjectList
+	if err := s.Client.List(ctx, &projectList, client.InNamespace(s.Namespace)); err != nil {
+		l.Error(err, "reaper: list projects; the idle stand-down falls back to the default conversation budget")
+	} else {
+		for i := range projectList.Items {
+			projects[projectList.Items[i].Name] = &projectList.Items[i]
+		}
+	}
+
 	// Track which pod names are still alive (present and non-orphan) so the
 	// Service pass below can identify Services whose Pod is gone.
 	alivePods := make(map[string]struct{}, len(pods.Items))
@@ -69,7 +85,7 @@ func (s *CallbackServer) ReapOrphans(ctx context.Context) {
 			return
 		}
 		pod := &pods.Items[i]
-		reason, orphan := s.orphanReason(pod, tasks)
+		reason, orphan := s.orphanReason(pod, tasks, projects)
 		if !orphan {
 			alivePods[pod.Name] = struct{}{}
 			continue
@@ -138,7 +154,8 @@ func (s *CallbackServer) ReapOrphans(ctx context.Context) {
 // Creation grace: never reap a pod younger than the grace window to avoid the
 // spawn-vs-reap race where a freshly created pod (or its Task) has not yet
 // propagated through the cache (fixing findings 1, 2, and 7).
-func (s *CallbackServer) orphanReason(pod *corev1.Pod, tasks map[string]*tatarav1alpha1.Task) (string, bool) {
+func (s *CallbackServer) orphanReason(pod *corev1.Pod, tasks map[string]*tatarav1alpha1.Task,
+	projects map[string]*tatarav1alpha1.Project) (string, bool) {
 	grace := s.ReaperGrace
 	if grace == 0 {
 		grace = pollRequeue
@@ -225,11 +242,66 @@ func (s *CallbackServer) orphanReason(pod *corev1.Pod, tasks map[string]*tatarav
 				return "", false
 			}
 		}
+		// THE SECOND STAND-DOWN, AND O3 IS WHY IT HAD TO EXIST.
+		//
+		// "No turn in flight" is not the same fact as "leaked wrapper". It is ALSO
+		// exactly what a LIVE conversation waiting on a human looks like: the agent
+		// answered, the turn completed, and nobody has replied yet. idlePodReapMinutes
+		// is 30 and ConversationIdleDefault is 60, so every such conversation crossed
+		// the idle backstop at the half-hour mark and had its pod deleted out from
+		// under it. That was survivable only because the churn it caused was bounded:
+		// the replacement pod cost one podRecreations, and maxPodRecreations
+		// terminated the Task after a handful of laps.
+		//
+		// O3 DELETED THAT BOUND. With no recreation ceiling, an abandoned
+		// conversation would rotate a pod every 30 minutes for the full 24h residency
+		// cap - ~48 pods on one Task doing nothing - and trip the very
+		// operator_pod_recreations_total alert that replaced the ceiling, with a
+		// cause that is pure operator churn rather than the crash loop the alert is
+		// for. Removing the cap without this stand-down would have manufactured the
+		// alert's own false positives.
+		//
+		// So: a LIVE, un-parked Task still INSIDE its ConversationIdle budget owns
+		// its pod, and the reaper does not touch it. Past that budget the stand-down
+		// lifts and #237's full reach returns - but by then reconcileClocks has
+		// already fired the idle edge and liveHandoffAndPark owns the teardown, which
+		// gives the agent its one handoff turn and parks or re-arms deliberately
+		// instead of deleting a live claude session mid-thought. The backstop is
+		// still the backstop for the case that matters: a wedged reconcile that never
+		// runs that edge at all.
+		//
+		// It reads the SAME clock reconcileClocks reads (stage.ArmedClock +
+		// ConversationIdle), never a reimplementation, so the two cannot disagree
+		// about when the conversation is over.
+		if liveConversationOwnsPod(task, projects[task.Spec.ProjectRef], time.Now()) {
+			return "", false
+		}
 		if time.Since(podLastActivity(pod, task)) > s.IdlePodReapAfter {
 			return "idle no live turn", true
 		}
 	}
 	return "", false
+}
+
+// liveConversationOwnsPod reports whether task is a LIVE, un-parked Task still
+// inside its ConversationIdle budget - i.e. a conversation waiting on a human
+// rather than a leaked wrapper. proj may be nil (project not found, or a List
+// error upstream), which yields ConversationIdleDefault.
+//
+// It requires ClockWork off stage.ArmedClock, which for a live state is the IDLE
+// clock and is armed ONLY once both pod clocks are stamped and no turn is in
+// flight. Every other shape answers false and is left to the backstop: a parked
+// Task (ArmedClock returns the park-retention clock, excluded here explicitly),
+// a live Task still booting (ClockAdmission/ClockReadiness), and a non-live state.
+func liveConversationOwnsPod(task *tatarav1alpha1.Task, proj *tatarav1alpha1.Project, now time.Time) bool {
+	if task == nil || tatarav1alpha1.Parked(task) || !stage.Live(task.Status.State) {
+		return false
+	}
+	clock, since, _, _ := stage.ArmedClock(task, false)
+	if clock != stage.ClockWork || since.IsZero() {
+		return false
+	}
+	return now.Sub(since) <= tatarav1alpha1.ConversationIdle(proj)
 }
 
 // podLastActivity returns the most recent moment this pod's Task showed agent
@@ -1393,15 +1465,13 @@ func (r *ProjectReconciler) deleteReapedTask(ctx context.Context, proj *tatarav1
 // the same way driveUnparks does, off the SAME LiveHasRoom helper - never
 // reimplemented.
 //
-// MaxTurnsPerTask is threaded from the SAME taskMaxTurns(proj, t) ApplyUnpark
-// uses (2026-07-28 security review NEW-1: this field was left at its zero value
-// here, so for a parked(no-outcome) Task, ReasonNoOutcome's
-// Stats.Turns >= in.MaxTurnsPerTask read as true for ANY Turns >= 0 - the probe
-// always declined turns-exhausted and fires=false regardless of the Task's real
-// turn count, so reapParked deleted every parked(no-outcome) Task once
-// ParkRetention elapsed, whether or not driveUnparks would have re-entered it.
-// Identical failure class to the LiveHasRoom fix above, on a different
-// field and reason).
+// UnparkInput.MaxTurnsPerTask IS GONE (O3), and with it the whole 2026-07-28
+// NEW-1 failure mode: the field was easy to leave at its zero value here, which
+// made ReasonNoOutcome's `Stats.Turns >= in.MaxTurnsPerTask` true for ANY
+// Turns >= 0, so the probe always declined turns-exhausted and reapParked
+// deleted every parked(no-outcome) Task once ParkRetention elapsed. The gate it
+// guarded no longer exists in stage.Unpark at all, so the two builders can no
+// longer disagree about it.
 //
 // FIELD-BY-FIELD AUDIT (2026-07-28 security review NEW-1; refreshed for
 // agent-judged-approval-gate step C), every UnparkInput field against this
@@ -1413,7 +1483,7 @@ func (r *ProjectReconciler) deleteReapedTask(ctx context.Context, proj *tatarav1
 // gone: identity-unverified now goes through ApplyUnpark like every other
 // comment-driven reason.
 //
-// NINE fields, SET BY BOTH builders, off the same helpers - no divergence
+// EIGHT fields, SET BY BOTH builders, off the same helpers - no divergence
 // possible without a tenth appearing and only one builder threading it,
 // which is exactly the diff this audit exists to make obvious:
 //   - Task, Now: always required.
@@ -1437,8 +1507,6 @@ func (r *ProjectReconciler) deleteReapedTask(ctx context.Context, proj *tatarav1
 //     branch carries - anyMerged(in.MRs) and HumanReviewRounds >=
 //     MaxHumanReviewRounds - so for that kind the MRs bullet above stays live
 //     too.
-//   - MaxTurnsPerTask: set by both (as of NEW-1), off the SAME taskMaxTurns.
-//     Read ONLY by ReasonNoOutcome.
 //   - ActiveTasks, MaxOpenTasks: read ONLY by ReasonBacklogSweep.
 //
 // NO fields set by neither. There is no longer any UnparkInput field that both
@@ -1469,15 +1537,14 @@ func (r *ProjectReconciler) unparkFires(ctx context.Context, proj *tatarav1alpha
 	}
 	probe := t.DeepCopy()
 	decline := stage.Unpark(stage.UnparkInput{
-		Task:            probe,
-		Issues:          issues,
-		MRs:             mrs,
-		ActiveTasks:     active,
-		MaxOpenTasks:    maxOpen,
-		BotLogin:        botLoginOf(proj),
-		MaxTurnsPerTask: taskMaxTurns(proj, t),
-		LiveHasRoom:     liveRoom,
-		Now:             now,
+		Task:         probe,
+		Issues:       issues,
+		MRs:          mrs,
+		ActiveTasks:  active,
+		MaxOpenTasks: maxOpen,
+		BotLogin:     botLoginOf(proj),
+		LiveHasRoom:  liveRoom,
+		Now:          now,
 	})
 	return decline == stage.DeclineNone, nil
 }

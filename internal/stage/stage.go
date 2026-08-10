@@ -215,15 +215,6 @@ type Edge struct {
 	Trigger string
 }
 
-// EnforcesMaxTurnsPerPod reports whether maxTurnsPerPod bounds this agent kind.
-// The implement kind is EXEMPT (F.4): a long healthy coding run must not be cut
-// off. It is bounded instead by maxTurnsPerTask and ResidencyExceeded.
-// maxTurnsPerPod never terminates a Task in any case - it stops the POD via the
-// G.7 TTL handoff and respawns, spending one podRecreations.
-func EnforcesMaxTurnsPerPod(agentKind string) bool {
-	return agentKind != "" && agentKind != AgentImplement
-}
-
 // Transitions is the transition table as data, keyed by the FROM state (plus
 // the Create pseudo-state). No agent writes status.state; only the operator
 // does, and a transition not in this table is REJECTED (Enter returns
@@ -293,7 +284,7 @@ var Transitions = map[string][]Edge{
 	},
 
 	v1alpha1.StateAwaitingReview: {
-		{To: v1alpha1.StateUnderImplementation, Trigger: "submit_outcome(request_changes) AND spec.kind != review AND reviewRounds < maxReviewRounds, or an approve whose LIVE CI at the reviewed head has FAILED (issue #476). Gated on pendingReview == nil"},
+		{To: v1alpha1.StateUnderImplementation, Trigger: "submit_outcome(request_changes) AND spec.kind != review (O3 deleted the reviewRounds < maxReviewRounds condition), or an approve whose LIVE CI at the reviewed head has FAILED (issue #476). Gated on pendingReview == nil"},
 		{To: v1alpha1.StateMerged, Trigger: "submit_outcome(approve) AND spec.kind != review. Gated on pendingReview == nil, and on the LIVE CI at the reviewed head not being red (issue #476)"},
 		{To: v1alpha1.StateDone, Reason: ReasonMRMergedExternally, Trigger: "kind=review Task, every owned MR merged externally before/while reviewing - no open MR to post an outcome against, so the operator finalizes the honest finished work"},
 		{To: v1alpha1.StateRejected, Trigger: "mr-closed-externally (the review target was abandoned), mr-taken-over (a maintainer took the MR over and this parent owns zero MRs), or a human closed the driving issue"},
@@ -352,8 +343,8 @@ func Legal(from, to string) bool { return legalPairs[[2]string{from, to}] }
 // awaiting-review -> merged BOTH require that every owned MergeRequest has
 // status.pendingReview == nil. A non-nil pendingReview means "a review is owed
 // to the forge and the mirror has not recorded it yet"; a pod spawned then
-// renders a bundle with no findings in it, re-submits, and burns
-// maxReviewRounds. An EMPTY owned-MR set does not open the gate either.
+// renders a bundle with no findings in it, re-submits, and spins another empty
+// review round. An EMPTY owned-MR set does not open the gate either.
 //
 // GUARD 3. awaiting-review -> done is the kind=review external-merge finalize
 // and nothing else may take it.
@@ -876,11 +867,6 @@ func StateElapsedSeconds(t *v1alpha1.Task, now time.Time) float64 {
 	return now.Sub(t.Status.StateEnteredAt.Time).Seconds() + float64(t.Status.StageElapsedCarrySeconds)
 }
 
-// RecordRespawn is the CLOCK 2 breach handler, and it mirrors the semantics of
-// the boot machinery verbatim (handleBootCrash -> resetAgentRun): a never-Ready
-// pod RESPAWNS, burning one podRecreations. It does NOT terminate the Task. The
-// terminal, once the budget is spent, is park(pod-recreation-exhausted) -
-// pod-not-ready does not exist.
 // ReArmAfterPodLoss puts a LIVE Task back in the admission queue for a fresh
 // pod, in place, charging one podRecreations. It is the answer to a pod that
 // ENDED WITHOUT THE AGENT SAYING ANYTHING - no handoff note, nothing asked and
@@ -903,45 +889,56 @@ func StateElapsedSeconds(t *v1alpha1.Task, now time.Time) float64 {
 //     worse than the awaiting-human this replaces. That is #513's "a retry that
 //     provides no retry" shape and it must not be recreated here.
 //   - podRecreations is NOT reset (unlike the un-park reArm), and RecordRespawn
-//     bumps it first. It is the ONLY thing bounding this loop: a Task whose pods
-//     keep dying spends the budget and terminates at pod-recreation-exhausted.
+//     bumps it first. It NO LONGER BOUNDS THIS LOOP - O3 deleted the terminal -
+//     but it is still counted, because it is the input to
+//     operator_pod_recreations_total and therefore to the churn alert
+//     (sum by (project) (increase(operator_pod_recreations_total[1h])) > 6,
+//     critical) that replaced the cap. A boot-crash loop is now bounded only by
+//     ResidencyCapAll; the alert is the compensating control.
 //
 // ConversationLastEventAt is deliberately untouched: it is the HUMAN half of the
 // idle base, and the idle clock is not armed while podStartedAt is nil anyway -
 // it re-bases off the replacement pod's stateWorkStartedAt at pod-ready.
-func ReArmAfterPodLoss(t *v1alpha1.Task, maxPodRecreations int, now time.Time) (Edge, bool) {
-	edge, terminal := RecordRespawn(t, maxPodRecreations)
-	if terminal {
-		return edge, true
-	}
+func ReArmAfterPodLoss(t *v1alpha1.Task, now time.Time) Edge {
+	edge := RecordRespawn(t)
 	stamp := metav1.NewTime(now)
 	t.Status.StateEnteredAt = &stamp
 	t.Status.PodStartedAt = nil
 	t.Status.StateWorkStartedAt = nil
-	return edge, false
+	return edge
 }
 
-func RecordRespawn(t *v1alpha1.Task, maxPodRecreations int) (edge Edge, terminal bool) {
+// RecordRespawn is the CLOCK 2 breach handler, and it mirrors the semantics of
+// the boot machinery verbatim (handleBootCrash -> resetAgentRun): a never-Ready
+// pod RESPAWNS, burning one podRecreations. It does NOT terminate the Task, and
+// since O3 it never returns a terminal edge at all - there is no
+// maxPodRecreations any more. It KEEPS COUNTING: stats.podRecreations is what
+// obs.PodRecreation reports, and that series is the churn alert's only input.
+// Stopping the count to match the deleted cap would blind the one control that
+// replaced it.
+func RecordRespawn(t *v1alpha1.Task) Edge {
 	t.Status.Stats.PodRecreations++
-	if t.Status.Stats.PodRecreations > maxPodRecreations {
-		return Edge{To: ParkTarget, Reason: ReasonPodRecreationExhausted}, true
-	}
-	return Edge{To: Respawn}, false
+	return Edge{To: Respawn}
 }
 
-// BudgetExit is the set of exits EVERY live state carries ON TOP of its clocks
-// (F.4). It returns no edge for a state that runs no pod.
-func BudgetExit(t *v1alpha1.Task, maxTurnsPerTask, maxPodRecreations int, podStoppedNoOutcome bool) (Edge, bool) {
+// BudgetExit is what is LEFT of the set of exits every live state used to carry
+// on top of its clocks (F.4). It returns no edge for a state that runs no pod.
+//
+// O3 deleted two of the three: `Turns >= maxTurnsPerTask` and
+// `PodRecreations > maxPodRecreations`. Both counted work rather than measuring
+// a stall, and both parked agents that were making progress - a 400-turn Task is
+// a long job, not a wedged one. Stall is now decided by the probe machinery (O2)
+// and, failing that, by ResidencyCapAll.
+//
+// podStoppedNoOutcome SURVIVES, without its recreation gate. It is not a budget:
+// it says the pod RAN and is GONE and the Task never left the state, which is a
+// fact about this Task right now rather than a count of how much it has done.
+// It parks no-outcome, which is UnparkTimer and re-drives.
+func BudgetExit(t *v1alpha1.Task, podStoppedNoOutcome bool) (Edge, bool) {
 	if !Live(t.Status.State) {
 		return Edge{}, false
 	}
-	if t.Status.Stats.Turns >= maxTurnsPerTask {
-		return Edge{To: ParkTarget, Reason: ReasonTurnBudgetExhausted}, true
-	}
-	if t.Status.Stats.PodRecreations > maxPodRecreations {
-		return Edge{To: ParkTarget, Reason: ReasonPodRecreationExhausted}, true
-	}
-	if podStoppedNoOutcome && t.Status.Stats.PodRecreations >= maxPodRecreations {
+	if podStoppedNoOutcome {
 		return Edge{To: ParkTarget, Reason: ReasonNoOutcome}, true
 	}
 	return Edge{}, false
@@ -954,16 +951,17 @@ func BudgetExit(t *v1alpha1.Task, maxTurnsPerTask, maxPodRecreations int, podSto
 // else's PR with no Issue, no ApprovalEvidence and no C.6 gate anywhere in its
 // history (fix V7-1). The review IS posted. The human fixes their own PR.
 //
-// On any other kind it re-enters under-implementation, bounded by
-// maxReviewRounds on the MR (cycle 1).
-func RequestChanges(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, maxReviewRounds int) (Edge, bool) {
+// On any other kind it re-enters under-implementation. It USED TO be bounded by
+// maxReviewRounds on the MR (cycle 1); O3 deleted that branch. A review
+// round-trip count measures how much conversation has happened, not whether it
+// is going anywhere, and parking review-loop-exhausted killed the exact
+// implement/review pairs that were converging. status.reviewRounds is still
+// incremented by the review-post path - it is observability, and the park-spike
+// dashboards read it - it just no longer terminates anything. What bounds the
+// loop now is ResidencyCapAll on the state the Task keeps re-entering.
+func RequestChanges(t *v1alpha1.Task) (Edge, bool) {
 	if t.Spec.Kind == kindReview {
 		return Edge{To: ParkTarget, Reason: ReasonAwaitingHuman}, true
-	}
-	for i := range mrs {
-		if mrs[i].Status.ReviewRounds >= maxReviewRounds {
-			return Edge{To: ParkTarget, Reason: ReasonReviewLoopExhausted}, true
-		}
 	}
 	return Edge{To: v1alpha1.StateUnderImplementation}, true
 }
@@ -989,12 +987,12 @@ func RequestChanges(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, maxReviewRoun
 //
 // GUARD 1 still refuses under-implementation/merged for a kind=review Task from
 // anywhere, so an adopted human PR is never driven.
-func ReenterOnReviewChangesRequested(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, maxTurnsPerTask int, now time.Time) (ok bool) {
+func ReenterOnReviewChangesRequested(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, now time.Time) (ok bool) {
 	if now.IsZero() {
 		now = time.Now()
 	}
 	if t.Status.ParkReason != "" {
-		return reenterParkedOnReview(t, mrs, maxTurnsPerTask, now)
+		return reenterParkedOnReview(t, mrs, now)
 	}
 	switch t.Status.State {
 	case v1alpha1.StateAwaitingReview, v1alpha1.StateMerged:
@@ -1022,7 +1020,7 @@ func enterFreshImplementing(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, now t
 
 // reenterParkedOnReview is the parked branch of ReenterOnReviewChangesRequested,
 // routed by ParkReason to mirror Unpark.
-func reenterParkedOnReview(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, maxTurnsPerTask int, now time.Time) bool {
+func reenterParkedOnReview(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, now time.Time) bool {
 	switch t.Status.ParkReason {
 	case ReasonMergeTimeout:
 		if t.Status.MergeReentries >= v1alpha1.MaxMergeReentries {
@@ -1039,9 +1037,10 @@ func reenterParkedOnReview(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, maxTur
 		if anyMerged(mrs) {
 			return false // a re-implement would duplicate an already-merged change
 		}
-		if t.Status.Stats.Turns >= maxTurnsPerTask {
-			return false // would bounce straight into park(turn-budget-exhausted)
-		}
+		// The turn gate that used to sit here ("would bounce straight into
+		// park(turn-budget-exhausted)") is gone with the park reason it guarded
+		// against: BudgetExit no longer exits on Stats.Turns, so there is nothing
+		// left to bounce into. See Unpark's ReasonNoOutcome arm.
 		reArm(t, now)
 		t.Status.HeadMoveReentries = 0
 		t.Status.MergeReentries = 0
@@ -1136,8 +1135,7 @@ type UnparkInput struct {
 	// BotLogin is Project.spec.scm.botLogin. An event authored by it is a BOT
 	// event and can never un-park anything: the operator's own park comment must
 	// not un-park the Task it parked.
-	BotLogin        string
-	MaxTurnsPerTask int
+	BotLogin string
 	// LiveHasRoom is the CALLER's answer to "is this project under its live-pod
 	// ceiling right now". internal/stage is pure and cannot count live Tasks, so
 	// the caller computes it once per pass. False is always SAFE: the un-park
@@ -1173,7 +1171,12 @@ const (
 	DeclineMergedMR = "merged-mr"
 	// DeclineRoundsExhausted: humanReviewRounds is at MaxHumanReviewRounds.
 	DeclineRoundsExhausted = "rounds-exhausted"
-	// DeclineTurnsExhausted: stats.turns is at maxTurnsPerTask.
+	// DeclineTurnsExhausted: stats.turns was at maxTurnsPerTask. RETIRED by O3
+	// and returned by nothing - the turn ceiling no longer terminates or vetoes
+	// anything. The constant STAYS because internal/controller mirrors this
+	// vocabulary onto operator_unpark_declined_total's `kind` label, and a label
+	// value that has stopped being emitted is a series going to zero, not a
+	// compile error to chase.
 	DeclineTurnsExhausted = "turns-exhausted"
 	// DeclineWrongParkedFrom: a no-outcome park from a pre-implement state must
 	// not auto-escalate into implementation (#406).
@@ -1229,9 +1232,17 @@ func Unpark(in UnparkInput) (decline string) {
 		return DeclineNotParked
 	}
 	class, ok := UnparkClassFor(t.Status.ParkReason)
-	if !ok || class == UnparkNever {
-		// review-loop-exhausted, implement-declined, stage-deadline,
-		// admission-starved, turn-budget-exhausted, pod-recreation-exhausted,
+	if !ok || class == UnparkNever || class == UnparkRetired {
+		// UnparkRetired lands here ON PURPOSE. Its three reasons are migrated
+		// EXACTLY ONCE by controller.driveRetiredUnparks, which does not go
+		// through this function at all; giving them an arm here instead would
+		// make a one-shot migration into a permanent retry rule, and would also
+		// hold every un-migrated leftover alive past ParkRetention because the
+		// reaper's unparkFires probe calls this. Treated as UnparkNever, they age
+		// out exactly as they did before O3.
+		//
+		// implement-declined, stage-deadline,
+		// admission-starved,
 		// fold-adoption-unverified, operator-error, triage-stalled,
 		// name-too-long, review-post-refused, object-too-large,
 		// merge-order-missing, agent-contract-mismatch, merge-blocked,
@@ -1278,7 +1289,7 @@ func Unpark(in UnparkInput) (decline string) {
 			// humanReviewRounds is a NEW counter and it is NOT mr.reviewRounds,
 			// which increments only on request_changes: on the approve path that
 			// bound did not exist, and this spawned ONE REVIEW POD PER HUMAN
-			// COMMENT, capped only by maxTurnsPerTask (300).
+			// COMMENT, capped only by the (since deleted) maxTurnsPerTask.
 			if anyMerged(in.MRs) {
 				// A pod spawned into awaiting-review on an already-merged MR has
 				// no legal outcome (issue #393). Refuse re-entry; the Task ages
@@ -1410,9 +1421,13 @@ func Unpark(in UnparkInput) (decline string) {
 			// A re-implement would duplicate an already-merged change.
 			return DeclineMergedMR
 		}
-		if t.Status.Stats.Turns >= in.MaxTurnsPerTask {
-			return DeclineTurnsExhausted
-		}
+		// THE TURN GATE IS GONE (O3), and its removal is the point rather than a
+		// side effect. It read `Stats.Turns >= in.MaxTurnsPerTask` and it was the
+		// SECOND CLOCK a no-outcome park landed on: clearing the park only to be
+		// refused re-entry on a turn count the same release stopped enforcing
+		// anywhere else is a Task that can never be recovered by any means the
+		// operator has. maxTurnsPerTask no longer terminates a live Task, so it
+		// must not veto an un-park either.
 		if d := liveRoomDecline(t, in); d != DeclineNone {
 			return d
 		}

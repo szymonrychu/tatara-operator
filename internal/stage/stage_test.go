@@ -541,22 +541,22 @@ func TestSteadyState_QueuedBehindThreeAgentsDoesNotTerminate(t *testing.T) {
 	require.Equal(t, stage.ReasonAdmissionStarved, edge.Reason)
 }
 
-func TestSteadyState_NeverReadyPodRespawnsThenExhausts(t *testing.T) {
+// O3: a never-Ready pod respawns FOREVER. There is no recreation ceiling left,
+// so RecordRespawn has no terminal - but it MUST keep counting, because
+// stats.podRecreations is the churn alert's only input.
+func TestSteadyState_NeverReadyPodRespawnsAndNeverExhausts(t *testing.T) {
 	tk := task(v1alpha1.StateUnderImplementation)
 	tk.Status.PodStartedAt = ptrTime(now.Add(-10 * time.Minute))
 	edge, fired := stage.Elapsed(tk, false, now)
 	require.True(t, fired)
 	require.Equal(t, stage.Respawn, edge.To, "a never-Ready pod RESPAWNS; it does not terminate the Task")
 
-	for i := 0; i < 3; i++ {
-		e, terminal := stage.RecordRespawn(tk, 3)
-		require.False(t, terminal, "lap %d", i)
-		require.Equal(t, stage.Respawn, e.To)
+	for i := 1; i <= 50; i++ {
+		e := stage.RecordRespawn(tk)
+		require.Equal(t, stage.Respawn, e.To, "lap %d must still respawn: O3 deleted maxPodRecreations", i)
+		require.Equal(t, i, tk.Status.Stats.PodRecreations,
+			"the count feeds operator_pod_recreations_total and must not stop with the cap")
 	}
-	e, terminal := stage.RecordRespawn(tk, 3)
-	require.True(t, terminal)
-	require.Equal(t, stage.ParkTarget, e.To)
-	require.Equal(t, stage.ReasonPodRecreationExhausted, e.Reason)
 }
 
 // The WORK clock measures WORK, not queue wait: a Task that burned its whole
@@ -722,25 +722,27 @@ func TestCIRedEdgeIsLegalFromBothSides(t *testing.T) {
 	require.True(t, stage.LegalFor(tk, mrs, v1alpha1.StateMerged, v1alpha1.StateUnderImplementation))
 }
 
-// CYCLE 1, review rounds.
+// CYCLE 1, review rounds. O3 deleted the round cap: a review round-trip counts
+// conversation, not progress, and review-loop-exhausted killed converging pairs.
 func TestRequestChangesRouting(t *testing.T) {
 	t.Run("review kind parks awaiting-human unconditionally", func(t *testing.T) {
-		e, ok := stage.RequestChanges(taskOfKind(v1alpha1.StateAwaitingReview, "review"), nil, 3)
+		e, ok := stage.RequestChanges(taskOfKind(v1alpha1.StateAwaitingReview, "review"))
 		require.True(t, ok)
 		require.Equal(t, stage.ParkTarget, e.To)
 		require.Equal(t, stage.ReasonAwaitingHuman, e.Reason)
 	})
 	t.Run("non-review kind re-enters under-implementation", func(t *testing.T) {
-		e, ok := stage.RequestChanges(task(v1alpha1.StateAwaitingReview), []v1alpha1.MergeRequest{{}}, 3)
+		e, ok := stage.RequestChanges(task(v1alpha1.StateAwaitingReview))
 		require.True(t, ok)
 		require.Equal(t, v1alpha1.StateUnderImplementation, e.To)
 	})
-	t.Run("rounds exhausted parks review-loop-exhausted", func(t *testing.T) {
-		mrs := []v1alpha1.MergeRequest{{Status: v1alpha1.MergeRequestStatus{ReviewRounds: 3}}}
-		e, ok := stage.RequestChanges(task(v1alpha1.StateAwaitingReview), mrs, 3)
+	t.Run("a hundred rounds still re-enters: the cap is gone", func(t *testing.T) {
+		tk := task(v1alpha1.StateAwaitingReview)
+		tk.Status.Stats.Turns = 400
+		e, ok := stage.RequestChanges(tk)
 		require.True(t, ok)
-		require.Equal(t, stage.ParkTarget, e.To)
-		require.Equal(t, stage.ReasonReviewLoopExhausted, e.Reason)
+		require.Equal(t, v1alpha1.StateUnderImplementation, e.To,
+			"review-loop-exhausted is no longer reachable from RequestChanges")
 	})
 }
 
@@ -748,41 +750,28 @@ func TestBudgetExit(t *testing.T) {
 	t.Run("no exit for an operator-driven state", func(t *testing.T) {
 		tk := task(v1alpha1.StateMerged)
 		tk.Status.Stats.Turns = 9999
-		_, ok := stage.BudgetExit(tk, 300, 3, false)
+		_, ok := stage.BudgetExit(tk, false)
 		require.False(t, ok, "merged runs no pod, so the pod budgets do not apply")
 	})
-	t.Run("turn budget", func(t *testing.T) {
+	t.Run("400 turns does not park: the turn ceiling is deleted", func(t *testing.T) {
 		tk := task(v1alpha1.StateUnderImplementation)
-		tk.Status.Stats.Turns = 300
-		e, ok := stage.BudgetExit(tk, 300, 3, false)
-		require.True(t, ok)
-		require.Equal(t, stage.ReasonTurnBudgetExhausted, e.Reason)
+		tk.Status.Stats.Turns = 400
+		_, ok := stage.BudgetExit(tk, false)
+		require.False(t, ok, "a 400-turn Task is a long job, not a stalled one")
 	})
-	t.Run("pod recreations", func(t *testing.T) {
+	t.Run("10 pod recreations does not park: the recreation ceiling is deleted", func(t *testing.T) {
 		tk := task(v1alpha1.StateUnderImplementation)
-		tk.Status.Stats.PodRecreations = 4
-		e, ok := stage.BudgetExit(tk, 300, 3, false)
-		require.True(t, ok)
-		require.Equal(t, stage.ReasonPodRecreationExhausted, e.Reason)
+		tk.Status.Stats.PodRecreations = 10
+		_, ok := stage.BudgetExit(tk, false)
+		require.False(t, ok, "the churn alert replaced maxPodRecreations, not another cap")
 	})
-	t.Run("no outcome once the recreation budget is spent", func(t *testing.T) {
+	t.Run("no outcome parks with NO recreation gate", func(t *testing.T) {
 		tk := task(v1alpha1.StateUnderImplementation)
-		tk.Status.Stats.PodRecreations = 3
-		e, ok := stage.BudgetExit(tk, 300, 3, true)
-		require.True(t, ok)
+		tk.Status.Stats.PodRecreations = 0
+		e, ok := stage.BudgetExit(tk, true)
+		require.True(t, ok, "podStoppedNoOutcome is a fact about now, not a budget, and keeps firing")
 		require.Equal(t, stage.ReasonNoOutcome, e.Reason)
 	})
-}
-
-// maxTurnsPerPod stops a POD, never a Task, and implement is exempt from it.
-func TestMaxTurnsPerPodIsAPodStopNotATaskTerminal(t *testing.T) {
-	require.False(t, stage.EnforcesMaxTurnsPerPod(stage.AgentImplement),
-		"a long healthy coding run must not be cut off")
-	require.False(t, stage.EnforcesMaxTurnsPerPod(""))
-	for _, k := range []string{stage.AgentReview, stage.AgentBrainstorm, stage.AgentIncident,
-		stage.AgentRefine, stage.AgentDocumentation} {
-		require.True(t, stage.EnforcesMaxTurnsPerPod(k))
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -919,7 +908,7 @@ func TestUnpark_NoOutcome(t *testing.T) {
 		tk := task(v1alpha1.StateNew)
 		require.NoError(t, stage.Park(tk, stage.ReasonNoOutcome, now))
 		require.Equal(t, stage.DeclineWrongParkedFrom, stage.Unpark(stage.UnparkInput{
-			Task: tk, MaxTurnsPerTask: 300, LiveHasRoom: true, Now: now}),
+			Task: tk, LiveHasRoom: true, Now: now}),
 			"#406: a pre-implement no-outcome park must not auto-escalate")
 	})
 	t.Run("refuses when an owned MR already merged", func(t *testing.T) {
@@ -927,20 +916,24 @@ func TestUnpark_NoOutcome(t *testing.T) {
 		require.NoError(t, stage.Park(tk, stage.ReasonNoOutcome, now))
 		mrs := []v1alpha1.MergeRequest{{Status: v1alpha1.MergeRequestStatus{State: "merged"}}}
 		require.Equal(t, stage.DeclineMergedMR, stage.Unpark(stage.UnparkInput{
-			Task: tk, MRs: mrs, MaxTurnsPerTask: 300, LiveHasRoom: true, Now: now}))
+			Task: tk, MRs: mrs, LiveHasRoom: true, Now: now}))
 	})
-	t.Run("refuses at the lifetime turn cap", func(t *testing.T) {
+	// O3: THE TURN GATE IS GONE. It was the second clock a no-outcome park landed
+	// on, so clearing the park only bought a refusal on a count nothing else
+	// enforces any more.
+	t.Run("re-arms at 400 turns: the lifetime turn cap no longer vetoes", func(t *testing.T) {
 		tk := task(v1alpha1.StateUnderImplementation)
-		tk.Status.Stats.Turns = 300
+		tk.Status.Stats.Turns = 400
 		require.NoError(t, stage.Park(tk, stage.ReasonNoOutcome, now))
-		require.Equal(t, stage.DeclineTurnsExhausted, stage.Unpark(stage.UnparkInput{
-			Task: tk, MaxTurnsPerTask: 300, LiveHasRoom: true, Now: now}))
+		require.Equal(t, stage.DeclineNone, stage.Unpark(stage.UnparkInput{
+			Task: tk, LiveHasRoom: true, Now: now}))
+		require.Empty(t, tk.Status.ParkReason)
 	})
 	t.Run("re-arms in place from under-implementation", func(t *testing.T) {
 		tk := task(v1alpha1.StateUnderImplementation)
 		require.NoError(t, stage.Park(tk, stage.ReasonNoOutcome, now))
 		require.Equal(t, stage.DeclineNone, stage.Unpark(stage.UnparkInput{
-			Task: tk, MaxTurnsPerTask: 300, LiveHasRoom: true, Now: now}))
+			Task: tk, LiveHasRoom: true, Now: now}))
 		require.Equal(t, v1alpha1.StateUnderImplementation, tk.Status.State)
 	})
 }
@@ -965,7 +958,7 @@ func TestUnpark_EveryUnparkNeverReasonDeclinesNoReentry(t *testing.T) {
 		require.NoError(t, stage.Park(tk, r, now))
 		require.Equal(t, stage.DeclineNoReentry, stage.Unpark(stage.UnparkInput{
 			Task: tk, BotLogin: "bot", Issues: openIssue(), LiveHasRoom: true,
-			ActiveTasks: 0, MaxOpenTasks: 6, MaxTurnsPerTask: 300, Now: now}),
+			ActiveTasks: 0, MaxOpenTasks: 6, Now: now}),
 			"reason %q must have no re-entry: re-entering an exhaustion terminal escapes its own cap one lap at a time", r)
 		require.Equal(t, r, tk.Status.ParkReason)
 	}
@@ -1025,7 +1018,7 @@ func TestReenterOnReviewChangesRequested(t *testing.T) {
 		{v1alpha1.StateDeployed, false},
 	} {
 		tk := task(tc.state)
-		require.Equal(t, tc.want, stage.ReenterOnReviewChangesRequested(tk, mrs, 300, now), "from %s", tc.state)
+		require.Equal(t, tc.want, stage.ReenterOnReviewChangesRequested(tk, mrs, now), "from %s", tc.state)
 		if tc.want {
 			require.Equal(t, v1alpha1.StateUnderImplementation, tk.Status.State)
 		}
@@ -1035,7 +1028,7 @@ func TestReenterOnReviewChangesRequested(t *testing.T) {
 func TestReenterOnReviewChangesRequested_ResetsMergeAndHeadBudgets(t *testing.T) {
 	tk := task(v1alpha1.StateMerged)
 	tk.Status.MergeReentries, tk.Status.HeadMoveReentries, tk.Status.CIRedReentries = 2, 2, 2
-	require.True(t, stage.ReenterOnReviewChangesRequested(tk, []v1alpha1.MergeRequest{{}}, 300, now))
+	require.True(t, stage.ReenterOnReviewChangesRequested(tk, []v1alpha1.MergeRequest{{}}, now))
 	require.Zero(t, tk.Status.MergeReentries)
 	require.Zero(t, tk.Status.HeadMoveReentries)
 	require.Zero(t, tk.Status.CIRedReentries)
@@ -1044,14 +1037,14 @@ func TestReenterOnReviewChangesRequested_ResetsMergeAndHeadBudgets(t *testing.T)
 func TestReenterOnReviewChangesRequested_MergeTimeoutAccounting(t *testing.T) {
 	tk := task(v1alpha1.StateMerged)
 	require.NoError(t, stage.Park(tk, stage.ReasonMergeTimeout, now))
-	require.True(t, stage.ReenterOnReviewChangesRequested(tk, nil, 300, now))
+	require.True(t, stage.ReenterOnReviewChangesRequested(tk, nil, now))
 	require.Equal(t, 1, tk.Status.MergeReentries)
 	require.Equal(t, v1alpha1.StateMerged, tk.Status.State, "NEVER under-implementation: that recreates deleted branches")
 	require.Empty(t, tk.Status.ParkReason)
 
 	tk.Status.MergeReentries = v1alpha1.MaxMergeReentries
 	require.NoError(t, stage.Park(tk, stage.ReasonMergeTimeout, now))
-	require.False(t, stage.ReenterOnReviewChangesRequested(tk, nil, 300, now),
+	require.False(t, stage.ReenterOnReviewChangesRequested(tk, nil, now),
 		"budget spent: fold rather than race driveUnparks' own terminal")
 }
 
@@ -1059,16 +1052,18 @@ func TestReenterOnReviewChangesRequested_NoOutcomeGuards(t *testing.T) {
 	merged := []v1alpha1.MergeRequest{{Status: v1alpha1.MergeRequestStatus{State: "merged"}}}
 	tk := task(v1alpha1.StateUnderImplementation)
 	require.NoError(t, stage.Park(tk, stage.ReasonNoOutcome, now))
-	require.False(t, stage.ReenterOnReviewChangesRequested(tk, merged, 300, now))
+	require.False(t, stage.ReenterOnReviewChangesRequested(tk, merged, now))
 
+	// The turn gate here is gone with Unpark's (O3): both read the same retired
+	// ceiling, and leaving one of them would just move the wedge.
 	tk2 := task(v1alpha1.StateUnderImplementation)
-	tk2.Status.Stats.Turns = 300
+	tk2.Status.Stats.Turns = 400
 	require.NoError(t, stage.Park(tk2, stage.ReasonNoOutcome, now))
-	require.False(t, stage.ReenterOnReviewChangesRequested(tk2, nil, 300, now))
+	require.True(t, stage.ReenterOnReviewChangesRequested(tk2, nil, now))
 
 	tk3 := task(v1alpha1.StateUnderImplementation)
 	require.NoError(t, stage.Park(tk3, stage.ReasonNoOutcome, now))
-	require.True(t, stage.ReenterOnReviewChangesRequested(tk3, nil, 300, now))
+	require.True(t, stage.ReenterOnReviewChangesRequested(tk3, nil, now))
 	require.Empty(t, tk3.Status.ParkReason)
 }
 
@@ -1079,7 +1074,7 @@ func TestReenterOnReviewChangesRequested_EveryOtherParkFolds(t *testing.T) {
 		}
 		tk := task(v1alpha1.StateUnderImplementation)
 		require.NoError(t, stage.Park(tk, r, now))
-		require.False(t, stage.ReenterOnReviewChangesRequested(tk, nil, 300, now), "reason %q", r)
+		require.False(t, stage.ReenterOnReviewChangesRequested(tk, nil, now), "reason %q", r)
 	}
 }
 

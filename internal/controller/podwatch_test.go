@@ -196,23 +196,30 @@ func TestPodWatchImagePullBackOffRespawns(t *testing.T) {
 	require.True(t, apierrors.IsNotFound(err) || fresh.DeletionTimestamp != nil, "the never-Ready pod is deleted")
 }
 
-// TestPodWatchRecreationBudgetExhaustedFailsTask: once maxPodRecreations is spent
-// the Task parks(pod-recreation-exhausted), state unchanged - NEVER
-// pod-not-ready, which is not a member of the F.5 closed reason set.
-func TestPodWatchRecreationBudgetExhaustedFailsTask(t *testing.T) {
+// O3: A BOOT-CRASH LOOP NO LONGER TERMINATES. This used to assert
+// park(pod-recreation-exhausted) once the budget was spent. The budget is
+// deleted, so a pod that never becomes Ready respawns at any recreation count -
+// the loop is bounded only by the 24h residency dead-man switch, and
+// sum by (project) (increase(operator_pod_recreations_total[1h])) > 6 is the
+// compensating control. The count must therefore keep advancing.
+//
+// THIS IS THE PHASE'S NAMED RISK, asserted rather than merely documented: at the
+// PodReadyTimeout cycle a crash loop can mint a few hundred pods inside 24h.
+func TestPodWatchNeverReadyPodRespawnsAtAnyRecreationCount(t *testing.T) {
 	r, task, pod := seedStagedTask(t, "podclock-exhausted", tatarav1alpha1.StateUnderImplementation, "implement", newFakeSession())
-	task.Status.Stats.PodRecreations = maxPodRecreations
+	task.Status.Stats.PodRecreations = 12
 	require.NoError(t, k8sClient.Status().Update(context.Background(), task))
 
 	setPodStatus(t, pod, 6*time.Minute, false)
 	reconcilePod(t, r, pod)
 
 	got := getTask(t, "podclock-exhausted")
-	require.Equal(t, tatarav1alpha1.StateUnderImplementation, got.Status.State, "a park never moves state")
-	require.True(t, tatarav1alpha1.Parked(got))
-	require.Equal(t, stage.ReasonPodRecreationExhausted, got.Status.ParkReason)
-	require.True(t, stage.ValidReason(got.Status.ParkReason))
-	require.NotEqual(t, "pod-not-ready", got.Status.ParkReason)
+	require.Equal(t, tatarav1alpha1.StateUnderImplementation, got.Status.State)
+	require.False(t, tatarav1alpha1.Parked(got),
+		"pod-recreation-exhausted is not reachable after O3; the alert replaced the cap")
+	require.Equal(t, 13, got.Status.Stats.PodRecreations,
+		"the count is the churn alert's only input and must not stop with the cap")
+	require.Nil(t, got.Status.PodStartedAt, "the replacement pod must re-stamp a fresh clock")
 }
 
 // TestPodWatchUnadmittedTaskSitsOnClock1: a Task that has not been admitted has

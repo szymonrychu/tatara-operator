@@ -37,9 +37,8 @@ const (
 	// session is processing a prior turn, so requeue on a short bounded interval
 	// (backpressure) instead of erroring and tight-looping on reconcile backoff
 	// (issue #168). A session stuck busy forever is bounded by the F.4 WORK clock.
-	busyRequeue       = 15 * time.Second
-	maxPodRecreations = 3
-	turnTimeoutGrace  = 60 * time.Second
+	busyRequeue      = 15 * time.Second
+	turnTimeoutGrace = 60 * time.Second
 
 	annCurrentTurn           = tatarav1alpha1.AnnCurrentTurn
 	annTurnComplete          = tatarav1alpha1.AnnTurnComplete
@@ -133,7 +132,7 @@ func isFieldSelectorUnsupported(err error) bool {
 //	mint          -> triaging (F.3's Create edge)
 //	terminal      -> the REAPER owns it; return
 //	clocks (F.4)  -> CLOCK 1 admission / CLOCK 2 readiness / CLOCK 3 work
-//	caps  (F.4)   -> maxTurnsPerTask, maxPodRecreations, pod-stopped-no-outcome
+//	caps  (F.4)   -> pod-stopped-no-outcome (O3 deleted the other two)
 //	pod-less stage-> the operator does the work
 //	pod stage     -> ticket -> admission -> pod -> G.10 handshake -> turn-0
 //

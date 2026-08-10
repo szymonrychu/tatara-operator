@@ -174,8 +174,10 @@ type TaskSpec struct {
 	// +optional
 	// +kubebuilder:validation:MaxItems=100
 	DocumentsTasks []string `json:"documentsTasks,omitempty"`
-	// MaxTurnsPerTask is the LIFETIME turn backstop across every pod of this
-	// Task. Zero = Project.spec.agent.maxTurnsPerTask (default 300).
+	// Deprecated: RETIRED BY O3 together with Project.spec.agent.maxTurnsPerTask,
+	// and read by no enforcement path. It WAS the per-Task override of the
+	// LIFETIME turn backstop. Retained for API compatibility with already-created
+	// Task objects; setting it has no effect.
 	// +optional
 	MaxTurnsPerTask int `json:"maxTurnsPerTask,omitempty"`
 	// InitialState is the Create-edge target a mint chooses when it is NOT the

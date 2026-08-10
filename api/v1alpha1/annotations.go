@@ -55,6 +55,17 @@ const (
 	// MR branch (e.g. renovate/*) can be worked without reproducing the derived
 	// tatara/* branch name.
 	AnnTakeoverHeadBranch = "tatara.dev/takeover-head-branch"
+	// AnnRetiredParkMigrated is the ONCE-ONLY LATCH for the O3 retired-park
+	// migration (controller.driveRetiredUnparks). Its VALUE is the RFC3339 instant
+	// the migration ran; its PRESENCE - not its value - is the guard.
+	//
+	// It lives on metadata, not status, precisely so it survives everything status
+	// does: a re-park, an un-park, a state transition, a spill. A Task migrated
+	// once and later parked turn-budget-exhausted again by some other build must
+	// NOT be migrated a second time, and a status field would have to be
+	// individually preserved by every writer to promise that. Nothing ever removes
+	// this annotation.
+	AnnRetiredParkMigrated = "tatara.dev/retired-park-migrated"
 )
 
 // AnnBrainstormSources is the annotation key carrying the comma-separated

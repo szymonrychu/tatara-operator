@@ -401,10 +401,7 @@ func projectV2(name string) *tatarav1alpha1.Project {
 			Scm: &tatarav1alpha1.ScmSpec{
 				Provider: "github", Owner: "acme", BotLogin: "tatara-bot",
 			},
-			Agent: tatarav1alpha1.AgentSpec{
-				Model: "m", MaxTurnsPerPod: 40, MaxTurnsPerTask: 300,
-				MaxReviewRounds: 3, MaxPodRecreations: 3,
-			},
+			Agent: tatarav1alpha1.AgentSpec{Model: "m"},
 		},
 	}
 }

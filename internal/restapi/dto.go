@@ -9,14 +9,17 @@ import (
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 )
 
+// agentDTO no longer carries maxTurnsPerPod / maxTurnsPerTask / maxReviewRounds /
+// maxPodRecreations. O3 retired all four ceilings, and the CRD fields they came
+// from are Deprecated with zero readers - reporting a budget the operator does
+// not enforce to the agent that thinks it is being budgeted is worse than
+// omitting it. Every one was `omitempty`, so a consumer that still reads them
+// sees the same absent-field/zero it already saw for any project that never set
+// one.
 type agentDTO struct {
 	Model              string `json:"model,omitempty"`
 	Image              string `json:"image,omitempty"`
 	PermissionMode     string `json:"permissionMode,omitempty"`
-	MaxTurnsPerPod     int    `json:"maxTurnsPerPod,omitempty"`
-	MaxTurnsPerTask    int    `json:"maxTurnsPerTask,omitempty"`
-	MaxReviewRounds    int    `json:"maxReviewRounds,omitempty"`
-	MaxPodRecreations  int    `json:"maxPodRecreations,omitempty"`
 	TurnTimeoutSeconds int    `json:"turnTimeoutSeconds,omitempty"`
 }
 
@@ -99,15 +102,14 @@ type TaskDTO struct {
 	Status        taskStatusDTO  `json:"status"`
 
 	// C.2.3 index fields and the C.2.4 spec additions.
-	Title           string   `json:"title,omitempty"`
-	Body            string   `json:"body,omitempty"`
-	Issues          []string `json:"issues,omitempty"`
-	MRs             []string `json:"mrs,omitempty"`
-	AgeSeconds      int64    `json:"ageSeconds,omitempty"`
-	MergeOrder      []string `json:"mergeOrder,omitempty"`
-	AlertRules      []string `json:"alertRules,omitempty"`
-	DocumentsTasks  []string `json:"documentsTasks,omitempty"`
-	MaxTurnsPerTask int      `json:"maxTurnsPerTask,omitempty"`
+	Title          string   `json:"title,omitempty"`
+	Body           string   `json:"body,omitempty"`
+	Issues         []string `json:"issues,omitempty"`
+	MRs            []string `json:"mrs,omitempty"`
+	AgeSeconds     int64    `json:"ageSeconds,omitempty"`
+	MergeOrder     []string `json:"mergeOrder,omitempty"`
+	AlertRules     []string `json:"alertRules,omitempty"`
+	DocumentsTasks []string `json:"documentsTasks,omitempty"`
 }
 
 func toProjectDTO(p tatarav1alpha1.Project) ProjectDTO {
@@ -120,9 +122,7 @@ func toProjectDTO(p tatarav1alpha1.Project) ProjectDTO {
 		MaxBundleBytes:      p.Spec.MaxBundleBytes,
 		Agent: agentDTO{
 			Model: p.Spec.Agent.Model, Image: p.Spec.Agent.Image,
-			PermissionMode: p.Spec.Agent.PermissionMode, MaxTurnsPerTask: p.Spec.Agent.MaxTurnsPerTask,
-			MaxTurnsPerPod: p.Spec.Agent.MaxTurnsPerPod, MaxReviewRounds: p.Spec.Agent.MaxReviewRounds,
-			MaxPodRecreations:  p.Spec.Agent.MaxPodRecreations,
+			PermissionMode:     p.Spec.Agent.PermissionMode,
 			TurnTimeoutSeconds: p.Spec.Agent.TurnTimeoutSeconds,
 		},
 		Status: projectStatusDTO{WebhookURL: p.Status.WebhookURL, Conditions: p.Status.Conditions},
@@ -214,15 +214,14 @@ func toTaskDTO(task tatarav1alpha1.Task) TaskDTO {
 			DeliveredAt:        rfc3339(task.Status.DeliveredAt),
 			DocumentedBy:       task.Status.DocumentedBy,
 		},
-		Title:           taskTitle(task.Spec.Goal),
-		Body:            taskBody(task.Spec.Goal),
-		Issues:          refKeys(task.Status.IssueRefs, "iss-", "#"),
-		MRs:             refKeys(task.Status.MRRefs, "mr-", "!"),
-		AgeSeconds:      int64(time.Since(task.CreationTimestamp.Time).Seconds()),
-		MergeOrder:      task.Spec.MergeOrder,
-		AlertRules:      task.Spec.AlertRules,
-		DocumentsTasks:  task.Spec.DocumentsTasks,
-		MaxTurnsPerTask: task.Spec.MaxTurnsPerTask,
+		Title:          taskTitle(task.Spec.Goal),
+		Body:           taskBody(task.Spec.Goal),
+		Issues:         refKeys(task.Status.IssueRefs, "iss-", "#"),
+		MRs:            refKeys(task.Status.MRRefs, "mr-", "!"),
+		AgeSeconds:     int64(time.Since(task.CreationTimestamp.Time).Seconds()),
+		MergeOrder:     task.Spec.MergeOrder,
+		AlertRules:     task.Spec.AlertRules,
+		DocumentsTasks: task.Spec.DocumentsTasks,
 	}
 	if task.Spec.Source != nil {
 		d.Source = &taskSourceDTO{

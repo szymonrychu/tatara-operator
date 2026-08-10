@@ -15,6 +15,7 @@ type taskMetrics struct {
 	taskParkedTotal         *prometheus.CounterVec
 	orphanAdoptedTotal      *prometheus.CounterVec
 	unparkDeclinedTotal     *prometheus.CounterVec
+	taskUnparkedTotal       *prometheus.CounterVec
 	livePods                *prometheus.GaugeVec
 	liveEntryDeclined       *prometheus.CounterVec
 	liveClosedTotal         *prometheus.CounterVec
@@ -77,6 +78,16 @@ func newTaskMetrics(reg prometheus.Registerer) *taskMetrics {
 				"guard (the live Task had already drifted from what the caller believed was parked - rare, " +
 				"anomalous) or rule (stage.Unpark's re-entry rule was not satisfied yet - normal steady state).",
 		}, []string{"parkReason", "kind"}),
+		taskUnparkedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_task_unparked_total",
+			Help: "Parks RELEASED, by the parkReason left behind and the unpark class that released it. " +
+				"class=retired is the O3 one-shot migration (driveRetiredUnparks) releasing a park written by a " +
+				"deleted ceiling - turn-budget-exhausted, review-loop-exhausted, pod-recreation-exhausted. It is " +
+				"EXPECTED to spike once after the O3 rollout and then sit flat at zero forever: each Task is " +
+				"latched by the tatara.dev/retired-park-migrated annotation and migrated exactly once, so a " +
+				"class=retired rate that does NOT decay to zero means the latch is not sticking and Tasks are " +
+				"being re-driven on every pass.",
+		}, []string{"reason", "class"}),
 		livePods: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "operator_live_pods",
 			Help: "Tasks currently in a LIVE state and un-parked, by project. It is the live reading of the per-project ceiling (Project.spec.maxLivePods, default 2, clamped strictly below maxConcurrentAgents).",
@@ -117,6 +128,7 @@ func newTaskMetrics(reg prometheus.Registerer) *taskMetrics {
 		m.taskParkedTotal,
 		m.orphanAdoptedTotal,
 		m.unparkDeclinedTotal,
+		m.taskUnparkedTotal,
 		m.livePods,
 		m.liveEntryDeclined,
 		m.liveClosedTotal,
@@ -310,6 +322,27 @@ func (m *OperatorMetrics) UnparkDeclined(stageReason, kind string) {
 		return
 	}
 	m.unparkDeclinedTotal.WithLabelValues(stageReason, kind).Inc()
+}
+
+// UnparkClassRetired is the `class` label value for the O3 retired-park
+// migration. It is declared in this package, not aliased from internal/stage,
+// so a stage-package identifier can never leak into a label value by accident -
+// the same rule internal/controller's UnparkDecline vocabulary follows.
+const UnparkClassRetired = "retired"
+
+// TaskUnparked increments operator_task_unparked_total for one released park.
+// Nil-safe: a reconciler wired without metrics is a test, not an outage.
+func (m *OperatorMetrics) TaskUnparked(parkReason, class string) {
+	if m == nil || m.taskUnparkedTotal == nil {
+		return
+	}
+	m.taskUnparkedTotal.WithLabelValues(parkReason, class).Inc()
+}
+
+// TaskUnparkedCounter returns the operator_task_unparked_total counter for
+// (parkReason,class) for test assertions.
+func (m *OperatorMetrics) TaskUnparkedCounter(parkReason, class string) prometheus.Counter {
+	return m.taskUnparkedTotal.WithLabelValues(parkReason, class)
 }
 
 // UnparkDeclinedCounter returns the operator_unpark_declined_total counter for
