@@ -7,6 +7,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
@@ -269,12 +270,19 @@ func TestNoReentryPark_CrashBetweenSeverAndCollectFinishes(t *testing.T) {
 	require.False(t, ok, "an interrupted resume must be finished, not left holding the intake name")
 }
 
-// TestNoReentryPark_NoOpenIssueLeavesTheReaperInCharge: a reply that is not on a
-// live owned OPEN Issue is not this driver's business. It must not collect the
-// Task early - the reaper's ParkRetention clock still owns it.
-func TestNoReentryPark_NoOpenIssueLeavesTheReaperInCharge(t *testing.T) {
+// TestNoReentryPark_ClosedIssueIsSeveredAndCollected is C.4: a CLOSED owned
+// Issue is no longer a dead end.
+//
+// The driver used to bail outright when no owned Issue was open, and that bail
+// was a silent vanish. The Task sat parked under a reason nothing un-parks
+// until ParkRetention deleted it seven days later, cascade-deleting the mirror
+// with it - and IsOrphanIssue needs state == "open", so nothing could ever look
+// at that issue again. Now the closed Issue is SEVERED (its mirror survives as
+// a zero-owner CR) and the Task is collected early. It is only the MINT the
+// closed issue does not get: forgeItemFromMirror describes an OPEN item.
+func TestNoReentryPark_ClosedIssueIsSeveredAndCollected(t *testing.T) {
 	ctx := context.Background()
-	proj, repo, old, iss, oldName, _ := noReentryFixture(t, stage.ReasonStageDeadline, "maintainer")
+	proj, repo, old, iss, oldName, issName := noReentryFixture(t, stage.ReasonStageDeadline, "maintainer")
 	iss.Status.State = "closed"
 
 	c := newMirrorClient(t, proj, repo, reapSecret(), old, iss)
@@ -282,10 +290,14 @@ func TestNoReentryPark_NoOpenIssueLeavesTheReaperInCharge(t *testing.T) {
 
 	require.NoError(t, r.resumeNoReentryParks(ctx, proj, time.Now()))
 
-	still, ok := mustGetTask(t, c, oldName)
-	require.True(t, ok, "no open owned issue: nothing to resume and nothing to collect early")
-	require.Equal(t, old.UID, still.UID)
-	require.Empty(t, still.Annotations[AnnResumeReleasing], "no commitment marker on a non-candidate")
+	_, ok := mustGetTask(t, c, oldName)
+	require.False(t, ok, "a closed owned issue collects the stranded task early, it does not strand it for a week")
+
+	var surviving tatarav1alpha1.Issue
+	require.NoError(t, c.Get(ctx, types.NamespacedName{Namespace: testNS, Name: issName}, &surviving),
+		"the mirror of a closed issue SURVIVES the collection; it must not cascade away")
+	_, owned := own.ControllerOwner(&surviving)
+	require.False(t, owned, "the severed mirror carries no controller owner")
 }
 
 // TestNoReentryPark_MintNotOwedDoesNotLogAsResumed is finding B5 (adversarial

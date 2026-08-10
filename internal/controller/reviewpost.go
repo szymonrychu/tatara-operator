@@ -49,10 +49,23 @@ const pendingCommentMarkerPrefix = "<!-- tatara-request id="
 // uses to defer issue_write(edit|close) through PendingComment, whose action
 // enum is only {comment,reply}. The drain reads them back out and performs the
 // edit/close; it never posts the marker as a comment body.
+// parkIntentMarker is the SAME deferral for the C.1 close invariant's refusal
+// arm. When a close is refused because the Task still owns a live PR, the
+// issue must be PARKED instead - the terminal-notice comment plus the
+// tatara-parked label, the pair notifyTerminalIssue posts on the reap path -
+// and the REST layer holds no SCM writer, so it defers both through the one
+// mechanism it does have. The drain performs the comment AND the label; the
+// two travel together for the reason notifyTerminalIssue's step 2 gives, that
+// a comment with no label leaves the next sweep minting the issue ACTIVE.
 const (
 	editIntentMarker  = "<!-- tatara-edit -->"
 	closeIntentMarker = "<!-- tatara-close -->"
+	parkIntentMarker  = "<!-- tatara-park -->"
 )
+
+// ParkIntentBody encodes a deferred park of one Issue: the comment body to
+// post, plus the tatara-parked label the drain stamps alongside it.
+func ParkIntentBody(reason string) string { return parkIntentMarker + "\n" + reason }
 
 // PendingCommentMarker renders the forge-side idempotency key of one deferred
 // comment. A comment on the thread carrying it means "this requestId already
@@ -646,6 +659,36 @@ func (d *StageDriver) DrainPendingComments(ctx context.Context, obj client.Objec
 			}
 			l.Info("review: issue closed", "action", "scm_issue_closed", "resource_id", obj.GetName(),
 				"repo", repo.Name, "number", number, "request_id_key", pc.RequestID)
+
+		case strings.HasPrefix(body, parkIntentMarker):
+			// The C.1 close invariant's refusal arm: comment, THEN label, both
+			// blocking, exactly as notifyTerminalIssue orders them. The comment is
+			// dedup'd on the thread by its requestId marker like the close arm
+			// above; AddLabel is idempotent on both forges and needs no marker.
+			reason := strings.TrimPrefix(body, parkIntentMarker)
+			reason = strings.TrimPrefix(reason, "\n")
+			marker := PendingCommentMarker(pc.RequestID)
+			thread, threadErr := listThreadComments(ctx, reader, obj, owner, name, number)
+			if threadErr != nil {
+				return threadErr
+			}
+			if !threadCarriesMarker(thread, marker) {
+				commentErr := writer.Comment(ctx, token, fmt.Sprintf("%s#%d", slug, number), marker+"\n"+reason)
+				RecordSCM(d.Metrics, provider, "comment", commentErr)
+				if commentErr != nil {
+					return fmt.Errorf("review: park comment on %s#%d (request_id_key %s): %w",
+						slug, number, pc.RequestID, commentErr)
+				}
+			}
+			labelErr := writer.AddLabel(ctx, token, fmt.Sprintf("%s#%d", slug, number), TataraParkedLabel)
+			RecordSCM(d.Metrics, provider, "add_label", labelErr)
+			if labelErr != nil {
+				return fmt.Errorf("review: stamp %s on %s#%d: %w", TataraParkedLabel, slug, number, labelErr)
+			}
+			l.Info("review: issue parked instead of closed",
+				"action", "scm_issue_parked", "resource_id", obj.GetName(),
+				"repo", repo.Name, "number", number, "label", TataraParkedLabel,
+				"request_id_key", pc.RequestID)
 
 		case strings.HasPrefix(body, editIntentMarker):
 			// issue_write(edit), deferred as a comment intent (C.2.12).

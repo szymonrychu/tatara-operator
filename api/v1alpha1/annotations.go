@@ -68,6 +68,28 @@ const (
 	AnnRetiredParkMigrated = "tatara.dev/retired-park-migrated"
 )
 
+// AnnAutoReentries / AnnAutoReentryExhausted are the C.3 automatic-pickup
+// bound, and they live on the ISSUE mirror on purpose.
+//
+// Every automatic re-entry COLLECTS the parked Task and mints a fresh one, so
+// anything stored on the Task resets to zero on every lap and bounds nothing.
+// The Issue CR is the only object that survives the laps - which is precisely
+// why C.4 stopped cascade-deleting it with its owner - so it is where the count
+// has to live. Metadata, not status: a mirror's status is re-derived from the
+// forge on every sync, and a counter a sync can clobber is a counter that
+// silently un-bounds the loop it exists to bound.
+//
+// AnnAutoReentries is the decimal count of automatic re-entries SPENT.
+// AnnAutoReentryExhausted latches the ONE dead-end notice posted when the count
+// reaches MaxAutoReentries; its VALUE is the RFC3339 instant, its PRESENCE is
+// the guard. Neither is ever removed: a re-opened issue that genuinely deserves
+// a fresh budget gets it from a human, who is the only actor whose judgement
+// the bound is protecting against being bypassed.
+const (
+	AnnAutoReentries        = "tatara.dev/auto-reentries"
+	AnnAutoReentryExhausted = "tatara.dev/auto-reentry-exhausted"
+)
+
 // AnnBrainstormSources is the annotation key carrying the comma-separated
 // brainstorm source list stamped on brainstorm Tasks by projectscan and read by
 // agent.BuildPod to gate the egress network label. Centralised here so the two

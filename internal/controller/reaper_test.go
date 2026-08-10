@@ -1518,6 +1518,13 @@ func TestReapDeliveredDocReferenceLogFetchFailureIsNonBlocking(t *testing.T) {
 	mr.Status.HeadBranch = agent.TaskBranch(&tatarav1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: "undoc-task"}})
 	mr.Status.State = "merged"
 
+	// AnnTerminalReleased short-circuits reapDelivered's C.2 terminal sequence,
+	// which reads MergeRequests of its own. This test is about the DIAGNOSTIC
+	// read only, so the terminal half is pinned as already-done rather than
+	// having the injection's call index re-derived every time that sequence
+	// changes shape.
+	undoc.Annotations = map[string]string{AnnTerminalReleased: "true"}
+
 	base := newMirrorClient(t, proj, repo, reapSecret(), undoc, mr)
 	// The first MergeRequest Get is needsDocumenting's OWN read (it must
 	// succeed so the Task is genuinely blocked); the second is the
