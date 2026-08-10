@@ -15,7 +15,7 @@ func TestToProjectDTO(t *testing.T) {
 		Spec: tatarav1alpha1.ProjectSpec{
 			ScmSecretRef: "demo-scm", TriggerLabel: "tatara", MaxConcurrentAgents: 3,
 			Agent: tatarav1alpha1.AgentSpec{Model: "claude", Image: "img:1",
-				PermissionMode: "bypassPermissions", MaxTurnsPerTask: 50, TurnTimeoutSeconds: 1800},
+				PermissionMode: "bypassPermissions", TurnTimeoutSeconds: 1800},
 		},
 		Status: tatarav1alpha1.ProjectStatus{WebhookURL: "https://x/operator/webhooks/demo"},
 	}

@@ -39,7 +39,7 @@ func TestRisk_ReaperDoesNotCollectALiveConversingPod(t *testing.T) {
 	srv := &CallbackServer{ReaperGrace: time.Minute, IdlePodReapAfter: time.Hour}
 	tasks := map[string]*tatarav1alpha1.Task{task.Name: task}
 
-	if reason, orphan := srv.orphanReason(pod, tasks); orphan {
+	if reason, orphan := srv.orphanReason(pod, tasks, nil); orphan {
 		t.Fatalf("the reaper would collect a live conversing pod: %q", reason)
 	}
 }
@@ -65,7 +65,7 @@ func TestRisk_ReaperStillCollectsASupersededPodUnderConversing(t *testing.T) {
 	srv := &CallbackServer{ReaperGrace: time.Minute}
 	tasks := map[string]*tatarav1alpha1.Task{task.Name: task}
 
-	if _, orphan := srv.orphanReason(pod, tasks); !orphan {
+	if _, orphan := srv.orphanReason(pod, tasks, nil); !orphan {
 		t.Fatal("a superseded pod survived under conversing: the next turn would run the wrong agent kind")
 	}
 }

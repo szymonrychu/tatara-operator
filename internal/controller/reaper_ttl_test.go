@@ -66,7 +66,7 @@ func TestReaper_StandsDownInsideTheTTLStopWindow(t *testing.T) {
 
 	pod, tasks := ttlRaceFixture(70*time.Minute, time.Hour, 15*time.Minute, true)
 
-	reason, reap := s.orphanReason(pod, tasks)
+	reason, reap := s.orphanReason(pod, tasks, nil)
 	if reap {
 		t.Fatalf("reaped a pod inside its TTL-stop window (reason %q): the G.7 stop owns this pod, "+
 			"and deleting it is what made every synthetic handoff note content-free", reason)
@@ -83,7 +83,7 @@ func TestReaper_StillReapsAnIdlePodBeforeT0(t *testing.T) {
 
 	pod, tasks := ttlRaceFixture(45*time.Minute, time.Hour, 15*time.Minute, true)
 
-	if _, reap := s.orphanReason(pod, tasks); !reap {
+	if _, reap := s.orphanReason(pod, tasks, nil); !reap {
 		t.Fatal("a pod idle past the backstop and BEFORE t0 must still be reaped: no stop is pending")
 	}
 }
@@ -108,7 +108,7 @@ func TestReaper_ReArmsPastTheStopsHardCap(t *testing.T) {
 	// t0 at 2h ago; cap = t0 + 2*15m + 60s = t0 + 31m, an hour and a half behind.
 	pod, tasks := ttlRaceFixture(3*time.Hour, time.Hour, 15*time.Minute, true)
 
-	if _, reap := s.orphanReason(pod, tasks); !reap {
+	if _, reap := s.orphanReason(pod, tasks, nil); !reap {
 		t.Fatal("past the stop's hard cap the stop has finished or is not coming; #237 must re-arm")
 	}
 }
@@ -122,7 +122,7 @@ func TestReaper_ReapsAPodCarryingNoTTL(t *testing.T) {
 
 	pod, tasks := ttlRaceFixture(70*time.Minute, time.Hour, 15*time.Minute, false)
 
-	if _, reap := s.orphanReason(pod, tasks); !reap {
+	if _, reap := s.orphanReason(pod, tasks, nil); !reap {
 		t.Fatal("no TTL on the pod means no TTL stop is coming; the backstop must still apply")
 	}
 }

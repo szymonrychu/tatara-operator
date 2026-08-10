@@ -36,8 +36,6 @@ func ApplyReviewChangesRequested(ctx context.Context, c client.Client, reader cl
 	if rdr == nil {
 		rdr = c
 	}
-	maxTurns := taskMaxTurns(proj, task)
-
 	key := client.ObjectKeyFromObject(task)
 	reentered := false
 	var prevStage string
@@ -61,7 +59,7 @@ func ApplyReviewChangesRequested(ctx context.Context, c client.Client, reader cl
 			}
 		}
 		prevStage = fresh.Status.State
-		if !stage.ReenterOnReviewChangesRequested(fresh, mrs, maxTurns, now) {
+		if !stage.ReenterOnReviewChangesRequested(fresh, mrs, now) {
 			return nil
 		}
 		if err := c.Status().Update(ctx, fresh); err != nil {

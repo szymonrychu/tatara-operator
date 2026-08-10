@@ -801,7 +801,7 @@ func TestReviewAdvanceEdge_TerminalMRBeatsStalePendingReview(t *testing.T) {
 		State:         "merged",
 		PendingReview: &tatarav1alpha1.PendingReview{},
 	}}
-	edge, ok := reviewAdvanceEdge(review, []tatarav1alpha1.MergeRequest{merged}, 3)
+	edge, ok := reviewAdvanceEdge(review, []tatarav1alpha1.MergeRequest{merged})
 	require.True(t, ok, "a merged MR must finalize even with a stale pendingReview")
 	require.Equal(t, tatarav1alpha1.StateDone, edge.To)
 	require.Equal(t, stage.ReasonMRMergedExternally, edge.Reason)

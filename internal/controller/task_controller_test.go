@@ -510,7 +510,7 @@ func TestReconcileStage_PodStageCapsAreIdempotentAgainstAStaleCache(t *testing.T
 	entered := metav1.NewTime(now.Add(-10 * time.Minute))
 	// THE STALE OBJECT the informer cache hands the reconciler: still
 	// implementing, pod stamps set (so CLOCK 3 WORK is what is armed, and it has
-	// not elapsed), podRecreations over maxPodRecreations, and no Pod object
+	// not elapsed), podRecreations over somePodRecreations, and no Pod object
 	// exists so podGone reports the pod stopped. reconcileCaps would derive
 	// park(pod-recreation-exhausted) from exactly this, if it were ever reached.
 	stale := &tatarav1alpha1.Task{
@@ -522,7 +522,7 @@ func TestReconcileStage_PodStageCapsAreIdempotentAgainstAStaleCache(t *testing.T
 			StateEnteredAt:     &entered,
 			PodStartedAt:       &entered,
 			StateWorkStartedAt: &entered,
-			Stats:              tatarav1alpha1.TaskStats{PodRecreations: maxPodRecreations + 1},
+			Stats:              tatarav1alpha1.TaskStats{PodRecreations: somePodRecreations + 1},
 		},
 	}
 	// THE API SERVER: our own previous pass already parked it for exactly this

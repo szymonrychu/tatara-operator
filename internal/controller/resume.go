@@ -27,6 +27,7 @@ import (
 const AnnResumeReleasing = "tatara.dev/resume-releasing"
 
 // resumeNoReentryParks restores the ONE-REPLY GUARANTEE for the UnparkNever
+// (and, since O3, UnparkRetired)
 // population: one human reply to a Task parked with a reason nobody un-parks is
 // enough, and the human never has to comment a SECOND time.
 //
@@ -96,9 +97,18 @@ func (r *ProjectReconciler) resumeNoReentryParks(ctx context.Context, proj *tata
 			continue
 		}
 		class, ok := stage.UnparkClassFor(t.Status.ParkReason)
-		if !ok || class != stage.UnparkNever {
+		if !ok || (class != stage.UnparkNever && class != stage.UnparkRetired) {
 			continue // a human- or timer-un-parked reason: driveUnparks owns it.
 		}
+		// UnparkRetired IS INCLUDED, and leaving it out would have been a silent
+		// regression of the one-reply guarantee. O3 moved three reasons out of
+		// UnparkNever into that migration class, and stage.Unpark still declines
+		// them (DeclineNoReentry) - so to a human replying on the issue they behave
+		// EXACTLY like an UnparkNever park, and this is still their only same-pass
+		// answer. driveRetiredUnparks does not overlap: it is a one-shot,
+		// annotation-latched sweep bounded at 48h that never looks at
+		// pendingEvents. Past that window - or on a Task it already migrated once -
+		// this path is the ONLY thing a reply can reach.
 		if !hasNonBotPendingEvent(t, botLoginOf(proj)) {
 			// No HUMAN reply waiting. The bot's own park comment must never
 			// resume the Task it parked, so authorship is the whole test here.

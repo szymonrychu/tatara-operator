@@ -119,11 +119,13 @@ func turnInFlight(t *v1alpha1.Task) bool {
 // stateWorkStartedAt and the replacement re-stamps it; the replacement's turn 0
 // completes), so an ABANDONED conversation on a project whose
 // agentPodTTLSeconds is at or below its conversationIdleMinutes can rotate a pod
-// instead of parking, repeatedly. It is bounded three ways and cannot run
-// forever: ResidencyExceeded (24h/6h/4h, cumulative), maxTurnsPerTask (every
-// rotation costs a turn 0) and maxPodRecreations. The alternative - a base that
-// only a human can move - is the #521 regression itself, which killed working
-// agents at 60 minutes.
+// instead of parking, repeatedly. Since O3 it is bounded ONE way and that way is
+// the only reason the ratchet is still acceptable: ResidencyExceeded, cumulative,
+// at ResidencyCapAll. The turn and pod-recreation budgets that used to be the
+// other two bounds are gone; the rotation churn they used to cap is now watched
+// by the operator_pod_recreations_total alert instead. The alternative - a base
+// that only a human can move - is the #521 regression itself, which killed
+// working agents at 60 minutes.
 //
 // An unparseable or absent turn stamp falls back to the other two: a malformed
 // annotation must never widen a deadline. ok is false when there is no
@@ -144,16 +146,42 @@ func idleBase(t *v1alpha1.Task) (time.Time, bool) {
 	return base, true
 }
 
+// ResidencyCapAll is THE ONE SURVIVING CEILING, and it is a CONSTANT.
+//
+// The stall-detection rework (O3) deleted maxTurnsPerTask, maxReviewRounds and
+// maxPodRecreations as terminals: every one of them killed agents that were
+// working, because a turn count, a review round and a pod recreation are all
+// proxies for "stuck" and none of them measures it. What replaced them is the
+// wrapper's probe/interrupt state machine (W3/W4, O2), which asks the agent
+// whether it is alive instead of counting how much it has done.
+//
+// Residency is what is left: a DEAD-MAN SWITCH, not a work budget. It exists so
+// that a Task the probe machinery cannot reach at all - a wedged pod, a boot
+// crash loop, an operator bug - still has a terminus. "No feature should exceed
+// 24h ever" is the platform invariant it encodes.
+//
+// IT IS A CONSTANT AND NOT A CRD FIELD, deliberately. A CRD field can be
+// silently dropped by structural-schema pruning when the schema and the values
+// fall out of lockstep, and the failure mode of a silently-pruned dead-man
+// switch is no dead-man switch at all. A constant cannot be pruned, cannot be
+// mis-set per project, and cannot drift between the operator and helmfile.
+const ResidencyCapAll = 24 * time.Hour
+
 // residencyCaps is the ABSOLUTE bound on time spent in a live state, whatever
 // the idle clock says. Only the live states have one: an operator-driven state
 // already has a work budget, and new/done/rejected are not where an agent runs.
 //
-// The three values are the old kind-specific stage budgets, carried over:
-// clarifying's 24h, implementing's 6h, reviewing's 4h.
+// All three are ResidencyCapAll. They used to be the old kind-specific stage
+// budgets (clarifying 24h, implementing 6h, reviewing 4h) and those two shorter
+// ones were exactly the "working agent killed by a clock that measures the wrong
+// thing" shape O3 removed everywhere else - a chatty review round-trip or a long
+// healthy coding run is not a stall at 4h or 6h. The known cost is that a
+// genuinely wedged Task holds a concurrency slot up to four times longer; the
+// compensation is the +2 on maxConcurrentAgents that ships with it.
 var residencyCaps = map[string]time.Duration{
-	v1alpha1.StateRefined:             24 * time.Hour,
-	v1alpha1.StateUnderImplementation: 6 * time.Hour,
-	v1alpha1.StateAwaitingReview:      4 * time.Hour,
+	v1alpha1.StateRefined:             ResidencyCapAll,
+	v1alpha1.StateUnderImplementation: ResidencyCapAll,
+	v1alpha1.StateAwaitingReview:      ResidencyCapAll,
 }
 
 // ResidencyExceeded is THE MANDATORY MITIGATION for the one genuine regression

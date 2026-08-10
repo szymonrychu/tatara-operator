@@ -289,9 +289,16 @@ type AgentSpec struct {
 	// +kubebuilder:default="bypassPermissions"
 	// +optional
 	PermissionMode string `json:"permissionMode,omitempty"`
-	// MaxTurnsPerTask is the LIFETIME turn backstop across every pod of a
-	// Task, for ALL agent kinds (contract A.6). Task.Spec.MaxTurnsPerTask
-	// overrides this per-Task when set.
+	// Deprecated: RETIRED BY O3 AND READ BY NOTHING. It is retained ONLY so that
+	// helmfile values already setting it keep validating; deleting the field is a
+	// breaking API change that needs a lockstep helmfile PR, and a later
+	// semver:major removes it once helmfile is clean. Setting it has NO EFFECT.
+	//
+	// MaxTurnsPerTask WAS the LIFETIME turn backstop across every pod of a Task
+	// (contract A.6). It parked turn-budget-exhausted, which killed long healthy
+	// runs: a turn count measures how much an agent has done, not whether it is
+	// stuck. Stall is now decided by the probe machinery and, failing that, by the
+	// 24h stage.ResidencyCapAll dead-man switch.
 	// +kubebuilder:default=300
 	// +optional
 	MaxTurnsPerTask int `json:"maxTurnsPerTask,omitempty"`
@@ -331,17 +338,41 @@ type AgentSpec struct {
 	// +kubebuilder:default=2
 	// +optional
 	StallProbeMaxAttempts int `json:"stallProbeMaxAttempts,omitempty"`
-	// MaxTurnsPerPod bounds turns within ONE pod's life. The implement agent
-	// kind is EXEMPT (a long, healthy coding run must not be cut off mid-pod;
-	// the boot-crash and TTL watchdogs remain its runaway bounds).
+	// Deprecated: RETIRED BY O3 AND READ BY NOTHING. It is retained ONLY so that
+	// helmfile values already setting it keep validating; deleting the field is a
+	// breaking API change that needs a lockstep helmfile PR, and a later
+	// semver:major removes it once helmfile is clean. Setting it has NO EFFECT.
+	//
+	// MaxTurnsPerPod bounded turns within ONE pod's life. It had NO enforcement
+	// reader even before O3 (stage.EnforcesMaxTurnsPerPod, its only gate, had zero
+	// callers and is deleted); the pod's runaway bounds are agentPodTTLSeconds and
+	// the boot-crash watchdog.
 	// +kubebuilder:default=40
 	// +optional
 	MaxTurnsPerPod int `json:"maxTurnsPerPod,omitempty"`
-	// MaxReviewRounds bounds request_changes round-trips on a kind=review Task.
+	// Deprecated: RETIRED BY O3 AND READ BY NOTHING. It is retained ONLY so that
+	// helmfile values already setting it keep validating; deleting the field is a
+	// breaking API change that needs a lockstep helmfile PR, and a later
+	// semver:major removes it once helmfile is clean. Setting it has NO EFFECT.
+	//
+	// MaxReviewRounds bounded request_changes round-trips. It parked
+	// review-loop-exhausted, which killed implement/review pairs that were
+	// converging - a round count says how much conversation happened, not whether
+	// it is going anywhere. status.reviewRounds is still incremented for
+	// observability.
 	// +kubebuilder:default=3
 	// +optional
 	MaxReviewRounds int `json:"maxReviewRounds,omitempty"`
-	// MaxPodRecreations bounds boot-crash respawns of one Task's agent pod.
+	// Deprecated: RETIRED BY O3 AND READ BY NOTHING. It is retained ONLY so that
+	// helmfile values already setting it keep validating; deleting the field is a
+	// breaking API change that needs a lockstep helmfile PR, and a later
+	// semver:major removes it once helmfile is clean. Setting it has NO EFFECT.
+	//
+	// MaxPodRecreations bounded boot-crash respawns of one Task's agent pod. It
+	// parked pod-recreation-exhausted. Its REPLACEMENT IS AN ALERT, not a cap:
+	// sum by (project) (increase(operator_pod_recreations_total[1h])) > 6,
+	// critical (tatara-observability). stats.podRecreations is still counted and
+	// still exported - that counter is the alert's only input.
 	// +kubebuilder:default=3
 	// +optional
 	MaxPodRecreations int `json:"maxPodRecreations,omitempty"`
