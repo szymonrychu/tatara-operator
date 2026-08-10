@@ -116,6 +116,66 @@ func TestStrandedPark_AutoReentryReMintsWithNoHumanReply(t *testing.T) {
 		"the budget is spent on the ISSUE, the only object that outlives the lap")
 }
 
+// TestStrandedPark_AllIssuesClosedIsSeveredAndCollected closes the LAST hole in
+// the no-re-entry population, and it is a hole BOTH drivers left open.
+//
+// driveStrandedParks skipped a Task whose every owned Issue was closed, on the
+// stated grounds that resumeNoReentryParks would sever and collect it - but that
+// driver `continue`s before resumeOne on `!hasNonBotPendingEvent`, so C.4's
+// closed-issue handling was unreachable without a human comment. UnparkNever
+// park + every owned issue closed + nobody commented = neither driver acted, and
+// the Task sat the full ParkRetention. It is not merely untidy: a parked Task is
+// not TaskDone, so createTaskRaceSafe answers MintExistingLive for the
+// deterministic IntakeTaskName it holds, blocking any re-mint of that
+// (project, kind, repo, number) for seven days.
+//
+// The live shape is a HUMAN closing the issue under a parked Task, which
+// ApplyIssueClosedStop structurally cannot convert into a clean terminal
+// (issue_apply.go short-circuits on Parked). It is severed and collected on the
+// SAME grace clock, with NO mint - there is nothing left to re-mint - and NO
+// budget spent, because a collect is not a re-entry.
+func TestStrandedPark_AllIssuesClosedIsSeveredAndCollected(t *testing.T) {
+	ctx := context.Background()
+	proj, repo, task, iss, taskName, issName := strandedFixture(t, 2*time.Hour)
+	iss.Status.State = "closed" // a human closed it, e.g. by merging the PR by hand
+
+	c := newMirrorClient(t, proj, repo, reapSecret(), task, iss)
+	r := reapReconciler(c, newStrandWriter())
+
+	require.NoError(t, r.driveStrandedParks(ctx, proj, time.Now()))
+
+	_, ok := mustGetTask(t, c, taskName)
+	require.False(t, ok,
+		"a stranded park whose every issue is closed is a corpse: collected early, not held for ParkRetention")
+
+	var surviving tatarav1alpha1.Issue
+	require.NoError(t, c.Get(ctx, types.NamespacedName{Namespace: testNS, Name: issName}, &surviving),
+		"the mirror survives the collection (C.4); only the ownerRef goes")
+	_, owned := own.ControllerOwner(&surviving)
+	require.False(t, owned)
+	require.Empty(t, surviving.Annotations[tatarav1alpha1.AnnAutoReentries],
+		"a collect spends NO automatic budget: nothing was re-minted, so there is no loop to bound")
+}
+
+// TestStrandedPark_OwningNoIssueIsLeftToTheReaper: the collect above is
+// justified by the intake key an ISSUE-owning Task holds. A Task owning no Issue
+// mirror at all has nothing to sever and no key worth freeing early, so it keeps
+// the reaper's ordinary ParkRetention clock.
+func TestStrandedPark_OwningNoIssueIsLeftToTheReaper(t *testing.T) {
+	ctx := context.Background()
+	proj, repo, task, _, taskName, _ := strandedFixture(t, 2*time.Hour)
+	task.Status.IssueRefs = nil
+
+	c := newMirrorClient(t, proj, repo, reapSecret(), task)
+	r := reapReconciler(c, newStrandWriter())
+
+	require.NoError(t, r.driveStrandedParks(ctx, proj, time.Now()))
+
+	still, ok := mustGetTask(t, c, taskName)
+	require.True(t, ok, "no owned issue: the reaper's retention clock still owns this task")
+	require.Equal(t, task.UID, still.UID)
+}
+
 // TestStrandedPark_WaitsOutTheGrace: the automatic pickup is not instant. The
 // grace window exists so the strictly better answer - a human replying on the
 // issue, which resumes it WITH the reply's context - gets there first.

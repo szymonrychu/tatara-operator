@@ -35,6 +35,10 @@ const AnnResumeReleasing = "tatara.dev/resume-releasing"
 const (
 	resumeTriggerHumanReply  = "human-reply"
 	resumeTriggerAutoReentry = "auto-reentry"
+	// resumeTriggerAutoCollect is the one trigger that RE-MINTS NOTHING: every
+	// owned Issue is already closed, so resumeOne severs, closes the Task's own
+	// bot PRs and collects, and its mint loop has no jobs to run.
+	resumeTriggerAutoCollect = "auto-collect"
 )
 
 // resumeNoReentryParks restores the ONE-REPLY GUARANTEE for the UnparkNever
@@ -387,7 +391,15 @@ func (r *ProjectReconciler) closeTaskBotMRs(ctx context.Context, proj *tatarav1a
 		if err != nil {
 			return err
 		}
-		body := fmt.Sprintf("Closing: tatara is restarting this issue (%s) after the previous attempt ended in `%s`.", trigger, t.Status.ParkReason)
+		// The wording follows the TRIGGER, because "restarting" is false on the
+		// collect path: every owned issue is already closed and nothing is being
+		// re-minted, so a PR closed there is being cleaned up, not superseded.
+		body := fmt.Sprintf("Closing: tatara is restarting this issue (%s) after the previous attempt ended in `%s`.",
+			trigger, t.Status.ParkReason)
+		if trigger == resumeTriggerAutoCollect {
+			body = fmt.Sprintf("Closing: the issue this PR was opened for is closed, and tatara's task ended in `%s`.",
+				t.Status.ParkReason)
+		}
 		closeErr := writer.ClosePR(ctx, repo.Spec.URL, token, mr.Spec.Number, body)
 		RecordSCM(r.Metrics, provider, "close_pr", closeErr)
 		if closeErr != nil && !isPermanentTargetGone(closeErr) {

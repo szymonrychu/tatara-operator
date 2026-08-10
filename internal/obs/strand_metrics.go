@@ -40,22 +40,30 @@ var TerminalIssueReleasedTotal = prometheus.NewCounterVec(prometheus.CounterOpts
 	Help: "Still-open issues released by a task's terminal transition, by task state and outcome (contract B.6).",
 }, []string{"state", "outcome"})
 
-// StrandedParkReentryTotal counts the C.3 AUTOMATIC re-entries of a park no
-// human ever un-parks, by park reason and outcome:
+// StrandedParkTotal counts what the C.3 driver DID with a park no human ever
+// un-parks, by park reason and outcome:
 //
 //	reentered  the stranded park was collected early and the issue re-minted
 //	exhausted  the per-issue automatic-re-entry budget is spent; the issue is
 //	           labelled tatara-parked and left in the backlog as a REAL dead end
+//	collected  every owned issue was already CLOSED, so the Task was collected
+//	           early with no re-mint and no budget charged
 //
-// BOTH members matter and neither is an error. `reentered` climbing without a
-// matching `exhausted` is the platform recovering; `exhausted` climbing is the
-// bound holding, which is the entire safety argument for letting UnparkNever
-// stop meaning permanent. What WOULD be a bug is `reentered` climbing past
-// MaxAutoReentries per issue, which is what the bound - persisted on the Issue
-// CR, because the Task is reaped on every lap - exists to make impossible.
-var StrandedParkReentryTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-	Name: "operator_stranded_park_reentry_total",
-	Help: "Automatic re-entries of a no-re-entry park, by project, park reason and outcome (contract F.6).",
+// NONE of the three is an error. `reentered` climbing without a matching
+// `exhausted` is the platform recovering; `exhausted` climbing is the bound
+// holding, which is the entire safety argument for letting UnparkNever stop
+// meaning permanent; `collected` is a corpse being cleared, most often a human
+// closing the issue under a parked Task. What WOULD be a bug is `reentered`
+// climbing past MaxAutoReentries per issue, which is what the bound - persisted
+// on the Issue CR, because the Task is reaped on every lap - makes impossible.
+//
+// It is NOT named ..._reentry_total, and the third member is why: a collect
+// re-mints nothing and charges nothing, so counting it on a series whose name
+// promises re-entries would be a lie of exactly the kind this tree keeps paying
+// for.
+var StrandedParkTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "operator_stranded_park_total",
+	Help: "Dispositions of a no-re-entry park by the automatic driver, by project, park reason and outcome (contract F.6).",
 }, []string{"project", "park_reason", "outcome"})
 
 // The closed {path} vocabulary of IssueCloseRefusedTotal and the closed
@@ -68,12 +76,13 @@ const (
 	TerminalIssueReleaseError   = "error"
 	StrandedParkReentered       = "reentered"
 	StrandedParkBudgetExhausted = "exhausted"
+	StrandedParkCollected       = "collected"
 )
 
 func init() {
 	ctrlmetrics.Registry.MustRegister(
 		IssueCloseRefusedTotal,
 		TerminalIssueReleasedTotal,
-		StrandedParkReentryTotal,
+		StrandedParkTotal,
 	)
 }

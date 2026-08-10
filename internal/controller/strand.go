@@ -83,8 +83,15 @@ func (r *ProjectReconciler) driveStrandedParksPaced(ctx context.Context, proj *t
 // once-only notice comment plus the tatara-parked label, so it stops spinning
 // AND is visible in the backlog rather than disappearing.
 //
+// A STRANDED PARK WHOSE EVERY OWNED ISSUE IS CLOSED is collected outright
+// instead, on the same clock and for no budget: there is nothing to re-mint, and
+// leaving it parked holds its deterministic IntakeTaskName against any future
+// mint for a week. See driveOneStrandedPark.
+//
 // LEADER-ONLY, like resumeNoReentryParks, and it defers to it: a Task carrying
-// a human reply is that driver's this pass, not this one's.
+// a human reply is that driver's this pass, not this one's. It does NOT rely on
+// that driver for anything, though - the closed-issue arm above exists because
+// the deferral used to be a load-bearing assumption and was false.
 func (r *ProjectReconciler) driveStrandedParks(ctx context.Context, proj *tatarav1alpha1.Project, now time.Time) error {
 	var tl tatarav1alpha1.TaskList
 	if err := r.List(ctx, &tl, client.InNamespace(proj.Namespace)); err != nil {
@@ -143,8 +150,12 @@ func (r *ProjectReconciler) strandedCandidate(proj *tatarav1alpha1.Project,
 	return now.After(parkedAt(t).Add(strandedParkGrace))
 }
 
-// driveOneStrandedPark spends the budget, or lands the dead end, for ONE parked
-// Task.
+// driveOneStrandedPark picks ONE of three dispositions for ONE parked Task:
+// COLLECT it (every owned issue is already closed - a corpse, no mint, no
+// budget), RE-ENTER it (budget left), or land it in the DEAD END (budget spent).
+// Between them they are total over the candidate population, which is the
+// property the previous version lacked: its closed-issue arm returned nil and
+// deferred to a driver that could not reach the case.
 //
 // EVERY open owned Issue must have budget left, not merely one of them. resumeOne
 // severs and re-mints all of them together, so a Task holding one issue with
@@ -165,10 +176,45 @@ func (r *ProjectReconciler) driveOneStrandedPark(ctx context.Context, proj *tata
 		}
 	}
 	if len(open) == 0 {
-		// Nothing to pick back up. A Task owning only closed issues is C.4's
-		// business (resumeNoReentryParks severs and collects it); a Task owning
-		// no issue at all is the reaper's.
-		return nil
+		if len(issues) == 0 {
+			// Owns no Issue mirror at all: nothing to sever, and no intake key
+			// worth freeing early. The reaper's ParkRetention clock owns it.
+			return nil
+		}
+		// EVERY OWNED ISSUE IS CLOSED, so this Task is a CORPSE and is collected
+		// early - severed, its bot PRs closed, deleted - with NO mint and NO
+		// budget spent.
+		//
+		// THIS ARM USED TO SAY "resumeNoReentryParks severs and collects it" AND
+		// THAT WAS FALSE. That driver `continue`s on !hasNonBotPendingEvent long
+		// before it reaches resumeOne, so C.4's closed-issue handling was
+		// unreachable without a human comment: UnparkNever park + every issue
+		// closed + nobody commented was picked up by NEITHER driver and sat the
+		// full seven days. The dominant way to reach it is a human closing the
+		// issue under a parked Task, which ApplyIssueClosedStop structurally
+		// cannot turn into a clean terminal (it short-circuits on Parked).
+		//
+		// The seven-day hold is not worth defending here. What it costs is not
+		// tidiness: a parked Task is not TaskDone, so createTaskRaceSafe answers
+		// MintExistingLive for the deterministic IntakeTaskName this Task holds,
+		// and a re-opened issue or any other mint for that
+		// (project, kind, repo, number) is blocked for the whole week. What it
+		// buys is the Task CR's internals as a debugging artifact - and the
+		// project already conceded that trade on the identical population, since
+		// the human-reply path collects these Tasks early too, in the case where
+		// a human is actually looking. The human-visible trail survives either
+		// way: the Issue mirror outlives the collection ownerless (C.4) and the
+		// forge issue keeps whatever the terminal sequence already posted.
+		//
+		// NO BUDGET IS SPENT, deliberately. MaxAutoReentries bounds a LOOP, and
+		// nothing is re-minted here - there is no lap to charge for, and charging
+		// one would let a Task that ended legitimately eat a budget that exists
+		// to stop a different Task spinning.
+		obs.StrandedParkTotal.WithLabelValues(proj.Name, t.Status.ParkReason, obs.StrandedParkCollected).Inc()
+		log.FromContext(ctx).Info("collecting a stranded park whose every owned issue is closed",
+			"action", "stranded_park_collect", "resource_id", t.Name,
+			"park_reason", t.Status.ParkReason, "kind", t.Spec.Kind, "issues", len(issues))
+		return r.resumeOne(ctx, proj, t, live, resumeTriggerAutoCollect)
 	}
 
 	for _, iss := range open {
@@ -185,7 +231,7 @@ func (r *ProjectReconciler) driveOneStrandedPark(ctx context.Context, proj *tata
 		if err := r.annotateIssue(ctx, iss, tatarav1alpha1.AnnAutoReentries, strconv.Itoa(spent)); err != nil {
 			return err
 		}
-		obs.StrandedParkReentryTotal.WithLabelValues(proj.Name, t.Status.ParkReason, obs.StrandedParkReentered).Inc()
+		obs.StrandedParkTotal.WithLabelValues(proj.Name, t.Status.ParkReason, obs.StrandedParkReentered).Inc()
 		log.FromContext(ctx).Info("picking a stranded park back up automatically",
 			"action", "stranded_park_reentry", "resource_id", iss.Name, "task", t.Name,
 			"park_reason", t.Status.ParkReason, "kind", t.Spec.Kind,
@@ -224,7 +270,7 @@ func (r *ProjectReconciler) landStrandedDeadEnd(ctx context.Context, proj *tatar
 		}); err != nil {
 			return err
 		}
-		obs.StrandedParkReentryTotal.WithLabelValues(proj.Name, t.Status.ParkReason, obs.StrandedParkBudgetExhausted).Inc()
+		obs.StrandedParkTotal.WithLabelValues(proj.Name, t.Status.ParkReason, obs.StrandedParkBudgetExhausted).Inc()
 		log.FromContext(ctx).Info("a stranded issue has spent its automatic re-entry budget and stops here",
 			"action", "stranded_park_exhausted", "resource_id", iss.Name, "task", t.Name,
 			"park_reason", t.Status.ParkReason, "kind", t.Spec.Kind,
