@@ -239,6 +239,66 @@ func UnparkTakeover(t *v1alpha1.Task, to string, now time.Time) error {
 	return nil
 }
 
+// mrTerminalReasons is UnparkForMRTerminal's allow-list: the three stateReasons
+// that mean THE WORLD MOVED ON, not that the Task made progress. Every one of
+// them is written by externalTerminalEdge or the takeover finalize, off a forge
+// fact the operator merely observed.
+var mrTerminalReasons = map[string]bool{
+	ReasonMRMergedExternally: true,
+	ReasonMRClosedExternally: true,
+	ReasonMRTakenOver:        true,
+}
+
+// UnparkForMRTerminal is the THIRD and last exception to "there is exactly one
+// way out of a park and it is Unpark", and it is the narrowest of them.
+//
+// WHY A PARK MUST NOT SURVIVE THIS. A park stops a Task making stage PROGRESS
+// while it waits on something - a human's answer, a retry clock, a ceiling. An
+// owned MR reaching a TERMINAL forge state is not progress: it is the world
+// moving on, and it makes the wait pointless. The measured shape (2026-08-10,
+// 7 of 7) is a review Task that posts its verdict, parks awaiting-human, and
+// then has its PR merged by a maintainer minutes later. Nobody comments on a
+// merged PR, so the UnparkHuman rule never fires; stage.Unpark's own
+// ReasonAwaitingHuman arm sees the merge and answers DeclineMergedMR, whose
+// comment says the Task "ages out at ParkRetention and is reaped". That was the
+// right call for what it decides (never spawn a pod against a merged MR) and it
+// is still the right call - but its stated CONSEQUENCE was written before #33's
+// pod-less finalize existed. This closes that gap without touching the decline.
+//
+// IT IS NARROW ON EVERY AXIS, and each guard is load-bearing:
+//
+//   - `to` must be a TERMINAL OUTCOME. This is the difference between ending a
+//     Task and RESTARTING one. ownMRsShippedEdge targets `merged`, which still
+//     owes the merge cursor, the deploy ledger and the issue closes - resuming a
+//     parked Task into that pipeline is real work restarted behind the back of
+//     the human the park was waiting for, which is precisely what a park exists
+//     to prevent.
+//   - `reason` must be in mrTerminalReasons, so this can only ever be reached
+//     from an external forge fact and never laundered onto an ordinary edge.
+//   - It does NOT re-arm the clocks (no reArm). The Task is going terminal;
+//     stampEnter inside Enter sets what a terminal entry needs, and re-arming a
+//     residency clock for a Task that will never run again is meaningless.
+//
+// It clears the flag ONLY: the caller applies Enter in the SAME mutation, so
+// the un-park and the terminal state reach the API server as ONE status write.
+// Two writes would leave a window in which the Task is live, un-parked and
+// non-terminal, which is the #521 bug shape exactly.
+//
+// A Task that is not parked is a no-op success, so the caller never has to ask.
+func UnparkForMRTerminal(t *v1alpha1.Task, to, reason string) error {
+	if t.Status.ParkReason == "" {
+		return nil
+	}
+	if !v1alpha1.TaskIsTerminalOutcome(to) {
+		return fmt.Errorf("mr-terminal un-park requires a terminal outcome, got %q", to)
+	}
+	if !mrTerminalReasons[reason] {
+		return fmt.Errorf("mr-terminal un-park requires an external-terminal reason, got %q", reason)
+	}
+	clearPark(t)
+	return nil
+}
+
 // UnparkRetiredPark is the O3 MIGRATION un-park, and it is a takeover in
 // everything but name: the operator - not a human, not a timer, not a re-entry
 // rule - decides that this park is void because the ceiling that wrote it has

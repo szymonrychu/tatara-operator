@@ -148,3 +148,61 @@ func TestParkAccumulatesTheElapsedCarryOnATimeoutPark(t *testing.T) {
 	require.NoError(t, stage.Park(tk, stage.ReasonMergeTimeout, now))
 	require.Equal(t, int((4 * time.Hour).Seconds()), tk.Status.StageElapsedCarrySeconds)
 }
+
+// TestUnparkForMRTerminalIsNarrow pins the guards that keep the C.2 park
+// override from becoming a general park bypass. The function is the third and
+// last exception to "Unpark is the only way out of a park", so its refusals are
+// the entire safety argument.
+func TestUnparkForMRTerminalIsNarrow(t *testing.T) {
+	parked := func() *v1alpha1.Task {
+		t := &v1alpha1.Task{}
+		t.Status.State = v1alpha1.StateAwaitingReview
+		t.Status.ParkReason = stage.ReasonAwaitingHuman
+		return t
+	}
+
+	tests := []struct {
+		name       string
+		to, reason string
+		wantErr    bool
+	}{
+		{"merged externally clears the park", v1alpha1.StateDone, stage.ReasonMRMergedExternally, false},
+		{"closed externally clears the park", v1alpha1.StateRejected, stage.ReasonMRClosedExternally, false},
+		{"taken over clears the park", v1alpha1.StateRejected, stage.ReasonMRTakenOver, false},
+		{
+			// THE SCOPE LINE. `merged` is not a terminal outcome: it RESTARTS a
+			// pipeline (merge cursor, deploy ledger, issue closes) behind the back
+			// of the human the park was waiting for.
+			"a non-terminal target is refused", v1alpha1.StateMerged, stage.ReasonMRMergedExternally, true,
+		},
+		{"an ordinary terminal reason is refused", v1alpha1.StateDone, stage.ReasonDeclined, true},
+		{"an empty reason is refused", v1alpha1.StateDone, "", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			task := parked()
+			err := stage.UnparkForMRTerminal(task, tc.to, tc.reason)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("stage.UnparkForMRTerminal(%q, %q) = nil, want an error", tc.to, tc.reason)
+				}
+				if task.Status.ParkReason == "" {
+					t.Fatal("a REFUSED un-park must leave the park standing")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("stage.UnparkForMRTerminal: %v", err)
+			}
+			if task.Status.ParkReason != "" {
+				t.Fatal("an accepted un-park must clear the park flag")
+			}
+		})
+	}
+
+	// A Task that is not parked is a no-op success, so no caller has to ask first.
+	unparked := &v1alpha1.Task{}
+	if err := stage.UnparkForMRTerminal(unparked, v1alpha1.StateDone, stage.ReasonMRMergedExternally); err != nil {
+		t.Fatalf("an unparked task must be a no-op success, got %v", err)
+	}
+}

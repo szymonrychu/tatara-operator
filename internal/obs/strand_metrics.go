@@ -33,8 +33,12 @@ var IssueCloseRefusedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 // re-minted the issue ACTIVE, with a pod, on every pass, unbounded. That loop
 // was invisible: every individual mint looked like an ordinary intake.
 //
-// `outcome` is "released" for the release that happened, or "error" when the
-// forge write failed and the reaper's blocking backstop still owes it.
+// `outcome` is "released" for the release that happened, "error" when the forge
+// write failed, or "deferred" when the process-wide pace limiter held it back.
+// The last two mean the same thing operationally - the reaper's blocking
+// backstop still owes it - but they are separate values because only "error" is
+// worth looking at: a sustained "deferred" rate is the limiter working during a
+// burst, while a sustained "error" rate is the forge refusing the operator.
 var TerminalIssueReleasedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Name: "operator_terminal_issue_released_total",
 	Help: "Still-open issues released by a task's terminal transition, by task state and outcome (contract B.6).",
@@ -72,11 +76,12 @@ const (
 	CloseRefusedPathGate   = "gate-rejected"
 	CloseRefusedPathRefine = "refine-closes"
 
-	TerminalIssueReleased       = "released"
-	TerminalIssueReleaseError   = "error"
-	StrandedParkReentered       = "reentered"
-	StrandedParkBudgetExhausted = "exhausted"
-	StrandedParkCollected       = "collected"
+	TerminalIssueReleased        = "released"
+	TerminalIssueReleaseError    = "error"
+	TerminalIssueReleaseDeferred = "deferred"
+	StrandedParkReentered        = "reentered"
+	StrandedParkBudgetExhausted  = "exhausted"
+	StrandedParkCollected        = "collected"
 )
 
 func init() {
