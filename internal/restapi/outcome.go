@@ -2257,7 +2257,9 @@ func (s *Server) mintGateTask(ctx context.Context, proj *tatarav1alpha1.Project,
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: s.ns},
 		Spec: tatarav1alpha1.TaskSpec{
 			ProjectRef: proj.Name, RepositoryRef: repo.Name, Kind: controller.SweepIssueKind,
-			Goal: truncateValidUTF8(pr.Title+"\n\n"+pr.Body, tatarav1alpha1.GoalMaxBytes),
+			Goal:              truncateValidUTF8(pr.Title+"\n\n"+pr.Body, tatarav1alpha1.GoalMaxBytes),
+			InitialState:      tatarav1alpha1.StateNew,
+			InitialParkReason: gateTaskMintParkReason(proj),
 			Source: &tatarav1alpha1.TaskSource{
 				Provider: providerOf(proj), IssueRef: issueRef(repo, number),
 				URL: url, Number: number,
@@ -2271,6 +2273,38 @@ func (s *Server) mintGateTask(ctx context.Context, proj *tatarav1alpha1.Project,
 		return nil, fmt.Errorf("create gate task %s: %w", name, err)
 	}
 	return t, nil
+}
+
+// gateTaskMintParkReason is the park reason a brainstorm proposal's gate Task is
+// minted with; "" mints it live, exactly as before.
+//
+// WHY IT PARKS: a proposal NO HUMAN HAS ENGAGED WITH must not consume an agent
+// pod. Every other mint site reaches that conclusion through
+// controller.MintStage, whose clause 2 deliberately excludes the bot login so a
+// bot-authored, comment-free issue mints PARKED. The propose path files exactly
+// such an issue and then mints its Task HERE, bypassing the intake funnel: left
+// live, triageTarget routes kind=implement straight to `refined`, a ticket is
+// admitted, an implement agent spawns, posts a `## Plan` comment on the thread,
+// submits action=approved and is refused with no-maintainer-comment. A full
+// agent session and a forge comment, spent on an idea nobody has approved.
+//
+// WHY backlog-sweep AND NOT A NEW REASON: it already means precisely "minted
+// from something nobody has spoken to yet". It is UnparkHuman
+// (internal/stage/park.go), so the FIRST non-bot comment on the thread releases
+// it through the webhook's driveCommentUnpark - and it is deliberately NOT in
+// NeedsLiveRoom, so that release does not additionally wait on live-pod
+// capacity. MintParked emits no park counter, so this mint does not pollute the
+// park-rate alert.
+//
+// WHY THE FLAG FLIPS IT: with autoApproveTataraProposals ON, the approval
+// carve-out grants that agent WITHOUT any maintainer comment, so parking it
+// would hold the Task for a comment the project has declared unnecessary. The
+// flag-on path is byte-for-byte today's behaviour.
+func gateTaskMintParkReason(proj *tatarav1alpha1.Project) string {
+	if proj.Spec.AutoApproveTataraProposals {
+		return ""
+	}
+	return stage.ReasonBacklogSweep
 }
 
 // issueRef is the provider-shaped owner/repo#N reference.
