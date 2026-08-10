@@ -569,7 +569,15 @@ func (d *StageDriver) enterStageWithCursor(ctx context.Context, proj *tatarav1al
 		mutate(task)
 		return nil
 	}
-	return EnterStage(ctx, d.Client, d.spiller(proj), d.Metrics, task, mrs, to, reason, now, mutate)
+	return EnterStage(ctx, d.Client, d.spiller(proj), d.Metrics, task, mrs, to, reason, now, mutate,
+		WithTerminalIssueRelease(d.terminalReleaser()))
+}
+
+// terminalReleaser binds the C.2 terminal treatment for the driver's own
+// transitions. It is built per call rather than held as a field so it can
+// never disagree with the driver's live Client/SCMFor.
+func (d *StageDriver) terminalReleaser() *TerminalReleaser {
+	return &TerminalReleaser{Client: d.Client, SCMFor: d.SCMFor, Metrics: d.Metrics}
 }
 
 // parkTask is StageDriver's binding of the park choke point.
@@ -655,7 +663,7 @@ func (d *StageDriver) CloseIssuesOnDelivery(ctx context.Context, proj *tatarav1a
 	if err := EnterStage(ctx, d.Client, d.spiller(proj), d.Metrics, task, mrs,
 		tatarav1alpha1.StateDone, "", d.now(), func(t *tatarav1alpha1.Task) {
 			t.Status.DeliveredAt = &now
-		}); err != nil {
+		}, WithTerminalIssueRelease(d.terminalReleaser())); err != nil {
 		return fmt.Errorf("delivery: %w", err)
 	}
 	obs.ClearMergeCursorStalled(task.Name)

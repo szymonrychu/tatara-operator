@@ -1530,7 +1530,11 @@ func (s *Server) mrOpen(w http.ResponseWriter, r *http.Request, proj *tatarav1al
 		writeClientErr(w, err)
 		return
 	}
-	body := controller.FilterCloseDirectives(req.Body, repoSlug(repo), allowedCloses(issues, repo))
+	// ... and, under the C.1 CLOSE INVARIANT, only while no SIBLING PR of this
+	// Task is still live: the forge auto-closes on the FIRST merge, which would
+	// beat the invariant before any operator-side guard could see it.
+	body := controller.FilterCloseDirectivesForTask(req.Body, repoSlug(repo),
+		allowedCloses(issues, repo), controller.OpenOwnedMRs(mrs))
 
 	target := repo.Spec.DefaultBranch
 	if target == "" {

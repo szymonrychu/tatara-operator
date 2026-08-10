@@ -1590,11 +1590,13 @@ func (o *outcomeCtx) gate(p implementPayload) {
 		if !o.claim() {
 			return
 		}
-		for i := range issues {
-			if err := s.queueIssueClose(ctx, o.proj, &issues[i], o.task.Name, p.Reason); err != nil {
-				writeClientErr(o.w, err)
-				return
-			}
+		// THE C.1 CLOSE INVARIANT. A decline still closes the issue, but only
+		// when the Task has no live PR left: an agent that declines while its
+		// own PR is still open would otherwise close the issue out from under
+		// it. Refused closes PARK instead.
+		if err := s.closeOrParkIssues(ctx, o.proj, o.task, issues, p.Reason, obs.CloseRefusedPathGate); err != nil {
+			writeClientErr(o.w, err)
+			return
 		}
 		if !o.commit(func(t *tatarav1alpha1.Task) error {
 			if err := stage.Enter(t, mrs, tatarav1alpha1.StateRejected, stage.ReasonDeclined, s.now()); err != nil {
@@ -2018,6 +2020,91 @@ func (s *Server) queueIssueClose(ctx context.Context, proj *tatarav1alpha1.Proje
 
 func closeIntentBody(reason string) string {
 	return "<!-- tatara-close -->\n" + reason
+}
+
+// closeOrParkIssues is THE C.1 CLOSE INVARIANT at the REST layer: an Issue is
+// closed only when nothing the Task still owns would be stranded by the close,
+// and otherwise it is PARKED - the terminal notice plus the tatara-parked
+// label - rather than closed.
+//
+// It is the single funnel for both operator-side close paths in this file (the
+// gate's rejected(declined) arm and refine's closes[] list), and being one
+// function is the point: those two arms are the reason the invariant was
+// breakable at all. CloseIssuesOnDelivery already carried a stricter version of
+// this guard - every owned MR merged AND deployed - so the gap was never the
+// delivery path, it was the two paths that had no guard whatsoever.
+//
+// path is the obs.IssueCloseRefusedTotal label; see that counter for the
+// vocabulary. It is a caller-supplied constant, never derived from a payload.
+func (s *Server) closeOrParkIssues(ctx context.Context, proj *tatarav1alpha1.Project,
+	task *tatarav1alpha1.Task, issues []tatarav1alpha1.Issue, reason, path string) error {
+
+	open, err := s.openOwnedMRs(ctx, task)
+	if err != nil {
+		return err
+	}
+	for i := range issues {
+		if err := s.closeOrParkIssue(ctx, proj, task, &issues[i], reason, path, open); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// openOwnedMRs is the invariant's read, hoisted so a caller closing N issues
+// pays ONE MergeRequest List rather than N.
+func (s *Server) openOwnedMRs(ctx context.Context, task *tatarav1alpha1.Task) ([]string, error) {
+	mrs, err := s.ownedMRs(ctx, task)
+	if err != nil {
+		return nil, err
+	}
+	return controller.OpenOwnedMRs(mrs), nil
+}
+
+// closeOrParkIssue applies the invariant to ONE issue against an already-read
+// open set. refine's closes[] uses it directly because each entry carries its
+// OWN reason, which closeOrParkIssues' single-reason shape cannot express.
+func (s *Server) closeOrParkIssue(ctx context.Context, proj *tatarav1alpha1.Project,
+	task *tatarav1alpha1.Task, iss *tatarav1alpha1.Issue, reason, path string, open []string) error {
+
+	if len(open) == 0 {
+		return s.queueIssueClose(ctx, proj, iss, task.Name, reason)
+	}
+	if err := s.queueIssuePark(ctx, proj, iss, task.Name,
+		controller.ParkedForOpenMRsComment(task.Name, open)); err != nil {
+		return err
+	}
+	obs.IssueCloseRefusedTotal.WithLabelValues(proj.Name, path).Inc()
+	s.log.InfoContext(ctx, "restapi: issue close refused; the task still owns an open merge request",
+		"action", "issue_close_refused", "resource_id", iss.Name,
+		"task", task.Name, "path", path, "open_mrs", strings.Join(open, ","))
+	return nil
+}
+
+// queueIssuePark is queueIssueClose's refusal twin: the same durable
+// PendingComment intent, carrying the park marker instead of the close one, so
+// the Issue reconciler's drain posts the notice AND stamps tatara-parked. The
+// requestId is keyed on "park" so a later genuine close of the same issue by
+// the same Task is not deduplicated against this park.
+func (s *Server) queueIssuePark(ctx context.Context, proj *tatarav1alpha1.Project,
+	iss *tatarav1alpha1.Issue, taskName, body string) error {
+
+	requestID := newRequestID(taskName, "park", iss.Name)
+	key := types.NamespacedName{Namespace: s.ns, Name: iss.Name}
+	return objbudget.FitIssue(ctx, s.c, s.spillerForOrNil(proj), key, func(i *tatarav1alpha1.Issue) {
+		for _, e := range i.Status.PendingComments {
+			if e.RequestID == requestID {
+				return
+			}
+		}
+		if len(i.Status.PendingComments) >= pendingCommentsCap {
+			return
+		}
+		i.Status.PendingComments = append(i.Status.PendingComments, tatarav1alpha1.PendingComment{
+			RequestID: requestID, Action: "comment",
+			Body: truncateValidUTF8(controller.ParkIntentBody(body), tatarav1alpha1.PendingCommentBodyMaxBytes),
+		})
+	})
 }
 
 // --- brainstorm -----------------------------------------------------------
@@ -2890,6 +2977,12 @@ func (o *outcomeCtx) refine(p refinePayload) {
 		if !ok {
 			return
 		}
+		// THE C.1 CLOSE INVARIANT, read ONCE for the whole list.
+		open, err := s.openOwnedMRs(ctx, o.task)
+		if err != nil {
+			writeClientErr(o.w, err)
+			return
+		}
 		for _, c := range p.Closes {
 			repo, err := s.repoCR(ctx, o.proj.Name, c.Repo)
 			if err != nil {
@@ -2913,7 +3006,8 @@ func (o *outcomeCtx) refine(p refinePayload) {
 				writeClientErr(o.w, err)
 				return
 			}
-			if err := s.queueIssueClose(ctx, o.proj, &iss, o.task.Name, c.Reason); err != nil {
+			if err := s.closeOrParkIssue(ctx, o.proj, o.task, &iss, c.Reason,
+				obs.CloseRefusedPathRefine, open); err != nil {
 				writeClientErr(o.w, err)
 				return
 			}
