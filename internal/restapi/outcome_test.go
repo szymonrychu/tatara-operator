@@ -46,6 +46,24 @@ import (
 type reviewPanicForge struct {
 	scm.SCMWriter
 	heads map[int]string
+	// The B1 readiness surface, defaulting to ready. See recordingForge.
+	ciStatuses  map[int]string
+	mergeStates map[int]scm.MergeState
+}
+
+func (f *reviewPanicForge) GetPRState(_ context.Context, _, _ string, number int) (scm.PRState, error) {
+	ci, ok := f.ciStatuses[number]
+	if !ok {
+		ci = "success"
+	}
+	return scm.PRState{Author: "tatara-agent", HeadSHA: f.heads[number], CIStatus: ci}, nil
+}
+
+func (f *reviewPanicForge) GetMergeState(_ context.Context, _, _ string, number int) (scm.MergeState, error) {
+	if ms, ok := f.mergeStates[number]; ok {
+		return ms, nil
+	}
+	return scm.MergeStateClean, nil
 }
 
 func (f *reviewPanicForge) GetPRHead(_ context.Context, _, _ string, number int) (string, error) {

@@ -64,6 +64,39 @@ type recordingForge struct {
 	commentErr     error              // returned by Comment when set (e.g. cross-repo 403 on the parent)
 	openChangeErr  error              // returned by OpenChange when set (e.g. a 422 or a transport error)
 	createIssueErr error              // returned by CreateIssue when set (e.g. the GitLab 400 that #529 is about)
+
+	// The B1 READINESS SURFACE. Both default to "ready" - CI success, merge state
+	// clean - so that every pre-PR-B test that submits an implement outcome keeps
+	// asserting what it always asserted. A test that wants a refusal names the
+	// number it wants refused.
+	ciStatuses    map[int]string         // number -> PRState.CIStatus ("" | pending | success | failure)
+	mergeStates   map[int]scm.MergeState // number -> GetMergeState answer
+	prStateErr    error                  // returned by GetPRState when set (the fail-open path)
+	mergeStateErr error                  // returned by GetMergeState when set
+}
+
+// GetPRState answers the B1 readiness read. The head it reports is the SAME
+// live head GetPRHead serves, because a fake whose two head reads disagree
+// would make the head-moved and readiness paths untestable against each other.
+func (f *recordingForge) GetPRState(_ context.Context, _, _ string, number int) (scm.PRState, error) {
+	if f.prStateErr != nil {
+		return scm.PRState{}, f.prStateErr
+	}
+	ci, ok := f.ciStatuses[number]
+	if !ok {
+		ci = "success"
+	}
+	return scm.PRState{Author: "tatara-agent", HeadSHA: f.heads[fmt.Sprint(number)], CIStatus: ci}, nil
+}
+
+func (f *recordingForge) GetMergeState(_ context.Context, _, _ string, number int) (scm.MergeState, error) {
+	if f.mergeStateErr != nil {
+		return "", f.mergeStateErr
+	}
+	if ms, ok := f.mergeStates[number]; ok {
+		return ms, nil
+	}
+	return scm.MergeStateClean, nil
 }
 
 type recordedComment struct {
@@ -79,6 +112,7 @@ type recordedSubIssue struct {
 func newRecordingForge() *recordingForge {
 	return &recordingForge{
 		heads: map[string]string{}, issueStates: map[int]scm.IssueState{}, nextNumber: 100,
+		ciStatuses: map[int]string{}, mergeStates: map[int]scm.MergeState{},
 	}
 }
 

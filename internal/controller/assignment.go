@@ -169,6 +169,51 @@ const resumedBranchMergeRule = "If your CLAUDE.md reports that the task branch w
 	"the base branch is unresolved, resolving that merge is your FIRST action: finish it and commit it before " +
 	"you read or write any other code. The tree you were given is stale by exactly the changes that conflicted.\n\n"
 
+// ownYourPRRule is the loop PR B requires of every agent that pushes code, and
+// it is stated to the implement kind because that is the kind that can fix all
+// three things it names.
+//
+// IT EXISTS BECAUSE NOTHING USED TO SAY THIS. The implement job text ran from
+// the gate to `submit_outcome` without the word CI appearing once, so an agent
+// that pushed a commit and submitted the same second was doing exactly what it
+// had been told to do - and the operator advanced the Task to awaiting-review
+// with no CI read of any kind. The pipeline failure was then discovered in the
+// merge corridor, three stages and one whole review round later, by which time
+// the pod that wrote the code was long gone.
+//
+// THE 20-MINUTE BOUND IS THE HALF THAT KEEPS IT HONEST. Without it "wait for
+// green" reads as "wait indefinitely", and an agent obeying it literally idles a
+// pod for the length of a terraform plan queue - which costs more than the
+// review round it saves. Past the bound the agent submits, the operator's CI
+// hold (status.ciWaitSince) takes over the wait at zero pod cost, and the agent
+// is told that outright so that submitting at the bound reads as compliance
+// rather than as giving up.
+//
+// EVERY TOOL IT NAMES IS REAL. `scm_read` is the tool; ci is a KIND argument to
+// it (restapi/server.go's route table: GET /projects/{p}/scm/ci is
+// scm_read(kind=ci), and internal/promptguidance.AgentVisibleTools carries
+// scm_read, not scm_read_ci). promptguidance.UnknownToolNames scans every
+// backticked span in this file, so an invented tool name here fails the
+// goal-builder conformance tests rather than reaching a pod.
+const ownYourPRRule = "### 3. You own the PR until it is clean\n\n" +
+	"OPENING THE PR IS NOT DELIVERING IT. A submitted change is handed straight to a reviewer and " +
+	"then to the merge corridor, and neither of them can write code - so anything wrong with the PR " +
+	"is yours to fix, now, while you still have the workspace checked out. Loop until all three of " +
+	"these are true:\n\n" +
+	"  - `scm_read(kind=\"ci\", repo=..., number=...)` reports the checks GREEN at your pushed head. " +
+	"It returns the per-check conclusion and the tail of the failing job's log, so a red check is " +
+	"already diagnosable without leaving the pod. Fix the cause, push, and read it again.\n" +
+	"  - Every review finding on the PR is answered IN CODE. A reply is not an answer; a push is. " +
+	"Where you disagree, say so with `mr_write(action=\"reply\", ...)` AND leave the code as it is - " +
+	"but never submit with findings you have simply not looked at.\n" +
+	"  - The branch merges cleanly into its base. If it conflicts, merge the base in, resolve every " +
+	"conflict, and push.\n\n" +
+	"BOUND YOUR WAIT AT ROUGHLY 20 MINUTES. If the checks are still RUNNING after that, submit " +
+	"anyway: the operator holds the Task on the pipeline itself and costs nothing while it waits, " +
+	"whereas you sitting on a poll costs a pod. Submitting on a still-running pipeline is CORRECT. " +
+	"Submitting on a RED one is not - the operator refuses that outcome, your turn does not end, and " +
+	"you are told which of CI, conflict or review findings is the problem.\n\n"
+
 // inheritedWorkspaceRule is what the REVIEW agent must be told when its pod
 // mounts the Task's persistent workspace volume. Empty when it does not, because
 // then the paragraph would simply be false - the review pod gets a fresh clone.
@@ -294,7 +339,8 @@ func agentJob(agentKind string, proj *tatarav1alpha1.Project, workspaceInherited
 			"DO NOT REWRITE THE PLAN NOTE AFTER APPROVAL. The operator hashed it at grant and " +
 			"re-checks the hash when you submit; a plan swapped after approval sends you back to the " +
 			"gate. Amend it BEFORE you ask, or ask again afterwards.\n\n" +
-			"When the change is complete and pushed:\n" +
+			ownYourPRRule +
+			"When the change is complete and pushed, and the loop above says the PR is clean:\n" +
 			"`submit_outcome(kind=implement, action=submitted, title=..., body=..., " +
 			"change_significance=major|minor|patch, merge_order=[...])`. merge_order is REQUIRED when " +
 			"you changed more than one repo: it is the DEPENDENCY order the repos merge in, and there " +
@@ -311,6 +357,13 @@ func agentJob(agentKind string, proj *tatarav1alpha1.Project, workspaceInherited
 			"read the diff AND run it: build it, run the repo's tests and linters, and say what you ran.\n\n"
 		job += inheritedWorkspaceRule(workspaceInherited)
 		return job +
+			"READ THE PIPELINE BEFORE YOU DECIDE. `scm_read(kind=\"ci\", repo=..., number=...)` gives you " +
+			"the per-check conclusion at the head you are reviewing, plus the tail of any failing job's " +
+			"log. A RED check is a finding: name it, quote the failure, and `action=request_changes` - " +
+			"an approve on a red head is REFUSED, because approving hands the change to a POD-LESS " +
+			"merge corridor that cannot fix a failing test and will spend hours re-reading the same " +
+			"verdict. A branch that conflicts with its base is refused for the same reason. Checks " +
+			"still RUNNING are not a finding: judge the code.\n\n" +
 			"End with `submit_outcome(kind=review, action=approve|request_changes)` and your findings. " +
 			"The OPERATOR posts the review to the forge - do not post it yourself, and do not merge, " +
 			"push, or open a PR."

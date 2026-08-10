@@ -195,4 +195,20 @@ const (
 	// far too loose to surface one that never runs, and the pod caps are
 	// suppressed underneath it, so this is what keeps the suppression bounded.
 	HandoffDeadline = 5 * time.Minute
+	// CIWaitDeadline bounds status.ciWaitSince - the hold PR B puts an accepted
+	// implement outcome in while CI at the pushed head is still running.
+	//
+	// It is a SEPARATE constant from HandoffDeadline and it is six times longer,
+	// because the two wait on different things. HandoffDeadline waits on this
+	// operator's own reconciler, which lands in about a second; this one waits on
+	// a forge's runners, and a terraform plan or a kaniko image build routinely
+	// takes fifteen minutes. Five minutes here would expire on every genuinely
+	// healthy pipeline, which is the same as not holding at all.
+	//
+	// EXPIRY IS FAIL-OPEN, NOT A PARK. On expiry reconcileCIWait advances to
+	// awaiting-review exactly as the pre-PR-B code did unconditionally, so the
+	// worst case of a forge that stops delivering CI events is the behaviour this
+	// platform already had. The B3 gate at awaiting-review then still bounces the
+	// Task if the pipeline later goes red.
+	CIWaitDeadline = 30 * time.Minute
 )

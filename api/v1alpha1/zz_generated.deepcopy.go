@@ -1528,6 +1528,10 @@ func (in *TaskStatus) DeepCopyInto(out *TaskStatus) {
 		in, out := &in.ConversationLastEventAt, &out.ConversationLastEventAt
 		*out = (*in).DeepCopy()
 	}
+	if in.CIWaitSince != nil {
+		in, out := &in.CIWaitSince, &out.CIWaitSince
+		*out = (*in).DeepCopy()
+	}
 	if in.FoldInFlight != nil {
 		in, out := &in.FoldInFlight, &out.FoldInFlight
 		*out = make([]string, len(*in))

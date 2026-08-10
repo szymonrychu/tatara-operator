@@ -699,6 +699,29 @@ type TaskStatus struct {
 	// Cap 3 -> failed(ci-blocked).
 	// +optional
 	CIRedReentries int `json:"ciRedReentries,omitempty"`
+	// CIWaitSince is THE CI HOLD (PR B): the implement outcome was ACCEPTED, the
+	// code is pushed, and the advance to awaiting-review is HELD because CI at
+	// the pushed head is still pending/running. It is the timestamp of the accept
+	// and it doubles as the flag - nil means no hold.
+	//
+	// IT IS DELIBERATELY NOT A PARK AND NOT A NEW STATE. Park would have been the
+	// cheaper-looking option and it is the wrong one twice over: a parked Task
+	// takes TaskReconciler's terminal early return, so nothing would drive the
+	// hold to its conclusion, and CIRefreshCadence drops a parked MR back to the
+	// 24h mirror cadence, so the ONE backstop that is supposed to clear this hold
+	// when a webhook is missed would run once a day. A new state would have to be
+	// taught to the stage enum, LegalFor's edge table, AgentKindFor and the budget
+	// rows. Holding at under-implementation costs one field, keeps the 5m
+	// CIRefreshCadenceActive backstop armed, and keeps Owns(&MergeRequest{})
+	// waking the Task on every webhook stamp.
+	//
+	// IT IS NEVER A DEAD END. reconcileCIWait clears it three ways: green ->
+	// awaiting-review, red -> the enterCIRed bounce, and CIWaitDeadline ->
+	// awaiting-review anyway (fail OPEN, which is exactly the pre-PR-B
+	// behaviour), so a forge that never delivers another CI event costs a bounded
+	// wait and not a stranded Task.
+	// +optional
+	CIWaitSince *metav1.Time `json:"ciWaitSince,omitempty"`
 	// HumanReviewRounds bounds the reviewing <-> parked(awaiting-human) cycle on a
 	// kind=review Task (fix V7-9). Cap 5, then it STAYS parked.
 	//

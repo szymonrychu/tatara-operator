@@ -1073,6 +1073,24 @@ func (o *outcomeCtx) implement(p implementPayload) {
 		}
 	}
 
+	// B1: NO AGENT LEAVES A DIRTY PR. This is the LAST validation step and it is
+	// deliberately the last: it is the only one that talks to the forge, so every
+	// cheap local refusal above has already had its say. See readiness.go for the
+	// three axes, why a read failure fails OPEN, and why a refusal here costs the
+	// agent nothing.
+	rd, readOK := o.evaluateReadiness(ctx, open, submitScope)
+	if readOK && o.refuseNotReady(ctx, rd, "submission") {
+		return
+	}
+	// PENDING IS NOT A VERDICT, so it is not a refusal - but it is not an advance
+	// either. Handing a change whose pipeline has not answered to a review pod is
+	// how a reviewer spends a full turn reading code that the next check_suite
+	// delivery is about to invalidate. The outcome is ACCEPTED (the agent's work
+	// is done and must not be re-run) and the transition is HELD on
+	// status.ciWaitSince, which controller.reconcileCIWait resolves three ways -
+	// green, red, or the CIWaitDeadline fail-open.
+	ciHold := readOK && anyCIPending(rd)
+
 	// VALIDATION ENDS HERE, EXECUTION BEGINS (#578): every 400 above wrote
 	// nothing, and everything below mutates.
 	if !o.claim() {
@@ -1099,7 +1117,16 @@ func (o *outcomeCtx) implement(p implementPayload) {
 	}
 
 	if !o.commit(func(t *tatarav1alpha1.Task) error {
-		if err := stage.Enter(t, mrs, tatarav1alpha1.StateAwaitingReview, "", s.now()); err != nil {
+		if ciHold {
+			// NO stage.Enter, and the Task therefore stays exactly where it is,
+			// UN-PARKED. Un-parked is load-bearing twice: TaskReconciler returns
+			// early on a parked Task so nothing would ever resolve the hold, and
+			// CIRefreshCadence drops a parked MR to the 24h mirror cadence so the
+			// missed-webhook backstop would run once a day. See the CIWaitSince
+			// field comment.
+			stamp := metav1.NewTime(s.now())
+			t.Status.CIWaitSince = &stamp
+		} else if err := stage.Enter(t, mrs, tatarav1alpha1.StateAwaitingReview, "", s.now()); err != nil {
 			return err
 		}
 		agentNote(t, o.kind, "note", "submitted: "+p.Title+"\n\n"+p.Body, s.now())
@@ -1157,7 +1184,7 @@ func (o *outcomeCtx) implement(p implementPayload) {
 	}
 
 	o.ok("submitted", "merge_order", strings.Join(p.MergeOrder, ","),
-		"change_significance", p.ChangeSignificance)
+		"change_significance", p.ChangeSignificance, "ci_hold", ciHold)
 }
 
 // ownedMRRepos is the DEDUPED repo list of the MRs still open, in stable order.
@@ -1358,6 +1385,27 @@ func (o *outcomeCtx) review(p reviewPayload) {
 					"Re-sync your workspace (git fetch && git checkout %s), re-review the new diff, and submit again.",
 					mr.Spec.RepositoryRef, mr.Spec.Number, reported[k], live, live),
 			})
+			return
+		}
+	}
+
+	// B1, THE REVIEW-AGENT EQUIVALENT. An APPROVE is a hand-off into the merge
+	// corridor, and the corridor is POD-LESS: a change approved while its
+	// pipeline is red or its branch conflicts spends the whole 4h merge budget
+	// re-reading a verdict that only a new commit can change (issue #476, the
+	// incident ci_gate.go was written for). Refusing it here puts the finding in
+	// front of the reviewer that is still in-turn, one whole stage earlier.
+	//
+	// APPROVE ONLY. request_changes is already the "this is not ready" answer and
+	// has nothing to be ready for; refusing it would leave the reviewer with no
+	// legal outcome at all on the exact PR that most needs its findings recorded.
+	//
+	// PENDING IS ACCEPTED HERE, with no hold. The merge corridor already stalls
+	// on ci-not-green (merge.go) and re-reads every 60s, so a CI hold at
+	// awaiting-review would only duplicate a wait that already exists and is
+	// already bounded.
+	if p.Verdict == "approve" {
+		if rd, readOK := o.evaluateReadiness(ctx, open, approveScope); readOK && o.refuseNotReady(ctx, rd, "approval") {
 			return
 		}
 	}
