@@ -11,7 +11,7 @@ import (
 
 func TestNewLogger_EmitsJSON(t *testing.T) {
 	var buf bytes.Buffer
-	logger := obs.NewLogger(&buf, slog.LevelInfo)
+	logger := obs.NewLogger(&buf, slog.LevelInfo, nil)
 	logger.Info("hello", slog.String("action", "test"))
 
 	var entry map[string]any

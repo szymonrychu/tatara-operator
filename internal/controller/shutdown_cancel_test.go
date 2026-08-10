@@ -1,17 +1,23 @@
 package controller
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"testing"
 
+	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/szymonrychu/tatara-operator/internal/obs"
@@ -30,6 +36,29 @@ func cancelClient(t *testing.T, err error) client.Client {
 			},
 			List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
 				return err
+			},
+		}).
+		Build()
+}
+
+// loggingCancelClient is cancelClient plus the half #557 could not see: before
+// returning the cancellation, every read logs it at ERROR through the
+// reconcile-scoped contextual logger, exactly as k8s.io/client-go
+// rest/request.go:1173-1200 does on a cancelled io.ReadAll(resp.Body).
+func loggingCancelClient(t *testing.T, err error) client.Client {
+	t.Helper()
+	logAndFail := func(ctx context.Context) error {
+		logf.FromContext(ctx).Error(context.Canceled, "Unexpected error when reading response body")
+		return err
+	}
+	return fake.NewClientBuilder().
+		WithScheme(mirrorScheme(t)).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, _ client.WithWatch, _ client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
+				return logAndFail(ctx)
+			},
+			List: func(ctx context.Context, _ client.WithWatch, _ client.ObjectList, _ ...client.ListOption) error {
+				return logAndFail(ctx)
 			},
 		}).
 		Build()
@@ -75,6 +104,50 @@ func TestReconcile_ShutdownCancellationIsNotAnError(t *testing.T) {
 				t.Fatalf("%s: Reconcile asked for a requeue (%v) on a shutting-down manager", name, res)
 			}
 		})
+	}
+}
+
+// TestReconcile_ShutdownCancellationEmitsZeroErrorLines is #579 action item 3,
+// and the assertion #557 did not make: "Reconcile returned nil" is not the same
+// claim as "the reconcile published no ERROR". The Loki rule counts ERROR LINES,
+// so the guarantee has to be stated in those terms or a dependency writing its
+// own ERROR from inside the reconcile re-fires the same alert under a new msg.
+func TestReconcile_ShutdownCancellationEmitsZeroErrorLines(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	gate := obs.NewShutdownGate()
+	gate.Arm(ctx)
+	var buf bytes.Buffer
+	logger := obs.NewLogger(&buf, slog.LevelInfo, gate)
+	ctx = logf.IntoContext(ctx, logr.FromSlogHandler(logger.Handler()))
+
+	c := loggingCancelClient(t, fmt.Errorf(
+		"unexpected error when reading response body. Please retry. Original error: %w", context.Canceled))
+	for name, r := range shutdownReconcilers(c) {
+		if _, err := r.Reconcile(ctx, shutdownReq); err != nil {
+			t.Fatalf("%s: Reconcile returned %v", name, err)
+		}
+	}
+
+	var downgraded int
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("log line is not valid JSON: %v (%q)", err, line)
+		}
+		if entry["level"] == "ERROR" {
+			t.Fatalf("a shutdown-cancelled reconcile published an ERROR line: %s", line)
+		}
+		if entry["shutdown_downgrade"] != nil {
+			downgraded++
+		}
+	}
+	if downgraded == 0 {
+		t.Fatal("no line was downgraded; the test did not exercise the dependency-emitted ERROR path")
 	}
 }
 
