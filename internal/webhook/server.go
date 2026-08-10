@@ -198,6 +198,8 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		s.handlePush(ctx, w, providerName, &proj, ev)
 	case "issue", "mr":
 		s.handleForgeItem(ctx, w, providerName, proj, ev)
+	case "ci":
+		s.handleCIStatus(ctx, w, providerName, proj, ev)
 	default:
 		s.accept(w, providerName, "other", ev.Action, "ignored")
 	}

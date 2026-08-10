@@ -50,9 +50,29 @@ type MergeRequestStatus struct {
 	// or an approval decision: both re-fetch the head LIVE (fix 10).
 	// +optional
 	HeadSHA string `json:"headSHA,omitempty"`
+	// CIStatus is the MIRROR CI vocabulary, and the enum below is load-bearing:
+	// the gate vocabulary the merge corridor speaks ("" | pending | success |
+	// failure, see scm.PRState) is REJECTED here by the API server. Cross with
+	// scm.MirrorCIStatus, never by hand.
+	//
+	// It has three writers: the mint-time mirror sync (SyncMergeRequest), the CI
+	// webhook (webhook.handleCIStatus), and the MergeRequestReconciler's live
+	// backstop re-read. Before the latter two existed, an MR the agent opened
+	// itself was stamped once with "" and stayed there forever, which is what
+	// every agent was shown as ci="".
 	// +kubebuilder:validation:Enum=none;pending;running;green;red
 	// +optional
 	CIStatus string `json:"ciStatus,omitempty"`
+	// CIUpdatedAt is when ciStatus was last written from a LIVE observation - a
+	// CI webhook delivery, or the reconciler's backstop re-read. It is stamped
+	// on every observation, INCLUDING one that leaves the status unchanged: it
+	// dates the observation, not the change, and a re-confirmed green is a
+	// different claim from the same green an hour later.
+	//
+	// The prompt bundle renders it beside the status, because a green with no
+	// date is a green an agent cannot reason about.
+	// +optional
+	CIUpdatedAt *metav1.Time `json:"ciUpdatedAt,omitempty"`
 	// +optional
 	Mergeable bool `json:"mergeable,omitempty"`
 	// +optional

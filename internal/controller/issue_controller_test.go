@@ -320,8 +320,13 @@ func TestMergeRequestControllerReconciles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reconcile mr: %v", err)
 	}
-	if res.RequeueAfter != MirrorCadenceActive {
-		t.Fatalf("RequeueAfter = %v, want %v", res.RequeueAfter, MirrorCadenceActive)
+	// The repair guard above has just promoted `task` to CONTROLLER owner, and
+	// awaiting-review is neither terminal nor parked, so this MR is one an agent
+	// is actively working: it requeues on the tightened CI backstop cadence, not
+	// the hourly mirror one. The THREAD sync still runs hourly - only the CI
+	// re-read is tightened.
+	if res.RequeueAfter != CIRefreshCadenceActive {
+		t.Fatalf("RequeueAfter = %v, want %v", res.RequeueAfter, CIRefreshCadenceActive)
 	}
 	// Never synced -> the first reconcile syncs the thread.
 	if rd.prCalls != 1 {

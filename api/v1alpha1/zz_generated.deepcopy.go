@@ -590,6 +590,10 @@ func (in *MergeRequestStatus) DeepCopyInto(out *MergeRequestStatus) {
 		in, out := &in.UpdatedAt, &out.UpdatedAt
 		*out = (*in).DeepCopy()
 	}
+	if in.CIUpdatedAt != nil {
+		in, out := &in.CIUpdatedAt, &out.CIUpdatedAt
+		*out = (*in).DeepCopy()
+	}
 	if in.Comments != nil {
 		in, out := &in.Comments, &out.Comments
 		*out = make([]Comment, len(*in))
