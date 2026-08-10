@@ -7,6 +7,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	tatarav1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/controller"
@@ -338,6 +339,83 @@ func (s *Server) stampMRState(ctx context.Context, proj *tatarav1.Project, repo 
 			now := metav1.Now()
 			m.Status.MergedAt = &now
 		}
+	})
+}
+
+// handleCIStatus is the CI-truth intake (PR A). GitHub check_suite/check_run/
+// status and GitLab's Pipeline Hook used to be decoded into Kind:"other" and
+// dropped on handle()'s default arm, which is why MergeRequest.status.ciStatus
+// had exactly ONE writer - the mint-time mirror sync - and an MR the agent
+// opened itself was stamped "" once and never again.
+//
+// THE JOIN IS ON THE HEAD SHA, not on a number: a CI delivery names a commit,
+// never a pull request. Every mirrored MergeRequest in the delivering repository
+// sitting at that head is stamped; two MRs may legitimately share a head.
+//
+// THE OWNING TASK NEEDS NO POKE FROM HERE. TaskReconciler's builder carries
+// Owns(&tatarav1alpha1.MergeRequest{}) (task_controller.go), so the mirror
+// status write enqueues its owner directly. That is also why this stays a pure
+// mirror write and performs no stage transition: the F6-1 boundary keeps every
+// Enter leader-only, and this runs on an HTTP goroutine.
+//
+// NO MATCH IS THE NORMAL CASE. CI runs on every push to every branch, and most
+// of those branches are nobody's Task. The delivery is accepted and logged at
+// debug - never rejected, because a 500 here is a delivery the forge retries
+// forever for a commit this platform will never care about.
+func (s *Server) handleCIStatus(ctx context.Context, w http.ResponseWriter, provider string,
+	proj tatarav1.Project, ev scm.WebhookEvent) {
+
+	repo, err := s.matchRepo(ctx, proj.Name, ev.Repo)
+	if err != nil {
+		s.reject(w, http.StatusInternalServerError, "list repositories", provider, "ci", ev.Action, "error")
+		return
+	}
+	if repo == nil || ev.HeadSHA == "" || ev.CIStatus == "" {
+		s.accept(w, provider, "ci", ev.Action, "ignored")
+		return
+	}
+
+	var mrs tatarav1.MergeRequestList
+	if err := s.cfg.Client.List(ctx, &mrs, client.InNamespace(s.cfg.Namespace)); err != nil {
+		s.reject(w, http.StatusInternalServerError, "list mergerequests", provider, "ci", ev.Action, "error")
+		return
+	}
+	stamped := 0
+	for i := range mrs.Items {
+		mr := &mrs.Items[i]
+		if mr.Spec.RepositoryRef != repo.Name || mr.Status.HeadSHA != ev.HeadSHA {
+			continue
+		}
+		if s.stampMRCI(ctx, &proj, repo, mr.Spec.Number, ev.CIStatus) {
+			stamped++
+		}
+	}
+	if stamped == 0 {
+		s.log.DebugContext(ctx, "ci: no mirrored merge request sits at this head; nothing to stamp",
+			"action", "ci_status_unmatched", "project", proj.Name, "repository", repo.Name,
+			"head_sha", ev.HeadSHA, "ci_status", ev.CIStatus)
+		s.accept(w, provider, "ci", ev.Action, "ignored")
+		return
+	}
+	s.log.InfoContext(ctx, "ci: stamped mirrored merge requests",
+		"action", "ci_status_stamp", "project", proj.Name, "repository", repo.Name,
+		"head_sha", ev.HeadSHA, "ci_status", ev.CIStatus, "count", stamped)
+	s.accept(w, provider, "ci", ev.Action, "accepted")
+}
+
+// stampMRCI upserts Status.CIStatus and Status.CIUpdatedAt together.
+//
+// CIUpdatedAt is written on EVERY observation, including one that leaves the
+// status untouched: it dates the OBSERVATION, not the change. A re-confirmed
+// green is a stronger claim than the same green an hour old, and the bundle
+// renders the date precisely so an agent can tell the two apart.
+func (s *Server) stampMRCI(ctx context.Context, proj *tatarav1.Project, repo *tatarav1.Repository,
+	number int, ciStatus string) bool {
+
+	now := metav1.NewTime(s.now())
+	return s.fitMR(ctx, proj, repo, number, func(m *tatarav1.MergeRequest) {
+		m.Status.CIStatus = ciStatus
+		m.Status.CIUpdatedAt = &now
 	})
 }
 

@@ -40,7 +40,11 @@ type glPayload struct {
 		URL          string `json:"url"`
 		Action       string `json:"action"`
 		SourceBranch string `json:"source_branch"`
-		LastCommit   struct {
+		// SHA and Status are the Pipeline Hook's own two fields: the commit the
+		// pipeline ran on, and the pipeline's aggregate status.
+		SHA        string `json:"sha"`
+		Status     string `json:"status"`
+		LastCommit struct {
 			ID string `json:"id"`
 		} `json:"last_commit"`
 	} `json:"object_attributes"`
@@ -85,8 +89,50 @@ func (*GitLab) DetectAndVerify(h http.Header, payload []byte, secret string) (We
 		return glWorkItemEvent("mr", true, p), nil
 	case "Note Hook":
 		return glNoteEvent(p), nil
+	case "Pipeline Hook":
+		return glPipelineEvent(p), nil
 	default:
 		return WebhookEvent{Kind: "other"}, nil
+	}
+}
+
+// glPipelineEvent builds the Kind:"ci" delivery from a Pipeline Hook.
+//
+// GitLab has no per-check webhook: a pipeline IS the fold over every job in it,
+// so unlike a single GitHub check_run this delivery may report green. The
+// merge_request object on the payload is deliberately unused - a pipeline can
+// run on a branch with no MR at all, and the server joins on the head sha for
+// every provider alike.
+func glPipelineEvent(p glPayload) WebhookEvent {
+	if p.ObjectAttributes.SHA == "" {
+		return WebhookEvent{Kind: "other"}
+	}
+	return WebhookEvent{
+		Kind:     "ci",
+		Repo:     p.Project.GitHTTPURL,
+		HeadSHA:  p.ObjectAttributes.SHA,
+		CIStatus: glPipelineCIStatus(p.ObjectAttributes.Status),
+	}
+}
+
+// glPipelineCIStatus is glCIStatus's mirror-vocabulary twin. It keeps the same
+// two rulings - skipped is neutral so it counts as passing, canceled is a
+// failure - and differs only in that the mirror vocabulary has a word for
+// "running" where the gate vocabulary folds it into pending.
+func glPipelineCIStatus(s string) string {
+	switch s {
+	case "success", "skipped":
+		return CIMirrorGreen
+	case "failed", "canceled":
+		return CIMirrorRed
+	case "running":
+		return CIMirrorRunning
+	case "":
+		return CIMirrorNone
+	default:
+		// created, waiting_for_resource, preparing, pending, manual, scheduled:
+		// the pipeline exists but has not produced a verdict.
+		return CIMirrorPending
 	}
 }
 

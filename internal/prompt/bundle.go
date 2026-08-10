@@ -137,9 +137,14 @@ type issueView struct {
 }
 
 type mrView struct {
-	Repo                string
-	Number              int
-	State, Status, CI   string
+	Repo              string
+	Number            int
+	State, Status, CI string
+	// CIUpdatedAt dates the CI OBSERVATION, empty when there has never been one.
+	// Without it ci="green" is unreadable: the mirror can be an hour stale (the
+	// premise ci_gate.go is built on), so an agent that cannot see when the
+	// status was taken cannot tell a verdict from a fossil.
+	CIUpdatedAt         string
 	Mergeable           bool
 	HeadBranch, HeadSHA string
 	LastBotHeadSHA      string
@@ -234,7 +239,7 @@ const bundleTmpl = `{{define "bundle"}}{{if .Events}}<events count="{{.Events.Co
   </issue>
 {{- end}}
 {{- range .MRs}}
-  <merge_request repo="{{x .Repo}}" number="{{.Number}}" state="{{x .State}}" status="{{x .Status}}" ci="{{x .CI}}" mergeable="{{.Mergeable}}" head_branch="{{x .HeadBranch}}" head_sha="{{x .HeadSHA}}"{{if .LastBotHeadSHA}} last_bot_head_sha="{{x .LastBotHeadSHA}}"{{end}} url="{{x .URL}}">
+  <merge_request repo="{{x .Repo}}" number="{{.Number}}" state="{{x .State}}" status="{{x .Status}}" ci="{{x .CI}}"{{if .CIUpdatedAt}} ci_updated_at="{{x .CIUpdatedAt}}"{{end}} mergeable="{{.Mergeable}}" head_branch="{{x .HeadBranch}}" head_sha="{{x .HeadSHA}}"{{if .LastBotHeadSHA}} last_bot_head_sha="{{x .LastBotHeadSHA}}"{{end}} url="{{x .URL}}">
     <title>{{x .Title}}</title>
     <author>{{x .Author}}</author>
     <body{{if .BodyTruncated}} truncated="true"{{end}}>{{x .Body}}</body>
@@ -551,6 +556,7 @@ func buildView(in Input, issues []v1alpha1.Issue, mrs []v1alpha1.MergeRequest, t
 			State:          mr.Status.State,
 			Status:         mr.Status.Status,
 			CI:             mr.Status.CIStatus,
+			CIUpdatedAt:    optStamp(mr.Status.CIUpdatedAt),
 			Mergeable:      mr.Status.Mergeable,
 			HeadBranch:     mr.Status.HeadBranch,
 			HeadSHA:        mr.Status.HeadSHA,
@@ -832,6 +838,17 @@ func logger(in Input) *slog.Logger {
 
 // stamp is RFC3339 UTC to the MINUTE (E.2).
 func stamp(t metav1.Time) string { return t.Time.UTC().Format(tsLayout) }
+
+// optStamp renders an optional timestamp, empty when unset. An absent
+// observation renders as an ABSENT attribute rather than a zero time: a
+// fabricated date reads as a fresh reading, which is the one lie this field
+// exists to prevent.
+func optStamp(t *metav1.Time) string {
+	if t == nil {
+		return ""
+	}
+	return stamp(*t)
+}
 
 // truncBody cuts a body to limit bytes on a rune boundary. limit < 0 means no
 // truncation; limit == 0 elides the body entirely (E.5 step 2's last resort).
