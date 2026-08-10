@@ -18,7 +18,7 @@ import (
 
 // EnterStage is THE TRANSITION CHOKE POINT. Every state transition the operator
 // applies goes through this one function - TaskReconciler's, StageDriver's,
-// PodWatchReconciler's, the doc batch's - because SIX things must happen on
+// PodWatchReconciler's, the doc batch's - because SEVEN things must happen on
 // every transition and a call site that forgets one of them is a bug that ships:
 //
 //  1. stage.LegalFor VALIDATES the edge, with the kind guard (a kind=review Task
@@ -46,6 +46,15 @@ import (
 //     it is the ONLY counter of terminal outcomes the platform has. The emit
 //     lives HERE, not at the call sites, precisely so the next transition someone
 //     adds cannot forget it.
+//  7. A TERMINAL destination PARKS every still-open Issue the Task owns - the
+//     terminal notice comment plus the tatara-parked label (C.2). It lives here
+//     for the same reason 6 does: the reap path used to cover `rejected` and not
+//     `done`, so a delivered Task's still-open issue got nothing at all, and
+//     since 4ee5c7f the sweep released its ownerRef anyway - MintStage fell
+//     through its label gate and re-minted the issue ACTIVE, with a pod, every
+//     pass, unbounded. It needs an SCM writer, which this free function cannot
+//     manufacture, so it arrives as the WithTerminalIssueRelease option and is
+//     a no-op when a caller does not pass one.
 //
 // IT REFUSES A PARKED TASK, through stage.Enter's own guard. Parking is
 // orthogonal to state now (#521), so a caller that wants a parked Task to move
@@ -66,9 +75,9 @@ import (
 // plus the create edge's park in the same status write.
 func EnterStage(ctx context.Context, c client.Client, sp objbudget.Spiller, m *obs.OperatorMetrics,
 	task *tatarav1alpha1.Task, mrs []tatarav1alpha1.MergeRequest,
-	to, reason string, now time.Time, mutate func(*tatarav1alpha1.Task)) error {
+	to, reason string, now time.Time, mutate func(*tatarav1alpha1.Task), opts ...EnterOption) error {
 
-	return enterStage(ctx, c, sp, m, task, mrs, to, reason, "", now, mutate)
+	return enterStage(ctx, c, sp, m, task, mrs, to, reason, "", now, mutate, opts...)
 }
 
 // MintParked is THE CREATE EDGE'S ONE WRITE: the minted state and the mint's
@@ -112,9 +121,14 @@ func MintParked(ctx context.Context, c client.Client, sp objbudget.Spiller, m *o
 // Task at `to` in the same status update, and only MintParked passes it.
 func enterStage(ctx context.Context, c client.Client, sp objbudget.Spiller, m *obs.OperatorMetrics,
 	task *tatarav1alpha1.Task, mrs []tatarav1alpha1.MergeRequest,
-	to, reason, parkReason string, now time.Time, mutate func(*tatarav1alpha1.Task)) error {
+	to, reason, parkReason string, now time.Time, mutate func(*tatarav1alpha1.Task),
+	opts ...EnterOption) error {
 
 	l := log.FromContext(ctx)
+	var eo enterOpts
+	for _, opt := range opts {
+		opt(&eo)
+	}
 	prev := task.Status.State // "" on a MINT: a mint is not an outcome (D1).
 	from := prev
 	if from == "" {
@@ -266,6 +280,14 @@ func enterStage(ctx context.Context, c client.Client, sp objbudget.Spiller, m *o
 		}
 	}
 
+	// STEP 7 (C.2): A TERMINAL TASK NEVER SILENTLY DROPS AN OPEN ISSUE. Every
+	// still-open Issue it owns gets the terminal notice and the tatara-parked
+	// label here, at the choke point, rather than only on whatever reap branch
+	// happens to cover this state. It runs AFTER the write and is non-fatal -
+	// see releaseTerminalIssues for why, and for which half of B.6 the reap pass
+	// deliberately keeps.
+	releaseTerminalIssues(ctx, eo, task, to)
+
 	l.Info("state transition",
 		"action", "stage_transition", "resource_id", task.Name, "task", task.Name,
 		"from", from, "to", to, "state_reason", reason, "kind", task.Spec.Kind)
@@ -383,7 +405,8 @@ func emitTerminalTokens(m *obs.OperatorMetrics, task *tatarav1alpha1.Task, prev,
 // enter is TaskReconciler's binding of the transition choke point.
 func (r *TaskReconciler) enter(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task,
 	mrs []tatarav1alpha1.MergeRequest, to, reason string, now time.Time) error {
-	return EnterStage(ctx, r.Client, r.spiller(proj), r.Metrics, task, mrs, to, reason, now, nil)
+	return EnterStage(ctx, r.Client, r.spiller(proj), r.Metrics, task, mrs, to, reason, now, nil,
+		WithTerminalIssueRelease(&TerminalReleaser{Client: r.Client, SCMFor: r.SCMFor, Metrics: r.Metrics}))
 }
 
 // park is TaskReconciler's binding of the park choke point.

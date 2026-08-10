@@ -26,6 +26,17 @@ import (
 // back to it by repairIssueBinding.
 const AnnResumeReleasing = "tatara.dev/resume-releasing"
 
+// resumeTriggerHumanReply / resumeTriggerAutoReentry name WHO asked for a
+// resume. resumeOne is one mechanism with two callers - the one-reply guarantee
+// and C.3's automatic pickup - and every log line it writes carries the trigger,
+// because "tatara restarted this by itself" and "a maintainer restarted this"
+// are the two facts an operator reading the resume trail actually needs to tell
+// apart. It is a closed vocabulary; nothing derives control flow from it.
+const (
+	resumeTriggerHumanReply  = "human-reply"
+	resumeTriggerAutoReentry = "auto-reentry"
+)
+
 // resumeNoReentryParks restores the ONE-REPLY GUARANTEE for the UnparkNever
 // (and, since O3, UnparkRetired)
 // population: one human reply to a Task parked with a reason nobody un-parks is
@@ -114,7 +125,7 @@ func (r *ProjectReconciler) resumeNoReentryParks(ctx context.Context, proj *tata
 			// resume the Task it parked, so authorship is the whole test here.
 			continue
 		}
-		if err := r.resumeOne(ctx, proj, t, live); err != nil {
+		if err := r.resumeOne(ctx, proj, t, live, resumeTriggerHumanReply); err != nil {
 			log.FromContext(ctx).Error(err, "resume: no-re-entry park resume failed",
 				"action", "resume_error", "resource_id", t.Name, "reason", t.Status.ParkReason)
 			if firstErr == nil {
@@ -182,23 +193,35 @@ func (r *ProjectReconciler) resumeNoReentryParksPaced(ctx context.Context, proj 
 // All severs happen before any mint (step 3 before step 5), so no mint can
 // observe a half-detached Task.
 func (r *ProjectReconciler) resumeOne(ctx context.Context, proj *tatarav1alpha1.Project,
-	t *tatarav1alpha1.Task, live map[string]bool) error {
+	t *tatarav1alpha1.Task, live map[string]bool, trigger string) error {
 
 	issues, err := r.ownedIssues(ctx, t)
 	if err != nil {
 		return err
 	}
-	var openNames []string
+	// A CLOSED owned Issue IS severed and DOES collect the Task early (C.4); it
+	// is only the MINT that it does not get. The old code bailed outright when
+	// no owned Issue was open, and that bail was a silent vanish: a Task parked
+	// with a reason nobody un-parks, holding one closed issue, had NO exit left
+	// at all. resumeNoReentryParks skipped it here, the reaper's ParkRetention
+	// clock deleted it at T+7d and cascade-deleted the mirror with it, and
+	// IsOrphanIssue (which needs state == "open") could never see the issue
+	// again. Severing a closed issue costs nothing - nothing is re-minted from
+	// it, because forgeItemFromMirror describes an OPEN item and MintStage would
+	// be lying about a closed one - and it frees the Task to be collected NOW
+	// rather than sitting parked for a week doing nothing.
+	var openNames, allNames []string
 	for i := range issues {
+		allNames = append(allNames, issues[i].Name)
 		if issues[i].Status.State == "open" {
 			openNames = append(openNames, issues[i].Name)
 		}
 	}
 	releasing := t.Annotations[AnnResumeReleasing] == "true"
-	if len(openNames) == 0 && !releasing {
-		// The reply is not on a live owned Issue (a closed Issue is the reopen
-		// path's job, not this one). Nothing to resume, nothing to collect
-		// early: the reaper's ordinary ParkRetention clock still owns this Task.
+	if len(allNames) == 0 && !releasing {
+		// The Task owns no Issue mirror at all, so there is nothing to sever and
+		// nothing to re-mint: the reaper's ordinary ParkRetention clock still
+		// owns this Task.
 		return nil
 	}
 	if !releasing {
@@ -210,7 +233,7 @@ func (r *ProjectReconciler) resumeOne(ctx context.Context, proj *tatarav1alpha1.
 	// Step 2. Retry-safe and idempotent (the AnnTerminalClosed marker, shared
 	// with the reaper's closeOwnMRs); a failure returns before anything is
 	// severed, so the whole resume retries cleanly next pass.
-	if err := r.closeTaskBotMRs(ctx, proj, t); err != nil {
+	if err := r.closeTaskBotMRs(ctx, proj, t, trigger); err != nil {
 		return err
 	}
 
@@ -226,13 +249,25 @@ func (r *ProjectReconciler) resumeOne(ctx context.Context, proj *tatarav1alpha1.
 		name string
 	}
 	var jobs []mintJob
+	open := make(map[string]bool, len(openNames))
 	for _, name := range openNames {
+		open[name] = true
+	}
+	for _, name := range allNames {
 		liveIss, err := r.liveIssue(ctx, proj.Namespace, name)
 		if err != nil {
 			return err
 		}
 		if liveIss == nil {
 			continue // already gone (concurrent reap): nothing to re-adopt.
+		}
+		if !open[name] {
+			// CLOSED: severed so the mirror survives the Task's collection as a
+			// zero-owner CR, never re-minted. See the openNames/allNames comment.
+			if err := SeverIssueFromTask(ctx, r.Client, t, name, SeverOrphan); err != nil {
+				return err
+			}
+			continue
 		}
 		r.stripForgeParkedLabel(ctx, proj, liveIss) // best-effort operator-on-promotion
 		if err := SeverIssueFromTask(ctx, r.Client, t, name, SeverOrphan); err != nil {
@@ -332,7 +367,8 @@ func (r *ProjectReconciler) liveIssue(ctx context.Context, ns, name string) (*ta
 // comment and stamps tatara-parked - both wrong for a resume, see resumeOne
 // step 4). It is the retry-safe, idempotent PR-close half of the resume and
 // shares ourMR + the AnnTerminalClosed marker with the reaper's closeOwnMRs.
-func (r *ProjectReconciler) closeTaskBotMRs(ctx context.Context, proj *tatarav1alpha1.Project, t *tatarav1alpha1.Task) error {
+func (r *ProjectReconciler) closeTaskBotMRs(ctx context.Context, proj *tatarav1alpha1.Project,
+	t *tatarav1alpha1.Task, trigger string) error {
 	mrs, err := r.ownedMRs(ctx, t)
 	if err != nil {
 		return err
@@ -351,7 +387,7 @@ func (r *ProjectReconciler) closeTaskBotMRs(ctx context.Context, proj *tatarav1a
 		if err != nil {
 			return err
 		}
-		body := fmt.Sprintf("Closing: tatara is restarting this issue from a human reply after the previous attempt ended in `%s`.", t.Status.ParkReason)
+		body := fmt.Sprintf("Closing: tatara is restarting this issue (%s) after the previous attempt ended in `%s`.", trigger, t.Status.ParkReason)
 		closeErr := writer.ClosePR(ctx, repo.Spec.URL, token, mr.Spec.Number, body)
 		RecordSCM(r.Metrics, provider, "close_pr", closeErr)
 		if closeErr != nil && !isPermanentTargetGone(closeErr) {

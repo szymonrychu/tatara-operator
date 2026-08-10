@@ -880,6 +880,28 @@ func (r *ProjectReconciler) deleteUnlessHoldingADecline(ctx context.Context, pro
 func (r *ProjectReconciler) reapDelivered(ctx context.Context, proj *tatarav1alpha1.Project,
 	t *tatarav1alpha1.Task, live map[string]bool, now time.Time, ds *docReapState) error {
 
+	// THE TERMINAL SEQUENCE FIRST, exactly as the rejected branch runs it, and
+	// its absence here was a LIVE UNBOUNDED LOOP, not a cosmetic gap.
+	//
+	// `done` was the one terminal state reapOne did not run releaseTerminal for,
+	// so a delivered Task's still-open owned Issue got no terminal comment and no
+	// tatara-parked label. Since 4ee5c7f the sweep releases the ownerRef anyway,
+	// so IsOrphanIssue answered orphan, MintStage fell through its label gate
+	// (the label was never stamped) and re-minted the issue ACTIVE - with an
+	// agent pod - on EVERY pass, forever, for any webhook-originated or
+	// trusted-author issue. With the label stamped, every such re-mint is
+	// parked(backlog-sweep) at zero pods instead.
+	//
+	// It runs BEFORE the documentation hold, and that ordering is the same one
+	// reapParked's comment argues for: the hold defers the DELETE and nothing
+	// else. A Task pinned for a nightly batch must not also pin its issues.
+	// Releasing early is safe for the hold itself - the delivered Task's MRs are
+	// all merged by definition, so releaseOwnership keeps their ownerRefs and
+	// needsDocumenting still sees them.
+	if err := r.releaseTerminal(ctx, proj, t, live); err != nil {
+		return err
+	}
+
 	needs, err := r.needsDocumenting(ctx, proj, t)
 	if err != nil {
 		return err
@@ -1083,6 +1105,55 @@ func (r *ProjectReconciler) notifyTerminalIssue(ctx context.Context, proj *tatar
 	if err != nil {
 		return err
 	}
+	return notifyTerminalIssueWith(ctx, r.Client, r.Metrics, proj, writer, token, t, iss, repo)
+}
+
+// notifyTerminalIssueWith is releaseTerminal steps 1 and 2 as a free function,
+// so the TRANSITION CHOKE POINT can take the same treatment without a second
+// copy of it (C.2). The reap path binds it through the method above; the
+// terminal releaser binds it with its own writer.
+//
+// Everything that made the method correct is here and nowhere else: the
+// per-(Issue, Task) AnnTerminalCommented marker, the blocking-on-both
+// discipline, the isPermanentTargetGone tolerance, and the ORDER - comment
+// first, then label - so a human never sees a tatara-parked label with no
+// explanation beside it.
+func notifyTerminalIssueWith(ctx context.Context, c client.Client, m *obs.OperatorMetrics,
+	proj *tatarav1alpha1.Project, writer scm.SCMWriter, token string,
+	t *tatarav1alpha1.Task, iss *tatarav1alpha1.Issue, repo *tatarav1alpha1.Repository) error {
+
+	return commentAndParkIssue(ctx, c, m, proj, writer, token, iss, repo, parkNotice{
+		Marker: AnnTerminalCommented, MarkerValue: t.Name, Body: terminalIssueComment(t),
+		LogFields: []any{"resource_id", t.Name, "state", t.Status.State, "park_reason", t.Status.ParkReason},
+	})
+}
+
+// parkNotice is one comment-plus-label pair: the body to post, the annotation
+// that makes the post once-only, and the extra structured-log fields the caller
+// wants on both lines.
+type parkNotice struct {
+	Marker      string
+	MarkerValue string
+	Body        string
+	LogFields   []any
+}
+
+// commentAndParkIssue is THE comment-then-label pair, shared by every path that
+// has to say "tatara has stopped, here is why" on a forge issue: the reap's
+// terminal sequence, the transition choke point's C.2 treatment, and C.3's
+// automatic-re-entry dead end.
+//
+// BOTH WRITES ARE BLOCKING and the ORDER IS FIXED. The comment goes first so a
+// human never finds a tatara-parked label with no explanation beside it; the
+// label is just as blocking as the comment because MintStage's outermost gate
+// READS it, so a label that silently fails to land makes the next sweep mint the
+// issue ACTIVE, the pod re-triages, it fails again - the exact loop this kills.
+// A target that is permanently GONE (deleted issue, deleted repo) is tolerated
+// on both, because no retry will ever make it land.
+func commentAndParkIssue(ctx context.Context, c client.Client, m *obs.OperatorMetrics,
+	proj *tatarav1alpha1.Project, writer scm.SCMWriter, token string,
+	iss *tatarav1alpha1.Issue, repo *tatarav1alpha1.Repository, n parkNotice) error {
+
 	slug, err := scm.RepoSlugFromURL(repo.Spec.URL)
 	if err != nil {
 		return fmt.Errorf("reap: repo slug for %s: %w", repo.Name, err)
@@ -1093,41 +1164,37 @@ func (r *ProjectReconciler) notifyTerminalIssue(ctx context.Context, proj *tatar
 		provider = proj.Spec.Scm.Provider
 	}
 	l := log.FromContext(ctx)
+	fields := func(extra ...any) []any { return append(append(extra, n.LogFields...), "issue_ref", issueRef) }
 
-	// Step 1. Not idempotent on the forge, so the marker is per (Issue, Task).
-	if iss.Annotations[AnnTerminalCommented] != t.Name {
-		body := terminalIssueComment(t)
-		commentErr := writer.Comment(ctx, token, issueRef, body)
-		RecordSCM(r.Metrics, provider, "comment", commentErr)
+	// Step 1. Not idempotent on the forge, so the marker is per (Issue, writer).
+	if iss.Annotations[n.Marker] != n.MarkerValue {
+		commentErr := writer.Comment(ctx, token, issueRef, n.Body)
+		RecordSCM(m, provider, "comment", commentErr)
 		if commentErr != nil {
 			if !isPermanentTargetGone(commentErr) {
 				return fmt.Errorf("reap: comment on %s: %w", issueRef, commentErr)
 			}
-			l.Info("reap: terminal comment target is gone; skipping",
-				"action", "reap_comment", "resource_id", t.Name, "issue_ref", issueRef)
+			l.Info("reap: terminal comment target is gone; skipping", fields("action", "reap_comment")...)
 		}
-		if err := r.annotateIssue(ctx, iss, AnnTerminalCommented, t.Name); err != nil {
+		if err := annotateIssueOn(ctx, c, iss, n.Marker, n.MarkerValue); err != nil {
 			return err
 		}
-		l.Info("posted the terminal notice on an owned issue",
-			"action", "reap_comment", "resource_id", t.Name, "issue_ref", issueRef,
-			"state", t.Status.State, "park_reason", t.Status.ParkReason)
+		l.Info("posted the terminal notice on an owned issue", fields("action", "reap_comment")...)
 	}
 
 	// Step 2. AddLabel IS idempotent on both forges, so it needs no marker - but
 	// it is just as BLOCKING as step 1.
 	labelErr := writer.AddLabel(ctx, token, issueRef, TataraParkedLabel)
-	RecordSCM(r.Metrics, provider, "add_label", labelErr)
+	RecordSCM(m, provider, "add_label", labelErr)
 	if labelErr != nil {
 		if !isPermanentTargetGone(labelErr) {
 			return fmt.Errorf("reap: stamp %s on %s: %w", TataraParkedLabel, issueRef, labelErr)
 		}
-		l.Info("reap: label target is gone; skipping",
-			"action", "reap_label", "resource_id", t.Name, "issue_ref", issueRef)
+		l.Info("reap: label target is gone; skipping", fields("action", "reap_label")...)
 		return nil
 	}
 	l.Info("stamped the tatara-parked label on an owned issue",
-		"action", "reap_label", "resource_id", t.Name, "issue_ref", issueRef, "label", TataraParkedLabel)
+		fields("action", "reap_label", "label", TataraParkedLabel)...)
 	return nil
 }
 
@@ -1295,8 +1362,18 @@ func (r *ProjectReconciler) releaseOwnership(ctx context.Context, proj *tatarav1
 				return mutate(fresh)
 			})
 		}
-		// An OPEN issue must be re-mintable RIGHT NOW (fix H13).
-		if err := release(iss, iss.Status.State != "closed", write); err != nil {
+		// EVERY issue, open or closed, is RELEASED rather than cascaded (C.4).
+		//
+		// An OPEN issue must be re-mintable RIGHT NOW (fix H13) - that half is
+		// unchanged. The closed half used to pass false, so the ownerRef was KEPT
+		// and the mirror cascade-deleted with the Task at T+7d. That is a silent
+		// vanish, not a collection: IsOrphanIssue needs state == "open" to ever
+		// look at an Issue again, so a closed-but-unfinished issue whose mirror
+		// is gone can never be seen by anything - not the sweep, not the resume
+		// driver, not a human's kubectl. Keeping the mirror costs one zero-owner
+		// CR (B.1 never garbage-collects one) and buys back the only record that
+		// the platform ever worked the issue at all.
+		if err := release(iss, true, write); err != nil {
 			return nil, err
 		}
 	}
@@ -1757,16 +1834,23 @@ func (r *ProjectReconciler) annotateTask(ctx context.Context, t *tatarav1alpha1.
 }
 
 func (r *ProjectReconciler) annotateIssue(ctx context.Context, iss *tatarav1alpha1.Issue, key, value string) error {
+	return annotateIssueOn(ctx, r.Client, iss, key, value)
+}
+
+// annotateIssueOn is annotateIssue for a caller that is not the reconciler -
+// the terminal releaser, which runs from the transition choke point and holds
+// only a client.
+func annotateIssueOn(ctx context.Context, c client.Client, iss *tatarav1alpha1.Issue, key, value string) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var cur tatarav1alpha1.Issue
-		if err := r.Get(ctx, client.ObjectKeyFromObject(iss), &cur); err != nil {
+		if err := c.Get(ctx, client.ObjectKeyFromObject(iss), &cur); err != nil {
 			return err
 		}
 		if cur.Annotations == nil {
 			cur.Annotations = map[string]string{}
 		}
 		cur.Annotations[key] = value
-		if err := r.Update(ctx, &cur); err != nil {
+		if err := c.Update(ctx, &cur); err != nil {
 			return err
 		}
 		iss.SetAnnotations(cur.Annotations)

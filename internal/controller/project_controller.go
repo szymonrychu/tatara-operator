@@ -230,6 +230,10 @@ type ProjectReconciler struct {
 	lastComputeProjectCounts map[string]time.Time
 	lastResumeNoReentryParks map[string]time.Time
 	lastReapTerminal         map[string]time.Time
+	// lastStrandedParks paces driveStrandedParks (C.3) on the same terms, and
+	// for the same reason, as lastResumeNoReentryParks beside it: it is the same
+	// full-namespace Task List over the same parked population.
+	lastStrandedParks map[string]time.Time
 
 	// lastBrainstormPausedLogged paces brainstorm()'s "no refill this pass"
 	// line at INFO (rather than V(1)) for reason=="paused", once per
@@ -522,6 +526,18 @@ func (r *ProjectReconciler) doReconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, fmt.Errorf("resume no-re-entry parks: %w", err)
 	}
 	requeueAfter = soonestRequeue(requeueAfter, resumeRequeue)
+
+	// C.3 AUTOMATIC PICKUP. The same early-reap-plus-fresh-mint as the driver
+	// above, on a clock instead of a human reply, bounded at
+	// MaxAutoReentries per ISSUE. It runs AFTER resumeNoReentryParks and skips
+	// anything carrying a human reply, so a maintainer's answer always wins the
+	// pass and no park is recovered twice.
+	strandRequeue, err := r.driveStrandedParksPaced(ctx, &project, time.Now())
+	if err != nil {
+		r.Metrics.ReconcileResult("Project", "error")
+		return ctrl.Result{}, fmt.Errorf("drive stranded parks: %w", err)
+	}
+	requeueAfter = soonestRequeue(requeueAfter, strandRequeue)
 
 	// THE B.6 TERMINAL REAPER (fix W2). Releases and GCs terminal Tasks
 	// (failed/rejected/parked/delivered) and their Issues/MRs, and stamps the

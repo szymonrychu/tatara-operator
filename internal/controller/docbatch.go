@@ -241,7 +241,7 @@ func (r *ProjectReconciler) forceDocTimeout(ctx context.Context, proj *tatarav1a
 	if err := EnterStage(ctx, r.Client, r.spillerFor(proj), r.Metrics, batch, mrs,
 		tatarav1alpha1.StateDone, stage.ReasonDocTimeout, now, func(t *tatarav1alpha1.Task) {
 			t.Status.DeliveredAt = &stamp
-		}); err != nil {
+		}, WithTerminalIssueRelease(&TerminalReleaser{Client: r.Client, SCMFor: r.SCMFor, Metrics: r.Metrics})); err != nil {
 		return fmt.Errorf("docbatch: force %s to delivered(doc-timeout): %w", batch.Name, err)
 	}
 	log.FromContext(ctx).Info("documentation batch exceeded docStageBudget; forced to delivered(doc-timeout)",

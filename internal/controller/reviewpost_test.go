@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -898,5 +899,64 @@ func TestParseEditIntent_TitleNeverExceedsTheForgeCap(t *testing.T) {
 			require.LessOrEqual(t, len([]rune(gotTitle)), tatarav1alpha1.IssueTitleMaxChars,
 				"a title leaving the decoder must already fit the forge cap")
 		})
+	}
+}
+
+// TestDrainPendingCommentsParkStampsTheLabel is the C.1 refusal arm's
+// deferral. The REST layer holds no SCM writer, so a close it refuses is queued
+// as a park INTENT and drained here - and the drain must do BOTH halves. The
+// comment alone is not enough: MintStage's outermost gate reads the label, so a
+// notice with no label leaves the next sweep minting the issue ACTIVE, which is
+// the loop the park exists to stop.
+func TestDrainPendingCommentsParkStampsTheLabel(t *testing.T) {
+	task := mdTask("t1", "clarify", tatarav1alpha1.StateRefined)
+	iss := mdIssue(task, "tatara-operator", 41)
+	iss.Status.PendingComments = []tatarav1alpha1.PendingComment{
+		{RequestID: "req-park", Action: "comment", Body: ParkIntentBody("an MR is still open")},
+	}
+	c := newMirrorClient(t, mdProject(), mdSecret(), mdRepo("tatara-operator"), task, iss)
+
+	f := newFakeForge(t)
+	d := mdNewDriver(t, f, c)
+	if err := d.DrainPendingComments(context.Background(), mdGetIssue(t, c, iss.Name)); err != nil {
+		t.Fatalf("DrainPendingComments: %v", err)
+	}
+	if len(f.closedIssues) != 0 {
+		t.Fatalf("a park intent must NEVER close the issue, got %v", f.closedIssues)
+	}
+	wantLabel := "szymonrychu/tatara-operator#41|" + TataraParkedLabel
+	if !slices.Contains(f.addedLabels, wantLabel) {
+		t.Fatalf("park intent did not stamp %s, got %v", TataraParkedLabel, f.addedLabels)
+	}
+	posted := 0
+	for _, tc := range f.thread[41] {
+		if strings.Contains(tc.Body, PendingCommentMarker("req-park")) {
+			posted++
+		}
+	}
+	if posted != 1 {
+		t.Fatalf("the park notice must be posted exactly once, got %d", posted)
+	}
+
+	// A re-drain (crash between the forge writes and removePendingComments) must
+	// not post a second notice: the thread already carries the requestId marker.
+	fresh := mdGetIssue(t, c, iss.Name)
+	fresh.Status.PendingComments = []tatarav1alpha1.PendingComment{
+		{RequestID: "req-park", Action: "comment", Body: ParkIntentBody("an MR is still open")},
+	}
+	if err := c.Status().Update(context.Background(), fresh); err != nil {
+		t.Fatalf("re-queue: %v", err)
+	}
+	if err := d.DrainPendingComments(context.Background(), mdGetIssue(t, c, iss.Name)); err != nil {
+		t.Fatalf("DrainPendingComments (re-run): %v", err)
+	}
+	posted = 0
+	for _, tc := range f.thread[41] {
+		if strings.Contains(tc.Body, PendingCommentMarker("req-park")) {
+			posted++
+		}
+	}
+	if posted != 1 {
+		t.Fatalf("re-drain posted the park notice again: %d", posted)
 	}
 }

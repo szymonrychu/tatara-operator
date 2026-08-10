@@ -10,6 +10,28 @@ const (
 	// ParkRetention is how long a park (except backlog-sweep) ages out before
 	// the reaper collects it (B.6).
 	ParkRetention = 7 * 24 * time.Hour
+	// MaxAutoReentries BOUNDS the C.3 automatic pickup of a stranded park: how
+	// many times, in total, tatara may collect a Task parked under a reason
+	// nothing un-parks and re-mint its issue BY ITSELF, with no human comment.
+	//
+	// THREE, and the number is the entire safety argument. Making UnparkNever
+	// stop meaning permanent removes the property that used to make it safe -
+	// that a broken issue eventually stops costing anything - so something else
+	// has to provide it. This does: three laps, then a REAL dead end that is
+	// labelled tatara-parked and sits in the backlog where a human can see it.
+	// An issue that is genuinely broken (a repo that does not build, a task no
+	// agent can complete) burns three fresh Tasks and stops; one that was
+	// stranded by a transient - a forge outage, an operator crash mid-stage, a
+	// CI runner that was down - gets three chances to succeed without anyone
+	// having to notice it was stuck.
+	//
+	// IT IS COUNTED PER ISSUE, NOT PER TASK, and it MUST be: every re-entry
+	// deletes the Task and mints a fresh one, so a per-Task counter starts at
+	// zero on every lap and bounds nothing at all. That is the same defect
+	// carryHumanReviewRounds exists to fix on the review side, and it is why
+	// this count is persisted on the Issue mirror (AnnAutoReentries), the one
+	// object that outlives the laps.
+	MaxAutoReentries = 3
 	// ConversationIdleDefault is a LIVE state's IDLE budget when a Project sets
 	// no scm.conversationIdleMinutes. It is measured from
 	// status.conversationLastEventAt, which every queued event re-stamps, so it
