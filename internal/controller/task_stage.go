@@ -754,17 +754,31 @@ func (r *TaskReconciler) reconcileCaps(ctx context.Context, proj *tatarav1alpha1
 	task *tatarav1alpha1.Task, now time.Time) (handled bool, err error) {
 
 	// podStoppedNoOutcome means the pod RAN (it became Ready: stageWorkStartedAt is
-	// set) and is now GONE without the Task having left the stage - i.e. it
+	// set) and is now UNUSABLE without the Task having left the stage - i.e. it
 	// submitted no outcome. A Task waiting in the ADMISSION QUEUE has podStartedAt
 	// == nil and is never this (fix V6-1): the fix that killed every Task that ever
 	// queued in normal steady state got exactly this predicate wrong.
+	//
+	// Unusable, not absent: a wrapper that died in place (OOMKilled, non-zero exit,
+	// phase Failed) leaves the Pod object standing under RestartPolicy: Never, and
+	// reading only NotFound here is what let one sit at under-implementation for 51
+	// minutes holding a live-pod slot. The park this reaches is ReasonNoOutcome,
+	// which is an UnparkTimer stall rather than a terminal, and ParkTask takes the
+	// corpse down with it.
 	stopped := false
 	if task.Status.PodStartedAt != nil && task.Status.StateWorkStartedAt != nil {
-		gone, gerr := r.podGone(ctx, task)
+		gone, reason, gerr := r.podUnusable(ctx, task)
 		if gerr != nil {
 			return true, gerr
 		}
 		stopped = gone
+		// Before ParkTask takes the corpse down, read the kill off it: the note is
+		// the only thing that tells the next pod its predecessor's workspace is gone.
+		if reason == obs.RecreationReasonOOMKilled {
+			if nerr := r.noteOOMKilledPod(ctx, proj, task); nerr != nil {
+				return true, nerr
+			}
+		}
 	}
 
 	edge, ok := stage.BudgetExit(task, stopped)
@@ -996,21 +1010,28 @@ func (r *TaskReconciler) reconcilePodStage(ctx context.Context, proj *tatarav1al
 		return ctrl.Result{RequeueAfter: admissionRequeue}, nil
 	}
 
-	// A pod that RAN and vanished without an outcome. reconcileCaps has already
-	// applied parked(no-outcome) if the recreation budget was spent, so reaching
-	// here means there is budget left: respawn.
+	// A pod that RAN and ended without an outcome - vanished, or died in place and
+	// left its corpse standing. reconcileCaps owns the case where the pod had
+	// become Ready (it parks no-outcome); reaching here means it never did, so:
+	// respawn.
 	if task.Status.PodStartedAt != nil {
-		gone, gerr := r.podGone(ctx, task)
+		gone, reason, gerr := r.podUnusable(ctx, task)
 		if gerr != nil {
 			return ctrl.Result{}, gerr
 		}
 		if gone {
 			if r.liveStageDiffers(ctx, task) {
-				log.FromContext(ctx).Info("wrapper pod gone but the live stage has moved; not respawning",
-					"action", "pod_respawn_skipped_stage_moved", "resource_id", task.Name, "acting_stage", task.Status.State)
+				log.FromContext(ctx).Info("wrapper pod unusable but the live stage has moved; not respawning",
+					"action", "pod_respawn_skipped_stage_moved", "resource_id", task.Name,
+					"acting_stage", task.Status.State, "reason", reason)
 				return ctrl.Result{RequeueAfter: agentBootRequeue}, nil
 			}
-			return r.respawnLostPod(ctx, proj, task, now)
+			if reason == obs.RecreationReasonOOMKilled {
+				if nerr := r.noteOOMKilledPod(ctx, proj, task); nerr != nil {
+					return ctrl.Result{}, nerr
+				}
+			}
+			return r.respawnLostPod(ctx, proj, task, reason, now)
 		}
 		// THE AGENT ASKED TO BE STOPPED, so stop it - now, not when some clock next
 		// comes round. A handoff note written by THIS pod's agent with no turn in
@@ -1442,15 +1463,28 @@ func (r *TaskReconciler) renderBundle(ctx context.Context, proj *tatarav1alpha1.
 // bounded only by the 24h stage.ResidencyCapAll; the alert is what makes it
 // visible before then.
 //
+// reason is the obs.RecreationReason* label for WHY the pod is being replaced.
+//
 // proj and now are retained in the signature for call-site symmetry with the
 // other pod-lifecycle handlers; nothing in here reads them any more.
 func (r *TaskReconciler) respawnLostPod(ctx context.Context, proj *tatarav1alpha1.Project,
-	task *tatarav1alpha1.Task, now time.Time) (ctrl.Result, error) {
+	task *tatarav1alpha1.Task, reason string, now time.Time) (ctrl.Result, error) {
 
 	_, _ = proj, now
+	// THE CORPSE GOES FIRST, and this is not tidying. This function was written for
+	// a pod that had already VANISHED; it is now also reached for one that died in
+	// place (RestartPolicy: Never keeps a Failed Pod object standing forever). Pod
+	// names are STABLE PER TASK (agent.PodName / BuildPodName), so leaving the
+	// corpse means ensureStagePod finds a pod already annotated for this stage on
+	// the next pass, returns early, and the replacement is never created - the Task
+	// would respawn-count forever and never get a pod. Idempotent: DeleteWrapper
+	// swallows NotFound, which is the vanished case.
+	if err := r.deleteWrapper(ctx, task); err != nil {
+		return ctrl.Result{}, fmt.Errorf("pod respawn corpse delete %s: %w", task.Name, err)
+	}
 	stage.RecordRespawn(task)
 	recreations := task.Status.Stats.PodRecreations
-	obs.PodRecreation(task.Spec.ProjectRef, task.Spec.Kind)
+	obs.PodRecreation(task.Spec.ProjectRef, task.Spec.Kind, reason)
 	// status.lastTurn* is DELIBERATELY left standing here, unlike the structurally
 	// identical patches in ttlStop and stalledTurnStop, which clear it. What
 	// differs is what each path already did with it: those two have just SPENT it
@@ -1467,8 +1501,8 @@ func (r *TaskReconciler) respawnLostPod(ctx context.Context, proj *tatarav1alpha
 	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("record pod respawn: %w", err)
 	}
-	// The pod VANISHED - this is the "ran and disappeared mid-turn" case, so the
-	// turn died with it and nothing will ever complete it. Clearing here also
+	// The pod IS GONE - it vanished mid-turn, or it died in place and was just
+	// deleted above - so the turn died with it and nothing will ever complete it. Clearing here also
 	// stops the poll backstop shouting about a stall the reconciler cannot reach:
 	// the pod clocks are nil now, so reconcilePodStage's turnTimedOut branch (and
 	// therefore stalledTurnStop) is unreachable until a replacement pod exists.
@@ -1492,7 +1526,7 @@ func (r *TaskReconciler) respawnLostPod(ctx context.Context, proj *tatarav1alpha
 		return ctrl.Result{}, fmt.Errorf("pod respawn turn clear %s: %w", task.Name, err)
 	}
 	log.FromContext(ctx).Info("agent pod lost; respawning",
-		"action", "pod_respawn", "resource_id", task.Name, "pod_recreations", recreations)
+		"action", "pod_respawn", "resource_id", task.Name, "pod_recreations", recreations, "reason", reason)
 	return ctrl.Result{RequeueAfter: agentBootRequeue}, nil
 }
 
@@ -1518,17 +1552,100 @@ func (r *TaskReconciler) liveStageDiffers(ctx context.Context, task *tatarav1alp
 	return live.Status.State != task.Status.State
 }
 
-// podGone reports whether the Task's wrapper Pod no longer exists.
-func (r *TaskReconciler) podGone(ctx context.Context, task *tatarav1alpha1.Task) (bool, error) {
+// podUnusable reports whether the Task's wrapper Pod can still serve a turn, and
+// the obs.RecreationReason* label for why it cannot.
+//
+// IT USED TO ASK ONLY "DOES THE POD OBJECT EXIST" (podGone), and with
+// RestartPolicy: Never that is not the same question. A wrapper the kernel
+// OOM-kills leaves the Pod OBJECT standing in phase Failed, forever: NotFound is
+// false, so nothing here fired, no respawn was ever counted, and the Task sat at
+// its stage holding one of the project's live-pod slots until the turn-inactivity
+// clock noticed ~59 minutes later. A pod nobody can talk to is gone in every
+// sense the caller cares about.
+//
+// THE EXIT-ZERO CARVE-OUT IS LOAD-BEARING - do not "simplify" it to "any
+// terminated container". A wrapper that exits 0 is one whose agent wrote its
+// handoff note and asked to be stopped, and agentAskedToBeStopped ->
+// stopAfterAgentHandoff owns that pod: it tears it down and SPENDS the last-turn
+// payload. This check runs FIRST, so treating a clean exit as unusable would
+// divert every graceful finish into respawnLostPod - a spurious increment on the
+// churn alert, and a payload kept alive for a later synthetic note to replay as
+// if it were fresh. Success is not a fault.
+func (r *TaskReconciler) podUnusable(ctx context.Context, task *tatarav1alpha1.Task) (bool, string, error) {
 	pod := &corev1.Pod{}
 	err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: agent.PodName(task)}, pod)
 	if apierrors.IsNotFound(err) {
-		return true, nil
+		return true, obs.RecreationReasonPodGone, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("get wrapper pod: %w", err)
+		return false, "", fmt.Errorf("get wrapper pod: %w", err)
 	}
-	return false, nil
+	reason, _ := podTerminationReason(pod)
+	return reason != "", reason, nil
+}
+
+// podTerminationReason classifies a wrapper Pod that has stopped being able to
+// serve turns, and reports WHEN the container died. An empty reason means the pod
+// is still usable.
+//
+// A container's own terminated state is preferred over the Pod phase because it
+// carries the ACTUAL cause - OOMKilled is only ever visible there, and it is the
+// reason the recreation-loop runbook most needs to see.
+func podTerminationReason(pod *corev1.Pod) (string, time.Time) {
+	for _, cs := range pod.Status.ContainerStatuses {
+		term := cs.State.Terminated
+		if term == nil {
+			continue
+		}
+		if term.Reason == agent.ReasonOOMKilled {
+			return obs.RecreationReasonOOMKilled, term.FinishedAt.Time
+		}
+		if term.ExitCode != 0 {
+			return obs.RecreationReasonContainerExited, term.FinishedAt.Time
+		}
+	}
+	if pod.Status.Phase == corev1.PodFailed {
+		return obs.RecreationReasonPodFailed, time.Time{}
+	}
+	return "", time.Time{}
+}
+
+// noteOOMKilledPod puts the OOM kill in the Task's notes journal BEFORE the pod
+// is parked or respawned away.
+//
+// It exists because the two halves of this fix would otherwise not meet.
+// TTLStopper.writeSyntheticNote also emits an OOM note, but podUnusable now
+// catches most OOM kills FIRST - the reconcile that spots the corpse parks or
+// respawns straight away, and no stop sequence ever runs. Without this the
+// warning would be written almost nowhere, and the next agent would still be sent
+// hunting for a commit that never left the dead pod's ephemeral workspace.
+//
+// Best-effort by design: an unreadable pod, a non-OOM death, or a note that has
+// already landed is a no-op. It must never be the thing that blocks a Task from
+// getting off a dead pod.
+func (r *TaskReconciler) noteOOMKilledPod(ctx context.Context, proj *tatarav1alpha1.Project,
+	task *tatarav1alpha1.Task) error {
+
+	pod := &corev1.Pod{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: agent.PodName(task)}, pod); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	reason, at := podTerminationReason(pod)
+	if reason != obs.RecreationReasonOOMKilled {
+		return nil
+	}
+	for _, n := range task.Status.Notes {
+		if n.Agent == agent.NoteAgentOperator && strings.Contains(n.Body, agent.OOMKilledNoteMarker) && !n.At.Time.Before(at) {
+			return nil
+		}
+	}
+	notes := &agent.FitNoteAppender{Client: r.Client, Spiller: r.spiller(proj), Namespace: task.Namespace}
+	return notes.AppendNote(ctx, task.Name, tatarav1alpha1.Note{
+		At:    metav1.NewTime(at),
+		Agent: agent.NoteAgentOperator,
+		Kind:  agent.NoteKindHandoff,
+		Body:  agent.OOMKilledNoteBody(at),
+	})
 }
 
 // ensureStagePod creates the wrapper Pod + Service for the CURRENT stage, and

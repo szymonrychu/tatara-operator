@@ -908,9 +908,9 @@ func ReArmAfterPodLoss(t *v1alpha1.Task, now time.Time) Edge {
 	return edge
 }
 
-// RecordRespawn is the CLOCK 2 breach handler, and it mirrors the semantics of
-// the boot machinery verbatim (handleBootCrash -> resetAgentRun): a never-Ready
-// pod RESPAWNS, burning one podRecreations. It does NOT terminate the Task, and
+// RecordRespawn is the respawn accounting shared by every pod-loss path - a
+// never-Ready pod (CLOCK 2), a pod that vanished, and a pod that died in place:
+// each RESPAWNS, burning one podRecreations. It does NOT terminate the Task, and
 // since O3 it never returns a terminal edge at all - there is no
 // maxPodRecreations any more. It KEEPS COUNTING: stats.podRecreations is what
 // obs.PodRecreation reports, and that series is the churn alert's only input.

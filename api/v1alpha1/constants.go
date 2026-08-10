@@ -98,16 +98,16 @@ const (
 	// constant, not a second one (fix V7-7). This is CLOCK 2: the pod EXISTS
 	// (podStartedAt != nil) but never became Ready within this long of
 	// podStartedAt. On breach the pod RESPAWNS (+1 podRecreations) via
-	// handleBootCrash -> resetAgentRun; it does NOT fail the Task until
-	// MaxPodRecreations attempts are exhausted (bootcrash.go:138-175), one
-	// attempt counted per distinct pod UID so a genuinely slow boot gets its
-	// full MaxPodRecreations x PodReadyTimeout budget.
+	// PodWatchReconciler.handleNotReady. It does NOT fail the Task at all:
+	// O3 deleted MaxPodRecreations, so a boot-crash loop is bounded only by
+	// ResidencyCapAll and made visible by the
+	// operator_pod_recreations_total{reason="BootTimeout"} churn alert.
 	//
 	// api/v1alpha1 cannot import internal/controller (layering/import-cycle),
 	// so this is a standalone literal. It MUST equal
-	// internal/controller.agentBootDeadline; internal/controller carries a
-	// test-time equality assertion (TestPodReadyTimeoutMatchesAgentBootDeadline
-	// in bootcrash_test.go) pinning them together so they cannot drift.
+	// internal/controller.agentBootDeadline; the pin against drift is the
+	// literal assertion in project_types_test.go (TestOperatorConstants),
+	// which asserts this equals 5 minutes.
 	PodReadyTimeout = 5 * time.Minute
 	// MaxMergeReentries bounds the merging<->reviewing re-entry cycle (fix H7).
 	MaxMergeReentries = 3

@@ -472,7 +472,8 @@ func TestOperatorConstants(t *testing.T) {
 		t.Errorf("AdmissionStarvedBudget = %v, want 24h", v1alpha1.AdmissionStarvedBudget)
 	}
 	// PodReadyTimeout IS agentBootDeadline (internal/controller/task_controller.go:35):
-	// 5m, not 15m. internal/controller carries the equality assertion.
+	// 5m, not 15m. api/v1alpha1 cannot import internal/controller, so this literal
+	// is the pin on both sides.
 	if v1alpha1.PodReadyTimeout != 5*time.Minute {
 		t.Errorf("PodReadyTimeout = %v, want 5m (== agentBootDeadline)", v1alpha1.PodReadyTimeout)
 	}

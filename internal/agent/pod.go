@@ -807,8 +807,9 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		Resources:    buildResourceRequirements(cfg),
 		// On a non-zero exit the kubelet captures the tail of the container's
 		// stdout/stderr into ContainerStatus.State.Terminated.Message, so a wrapper
-		// that crashes before /readyz comes up leaves its cause on pod.Status for
-		// handleBootCrash to surface (no logs API / RBAC needed). See bootCrashDetail.
+		// that dies leaves its cause on pod.Status, readable with no logs API and no
+		// extra RBAC. podTerminationReason (internal/controller/task_stage.go) reads
+		// that terminated state to decide a pod is unusable and why.
 		TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
 		SecurityContext:          buildSecurityContext(cfg),
 		ReadinessProbe: &corev1.Probe{

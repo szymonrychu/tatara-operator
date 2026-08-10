@@ -202,7 +202,7 @@ func (r *TaskReconciler) reArmWithoutHandoff(ctx context.Context, proj *tatarav1
 	}
 	// AFTER the patch, not inside the mutator: patchTaskStatus retries the closure
 	// on conflict, so counting in there would report N recreations for one.
-	obs.PodRecreation(task.Spec.ProjectRef, task.Spec.Kind)
+	obs.PodRecreation(task.Spec.ProjectRef, task.Spec.Kind, obs.RecreationReasonNoHandoff)
 	// stage.ReArmAfterPodLoss nils the pod clocks and nothing else - annotations
 	// are not among its three documented stamps, and they could not be: it is a
 	// pure status mutation in a package that cannot write metadata. This is the

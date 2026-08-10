@@ -626,7 +626,7 @@ func (r *TaskReconciler) handleTransientWrapper(ctx context.Context, proj *tatar
 		}); aerr != nil {
 			return ctrl.Result{}, aerr, true
 		}
-		res, rerr := r.respawnLostPod(ctx, proj, task, time.Now())
+		res, rerr := r.respawnLostPod(ctx, proj, task, obs.RecreationReasonBootTimeout, time.Now())
 		return res, rerr, true
 	}
 
@@ -838,8 +838,9 @@ func (r *TaskReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	// The pod-clock watch (F.4 clocks 2 and 3, plus the G.10 handshake). A SECOND
 	// controller on Pods: the Owns(&corev1.Pod{}) below must keep firing on every
-	// Pod event for handleBootCrash, so the Ready-predicated watch cannot be
-	// folded into it. It acts only on Tasks carrying status.stage.
+	// Pod event, including the death of a pod that was already Ready, so the
+	// Ready-predicated watch cannot be folded into it. It acts only on Tasks
+	// carrying status.stage.
 	podClocks := &PodWatchReconciler{
 		Client:     r.Client,
 		Session:    r.Session,

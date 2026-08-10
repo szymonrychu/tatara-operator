@@ -35,9 +35,12 @@ func ttlScheme(t *testing.T) *runtime.Scheme {
 // consumed one entry per GetSession call (the last entry repeats); handoffErr is
 // what SubmitHandoffTurn returns.
 type stopSession struct {
-	mu             sync.Mutex
-	states         []string
-	getCalls       int
+	mu       sync.Mutex
+	states   []string
+	getCalls int
+	// getErr is what GetSession returns: an OOMKilled wrapper's session endpoint
+	// is unreachable, which is exactly why the handoff turn is never attempted.
+	getErr         error
 	handoffErr     error
 	handoffs       int
 	normalTurns    int
@@ -85,6 +88,10 @@ func (s *stopSession) GetTurn(context.Context, string, string) (agent.TurnResult
 func (s *stopSession) GetSession(context.Context, string) (agent.SessionInfo, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.getErr != nil {
+		s.getCalls++
+		return agent.SessionInfo{}, s.getErr
+	}
 	st := agent.SessionStateReady
 	if len(s.states) > 0 {
 		if s.getCalls < len(s.states) {
@@ -495,4 +502,71 @@ func (s *stopSession) ProbeStatus(context.Context, string, string) (agent.ProbeR
 
 func (s *stopSession) Interrupt(context.Context, string) error {
 	return agent.ErrProbeUnsupported
+}
+
+// oomCorpse replaces the harness pod with an OOMKilled corpse: RestartPolicy
+// Never leaves the Pod object standing in phase Failed with the wrapper's
+// terminated state on it.
+func (h *ttlHarness) oomCorpse(t *testing.T, at time.Time) {
+	t.Helper()
+	pod := &corev1.Pod{}
+	require.NoError(t, h.c.Get(context.Background(),
+		types.NamespacedName{Namespace: ttlNS, Name: agent.PodName(h.task)}, pod))
+	pod.Status = corev1.PodStatus{
+		Phase: corev1.PodFailed,
+		ContainerStatuses: []corev1.ContainerStatus{{
+			Name: "wrapper",
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				ExitCode:   137,
+				Reason:     "OOMKilled",
+				FinishedAt: metav1.NewTime(at),
+			}},
+		}},
+	}
+	require.NoError(t, h.c.Status().Update(context.Background(), pod))
+}
+
+// TestTTLStop_OOMKilledNote: an OOMKilled pod can NEVER answer the handoff turn -
+// waitIdle errors on the unreachable session endpoint, so SubmitHandoffTurn is
+// never even attempted - and the generic placeholder it gets instead is actively
+// harmful. The workspace was EPHEMERAL: a commit an earlier note claims exists
+// may never have reached the remote, and the next agent goes looking for work it
+// cannot find.
+func TestTTLStop_OOMKilledNote(t *testing.T) {
+	killedAt := time.Date(2026, 8, 10, 7, 51, 51, 0, time.UTC)
+	sess := &stopSession{states: []string{agent.SessionStateReady}}
+	sess.getErr = &agent.UnreachableError{}
+	h := newTTLHarness(t, sess)
+	h.oomCorpse(t, killedAt)
+
+	_, err := h.stopper.StopWithHandoff(context.Background(), h.task, h.input())
+	require.NoError(t, err)
+	require.Zero(t, sess.handoffs, "a dead wrapper is never asked for a handoff turn")
+
+	notes := h.notes(t)
+	require.Len(t, notes, 1)
+	body := notes[0].Body
+	require.Contains(t, body, agent.OOMKilledNoteMarker)
+	require.Contains(t, body, killedAt.Format(time.RFC3339), "name the time of death")
+	require.Contains(t, body, "memory limit")
+	require.Contains(t, body, "ephemeral")
+	require.Contains(t, body, "remote", "tell the next agent to verify against the remote")
+	require.NotContains(t, body, agent.SyntheticNoteLostMarker,
+		"the OOM note REPLACES the generic placeholder; the two say different things")
+}
+
+// A non-OOM termination keeps the existing bodies verbatim: the OOM note makes a
+// claim about an ephemeral workspace that is only true when the kernel took the
+// pod out, and it must not be stamped on every dead wrapper.
+func TestTTLStop_NonOOMTerminationKeepsTheOrdinarySyntheticNote(t *testing.T) {
+	sess := &stopSession{states: []string{agent.SessionStateReady}}
+	sess.getErr = &agent.UnreachableError{}
+	h := newTTLHarness(t, sess)
+
+	_, err := h.stopper.StopWithHandoff(context.Background(), h.task, h.input())
+	require.NoError(t, err)
+
+	body := h.notes(t)[0].Body
+	require.NotContains(t, body, agent.OOMKilledNoteMarker)
+	require.Contains(t, body, "wired the reconciler, tests still red")
 }

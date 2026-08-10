@@ -569,7 +569,7 @@ func TestRespawnLostPod_TenRecreationsStillRespawns(t *testing.T) {
 	proj := tsProject(3)
 	r := tsReconciler(newMirrorClient(t, proj, mdSecret(), task))
 
-	if _, err := r.respawnLostPod(context.Background(), proj, task, now); err != nil {
+	if _, err := r.respawnLostPod(context.Background(), proj, task, obs.RecreationReasonPodGone, now); err != nil {
 		t.Fatalf("respawnLostPod: %v", err)
 	}
 
@@ -2467,9 +2467,9 @@ func TestRespawnLostPod_CountsThePodRecreation(t *testing.T) {
 			proj := tsProject(3)
 			r := tsReconciler(newMirrorClient(t, proj, mdSecret(), task))
 
-			c := obs.PodRecreationCounter(task.Spec.ProjectRef, task.Spec.Kind)
+			c := obs.PodRecreationCounter(task.Spec.ProjectRef, task.Spec.Kind, obs.RecreationReasonPodGone)
 			before := testutil.ToFloat64(c)
-			if _, err := r.respawnLostPod(context.Background(), proj, task, now); err != nil {
+			if _, err := r.respawnLostPod(context.Background(), proj, task, obs.RecreationReasonPodGone, now); err != nil {
 				t.Fatalf("respawnLostPod: %v", err)
 			}
 			if got := testutil.ToFloat64(c) - before; got != 1 {
