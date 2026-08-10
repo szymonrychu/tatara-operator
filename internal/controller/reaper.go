@@ -515,8 +515,21 @@ func (r *ProjectReconciler) ReapTerminal(ctx context.Context, proj *tatarav1alph
 	}
 	now := time.Now()
 
-	// live is EVERY Task that currently exists, and foldHeldSince is the SKIP
-	// list: member name -> when the adoption holding it started.
+	// live is every Task that currently exists AND CAN STILL WORK, and
+	// foldHeldSince is the SKIP list: member name -> when the adoption holding it
+	// started.
+	//
+	// IT IS THE HEIR SET, and nothing else reads it: every path threads it
+	// straight through to releaseOwnership, whose only use is
+	// own.OldestSurvivingOwner. It used to be "every Task that exists", and that
+	// is how the deed on an OPEN issue was passed from one FINISHED owner to the
+	// next instead of being dropped for the sweep. mtg-decks#14 carried three
+	// ownerRefs, all to `done` backlog-groomer Tasks, and the daily refine cron
+	// appended a fresh candidate heir faster than retention removed them: a
+	// PERMANENT wedge assembled entirely out of correct-looking handovers. A Task
+	// that has finished cannot act on what it inherits and cannot be woken, so it
+	// is not a survivor. Parked is NOT terminal (TaskDone excludes it) and stays
+	// eligible on purpose - a parked heir CAN be woken by a human reply.
 	//
 	// THE GATE IS FoldInFlightActive, NOT "the marker is set" (issue #467). A
 	// fold adoption is the body of ONE submit_outcome request; nothing outside
@@ -536,7 +549,7 @@ func (r *ProjectReconciler) ReapTerminal(ctx context.Context, proj *tatarav1alph
 	ds := &docReapState{activeBatchMembers: map[string]bool{}}
 	for i := range tl.Items {
 		t := &tl.Items[i]
-		live[t.Name] = true
+		live[t.Name] = !tatarav1alpha1.TaskDone(t)
 		if len(t.Status.FoldInFlight) > 0 {
 			if tatarav1alpha1.FoldInFlightActive(t, now) {
 				for _, member := range t.Status.FoldInFlight {

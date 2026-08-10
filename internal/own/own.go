@@ -127,6 +127,15 @@ func ControllerOwner(obj client.Object) (string, bool) {
 // alive. Owner refs are APPENDED, so ownerRef order IS creation order and the
 // first live ref is the oldest survivor. `live` maps Task name to liveness;
 // a name absent from the map, or present as false, is dead.
+//
+// LIVE MEANS "CAN STILL WORK", NOT "EXISTS". Every caller builds this map, and
+// every caller must exclude a Task that is TERMINAL (v1alpha1.TaskDone). An heir
+// that has already finished cannot act on the artifact it inherits and cannot be
+// woken, so promoting one does not transfer ownership - it PARKS the artifact
+// behind a name that resolves. That is the mtg-decks#14 shape: each reap handed
+// the deed from one `done` backlog-groomer to the next while the sweep's orphan
+// predicate read every one of them as an owner, and the issue went twelve days
+// with no Task.
 func OldestSurvivingOwner(obj client.Object, live map[string]bool) (string, bool) {
 	for _, r := range obj.GetOwnerReferences() {
 		if isTaskRef(r) && live[r.Name] {
@@ -179,6 +188,15 @@ func DropOwner(obj client.Object, task string) bool {
 // at all (a zero-owner artifact is the sweep's business, not this guard's),
 // and when no owner survives (the artifact cascades with its last owner).
 //
+// A TERMINAL OWNER IS NOT AN HEIR (see OldestSurvivingOwner). This guard runs at
+// the top of EVERY Issue and MergeRequest reconcile, so promoting a `done` Task
+// re-installs, within milliseconds, exactly the ref the intake funnel's terminal
+// release had just removed - the two would disagree about what an owner is, and
+// the guard would win. When every owner has finished, the honest answer is that
+// this artifact has no controller and the SWEEP owns it: that is a designed
+// hand-off, not the fold/reap bug the ERROR line is about, so it is logged as
+// one.
+//
 // This is the ONE function in the package that talks to the API server.
 func RepairZeroController(ctx context.Context, c client.Client, obj client.Object) (bool, error) {
 	if _, ok := ControllerOwner(obj); ok {
@@ -199,12 +217,14 @@ func RepairZeroController(ctx context.Context, c client.Client, obj client.Objec
 	obs.OrphanNoControllerTotal.Inc()
 
 	live := make(map[string]bool, len(owners))
+	anyExists := false
 	for _, name := range owners {
 		var task tataradevv1alpha1.Task
 		err := c.Get(ctx, types.NamespacedName{Namespace: obj.GetNamespace(), Name: name}, &task)
 		switch {
 		case err == nil:
-			live[name] = true
+			anyExists = true
+			live[name] = !tataradevv1alpha1.TaskDone(&task)
 		case apierrors.IsNotFound(err):
 			live[name] = false
 		default:
@@ -214,6 +234,11 @@ func RepairZeroController(ctx context.Context, c client.Client, obj client.Objec
 
 	promote, ok := OldestSurvivingOwner(obj, live)
 	if !ok {
+		if anyExists {
+			l.Info("artifact has owner refs but no controller owner and every owner has finished; the sweep re-mints and adopts it",
+				"namespace", obj.GetNamespace(), "name", obj.GetName(), "owners", owners)
+			return false, nil
+		}
 		l.Error(nil, "artifact has owner refs but no controller owner and no surviving owner; it cascades with its last owner",
 			"namespace", obj.GetNamespace(), "name", obj.GetName(), "owners", owners)
 		return false, nil

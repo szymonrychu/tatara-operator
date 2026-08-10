@@ -852,3 +852,241 @@ func TestSoonerRequeue(t *testing.T) {
 		})
 	}
 }
+
+// terminalTask builds a Task that EXISTS and has finished. It is the whole
+// difference between this file's #521 half and its terminal half: the API
+// server HAS this object, so every existence-only liveness check passes.
+func terminalTask(name, state string) *tatarav1alpha1.Task {
+	t := liveTask(name)
+	t.Status.State = state
+	return t
+}
+
+// refineOwnedIssue reproduces iss-mtg-decks-14 as production carried it: THREE
+// ownerReferences, all to REFINE (backlog-groomer) Tasks, all `done`, all with
+// blockOwnerDeletion. The oldest carries controller=true, the second
+// controller=false (a RepairZeroController promotion rewrites every sibling),
+// and the newest carries no controller field at all (own.AddPlainOwner leaves
+// it unset).
+func refineOwnedIssue(repo string, number int, names ...string) *tatarav1alpha1.Issue {
+	yes, no := true, false
+	iss := &tatarav1alpha1.Issue{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      tatarav1alpha1.IssueName(repo, number),
+			Namespace: testNS,
+		},
+	}
+	iss.Status.State = "open"
+	for i, n := range names {
+		ref := metav1.OwnerReference{
+			APIVersion:         tatarav1alpha1.GroupVersion.String(),
+			Kind:               "Task",
+			Name:               n,
+			UID:                types.UID("u-" + n),
+			BlockOwnerDeletion: &yes,
+		}
+		switch i {
+		case 0:
+			ref.Controller = &yes
+		case 1:
+			ref.Controller = &no
+		}
+		iss.OwnerReferences = append(iss.OwnerReferences, ref)
+	}
+	return iss
+}
+
+// TestSweepMintsIssueHeldOnlyByDoneRefineTasks IS the production defect, end to
+// end: mtg-decks#14 and #16 were filed on 2026-07-29/30, the maintainer asked
+// for them twice, and every sweep answered
+// `sweep_skip_issue num=14 reason=issue_owned` because the Issue mirror's
+// controller owner was a `done` backlog-groomer Task that still EXISTS. The
+// #521 tombstone branch cannot reach it - the API server HAS the Task - and the
+// comment-driven un-park cannot either, because there is no parked Task to
+// wake: three dead refiners were holding the deed.
+//
+// A groomer that has finished is not working the issue. The pass that
+// discovers that must RELEASE the deed and mint, exactly as the #521 pass does
+// for a tombstone.
+func TestSweepMintsIssueHeldOnlyByDoneRefineTasks(t *testing.T) {
+	proj := sweepProject("wedge-proj")
+	repo := sweepRepo("wedge-proj")
+	iss := refineOwnedIssue(repo.Name, 14,
+		"refine-qe-2c0080a39859a7d7-k8vkg",
+		"refine-qe-2c0080a39859a7d7-4q76q",
+		"refine-qe-2c0080a39859a7d7-qbmk4")
+	c := newMirrorClient(t, proj, repo, iss,
+		terminalTask("refine-qe-2c0080a39859a7d7-k8vkg", tatarav1alpha1.StateDone),
+		terminalTask("refine-qe-2c0080a39859a7d7-4q76q", tatarav1alpha1.StateDone),
+		terminalTask("refine-qe-2c0080a39859a7d7-qbmk4", tatarav1alpha1.StateDone))
+
+	before := testutil.ToFloat64(
+		obs.SweepTerminalOwnerReleasedTotal.WithLabelValues(proj.Name, SweepActivity))
+	runSweep(t, c, proj, repo, &sweepReader{issues: []scm.IssueRef{{
+		Number: 14, State: "open", Author: "szymonrychu", Title: "add a deck importer",
+		CreatedAt: time.Now().Add(-12 * 24 * time.Hour),
+	}}})
+
+	tasks := sweepTasks(t, c, proj.Name)
+	if len(tasks) != 1 {
+		t.Fatalf("minted %d tasks, want 1 (a finished groomer must not hold the deed)", len(tasks))
+	}
+	if tasks[0].Spec.Kind != SweepIssueKind {
+		t.Fatalf("minted kind = %q, want %q", tasks[0].Spec.Kind, SweepIssueKind)
+	}
+	stored := getIssueCR(t, c, iss.Name)
+	ctrl, owned := own.ControllerOwner(stored)
+	if !owned || ctrl != tasks[0].Name {
+		t.Fatalf("issue controller owner = %q/%v, want the freshly minted %q", ctrl, owned, tasks[0].Name)
+	}
+	if d := testutil.ToFloat64(
+		obs.SweepTerminalOwnerReleasedTotal.WithLabelValues(proj.Name, SweepActivity)) - before; d != 1 {
+		t.Fatalf("SweepTerminalOwnerReleasedTotal delta = %v, want 1", d)
+	}
+}
+
+// TestResolveLiveOwnerTerminalOwnerReleasesRef pins the predicate itself over
+// the WHOLE state enum, in one table, because the only thing that separates the
+// fix from an issue stolen out from under a running agent is which side of this
+// line a state falls on.
+//
+// done and rejected are treated IDENTICALLY, and that is not a shortcut: it is
+// the definition api/v1alpha1.TaskDone already gives and the one the reaper's
+// releaseOwnership already applies (an OPEN artifact owned by a terminal Task
+// is released, whichever terminal it reached). A fourth definition of terminal
+// is how this codebase has produced three disagreeing predicates before.
+//
+// PARKED IS NOT TERMINAL and must keep its deed: TaskDone(parked) is false
+// since #521, a parked Task can still be woken by a human reply, and
+// resume.go's no-re-entry driver owns that population.
+func TestResolveLiveOwnerTerminalOwnerReleasesRef(t *testing.T) {
+	tests := map[string]struct {
+		state       string
+		parkReason  string
+		wantOwner   string
+		wantRelease float64
+	}{
+		"done releases":                  {state: tatarav1alpha1.StateDone, wantRelease: 1},
+		"rejected releases":              {state: tatarav1alpha1.StateRejected, wantRelease: 1},
+		"new keeps":                      {state: tatarav1alpha1.StateNew, wantOwner: "owner-task"},
+		"refined keeps":                  {state: tatarav1alpha1.StateRefined, wantOwner: "owner-task"},
+		"under-implementation keeps":     {state: tatarav1alpha1.StateUnderImplementation, wantOwner: "owner-task"},
+		"awaiting-review keeps":          {state: tatarav1alpha1.StateAwaitingReview, wantOwner: "owner-task"},
+		"merged keeps":                   {state: tatarav1alpha1.StateMerged, wantOwner: "owner-task"},
+		"deployed keeps":                 {state: tatarav1alpha1.StateDeployed, wantOwner: "owner-task"},
+		"parked is NOT terminal - keeps": {state: tatarav1alpha1.StateRefined, parkReason: "awaiting-human", wantOwner: "owner-task"},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			proj := sweepProject("terminal-proj")
+			iss := issueOwnedBy("tatara-operator", 14, "owner-task")
+			iss.Status.State = "open"
+			task := terminalTask("owner-task", tc.state)
+			task.Status.ParkReason = tc.parkReason
+			c := newMirrorClient(t, iss, task)
+
+			before := testutil.ToFloat64(
+				obs.SweepTerminalOwnerReleasedTotal.WithLabelValues(proj.Name, SweepActivity))
+			got, err := minterOn(c).resolveLiveIssueOwner(context.Background(), proj, iss, SweepActivity)
+			if err != nil {
+				t.Fatalf("resolveLiveIssueOwner: %v", err)
+			}
+			if got != tc.wantOwner {
+				t.Fatalf("resolveLiveIssueOwner = %q, want %q", got, tc.wantOwner)
+			}
+			stored := getIssueCR(t, c, iss.Name)
+			if tc.wantOwner == "" {
+				if len(stored.OwnerReferences) != 0 {
+					t.Fatalf("the terminal owner's ref must be DROPPED IN ETCD, %d remain", len(stored.OwnerReferences))
+				}
+			} else if _, owned := own.ControllerOwner(stored); !owned {
+				t.Fatal("a non-terminal owner's controller ref must survive untouched")
+			}
+			d := testutil.ToFloat64(
+				obs.SweepTerminalOwnerReleasedTotal.WithLabelValues(proj.Name, SweepActivity)) - before
+			if d != tc.wantRelease {
+				t.Fatalf("SweepTerminalOwnerReleasedTotal delta = %v, want %v", d, tc.wantRelease)
+			}
+		})
+	}
+}
+
+// TestTerminalReleaseLeavesTheTombstoneCounterAlone pins the #521 branch as
+// UNCHANGED. A ref naming a Task the API server does not have is still dropped
+// with a WRITE and still counted on operator_sweep_stale_owner_repaired_total -
+// and NOT on the terminal series. The two counters have different expected
+// shapes and different runbooks (a sustained tombstone rate is a reap that is
+// not handing over ownership; a sustained terminal rate is a Task kind claiming
+// a deed it should not hold), so a shared series would destroy both.
+func TestTerminalReleaseLeavesTheTombstoneCounterAlone(t *testing.T) {
+	proj := sweepProject("both-proj")
+	iss := issueOwnedBy("tatara-operator", 521, "reaped-task")
+	iss.Status.State = "open"
+	c := newMirrorClient(t, iss)
+
+	tombBefore := testutil.ToFloat64(obs.SweepStaleOwnerRepairedTotal.WithLabelValues(proj.Name, SweepActivity))
+	termBefore := testutil.ToFloat64(obs.SweepTerminalOwnerReleasedTotal.WithLabelValues(proj.Name, SweepActivity))
+	got, err := minterOn(c).resolveLiveIssueOwner(context.Background(), proj, iss, SweepActivity)
+	if err != nil {
+		t.Fatalf("resolveLiveIssueOwner: %v", err)
+	}
+	if got != "" {
+		t.Fatalf("resolveLiveIssueOwner = %q, want \"\"", got)
+	}
+	if n := len(getIssueCR(t, c, iss.Name).OwnerReferences); n != 0 {
+		t.Fatalf("the tombstone ref must still be dropped in etcd, %d remain", n)
+	}
+	if d := testutil.ToFloat64(obs.SweepStaleOwnerRepairedTotal.WithLabelValues(proj.Name, SweepActivity)) - tombBefore; d != 1 {
+		t.Fatalf("SweepStaleOwnerRepairedTotal delta = %v, want 1 (the #521 branch is unchanged)", d)
+	}
+	if d := testutil.ToFloat64(obs.SweepTerminalOwnerReleasedTotal.WithLabelValues(proj.Name, SweepActivity)) - termBefore; d != 0 {
+		t.Fatalf("SweepTerminalOwnerReleasedTotal delta = %v, want 0 (a tombstone is not a terminal owner)", d)
+	}
+}
+
+// TestResolveLiveOwnerKeepsATerminalOwnerOfAClosedIssue: the release rule is
+// the reaper's rule, and the reaper's rule is "an OPEN issue must be
+// re-mintable RIGHT NOW" (fix H13). A CLOSED mirror is skipped by
+// IsOrphanIssue clause (a) anyway, so releasing it would mint nothing and would
+// instead orphan a mirror the reaper deliberately keeps so it CASCADES with its
+// owner - which is exactly how a retained declined brainstorm proposal is
+// stored.
+func TestResolveLiveOwnerKeepsATerminalOwnerOfAClosedIssue(t *testing.T) {
+	proj := sweepProject("closed-proj")
+	iss := issueOwnedBy("tatara-operator", 15, "declining-task")
+	iss.Status.State = "closed"
+	c := newMirrorClient(t, iss, terminalTask("declining-task", tatarav1alpha1.StateRejected))
+
+	got, err := minterOn(c).resolveLiveIssueOwner(context.Background(), proj, iss, SweepActivity)
+	if err != nil {
+		t.Fatalf("resolveLiveIssueOwner: %v", err)
+	}
+	if got != "declining-task" {
+		t.Fatalf("resolveLiveIssueOwner = %q, want \"declining-task\" (a closed mirror keeps its owner)", got)
+	}
+	if _, owned := own.ControllerOwner(getIssueCR(t, c, iss.Name)); !owned {
+		t.Fatal("a closed mirror's controller ref was dropped; its retained record now leaks")
+	}
+}
+
+// TestResolveLiveMROwnerKeepsATerminalOwner: the MR arm is deliberately NOT
+// given this rule. The reaper's MergeRequest release is a DIFFERENT predicate -
+// it drops only when step 4 will not close the PR (!ourMR) AND the PR is still
+// open - and it carries humanReviewRounds forward before it orphans. Applying
+// the issue rule here would re-adopt a bot MR we are about to close and would
+// silently reset a human's review-round count.
+func TestResolveLiveMROwnerKeepsATerminalOwner(t *testing.T) {
+	proj := sweepProject("mrterm-proj")
+	repo := sweepRepo("mrterm-proj")
+	task := terminalTask("mr-owner-task", tatarav1alpha1.StateDone)
+	mr := claimedMR(t, proj, repo, 1358, task)
+	c := newMirrorClient(t, mr, task)
+
+	got, err := minterOn(c).resolveLiveMROwner(context.Background(), proj, mr, SweepActivity)
+	if err != nil {
+		t.Fatalf("resolveLiveMROwner: %v", err)
+	}
+	if got != task.Name {
+		t.Fatalf("resolveLiveMROwner = %q, want %q (the MR arm keeps the reaper's own predicate)", got, task.Name)
+	}
+}

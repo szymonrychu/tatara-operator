@@ -464,3 +464,98 @@ func (s *recordingSink) Info(int, string, ...any)       {}
 func (s *recordingSink) Error(error, string, ...any)    { s.errors++ }
 func (s *recordingSink) WithValues(...any) logr.LogSink { return s }
 func (s *recordingSink) WithName(string) logr.LogSink   { return s }
+
+// TestRepairZeroControllerNeverPromotesATerminalOwner pins the other half of
+// the mtg-decks#14 wedge. The B.2 rule 5 guard runs at the top of EVERY Issue
+// and MergeRequest reconcile, so a version of it that promotes a Task which has
+// already FINISHED re-installs, within milliseconds, exactly the ref the intake
+// funnel's terminal release had just dropped - and it wins, because it runs far
+// more often than an hourly sweep. That is not a race, it is a fixed point: an
+// artifact whose owners are all `done` would be handed back and forth forever
+// and never re-minted.
+//
+// A terminal Task is therefore NOT a surviving owner. When every owner has
+// finished, this guard reports no repair, does NOT write, and leaves the
+// artifact zero-controller - which IsOrphanIssue reads as an orphan, which is
+// the sweep re-minting and adopting it. And it says so at INFO, not ERROR: that
+// is a designed hand-off, not the fold-or-reap bug the ERROR line names.
+func TestRepairZeroControllerNeverPromotesATerminalOwner(t *testing.T) {
+	ctx := context.Background()
+	done := mkTask(t, ctx, "own-term-done")
+	rejected := mkTask(t, ctx, "own-term-rejected")
+	livePicked := mkTask(t, ctx, "own-term-live")
+
+	seed := &tataradevv1alpha1.Issue{}
+	AddPlainOwner(seed, done)
+	AddPlainOwner(seed, rejected)
+	AddPlainOwner(seed, livePicked)
+	mkIssue(t, ctx, "iss-own-terminal", seed.GetOwnerReferences())
+
+	setTaskState(t, ctx, done, tataradevv1alpha1.StateDone)
+	setTaskState(t, ctx, rejected, tataradevv1alpha1.StateRejected)
+
+	sink := &recordingSink{}
+	lctx := logf.IntoContext(ctx, logr.New(sink))
+
+	// The two terminal owners are OLDER, so an existence-only survivor test
+	// promotes `done`. The live one must win.
+	repaired, err := RepairZeroController(lctx, k8sClient, getIssue(t, ctx, "iss-own-terminal"))
+	if err != nil {
+		t.Fatalf("RepairZeroController: %v", err)
+	}
+	if !repaired {
+		t.Fatal("RepairZeroController reported no repair with a live owner available")
+	}
+	if name, ok := ControllerOwner(getIssue(t, ctx, "iss-own-terminal")); !ok || name != livePicked.Name {
+		t.Fatalf("controller owner = (%q, %v), want the oldest NON-TERMINAL owner (%s, true)", name, ok, livePicked.Name)
+	}
+
+	// Now every owner is terminal. The guard must stand down, write nothing, and
+	// leave the artifact for the sweep.
+	setTaskState(t, ctx, livePicked, tataradevv1alpha1.StateDone)
+	stripControllerFlags(t, ctx, "iss-own-terminal")
+
+	sink.errors = 0
+	repaired, err = RepairZeroController(lctx, k8sClient, getIssue(t, ctx, "iss-own-terminal"))
+	if err != nil {
+		t.Fatalf("RepairZeroController with only terminal owners: %v", err)
+	}
+	if repaired {
+		t.Fatal("RepairZeroController promoted a TERMINAL owner; the artifact is wedged again")
+	}
+	if _, ok := ControllerOwner(getIssue(t, ctx, "iss-own-terminal")); ok {
+		t.Fatal("a terminal owner was written back as controller")
+	}
+	if sink.errors != 0 {
+		t.Fatalf("ERROR log lines = %d, want 0: an all-terminal owner set is a hand-off to the sweep, not a fold/reap bug", sink.errors)
+	}
+}
+
+// setTaskState drives a Task to a terminal state through the status
+// subresource, which is where TaskDone reads from.
+func setTaskState(t *testing.T, ctx context.Context, tk *tataradevv1alpha1.Task, state string) {
+	t.Helper()
+	var fresh tataradevv1alpha1.Task
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: tk.Name}, &fresh); err != nil {
+		t.Fatalf("get Task %s: %v", tk.Name, err)
+	}
+	fresh.Status.State = state
+	if err := k8sClient.Status().Update(ctx, &fresh); err != nil {
+		t.Fatalf("stamp %s on Task %s: %v", state, tk.Name, err)
+	}
+}
+
+// stripControllerFlags clears every controller flag on an Issue, reproducing
+// the zero-controller window a fold or a reap leaves behind.
+func stripControllerFlags(t *testing.T, ctx context.Context, name string) {
+	t.Helper()
+	iss := getIssue(t, ctx, name)
+	refs := iss.GetOwnerReferences()
+	for i := range refs {
+		refs[i].Controller = nil
+	}
+	iss.SetOwnerReferences(refs)
+	if err := k8sClient.Update(ctx, iss); err != nil {
+		t.Fatalf("strip controller flags on %s: %v", name, err)
+	}
+}
