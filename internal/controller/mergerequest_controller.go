@@ -10,6 +10,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/own"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -98,7 +99,9 @@ func (r *MergeRequestReconciler) doReconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, fmt.Errorf("mergerequest: get repository %s: %w", mr.Spec.RepositoryRef, err)
 	}
 
-	cadence := MirrorCadence(mirrorOwnerTask(ctx, r.Client, &mr))
+	owner := mirrorOwnerTask(ctx, r.Client, &mr)
+	cadence := MirrorCadence(owner)
+	ciCadence := CIRefreshCadence(owner)
 
 	if r.ReaderFor != nil && mirrorSyncDue(mr.Status.LastSyncedAt, cadence, r.now()) {
 		reader, err := mirrorReaderFor(ctx, r.Client, r.ReaderFor, &proj)
@@ -109,6 +112,13 @@ func (r *MergeRequestReconciler) doReconcile(ctx context.Context, req ctrl.Reque
 			return ctrl.Result{}, err
 		}
 	}
+
+	// THE MISSED-WEBHOOK BACKSTOP (PR A item 3). The CI webhook is the primary
+	// writer of status.ciStatus; this is what covers a delivery the forge dropped
+	// and, just as often, one that arrived while this mirror still carried the
+	// PREVIOUS head - a stamp keyed on headSHA has nothing to match, so it lands
+	// nowhere and only a live re-read ever recovers it.
+	r.refreshCI(ctx, &proj, &repo, &mr, ciCadence)
 
 	// THE DURABLE INTENTS (C.5.3 phase 2). /outcome and the MCP writes are pure
 	// etcd: they persist an intent and return. THIS is what performs it, and it is
@@ -152,14 +162,94 @@ func (r *MergeRequestReconciler) doReconcile(ctx context.Context, req ctrl.Reque
 					}
 					log.FromContext(ctx).Info("mergerequest: upstream permanently gone (404); marked closed, stopped forge drains",
 						"action", "mr_gone_404", "resource_id", mr.Name)
-					return ctrl.Result{RequeueAfter: cadence}, nil
+					return ctrl.Result{RequeueAfter: min(cadence, ciCadence)}, nil
 				}
 				return ctrl.Result{}, err
 			}
 		}
 	}
 
-	return ctrl.Result{RequeueAfter: cadence}, nil
+	return ctrl.Result{RequeueAfter: min(cadence, ciCadence)}, nil
+}
+
+// refreshCI re-reads LIVE CI at this MR's mirrored head and stamps
+// status.ciStatus / status.ciUpdatedAt.
+//
+// THE READ IS AGGREGATE. GetCommitCIStatus folds every check-run and every
+// commit status on the commit before it answers, which is what entitles this
+// path - unlike a single check_run webhook - to write green. It is also why it
+// is the authority that corrects a webhook-stamped green down when a second
+// check suite is still red.
+//
+// IT RETURNS NOTHING AND SWALLOWS EVERY ERROR, deliberately. It is a backstop:
+// the drains that run after it (DrainPendingReview above all) are the only thing
+// that advances a Task off reviewing, and a forge that 502s on a CI read must
+// not be able to wedge them. The next cadence tick simply asks again.
+func (r *MergeRequestReconciler) refreshCI(ctx context.Context, proj *tatarav1alpha1.Project,
+	repo *tatarav1alpha1.Repository, mr *tatarav1alpha1.MergeRequest, cadence time.Duration) {
+
+	if r.ReaderFor == nil || mr.Status.HeadSHA == "" {
+		return
+	}
+	// A merged or closed MR's CI can no longer gate anything (same exclusion
+	// ciRedAtReviewedHead makes), and re-reading it forever is pure forge load.
+	if mr.Status.State == "merged" || mr.Status.State == "closed" {
+		return
+	}
+	if !mirrorSyncDue(mr.Status.CIUpdatedAt, cadence, r.now()) {
+		return
+	}
+
+	l := log.FromContext(ctx)
+	reader, err := mirrorReaderFor(ctx, r.Client, r.ReaderFor, proj)
+	if err != nil {
+		l.Info("mergerequest: ci backstop skipped, no reader", "resource_id", mr.Name, "err", err.Error())
+		return
+	}
+	owner, name, err := ciOwnerRepo(repo.Spec.URL, providerOf(proj))
+	if err != nil {
+		l.Info("mergerequest: ci backstop skipped, unparseable repo url", "resource_id", mr.Name, "err", err.Error())
+		return
+	}
+	status, err := reader.GetCommitCIStatus(ctx, owner, name, mr.Status.HeadSHA)
+	if err != nil {
+		l.Info("mergerequest: ci backstop read failed (non-fatal)",
+			"action", "ci_backstop_read", "resource_id", mr.Name, "head_sha", mr.Status.HeadSHA, "err", err.Error())
+		return
+	}
+
+	mirrored := scm.MirrorCIStatus(status)
+	now := metav1.NewTime(r.now())
+	if err := objbudget.FitMergeRequest(ctx, r.Client, r.spiller(proj), client.ObjectKeyFromObject(mr),
+		func(m *tatarav1alpha1.MergeRequest) {
+			m.Status.CIStatus = mirrored
+			m.Status.CIUpdatedAt = &now
+		}); err != nil {
+		l.Info("mergerequest: ci backstop write failed (non-fatal)",
+			"action", "ci_backstop_write", "resource_id", mr.Name, "err", err.Error())
+		return
+	}
+	// Fold the observation onto the in-memory copy the drains below still read.
+	mr.Status.CIStatus = mirrored
+	mr.Status.CIUpdatedAt = &now
+}
+
+// ciOwnerRepo resolves the (owner, repo) pair GetCommitCIStatus wants for this
+// provider. GitLab's CI reads take the FULL project path as the single "owner"
+// argument - its notion of a project id - and an empty repo; splitting a
+// subgroup path into owner/name reads the wrong project or none. Same resolution
+// as releaseGreen in merge.go and gatherRepoCIState in projectscan.go.
+func ciOwnerRepo(repoURL, provider string) (string, string, error) {
+	owner, name, err := scm.OwnerRepo(repoURL)
+	if err != nil {
+		return "", "", err
+	}
+	if provider == "gitlab" {
+		if pp, perr := scm.GitLabProjectPath(repoURL); perr == nil {
+			return pp, "", nil
+		}
+	}
+	return owner, name, nil
 }
 
 // markMergeRequestGone stamps a permanently-404ing MergeRequest's mirror as

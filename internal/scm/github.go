@@ -49,6 +49,15 @@ type ghWorkItem struct {
 	} `json:"pull_request"`
 }
 
+// ghCheck is the shared shape of a check_run and a check_suite object. The two
+// differ in what they MEAN - a run is one check, a suite is the aggregate over
+// its runs - not in what they carry.
+type ghCheck struct {
+	HeadSHA    string `json:"head_sha"`
+	Status     string `json:"status"`
+	Conclusion string `json:"conclusion"`
+}
+
 type ghPayload struct {
 	Action     string `json:"action"`
 	Ref        string `json:"ref"`
@@ -68,6 +77,12 @@ type ghPayload struct {
 		ID   int    `json:"id"`
 		Body string `json:"body"`
 	} `json:"comment"`
+	// SHA and State are the `status` (commit status) event's own two fields:
+	// the commit the status is for, and one context's verdict on it.
+	SHA         string      `json:"sha"`
+	State       string      `json:"state"`
+	CheckRun    *ghCheck    `json:"check_run"`
+	CheckSuite  *ghCheck    `json:"check_suite"`
 	Issue       *ghWorkItem `json:"issue"`
 	PullRequest *ghWorkItem `json:"pull_request"`
 	Review      struct {
@@ -125,8 +140,95 @@ func (*GitHub) DetectAndVerify(h http.Header, payload []byte, secret string) (We
 		ev.ReviewCommitSHA = p.Review.CommitID
 		ev.CommentBody = p.Review.Body // carries the review text through the folded pending-event path
 		return ev, nil
+	case "check_suite":
+		// A check_suite conclusion IS an aggregate - over every run GitHub
+		// grouped into that suite - so it is allowed to say green.
+		if p.CheckSuite == nil {
+			return WebhookEvent{Kind: "other"}, nil
+		}
+		return ghCIEvent(p, p.CheckSuite.HeadSHA, ghAggregateCIStatus(p.CheckSuite.Status, p.CheckSuite.Conclusion)), nil
+	case "check_run":
+		if p.CheckRun == nil {
+			return WebhookEvent{Kind: "other"}, nil
+		}
+		return ghCIEvent(p, p.CheckRun.HeadSHA, ghSingleCheckCIStatus(p.CheckRun.Status, p.CheckRun.Conclusion)), nil
+	case "status":
+		// The legacy combined-status API: one delivery per CONTEXT, never a fold.
+		return ghCIEvent(p, p.SHA, ghSingleCheckCIStatus("completed", p.State)), nil
 	default:
 		return WebhookEvent{Kind: "other"}, nil
+	}
+}
+
+// ghCIEvent builds the Kind:"ci" delivery. Repo (the clone URL) is the repo
+// identity every other webhook handler matches on via scm.SameRemote, and
+// HeadSHA is what the server joins against MergeRequest.status.headSHA - a CI
+// delivery names no issue and no PR number, so those two fields plus the status
+// are the whole event.
+//
+// An empty head sha yields Kind:"other": there is nothing to join it to, and an
+// unjoinable "ci" event would only make the server's no-match debug log lie
+// about what arrived.
+func ghCIEvent(p ghPayload, headSHA, ciStatus string) WebhookEvent {
+	if headSHA == "" {
+		return WebhookEvent{Kind: "other"}
+	}
+	return WebhookEvent{Kind: "ci", Repo: p.Repository.CloneURL, HeadSHA: headSHA, CIStatus: ciStatus}
+}
+
+// ghAggregateCIStatus maps an AGGREGATE GitHub CI object (a check_suite) onto
+// the mirror vocabulary.
+//
+// The suite is an aggregate over its own runs, which is what entitles it to
+// report green - with one honest caveat: a repository with checks from SEVERAL
+// apps has several suites, and one suite's success is not the pull request's.
+// That gap is covered by the MergeRequestReconciler's live GetCommitCIStatus
+// backstop, which folds every check on the commit regardless of who reported
+// it. A green stamped here is therefore a green that a later aggregate read can
+// still correct downward; a red is never corrected upward without one.
+func ghAggregateCIStatus(status, conclusion string) string {
+	if status != "completed" {
+		if status == "queued" {
+			return CIMirrorPending
+		}
+		return CIMirrorRunning
+	}
+	switch conclusion {
+	case "success", "neutral", "skipped":
+		return CIMirrorGreen
+	case "":
+		return CIMirrorPending
+	default:
+		return CIMirrorRed
+	}
+}
+
+// ghSingleCheckCIStatus maps ONE check - a single check_run, or a single commit
+// status context - onto the mirror vocabulary.
+//
+// IT CAN PROVE RED. IT CAN NEVER PROVE GREEN. A pull request is green only when
+// every required check passes, and one passing check says nothing about the
+// others, so the honest answer for "this one passed, the rest unknown" is
+// running. Reporting green off a single check_run is exactly the bug that would
+// let PR B's readiness gate wave through a pull request whose test job is still
+// queued.
+//
+// A failure, by contrast, is final on its own: one red required check makes the
+// pull request unmergeable until a NEW commit lands, and merging is pod-less
+// (see ci_gate.go's "RED IS A VERDICT; PENDING IS NOT"), so there is nothing to
+// gain by waiting for the rest.
+//
+// It mirrors ghRunCIStatus's neutral/skipped ruling deliberately: the two
+// disagree only about which vocabulary they answer in.
+func ghSingleCheckCIStatus(status, conclusion string) string {
+	if status != "" && status != "completed" {
+		return CIMirrorRunning
+	}
+	switch conclusion {
+	case "success", "neutral", "skipped", "pending", "":
+		return CIMirrorRunning
+	default:
+		return CIMirrorRed
 	}
 }
 

@@ -15,7 +15,7 @@ import (
 
 // WebhookEvent is the provider-agnostic parse of an inbound SCM webhook.
 type WebhookEvent struct {
-	Kind         string // "push" | "issue" | "mr" | "other"
+	Kind         string // "push" | "issue" | "mr" | "ci" | "other"
 	Repo         string // remote URL
 	Branch       string // for push
 	Labels       []string
@@ -36,6 +36,14 @@ type WebhookEvent struct {
 	BaseSHA      string // push before-SHA (documentation agent diff base); empty for non-push events
 	HeadBranch   string // PR/MR source branch
 	ChangedLabel string // for labeled/unlabeled: the single label added/removed
+
+	// CIStatus is set ONLY on Kind:"ci" deliveries (GitHub check_suite /
+	// check_run / status, GitLab Pipeline Hook). It is already normalised to the
+	// MIRROR vocabulary - none | pending | running | green | red - because that
+	// is the enum MergeRequest.status.ciStatus pins, and the webhook server
+	// writes it straight onto the CR. A Kind:"ci" event with an empty HeadSHA is
+	// never produced: there would be nothing to match it to.
+	CIStatus string
 
 	IsReview        bool   // true only for pull_request_review / GitLab MR-approval
 	ReviewState     string // approved | changes_requested | commented | dismissed

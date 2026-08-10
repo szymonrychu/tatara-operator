@@ -47,3 +47,48 @@ type MergeRequest struct {
 	// Comments is the thread, oldest-first.
 	Comments []IssueComment
 }
+
+// THIS REPO CARRIES TWO CI VOCABULARIES AND THEY ARE NOT INTERCHANGEABLE.
+//
+//   - The GATE vocabulary - "" | pending | success | failure - is what PRState
+//     and GetCommitCIStatus return and what merge.go / ci_gate.go compare
+//     against. It never reaches etcd.
+//   - The MIRROR vocabulary below - none | pending | running | green | red - is
+//     what MergeRequest.status.ciStatus holds. The CRD pins an ENUM on that
+//     field, so writing "success" onto it is rejected by the API server, not
+//     merely inconsistent.
+//
+// Every writer of the CR field goes through these constants, and every value
+// crossing from the gate vocabulary to the mirror one goes through
+// MirrorCIStatus.
+const (
+	CIMirrorNone    = "none"
+	CIMirrorPending = "pending"
+	CIMirrorRunning = "running"
+	CIMirrorGreen   = "green"
+	CIMirrorRed     = "red"
+)
+
+// MirrorCIStatus maps a gate-vocabulary CI status onto the mirror vocabulary.
+//
+// Mapping success -> green is sound HERE and only here: both producers of the
+// gate vocabulary (GetPRState, GetCommitCIStatus) fold EVERY check and commit
+// status on the commit before they answer, so their "success" is an AGGREGATE
+// claim. A single check_run webhook carries no such claim and must never take
+// this path - see ghSingleCheckCIStatus.
+//
+// An unrecognised value maps to none rather than to a guess: "I have no CI
+// observation" is the honest reading of a word this operator does not know, and
+// it is the one reading that cannot let a Task act on a fiction.
+func MirrorCIStatus(s string) string {
+	switch s {
+	case "success":
+		return CIMirrorGreen
+	case "failure":
+		return CIMirrorRed
+	case "pending":
+		return CIMirrorPending
+	default:
+		return CIMirrorNone
+	}
+}

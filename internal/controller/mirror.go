@@ -56,6 +56,23 @@ const (
 	// The DAILY cadence is what makes SyncIssueOnDemand mandatory rather than an
 	// optimisation - see that function.
 	MirrorCadenceParked = 24 * time.Hour
+
+	// CIRefreshCadenceActive is the LIVE-CI re-read interval for a MergeRequest
+	// whose owning Task is neither terminal nor parked - a Task actively working
+	// that MR right now.
+	//
+	// It is deliberately far tighter than MirrorCadenceActive because the two
+	// reads answer different questions. The mirror sync refreshes a THREAD, which
+	// nothing is blocked on; this one refreshes the CI verdict an agent is
+	// blocked on, and it exists only as the backstop for a CI webhook that never
+	// arrived. "Missed" at hourly resolution means a pod sitting a full hour on a
+	// pipeline that went red in ninety seconds - which is precisely the incident
+	// ci_gate.go was written for, one rung earlier in the loop.
+	//
+	// Five minutes costs one extra forge read per ACTIVE MR per five minutes.
+	// That is nothing against what one idle agent pod costs for the same window,
+	// and the active set is bounded by the sweep's mint cap.
+	CIRefreshCadenceActive = 5 * time.Minute
 )
 
 // Field indexes (contract A.3). Dedup - the sweep AND the QueuedEvent producer -
@@ -138,6 +155,21 @@ func MirrorCadence(t *tatarav1alpha1.Task) time.Duration {
 		return MirrorCadenceParked
 	}
 	return MirrorCadenceActive
+}
+
+// CIRefreshCadence is MirrorCadence's CI twin: how often the MergeRequest
+// reconciler re-reads LIVE CI as the missed-webhook backstop.
+//
+// Only a Task ACTIVELY WORKING the MR earns the tightened interval. Terminal
+// (done/rejected), parked and unowned mirrors fall back to the ordinary mirror
+// cadence, because there is no agent waiting on the answer - and a parked
+// backlog of 150 MRs re-reading CI every five minutes would be the exact
+// forge-request blowup fix M27 removed from the mirror sync.
+func CIRefreshCadence(t *tatarav1alpha1.Task) time.Duration {
+	if t != nil && !tatarav1alpha1.TaskDone(t) && !tatarav1alpha1.Parked(t) {
+		return CIRefreshCadenceActive
+	}
+	return MirrorCadence(t)
 }
 
 // truncateCommentBody cuts body at commentBodyLimit BYTES on a RUNE boundary
