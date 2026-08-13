@@ -339,6 +339,11 @@ var sweepSeedReasons = []string{
 var cronReasons = []string{"invalid_cron", "stamp_failed"}
 var refineReasons = []string{"invalid_cron", "stamp_failed", "refine_inflight_check_failed"}
 
+// upgrade carries the plain cron shape plus its own capacity-count failure: the
+// tick reads the live upgrade-Task count before minting, and a failed read is a
+// tick that silently minted nothing.
+var upgradeReasons = []string{"invalid_cron", "stamp_failed", "upgrade_count_failed"}
+
 // SeedSweepErrorsForProject pre-seeds the closed (activity x reason) label set of
 // SweepErrorsTotal for ONE project, so a healthy sweep with zero errors still
 // exposes a zero baseline and increase(operator_sweep_errors_total[1h]) is
@@ -349,14 +354,14 @@ var refineReasons = []string{"invalid_cron", "stamp_failed", "refine_inflight_ch
 // This used to run in init(). It cannot any more: `project` joined the label set
 // in issue #441 and project names are not known at process start. The Project
 // reconciler calls this on every pass; WithLabelValues returns the existing child
-// for an already-seeded combination, so it is idempotent and cheap (21 map
+// for an already-seeded combination, so it is idempotent and cheap (29 map
 // lookups per Project per reconcile).
 func SeedSweepErrorsForProject(project string) {
 	seed := func(l ...string) { SweepErrorsTotal.WithLabelValues(l...) }
 	// "nightlySweep" dropped (boy-scout, this line was already being rewritten
 	// for #441): SweepNightlyActivity was deleted as dead in the 2026-07-18
 	// #325 change (no nightly sweep planned, no live producer ever existed)
-	// but the seed list carried it over verbatim, so 13 of the 44 seeded
+	// but the seed list carried it over verbatim, so 13 of the then-44 seeded
 	// series per Project were permanently zero for an activity that can never
 	// fire - 13 wasted series process-wide before this branch, 13 per Project
 	// after it labelled the metric by project.
@@ -364,6 +369,7 @@ func SeedSweepErrorsForProject(project string) {
 	seedLabels(seed, []string{project}, []string{"brainstorm"}, []string{"stamp_failed"})
 	seedLabels(seed, []string{project}, []string{"documentation", "issueScan"}, cronReasons)
 	seedLabels(seed, []string{project}, []string{"refine"}, refineReasons)
+	seedLabels(seed, []string{project}, []string{"upgrade"}, upgradeReasons)
 	skip := func(l ...string) { SweepSkippedTotal.WithLabelValues(l...) }
 	seedLabels(skip, []string{project}, sweepActivities, sweepSkipReasons)
 	for _, activity := range sweepActivities {

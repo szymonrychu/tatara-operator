@@ -84,6 +84,44 @@ project:
           targetOpenProposals: 3
           historyWindow: 20
           sources: [docs, memory, internet]
+        # The dependency-upgrade cron. DEFAULT OFF: an empty schedule disables
+        # it, and enabling it lets an agent open merge requests that change
+        # deployed versions, so it is opt-in per project here. Each due tick
+        # mints AT MOST ONE upgrade Task - throughput is the cron FREQUENCY, not
+        # a fan-out.
+        #
+        # THERE IS NO `enabled` FLAG HERE, unlike brainstorm above: the empty
+        # (or absent) schedule IS the off switch. Do not add one - this chart
+        # renders project.spec verbatim and the API server PRUNES unknown
+        # fields silently, so an `enabled: false` next to a live schedule would
+        # be dropped and the cron would run anyway.
+        #
+        # maxOpenUpgrades caps the concurrent open upgrade lanes (live upgrade
+        # Tasks plus enqueued-but-unminted events). SET IT EXPLICITLY: a CRD
+        # default is applied on WRITE and never retroactively, so raising it
+        # later does not reach a Project CR that already exists.
+        upgrade:
+          schedule: ""
+          maxOpenUpgrades: 2
+          # To opt in, replace the empty schedule above with a real one:
+          # schedule: "0 */4 * * *"
+    # Policy the upgrade agent is HANDED in its turn-0 assignment; the operator
+    # renders it, never acts on it. Only read when scm.cron.upgrade is enabled.
+    #   engine        - renovate | none. renovate runs the Renovate CLI
+    #                   read-only in the pod and its report is a HINT; none
+    #                   means the agent enumerates candidates itself.
+    #   majorStrategy - nextHopOnly | latest. nextHopOnly walks a multi-hop
+    #                   chain one deployed Task at a time; the repo's current
+    #                   pin IS the cursor, no chain state is persisted.
+    #   minimumReleaseAge - days a release must have been published before it
+    #                   may be proposed, per semver level. 0 is bleeding edge.
+    upgradePolicy:
+      engine: none
+      majorStrategy: nextHopOnly
+      minimumReleaseAge:
+        major: 7
+        minor: 3
+        patch: 0
 
 repositories:
   - name: tatara-operator

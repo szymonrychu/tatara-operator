@@ -78,13 +78,13 @@ spec:
                       EffortByKind overrides the project-wide Effort per Task Kind. Same keying as
                       ModelByKind (including the "healthCheck" pseudo-key); a missing or empty
                       entry falls back to Effort. Values are the effort enum (low|medium|high|xhigh|max).
-                    maxProperties: 11
+                    maxProperties: 12
                     type: object
                     x-kubernetes-validations:
                     - message: 'effortByKind keys must be one of: implement, review,
                         clarify, triageIssue, brainstorm, issueLifecycle, incident,
-                        selfImprove, refine, healthCheck, documentation'
-                      rule: self.all(k, k in ['implement','review','clarify','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine','healthCheck','documentation'])
+                        selfImprove, refine, healthCheck, documentation, upgrade'
+                      rule: self.all(k, k in ['implement','review','clarify','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine','healthCheck','documentation','upgrade'])
                     - message: 'effortByKind values must be one of: low, medium, high,
                         xhigh, max'
                       rule: self.all(k, self[k] in ['low','medium','high','xhigh','max'])
@@ -5487,19 +5487,20 @@ spec:
                     description: |-
                       ModelByKind overrides the project-wide Model per Task Kind. Keys are the
                       Task.Spec.Kind enum values (clarify, triageIssue, review, brainstorm, refine,
-                      implement, incident, issueLifecycle, selfImprove) plus the "healthCheck"
+                      implement, incident, issueLifecycle, selfImprove, documentation, upgrade) plus
+                      the "healthCheck"
                       pseudo-key: healthCheck shares Kind=brainstorm but is resolved against this
                       key first (falling back to the brainstorm entry when absent), letting
                       healthCheck's recurring classification work be tiered separately from
                       brainstorm's creative work. A missing or empty entry falls back to Model.
                       Values are authoritative model IDs (claude-opus-5, claude-sonnet-5).
-                    maxProperties: 11
+                    maxProperties: 12
                     type: object
                     x-kubernetes-validations:
                     - message: 'modelByKind keys must be one of: implement, review,
                         clarify, triageIssue, brainstorm, issueLifecycle, incident,
-                        selfImprove, refine, healthCheck, documentation'
-                      rule: self.all(k, k in ['implement','review','clarify','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine','healthCheck','documentation'])
+                        selfImprove, refine, healthCheck, documentation, upgrade'
+                      rule: self.all(k, k in ['implement','review','clarify','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine','healthCheck','documentation','upgrade'])
                     - message: modelByKind values must be a claude model ID (start
                         with 'claude-', max 64 chars)
                       rule: self.all(k, self[k].startsWith('claude-') && self[k].size()
@@ -5514,7 +5515,7 @@ spec:
                       PromptAppendByKind appends project-specific instruction text AFTER the
                       built-in per-kind agentJob prompt (internal/controller/assignment.go). Keys
                       are agent kinds (implement, review, clarify, brainstorm, incident, refine,
-                      documentation) plus the "*" wildcard, which is appended to every kind BEFORE
+                      documentation, upgrade) plus the "*" wildcard, which is appended to every kind BEFORE
                       that kind's own entry. This is TRUSTED project config (maintainer-supplied
                       via helmfile), never user/issue text, so assignment.go may interpolate it.
                     maxProperties: 12
@@ -6026,6 +6027,31 @@ spec:
                             pattern: ^$|^(\S+\s+){4}\S+$
                             type: string
                         type: object
+                      upgrade:
+                        description: |-
+                          Upgrade is the dependency-upgrade cron. DEFAULT OFF (empty Schedule) for
+                          every project: enabling it lets an agent open merge requests that change
+                          deployed versions, so it is opt-in per project in the enrollment values.
+                        properties:
+                          maxOpenUpgrades:
+                            default: 1
+                            description: |-
+                              MaxOpenUpgrades caps the project's concurrent open upgrade lanes (live
+                              Tasks plus not-yet-minted enqueued events).
+
+                              SET IT EXPLICITLY IN THE ENROLLMENT VALUES. A kubebuilder default is
+                              applied on WRITE and NEVER retroactively, so raising this default later
+                              does not reach a Project CR that already exists.
+                            maximum: 10
+                            minimum: 1
+                            type: integer
+                          schedule:
+                            description: |-
+                              Schedule is a 5-field cron (robfig ParseStandard). Empty disables upgrade,
+                              matching refine. Default off for every project.
+                            pattern: ^$|^(\S+\s+){4}\S+$
+                            type: string
+                        type: object
                     type: object
                   declinedLabel:
                     default: tatara-declined
@@ -6186,13 +6212,13 @@ spec:
                       SpawnCeilingByKind gates each Task kind independently in claudeSubscription
                       mode: work of kind K is held once account usage reaches the given percent.
                       Keys are Task kinds; kinds absent here fall through to proactive/emergency.
-                    maxProperties: 11
+                    maxProperties: 12
                     type: object
                     x-kubernetes-validations:
                     - message: spawnCeilingByKind values must be 0..100
                       rule: self.all(k, self[k] >= 0 && self[k] <= 100)
                     - message: spawnCeilingByKind keys must be valid Task kinds
-                      rule: self.all(k, k in ['implement','review','clarify','selfImprove','triageIssue','brainstorm','issueLifecycle','incident','healthCheck','refine','documentation'])
+                      rule: self.all(k, k in ['implement','review','clarify','selfImprove','triageIssue','brainstorm','issueLifecycle','incident','healthCheck','refine','documentation','upgrade'])
                   tokenLimit:
                     description: TokenLimit is the absolute total-token budget per
                       window (customWindow mode).
@@ -6207,6 +6233,57 @@ spec:
               triggerLabel:
                 default: tatara
                 type: string
+              upgradePolicy:
+                description: |-
+                  UpgradePolicy configures the dependency-upgrade agent. Nil is the
+                  default-off shape (engine none, nextHopOnly, no minimum release age) - a
+                  kubebuilder default inside a nil struct pointer is never applied, so the
+                  goal renderer resolves those defaults itself rather than reading them back.
+                properties:
+                  engine:
+                    default: none
+                    description: |-
+                      Engine selects the candidate-discovery mechanism. `renovate` runs the
+                      Renovate CLI read-only inside the pod and reads its report as a HINT;
+                      `none` means the agent enumerates candidates itself, which is right for a
+                      repo with no dependency manifests at all.
+                    enum:
+                    - renovate
+                    - none
+                    type: string
+                  majorStrategy:
+                    default: nextHopOnly
+                    description: |-
+                      MajorStrategy is how far a single Task may jump. `nextHopOnly` proposes the
+                      next mandatory release and nothing beyond it, walking a multi-hop chain one
+                      deployed Task at a time (the repo's current pin IS the cursor; no chain
+                      state is persisted anywhere). `latest` jumps straight to the newest release.
+                    enum:
+                    - nextHopOnly
+                    - latest
+                    type: string
+                  minimumReleaseAge:
+                    description: |-
+                      ReleaseAgeSpec is the minimum age, IN DAYS, a released version must have
+                      before the upgrade agent will propose it, per semver level. Zero means
+                      bleeding edge: take it the moment it publishes.
+
+                      Bleeding edge is a deliberate, accepted trade, not an oversight: it means a
+                      broken release reaches the cluster (grafana v13.0.0 shipped a dashboard-losing
+                      migration bug and was pulled; the fix was v13.0.1). This field exists so a
+                      project can be made conservative without a code change.
+                    properties:
+                      major:
+                        minimum: 0
+                        type: integer
+                      minor:
+                        minimum: 0
+                        type: integer
+                      patch:
+                        minimum: 0
+                        type: integer
+                    type: object
+                type: object
               workspace:
                 description: |-
                   WorkspaceSpec configures the PERSISTENT agent workspace: a per-Task volume
@@ -6395,6 +6472,13 @@ spec:
               lastRefine:
                 description: LastRefine is the last time the project's refine pre-step
                   completed.
+                format: date-time
+                type: string
+              lastUpgrade:
+                description: |-
+                  LastUpgrade is the last time the upgrade cron TICKED (not the last time an
+                  upgrade completed): the stamp advances the schedule, so an upgrade Task
+                  that never terminates must not refire the cron on every reconcile pass.
                 format: date-time
                 type: string
               memory:

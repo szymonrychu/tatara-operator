@@ -3638,3 +3638,75 @@ func TestOutcome_Brainstorm_ProposedGateTaskCarriesPodName(t *testing.T) {
 	// "imp" is the implement kind's pod-name type token (#521: was "clr").
 	require.Equal(t, "imp-tatara-tatara-operator-i101", agent.PodName(gateTask))
 }
+
+// --- upgrade --------------------------------------------------------------
+
+// An upgrade agent has NO approval gate: nobody filed an issue for a scheduled
+// dependency bump and there is no maintainer comment to cite. Its outcome shares
+// documentation's schema (action enum submitted|declined) and routes straight to
+// oc.implement, so it never reaches oc.gate.
+func TestOutcome_Upgrade_SubmittedRoutesToImplementAndAwaitsReview(t *testing.T) {
+	e := buildV2(t, v2Opts{writer: &reviewPanicForge{heads: map[int]string{295: "live-head", 80: "live-head-cli"}}},
+		projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"), repoV2("tatara-cli", "tatara"),
+		taskV2("t1", "tatara", "upgrade", tatarav1alpha1.StateUnderImplementation, "upgrade"),
+		mrV2("tatara-operator", 295, "t1"), mrV2("tatara-cli", 80, "t1"))
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"upgrade","payload":{"action":"submitted","title":"cilium 1.16 -> 1.17","body":"hop 1 of 4",`+
+			`"changeSignificance":"minor","mergeOrder":["tatara-operator","tatara-cli"]}}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	got := e.task(t, "t1")
+	require.Equal(t, tatarav1alpha1.StateAwaitingReview, got.Status.State,
+		"an upgrade Task's own merge request is reviewed ON THE SAME TASK")
+	require.Equal(t, []string{"tatara-operator", "tatara-cli"}, got.Spec.MergeOrder,
+		"mergeOrder is what makes a multi-repo upgrade unit merge in publish-dependency order")
+	require.Equal(t, "minor", e.mr(t, tatarav1alpha1.MergeRequestName("tatara-operator", 295)).Status.Significance)
+}
+
+// The gate fields are refused on an upgrade outcome exactly as they are on an
+// implement `submitted`: a scheduled upgrade that claims an approval is a client
+// bug, not a shortcut.
+func TestOutcome_Upgrade_GateFieldsAreRefused(t *testing.T) {
+	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "upgrade", tatarav1alpha1.StateUnderImplementation, "upgrade"),
+		mrV2("tatara-operator", 295, "t1"))
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"upgrade","payload":{"action":"submitted","title":"T","body":"B","changeSignificance":"patch",`+
+			`"approvingMaintainer":"someone"}}`)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	require.Contains(t, w.Body.String(), "only valid when action=approved")
+}
+
+// declined is a correct and common answer for a scheduled kind: most cycles have
+// nothing worth taking. It parks with a reason rather than shipping nothing.
+func TestOutcome_Upgrade_DeclinedParksWithItsReason(t *testing.T) {
+	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "upgrade", tatarav1alpha1.StateUnderImplementation, "upgrade"))
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"upgrade","payload":{"action":"declined","reason":"every candidate is under its minimumReleaseAge"}}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	got := e.task(t, "t1")
+	require.True(t, tatarav1alpha1.Parked(got), "a declined upgrade has shipped nothing; it parks and the reaper collects it")
+	require.Len(t, got.Status.Notes, 1)
+	require.Equal(t, "declined: every candidate is under its minimumReleaseAge", got.Status.Notes[0].Body)
+}
+
+// The pod's claim is NEVER trusted: kind must equal status.agentKind.
+func TestOutcome_Upgrade_KindMustMatchStatusAgentKind(t *testing.T) {
+	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
+		mrV2("tatara-operator", 295, "t1"))
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"upgrade","payload":{"action":"submitted","title":"T","body":"B","changeSignificance":"patch"}}`)
+	require.Equal(t, http.StatusConflict, w.Code)
+	require.Contains(t, w.Body.String(), "kind does not match the task's agent kind")
+}

@@ -51,7 +51,7 @@ func TestRequiredSkillsForKind(t *testing.T) {
 
 // TestSkillsDirective_RequiredWording asserts "Required skills" wording for non-reference kinds.
 func TestSkillsDirective_RequiredWording(t *testing.T) {
-	for _, kind := range []string{"implement", "review", "incident", "documentation"} {
+	for _, kind := range []string{"implement", "review", "incident", "documentation", "upgrade"} {
 		t.Run(kind, func(t *testing.T) {
 			d := skillsDirective(kind)
 			if d == "" {

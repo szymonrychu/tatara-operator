@@ -17,6 +17,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/queue"
 	"github.com/szymonrychu/tatara-operator/internal/refine"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
+	"github.com/szymonrychu/tatara-operator/internal/upgrade"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -71,7 +72,7 @@ func nextExpectedUnix(proj *tatarav1alpha1.Project, schedule string, last *metav
 //
 // No "brainstorm" case: brainstorm's cron path was retired (c0a50f9, demand-
 // driven now) and no caller has passed "brainstorm" since - only "issueScan",
-// "refine" and "documentation" ever reach here. Brainstorm.Schedule stays on
+// "refine", "documentation" and "upgrade" ever reach here. Brainstorm.Schedule stays on
 // the CRD for compat (Brainstorm.Enabled still gates the event-driven refill
 // path), it is just never read through this function any more.
 func activityScheduleAndLast(proj *tatarav1alpha1.Project, activity string) (string, *metav1.Time) {
@@ -83,6 +84,8 @@ func activityScheduleAndLast(proj *tatarav1alpha1.Project, activity string) (str
 		return c.Documentation.Schedule, proj.Status.LastDocumentation
 	case "refine":
 		return c.Refine.Schedule, proj.Status.LastRefine
+	case "upgrade":
+		return c.Upgrade.Schedule, proj.Status.LastUpgrade
 	}
 	return "", nil
 }
@@ -498,7 +501,8 @@ func (r *ProjectReconciler) reposDueForScan(proj *tatarav1alpha1.Project, activi
 //
 // On success it also sets obs.SweepLastSuccessTimestamp{activity} - the same
 // heartbeat gauge sweep.go's B.4 pass sets for sweep/nightlySweep, extended
-// to the brainstorm/documentation/issueScan crons. This is the successor for
+// to the brainstorm/documentation/issueScan crons (refine and upgrade stamp
+// through their own stampRefine/stampUpgrade, which set the same gauge). This is the successor for
 // tatara_scan_items_total, which the metric-wiring audit (issue #370) pruned
 // as dead-per-redesign; TataraLoopStalled's deadman alert and the
 // tatara-loop dashboard panel are repointed onto this gauge in the same
@@ -1151,6 +1155,117 @@ func (r *ProjectReconciler) stampRefine(ctx context.Context, proj *tatarav1alpha
 	})
 }
 
+// createUpgradeTask enqueues an unconstrained-scope upgrade QueuedEvent.
+// Returns created=true when a new event was enqueued.
+//
+// The dedup key is PER TICK, not per project. refine's project-wide key is
+// right for a one-at-a-time activity; upgrade runs up to maxOpenUpgrades at
+// once, so a project-wide key would collapse every fire into the first Task
+// forever. Unit-level dedup is AGENT-SIDE (task_context(index=true) plus a read
+// of each live sibling's merge request): nothing here knows which unit the
+// agent will pick, and spec.dedupKey is immutable and set at mint, so it could
+// not carry one anyway.
+//
+// InitialState is under-implementation, NOT the default `new`. An upgrade Task
+// has no gate to face: refined's only exit into under-implementation is
+// submit_outcome(action=approved), and the upgrade outcome schema's action enum
+// is submitted|declined. Triaging one to refined would leave it re-submitting
+// against an edge that does not exist. This is the nightly documentation
+// batch's shape, for the same reason.
+func (r *ProjectReconciler) createUpgradeTask(ctx context.Context, proj *tatarav1alpha1.Project,
+	goal string, tick time.Time) (bool, error) {
+	provider := ""
+	if proj.Spec.Scm != nil {
+		provider = proj.Spec.Scm.Provider
+	}
+	dedupKey := fmt.Sprintf("upgrade-%s-%d", proj.Name, tick.Unix())
+	payload := tatarav1alpha1.QueuedEventPayload{
+		Kind:         "upgrade",
+		Goal:         goal,
+		Labels:       map[string]string{labelActivity: "upgrade"},
+		GenerateName: "upgrade-",
+		Provider:     provider,
+		PodRepo:      "",
+		InitialState: tatarav1alpha1.StateUnderImplementation,
+	}
+	_, created, err := queue.EnqueueEvent(ctx, r.Client, r.Seq, proj, tatarav1alpha1.QueueClassNormal, true, dedupKey, payload)
+	if err != nil {
+		log.FromContext(ctx).Error(err, "scan: enqueue upgrade event failed; skipping",
+			"action", "scan_enqueue_failed", "project", proj.Name)
+		return false, nil
+	}
+	return created, nil
+}
+
+// openUpgradeLaneCount counts the upgrade lanes the project currently owes,
+// against which maxOpenUpgrades is checked. A lane is held by a live Task OR by
+// a QueuedEvent that has been enqueued but not yet minted into one.
+//
+// Counting Tasks alone was a capacity bypass. A mint sits Queued until the
+// dispatcher admits it, which it may hold for a long time (priority ordering,
+// the project's live-pod ceiling), and the cron keeps firing meanwhile: every
+// tick in that window saw a Task count that did not yet include the work
+// already committed to, minted another event, and the whole backlog then
+// admitted at once, past the cap.
+//
+// A PARKED Task holds no lane: it runs no pod, the reaper collects it, and
+// `declined` - the correct and common answer for a scheduled kind that finds
+// nothing worth taking - parks. Counting a park as live would stop the cron for
+// the whole park retention after the first quiet cycle.
+func (r *ProjectReconciler) openUpgradeLaneCount(ctx context.Context, proj *tatarav1alpha1.Project) (int, error) {
+	var list tatarav1alpha1.TaskList
+	if err := r.List(ctx, &list, client.InNamespace(proj.Namespace)); err != nil {
+		return 0, err
+	}
+	n := 0
+	for i := range list.Items {
+		t := &list.Items[i]
+		if t.Spec.ProjectRef != proj.Name || t.Spec.Kind != "upgrade" {
+			continue
+		}
+		if !tatarav1alpha1.TaskDone(t) && !tatarav1alpha1.Parked(t) {
+			n++
+		}
+	}
+	var qes tatarav1alpha1.QueuedEventList
+	if err := r.List(ctx, &qes, client.InNamespace(proj.Namespace)); err != nil {
+		return 0, err
+	}
+	for i := range qes.Items {
+		q := &qes.Items[i]
+		if q.Spec.ProjectRef != proj.Name || q.Spec.Kind != "upgrade" {
+			continue
+		}
+		// An admission TICKET spawns the next pod stage of a Task that already
+		// exists and is already counted above; counting it too would double-book
+		// the lane for that Task's whole life. Status.TaskRef is the same test one
+		// step later: once the dispatcher has minted, the Task is the lane.
+		if queue.IsAdmissionTicket(q) || q.Status.TaskRef != "" {
+			continue
+		}
+		n++
+	}
+	return n, nil
+}
+
+// stampUpgrade records LastUpgrade on the project status.
+func (r *ProjectReconciler) stampUpgrade(ctx context.Context, proj *tatarav1alpha1.Project) error {
+	now := metav1.Now()
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Project{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: proj.Namespace, Name: proj.Name}, fresh); err != nil {
+			return err
+		}
+		fresh.Status.LastUpgrade = &now
+		proj.Status.LastUpgrade = &now
+		return r.Status().Update(ctx, fresh)
+	}); err != nil {
+		return err
+	}
+	obs.SweepLastSuccessTimestamp.WithLabelValues(proj.Name, "upgrade").Set(float64(now.Unix()))
+	return nil
+}
+
 // projectRepoSlugs returns owner/repo slugs for all repositories in the project.
 func (r *ProjectReconciler) projectRepoSlugs(ctx context.Context, proj *tatarav1alpha1.Project, repos []tatarav1alpha1.Repository) []string {
 	var slugs []string
@@ -1285,6 +1400,21 @@ func (r *ProjectReconciler) publishNextExpected(proj *tatarav1alpha1.Project, re
 		obs.SweepNextExpectedTimestamp.DeleteLabelValues(proj.Name, "refine")
 	}
 
+	if c.Upgrade.Schedule != "" {
+		if next, ok := nextExpectedUnix(proj, c.Upgrade.Schedule, proj.Status.LastUpgrade); ok {
+			obs.SweepNextExpectedTimestamp.WithLabelValues(proj.Name, "upgrade").Set(next)
+		} else {
+			obs.SweepNextExpectedTimestamp.DeleteLabelValues(proj.Name, "upgrade")
+			obs.SweepErrorsTotal.WithLabelValues(proj.Name, "upgrade", "invalid_cron").Inc()
+		}
+	} else {
+		// Actively RETRACT: a GaugeVec child, once created, stays exported at its
+		// last value for the life of the process, so disabling the cron would
+		// otherwise leave a frozen timestamp that reads as ever-more-overdue and
+		// false-pages forever.
+		obs.SweepNextExpectedTimestamp.DeleteLabelValues(proj.Name, "upgrade")
+	}
+
 	if doc := proj.Spec.Documentation; doc != nil && doc.Enabled && doc.Repo != "" {
 		if next, ok := nextExpectedUnix(proj, c.Documentation.Schedule, proj.Status.LastDocumentation); ok {
 			obs.SweepNextExpectedTimestamp.WithLabelValues(proj.Name, "documentation").Set(next)
@@ -1372,6 +1502,9 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 	}
 	if proj.Status.LastRefine != nil {
 		obs.SweepLastSuccessTimestamp.WithLabelValues(proj.Name, "refine").Set(float64(proj.Status.LastRefine.Unix()))
+	}
+	if proj.Status.LastUpgrade != nil {
+		obs.SweepLastSuccessTimestamp.WithLabelValues(proj.Name, "upgrade").Set(float64(proj.Status.LastUpgrade.Unix()))
 	}
 
 	cronSpec := proj.Spec.Scm.Cron
@@ -1536,6 +1669,52 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 		} else {
 			l.Error(fmt.Errorf("invalid cron %q", cronSpec.Refine.Schedule), "scan: invalid refine cron, disabling",
 				"action", "scan_cron_invalid", "resource_id", proj.Name, "activity", "refine")
+			// invalid_cron is metered once per tick by publishNextExpected (deferred above).
+		}
+	}
+
+	// upgrade (opt-in cron): the dependency-upgrade tick. Each due fire mints AT
+	// MOST ONE upgrade Task, and only while the project's open upgrade lanes
+	// (live Tasks plus not-yet-minted QueuedEvents) are under maxOpenUpgrades. Throughput is the cron FREQUENCY, not a fan-out - minting
+	// N per fire was rejected because each would self-scan and race for the same
+	// top candidate, with no agent-side tool to partition the work.
+	//
+	// No per-repo scanOffset phase-shift here: upgrade is project-scoped in its
+	// firing (one Task per tick regardless of repo count) and goes through plain
+	// activityDue, exactly like refine and documentation.
+	if cronSpec.Upgrade.Schedule != "" {
+		if _, due, next, ok := r.activityDue(proj, "upgrade"); ok {
+			if due {
+				maxOpen := cronSpec.Upgrade.MaxOpenUpgrades
+				if maxOpen <= 0 {
+					maxOpen = 1
+				}
+				live, cerr := r.openUpgradeLaneCount(ctx, proj)
+				if cerr != nil {
+					l.Error(cerr, "scan: count open upgrade lanes",
+						"action", "scan_upgrade_error", "resource_id", proj.Name)
+					obs.SweepErrorsTotal.WithLabelValues(proj.Name, "upgrade", "upgrade_count_failed").Inc()
+				} else if live < maxOpen {
+					slugs := r.projectRepoSlugs(ctx, proj, repos)
+					_, _ = r.createUpgradeTask(ctx, proj, upgrade.GoalProject(slugs, proj.Spec.UpgradePolicy), now)
+				}
+				// Stamp on the TICK, matching every other cron activity here: the
+				// stamp advances the schedule, and an upgrade Task that never
+				// terminates must not refire the cron on every pass.
+				if serr := r.stampUpgrade(ctx, proj); serr != nil {
+					l.Error(serr, "scan: persist upgrade stamp failed",
+						"action", "scan_stamp_error", "resource_id", proj.Name, "activity", "upgrade")
+					obs.SweepErrorsTotal.WithLabelValues(proj.Name, "upgrade", "stamp_failed").Inc()
+				}
+				if next2, ok2 := activityNextFire(cronSpec.Upgrade.Schedule, now); ok2 {
+					consider(next2)
+				}
+			} else {
+				consider(next)
+			}
+		} else {
+			l.Error(fmt.Errorf("invalid cron %q", cronSpec.Upgrade.Schedule), "scan: invalid upgrade cron, disabling",
+				"action", "scan_cron_invalid", "resource_id", proj.Name, "activity", "upgrade")
 			// invalid_cron is metered once per tick by publishNextExpected (deferred above).
 		}
 	}

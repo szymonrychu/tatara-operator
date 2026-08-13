@@ -67,7 +67,7 @@ func TestAdmittedTicketWakesTaskReconcile(t *testing.T) {
 	}
 
 	// Kind must be a member of Task's own enum (api/v1alpha1/task_types.go:119:
-	// brainstorm;incident;clarify;refine;review;documentation;takeover). It does
+	// brainstorm;incident;implement;refine;review;documentation;takeover;upgrade). It does
 	// NOT include "implement" - that is an AGENT kind, which is a different enum
 	// (queuedevent_types.go:57) and lives on the ticket's payload, not here.
 	task := &tatarav1alpha1.Task{

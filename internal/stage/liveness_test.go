@@ -57,7 +57,7 @@ func TestAgentKindForRoutesTakeoverToImplement(t *testing.T) {
 
 func TestClarifyIsNotAnAgentKind(t *testing.T) {
 	for _, s := range stage.AllStates() {
-		for _, k := range []string{"implement", "review", "brainstorm", "incident", "refine", "documentation", "takeover"} {
+		for _, k := range []string{"implement", "review", "brainstorm", "incident", "refine", "documentation", "takeover", "upgrade"} {
 			require.NotEqual(t, "clarify", stage.AgentKindFor(s, k))
 		}
 	}
@@ -369,4 +369,21 @@ func TestASilentlyWorkingAgentIsBoundedByResidencyNotByTheIdleClock(t *testing.T
 	clock, _, _, _ = stage.ArmedClock(fresh, false)
 	require.Equal(t, stage.ClockNone, clock)
 	require.False(t, stage.ResidencyExceeded(fresh, now))
+}
+
+// An origin kind absent from originAgentKinds maps to "" and NO POD EVER
+// SPAWNS. This is the fail-closed entry that silently breaks the whole kind.
+func TestAgentKindFor_UpgradeRunsTheUpgradeAgentInBothWorkStates(t *testing.T) {
+	for _, state := range []string{v1alpha1.StateRefined, v1alpha1.StateUnderImplementation} {
+		require.Equal(t, stage.AgentUpgrade, stage.AgentKindFor(state, "upgrade"),
+			"an upgrade Task in %s must run the upgrade agent", state)
+	}
+}
+
+// awaiting-review is kind-AGNOSTIC by design: an upgrade Task's own merge
+// request is reviewed by the review agent ON THE SAME TASK, and no separate
+// review Task is ever minted for it.
+func TestAgentKindFor_UpgradeAwaitingReviewIsStillTheReviewAgent(t *testing.T) {
+	require.Equal(t, stage.AgentReview,
+		stage.AgentKindFor(v1alpha1.StateAwaitingReview, "upgrade"))
 }

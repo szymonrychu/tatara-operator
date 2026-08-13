@@ -144,6 +144,7 @@ spec:
                 - review
                 - documentation
                 - takeover
+                - upgrade
                 type: string
               maxTurnsPerTask:
                 description: |-
@@ -222,6 +223,7 @@ spec:
                 - review
                 - documentation
                 - implement
+                - upgrade
                 type: string
               botRounds:
                 description: |-
@@ -497,6 +499,7 @@ spec:
                       - review
                       - documentation
                       - implement
+                      - upgrade
                       - operator
                       - clarify
                       type: string

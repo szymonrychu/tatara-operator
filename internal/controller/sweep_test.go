@@ -1882,6 +1882,7 @@ func TestSweepErrorsSeededForProject(t *testing.T) {
 		"documentation": {"invalid_cron", "stamp_failed"},
 		"issueScan":     {"invalid_cron", "stamp_failed"},
 		"refine":        {"invalid_cron", "stamp_failed", "refine_inflight_check_failed"},
+		"upgrade":       {"invalid_cron", "stamp_failed", "upgrade_count_failed"},
 	}
 	for activity, reasons := range perActivityReasons {
 		for _, reason := range reasons {

@@ -68,10 +68,17 @@ var projectScopedKinds = map[string]bool{
 // has no clarify row, and each one parks ONCE at triage-stalled with
 // action=triage_unknown_kind before the 7-day park retention reaps it. Loud,
 // bounded, and deliberately not special-cased.
+//
+// upgrade joined the set on 2026-08-13. The cron mints it with no repo at all
+// and it picks its own blast radius from the enrolled set, so it must validate
+// with an empty RepositoryRef; it belongs here rather than in
+// projectScopedKinds because it DOES open merge requests, which is exactly the
+// property projectScopedKinds denies.
 var unconstrainedKinds = map[string]bool{
 	"review":    true,
 	"implement": true,
 	"takeover":  true,
+	"upgrade":   true,
 }
 
 // IsProjectScopedKind reports whether a task kind is project-scoped (operates on
@@ -131,7 +138,7 @@ type TaskSpec struct {
 	Source *TaskSource `json:"source,omitempty"`
 	// Kind is the ORIGIN. Immutable, baked into the name. NOT the running agent
 	// kind (that is Status.AgentKind, driven by the F.2 state/origin table).
-	// +kubebuilder:validation:Enum=brainstorm;incident;implement;refine;review;documentation;takeover
+	// +kubebuilder:validation:Enum=brainstorm;incident;implement;refine;review;documentation;takeover;upgrade
 	// +optional
 	Kind string `json:"kind,omitempty"`
 	// DedupKey is the dedup identity for an incident Task: the alert-group hash
@@ -405,7 +412,7 @@ type Note struct {
 	// because appending a note revalidates its siblings and ratcheting only
 	// exempts unchanged keypaths. That broke enforce-live-pod-ceiling into a
 	// reconcile error loop. No writer can produce it: AgentKindFor has no clarify.
-	// +kubebuilder:validation:Enum=brainstorm;incident;refine;review;documentation;implement;operator;clarify
+	// +kubebuilder:validation:Enum=brainstorm;incident;refine;review;documentation;implement;upgrade;operator;clarify
 	Agent string `json:"agent"`
 	// +kubebuilder:validation:Enum=note;plan;handoff
 	Kind string `json:"kind"`
@@ -525,7 +532,7 @@ type TaskStatus struct {
 	// not queue wait. Cleared on every state transition.
 	// +optional
 	StateWorkStartedAt *metav1.Time `json:"stateWorkStartedAt,omitempty"`
-	// +kubebuilder:validation:Enum=brainstorm;incident;refine;review;documentation;implement
+	// +kubebuilder:validation:Enum=brainstorm;incident;refine;review;documentation;implement;upgrade
 	// +optional
 	AgentKind string `json:"agentKind,omitempty"`
 	// PodStartedAt is stamped when the pod is CREATED (not when it becomes Ready),

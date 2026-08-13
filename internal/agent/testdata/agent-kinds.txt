@@ -1,17 +1,18 @@
-# The six agent kinds. Contract G.9.
+# The seven agent kinds. Contract G.9.
 # tatara-operator/internal/agent/pod.go carries a byte-identical copy of this
 # file at internal/agent/testdata/agent-kinds.txt. If the two ever differ, a
 # pod is spawned with a TATARA_TOOL_PROFILE the cli does not know, the cli
 # fails closed to six tools with no submit_outcome, and the Task can never
 # terminate. That is not hypothetical: it is exactly what happened to every
 # clarify pod before 2026-07-12 (contract L.5).
-#
-# #521 folded the seventh kind, clarify, into implement: its three decisions
-# became action values on the implement outcome. clarify's absence from this
-# list is now load-bearing (see kindProfiles' doc comment in pod.go).
+# clarify was DELETED as an agent kind at contract 4 (#521): its three
+# decisions became approved/discuss/rejected actions on the implement outcome.
+# upgrade was ADDED as the 7th agent kind (2026-08-13): a scheduled agent that
+# opens MRs the same way implement does, with no approval gate.
 brainstorm
 documentation
 implement
 incident
 refine
 review
+upgrade

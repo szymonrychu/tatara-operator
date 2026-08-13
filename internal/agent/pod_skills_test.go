@@ -47,6 +47,7 @@ func TestSkillProfileForKind_AllActiveCRDKinds(t *testing.T) {
 		"brainstorm",
 		"incident",
 		"refine",
+		"upgrade",
 	}
 	for _, kind := range crdKinds {
 		t.Run(kind, func(t *testing.T) {

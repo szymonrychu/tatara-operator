@@ -78,3 +78,26 @@ func TestEffectiveQueuePriority(t *testing.T) {
 		})
 	}
 }
+
+// validAgentKinds is a fail-closed set: a QueuedEvent payload naming an agent
+// kind absent from it is rejected at validation, so the first hand-enqueued
+// upgrade admission ticket would never admit.
+func TestUpgradeIsAValidQueuedEventAgentKind(t *testing.T) {
+	if !validAgentKinds["upgrade"] {
+		t.Fatal("validAgentKinds must carry upgrade or a hand-enqueued upgrade event is rejected")
+	}
+	err := ValidateQueuedEventSpec(QueuedEventSpec{
+		Seq:        1,
+		Class:      QueueClassNormal,
+		Kind:       "upgrade",
+		ProjectRef: "p",
+		Payload: QueuedEventPayload{
+			Kind:      "upgrade",
+			AgentKind: "upgrade",
+			TaskRef:   "upgrade-abc123",
+		},
+	})
+	if err != nil {
+		t.Fatalf("an upgrade admission ticket must validate: %v", err)
+	}
+}

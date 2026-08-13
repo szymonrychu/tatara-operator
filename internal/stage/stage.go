@@ -39,9 +39,11 @@ const (
 	ParkTarget = "(park)"
 )
 
-// The six agent kinds. `clarify` was the seventh and is DELETED: its three
-// decisions became action values on the implement outcome, behind the extended
-// approval gate (#521).
+// The seven agent kinds. `clarify` was one of the original seven and is
+// DELETED: its three decisions became action values on the implement outcome,
+// behind the extended approval gate (#521). `upgrade` was added in its place as
+// a distinct kind (2026-08-13): a scheduled dependency-upgrade agent that opens
+// merge requests the way implement does, with no approval gate.
 const (
 	AgentBrainstorm    = "brainstorm"
 	AgentIncident      = "incident"
@@ -49,6 +51,7 @@ const (
 	AgentImplement     = "implement"
 	AgentReview        = "review"
 	AgentDocumentation = "documentation"
+	AgentUpgrade       = "upgrade"
 )
 
 // kindReview is the Task.Spec.Kind that may NEVER reach under-implementation or
@@ -259,7 +262,7 @@ var Transitions = map[string][]Edge{
 	Create: {
 		{To: v1alpha1.StateNew, Trigger: "Task minted for triage: webhook-originated, a sweep-discovered backlog issue (minted parked(backlog-sweep) alongside), or a human has the last word on the thread (B.4)"},
 		{To: v1alpha1.StateRefined, Trigger: "a maintainer-gated takeover mints a Task already bound to an existing MR: the MR exists, so there is nothing to triage, but the work still faces the gate"},
-		{To: v1alpha1.StateUnderImplementation, Trigger: "the NIGHTLY DOCUMENTATION BATCH is minted straight into implementation work. No triage (it has no driving issue) and no gate (a nightly batch is the operator's own decision, already made)"},
+		{To: v1alpha1.StateUnderImplementation, Trigger: "a CRON-MINTED kind with no gate to face - the nightly documentation batch, or a dependency-upgrade tick - is minted straight into implementation work. No triage (neither has a driving issue) and no gate (a scheduled fire is the operator's own decision, already made). For upgrade the routing is also forced: refined's only exit into under-implementation is submit_outcome(action=approved), and the upgrade outcome schema's action enum is submitted|declined"},
 		{To: v1alpha1.StateDone, Trigger: "THE #521 TERMINAL-RESET GUARD: a Task served stateless by the narrowed CRD carries proof it already DELIVERED (status.deliveredAt, status.documentedBy, or every owned Issue mirror stamped done). It is stamped where it finished instead of being re-triaged"},
 		{To: v1alpha1.StateRejected, Trigger: "THE #521 TERMINAL-RESET GUARD: a Task served stateless by the narrowed CRD carries proof it already STOPPED (an owned Issue mirror declined, or every owned mirror closed on the forge with no platform verdict). It is stamped where it finished instead of being re-triaged"},
 	},
@@ -351,7 +354,11 @@ func Legal(from, to string) bool { return legalPairs[[2]string{from, to}] }
 //
 // GUARD 4. under-implementation -> done is the nightly DOCUMENTATION batch's
 // terminal and nothing else may take it. Any other kind arriving at done from
-// under-implementation has opened no MR and been reviewed by nobody.
+// under-implementation has opened no MR and been reviewed by nobody. UPGRADE is
+// the second kind minted STRAIGHT into under-implementation (see the create
+// edge) and is deliberately NOT let onto this edge with it: an upgrade Task
+// opens merge requests, so it must leave through review like any other code
+// kind, and a declined upgrade PARKS rather than taking a terminal here.
 //
 // GUARD 5. new -> awaiting-review is the kind=review triage target and nothing
 // else may take it. Every other kind is triaged to `refined`, which is where the
@@ -363,7 +370,8 @@ func Legal(from, to string) bool { return legalPairs[[2]string{from, to}] }
 // file_issue minted its tracker - and nothing else may take it. An implement,
 // takeover, review or documentation Task reaching done from refined has opened
 // no MR and faced no review either, the same hole GUARDS 3-5 close for their
-// own edges.
+// own edges - and upgrade is in that same set: it opens merge requests, so
+// `refined -> done` is closed to it too.
 //
 // GUARDS 4, 5 AND 6 WERE CALLER-GATED UNTIL #521's REVIEW (GUARD 6 slipped past
 // that same review and was only caught in the round after). The table's own

@@ -62,6 +62,7 @@ func TestAssignment_NoInheritedWorkspaceParagraphWhenTheFeatureIsOff(t *testing.
 func TestAssignment_OnlyReviewGetsTheInheritedWorkspaceRule(t *testing.T) {
 	for _, kind := range []string{
 		stage.AgentImplement, stage.AgentBrainstorm, stage.AgentIncident, stage.AgentDocumentation,
+		stage.AgentUpgrade,
 	} {
 		got := assignmentFor(kind, wsReviewTask(), &tatarav1alpha1.Project{}, true)
 		if strings.Contains(got, "The workspace is INHERITED") {

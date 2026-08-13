@@ -39,7 +39,9 @@ const (
 // this an implement-shaped Task". clarify is the full proposal-to-implementation
 // lifecycle (the "implement" of the design table - note that implement is an
 // AGENT kind, Task.Status.AgentKind, and never a Task.Spec.Kind), and incident
-// is a fix landing. takeover is included for the SAME reason: a takeover Task
+// is a fix landing. upgrade lands real code too - a dependency hop that moves a
+// pin AND the config that has to move with it is the project moving. takeover is
+// included for the SAME reason: a takeover Task
 // lands real code changes on behalf of real task work, so the project moved,
 // exactly as much as an implement or incident merge does - do not "simplify" it
 // back out. documentation, refine and review are not: they are housekeeping
@@ -47,7 +49,7 @@ const (
 // space, documentation above all (see the regression test).
 func brainstormResumeKind(kind string) bool {
 	switch kind {
-	case "implement", "incident", "takeover":
+	case "implement", "incident", "takeover", "upgrade":
 		return true
 	}
 	return false

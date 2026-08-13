@@ -53,6 +53,8 @@ func requiredSkillsForKind(kind string) []string {
 		return []string{"tatara-incident-investigation", "systematic-debugging"}
 	case "documentation":
 		return []string{"tatara-documentation-workflow"}
+	case "upgrade":
+		return []string{"tatara-upgrade-workflow", "test-driven-development"}
 	default:
 		return nil
 	}
@@ -376,6 +378,54 @@ func agentJob(agentKind string, proj *tatarav1alpha1.Project, workspaceInherited
 			resumedBranchMergeRule +
 			"`submit_outcome(kind=documentation, action=submitted, ...)` when the docs PR is open, or " +
 			"`action=declined` when nothing delivered was doc-relevant. `declined` is a correct answer."
+
+	case stage.AgentUpgrade:
+		// NO GATE ARM. This kind's outcome schema (tatara-cli, shared verbatim
+		// with documentation) has action=submitted|declined and nothing else:
+		// nobody filed an issue for a scheduled upgrade and there is no
+		// maintainer comment to cite. Naming a gate field here would send the
+		// agent looking for an approval it can neither obtain nor submit.
+		//
+		// `submit_outcome` is written WITHOUT a kind argument on purpose. The cli
+		// stamps kind server-side from the pod's tool profile, the schema is
+		// additionalProperties:false, and tatara-agent-skills'
+		// tatara-upgrade-workflow spells the call the same way. The older arms
+		// above still write `kind=...`; that is pre-existing and not worth
+		// churning six prompts over, but a new arm should not copy it.
+		return "## Your job\n\n" +
+			"Keep this project's dependencies current. A pin bump is only the mechanical half of an " +
+			"upgrade; the half that breaks is the code and config that has to move with it - a renamed " +
+			"values key, a removed Kubernetes API version, a two-phase protocol bump. You do both " +
+			"halves or you decline.\n\n" +
+			"Take EXACTLY ONE upgrade unit this Task: one thing being upgraded, across however many " +
+			"repos it touches. Call `task_context(index=true)` BEFORE you pick, and read each live " +
+			"upgrade sibling's merge request title with `scm_read` - the sibling's own index entry is " +
+			"rendered from a goal the cron froze at mint, so it names no unit and never will. That " +
+			"read is the only dedup mechanism there is, it is best-effort, and a sibling mid-turn " +
+			"with no merge request open yet is invisible to it.\n\n" +
+			"Read the release notes for EVERY release between the current pin and your target, not " +
+			"just the target. There is no machine-readable signal that a hop is mandatory: " +
+			"artifacthub's changes annotation has no breaking kind and no engine here reads it, and a " +
+			"semver major is a convention, not a promise. The one case that IS automatable is " +
+			"Kubernetes API removal - render the chart and run Pluto over the output.\n\n" +
+			"Your resolved upgrade policy is in the <goal> element. Under `nextHopOnly` you propose " +
+			"the NEXT mandatory release only, never the latest; the chain is walked one deployed Task " +
+			"at a time, and the repo's current pin IS the cursor - no hop-chain state is persisted " +
+			"anywhere. Write the full planned chain into the merge request body so a human can see " +
+			"where it is going.\n\n" +
+			"Run the repo's REAL test suite, not just a build. A build that succeeds while the tests " +
+			"are red is a failed upgrade, not a partial one.\n\n" +
+			resumedBranchMergeRule +
+			"When the change is complete and pushed:\n" +
+			"`submit_outcome(action=submitted, title=..., body=..., " +
+			"change_significance=major|minor|patch, merge_order=[...])`. merge_order is REQUIRED when " +
+			"you changed more than one repo: it is the DEPENDENCY order the repos merge in, and there " +
+			"is no default - getting it backwards ships a chart against an image tag that never " +
+			"published.\n\n" +
+			"If no unit is worth taking this cycle, or the one you picked turns out to be unsafe, " +
+			"`submit_outcome(action=declined, decline_reason=...)`. `declined` is a correct and " +
+			"common answer, and there is no partial delivery." +
+			promptguidance.ToolingConsumeGuidance
 
 	default:
 		return "## Your job\n\nComplete the goal above and end your stage with `submit_outcome`."

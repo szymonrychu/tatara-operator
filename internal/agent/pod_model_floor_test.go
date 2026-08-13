@@ -46,6 +46,26 @@ func TestModelForKindOnRepo_HelmfileFloor(t *testing.T) {
 	}
 }
 
+// TestModelForKindOnRepo_UpgradeIsRepoLessAndThereforeNotFloored pins the
+// DELIBERATE decision that the self-heal floor does not reach upgrade. The floor
+// keys on targetRepo, which BuildPod fills only from Spec.RepositoryRef; an
+// upgrade Task is repo-less and its mergeOrder is declared by the agent at
+// outcome time, so at pod-build time there is nothing to key on. Its locked
+// default is already opus, so only an explicit per-project downgrade tiers it -
+// which is what modelByKind is for. A floor entry for upgrade would be
+// unreachable, and making it unconditional would silently neuter that key.
+func TestModelForKindOnRepo_UpgradeIsRepoLessAndThereforeNotFloored(t *testing.T) {
+	proj := &tatarav1alpha1.Project{}
+	proj.Spec.Agent.Model = "claude-opus-5"
+	if got := modelForKindOnRepo(proj, "upgrade", "", ""); got != "claude-opus-5" {
+		t.Fatalf("upgrade default = %q, want claude-opus-5 (the locked per-kind default)", got)
+	}
+	proj.Spec.Agent.ModelByKind = map[string]string{"upgrade": "claude-sonnet-5"}
+	if got := modelForKindOnRepo(proj, "upgrade", "", ""); got != "claude-sonnet-5" {
+		t.Fatalf("upgrade with an explicit override = %q, want claude-sonnet-5 (modelByKind must not be inert)", got)
+	}
+}
+
 // TestModelForKindOnRepo_HealthCheckTierableOnHelmfile confirms a healthCheck
 // override still applies on helmfile (the floor exempts healthCheck).
 func TestModelForKindOnRepo_HealthCheckTierableOnHelmfile(t *testing.T) {

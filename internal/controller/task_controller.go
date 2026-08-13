@@ -743,7 +743,7 @@ func shortDescription(goal string) string {
 
 // inflightKinds are the Task ORIGIN kinds the per-kind in-flight gauge always
 // emits, so a kind with no live Task reports 0 rather than dropping its series.
-var inflightKinds = []string{"brainstorm", "incident", "implement", "refine", "review", "documentation"}
+var inflightKinds = []string{"brainstorm", "incident", "implement", "refine", "review", "documentation", "upgrade"}
 
 // updateInflightGauge sets operator_tasks_inflight (aggregate) and
 // tatara_tasks_inflight{kind} (per-kind) to the count of Tasks in a POD stage.
