@@ -34,6 +34,7 @@ func TestGoalBuildersNameOnlyRealTools(t *testing.T) {
 		stage.AgentImplement,
 		stage.AgentReview,
 		stage.AgentDocumentation,
+		stage.AgentUpgrade,
 	} {
 		task := &tatarav1alpha1.Task{}
 		task.Name = "task-x"

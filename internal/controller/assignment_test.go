@@ -143,7 +143,7 @@ func TestAssignmentFor_ResumedBranchMergeIsFirstAction(t *testing.T) {
 
 	const rule = "resolving that merge is your FIRST action"
 
-	for _, kind := range []string{stage.AgentImplement, stage.AgentDocumentation} {
+	for _, kind := range []string{stage.AgentImplement, stage.AgentDocumentation, stage.AgentUpgrade} {
 		got := assignmentFor(kind, task, &tatarav1alpha1.Project{}, false)
 		if !strings.Contains(got, rule) {
 			t.Errorf("kind %q pushes code and must carry the resumed-branch merge rule", kind)
@@ -160,5 +160,69 @@ func TestAssignmentFor_ResumedBranchMergeIsFirstAction(t *testing.T) {
 		if strings.Contains(got, rule) {
 			t.Errorf("kind %q pushes no code and must not carry the resumed-branch merge rule", kind)
 		}
+	}
+}
+
+// --- upgrade --------------------------------------------------------------
+
+func TestRequiredSkills_UpgradeDemandsTheWorkflowAndTDD(t *testing.T) {
+	got := requiredSkillsForKind("upgrade")
+	want := []string{"tatara-upgrade-workflow", "test-driven-development"}
+	if len(got) != len(want) {
+		t.Fatalf("requiredSkillsForKind(upgrade) = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("requiredSkillsForKind(upgrade) = %v, want %v", got, want)
+		}
+	}
+	if d := skillsDirective("upgrade"); !strings.HasPrefix(d, "Required skills this turn:") {
+		t.Fatalf("upgrade must get MANDATORY wording, not brainstorm's advisory Consult wording: %q", d)
+	}
+}
+
+func TestAgentJob_UpgradeCarriesTheOneUnitAndReleaseNotesRules(t *testing.T) {
+	job := agentJob(stage.AgentUpgrade, &tatarav1alpha1.Project{}, false)
+	for _, want := range []string{
+		"EXACTLY ONE",
+		"task_context(index=true)",
+		"release notes",
+		"merge_order",
+		"submit_outcome(action=submitted",
+		"action=declined",
+		"nextHopOnly",
+	} {
+		if !strings.Contains(job, want) {
+			t.Errorf("upgrade job text missing %q", want)
+		}
+	}
+	// THE GATE BELONGS TO implement. An upgrade agent has no issue and no
+	// maintainer comment to cite, and its outcome schema has no approved action
+	// at all - telling it to seek approval sends it into a guaranteed refusal.
+	for _, forbidden := range []string{"approving_maintainer", "approval_citations", "action=approved"} {
+		if strings.Contains(job, forbidden) {
+			t.Errorf("upgrade job text must not carry the gate field %q", forbidden)
+		}
+	}
+}
+
+// The upgrade agent pushes code, so it carries the resumed-branch merge rule
+// like every other code-pushing kind.
+func TestAgentJob_UpgradeCarriesTheResumedBranchRule(t *testing.T) {
+	job := agentJob(stage.AgentUpgrade, &tatarav1alpha1.Project{}, false)
+	if !strings.Contains(job, "resolving that merge is your FIRST action") {
+		t.Error("upgrade pushes code and must carry the resumed-branch merge rule")
+	}
+}
+
+func TestAssignmentFor_UpgradeAppliesPromptAppendByKind(t *testing.T) {
+	proj := &tatarav1alpha1.Project{}
+	proj.Spec.Agent.PromptAppendByKind = map[string]string{"upgrade": "DECK REFRESH RULES HERE"}
+	task := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "upgrade-abc"},
+		Spec:       tatarav1alpha1.TaskSpec{Kind: "upgrade", ProjectRef: "p"},
+	}
+	if got := assignmentFor(stage.AgentUpgrade, task, proj, false); !strings.Contains(got, "DECK REFRESH RULES HERE") {
+		t.Fatal("promptAppendByKind[upgrade] must reach the upgrade assignment")
 	}
 }

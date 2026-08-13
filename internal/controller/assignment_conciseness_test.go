@@ -24,6 +24,7 @@ func TestAssignmentFor_ConcisenessGuidance(t *testing.T) {
 	for _, kind := range []string{
 		stage.AgentBrainstorm, stage.AgentIncident,
 		stage.AgentRefine, stage.AgentImplement, stage.AgentReview, stage.AgentDocumentation,
+		stage.AgentUpgrade,
 	} {
 		got := assignmentFor(kind, task, &tatarav1alpha1.Project{}, false)
 		if !strings.Contains(got, promptguidance.ConcisenessGuidance) {
