@@ -112,7 +112,7 @@ func TestUnderImplementationToDoneExistsForTheDocumentationBatch(t *testing.T) {
 // could finish at done with no MR and no review (guard 5), and any kind could
 // be triaged straight into the review lane (guard 4).
 func TestLegalFor_UnderImplementationToDoneIsTheDocumentationBatchOnly(t *testing.T) {
-	for _, kind := range []string{"implement", "takeover", "brainstorm", "incident", "refine", "review"} {
+	for _, kind := range []string{"implement", "takeover", "brainstorm", "incident", "refine", "review", "upgrade"} {
 		require.False(t,
 			stage.LegalFor(taskOfKind(v1alpha1.StateUnderImplementation, kind), nil,
 				v1alpha1.StateUnderImplementation, v1alpha1.StateDone),
@@ -125,7 +125,7 @@ func TestLegalFor_UnderImplementationToDoneIsTheDocumentationBatchOnly(t *testin
 func TestLegalFor_NewToAwaitingReviewIsTheReviewKindOnly(t *testing.T) {
 	require.True(t, stage.LegalFor(taskOfKind(v1alpha1.StateNew, "review"), nil,
 		v1alpha1.StateNew, v1alpha1.StateAwaitingReview))
-	for _, kind := range []string{"implement", "takeover", "brainstorm", "incident", "refine", "documentation"} {
+	for _, kind := range []string{"implement", "takeover", "brainstorm", "incident", "refine", "documentation", "upgrade"} {
 		require.False(t,
 			stage.LegalFor(taskOfKind(v1alpha1.StateNew, kind), nil,
 				v1alpha1.StateNew, v1alpha1.StateAwaitingReview),
@@ -1110,4 +1110,30 @@ func TestNewToAwaitingReviewExistsForTheReviewKind(t *testing.T) {
 	require.True(t, stage.LegalFor(tk, nil, v1alpha1.StateNew, v1alpha1.StateAwaitingReview))
 	require.NoError(t, stage.Enter(tk, nil, v1alpha1.StateAwaitingReview, "", now))
 	require.Equal(t, stage.AgentReview, tk.Status.AgentKind)
+}
+
+// WHY AN UPGRADE TASK IS MINTED STRAIGHT INTO under-implementation, and never
+// triaged to refined like every other unconstrained kind.
+//
+// refined is where the APPROVAL GATE runs, and the only edge out of it into
+// under-implementation is submit_outcome(action=approved). tatara-cli's upgrade
+// outcome schema has no such action - its enum is submitted|declined only,
+// because a scheduled upgrade has no issue thread and no maintainer comment to
+// cite. An upgrade Task parked at refined would submit `submitted`, the operator
+// would try refined -> awaiting-review, and THAT EDGE DOES NOT EXIST: the Task
+// would respawn and re-submit against the same refusal forever.
+//
+// So upgrade takes the documentation batch's shape instead - Create ->
+// under-implementation, no triage, no gate - and these are the two halves of
+// that fact, pinned so a later "tidy the kind lists" change cannot quietly
+// reintroduce the loop.
+func TestUpgradeIsMintedIntoUnderImplementationBecauseRefinedHasNoExit(t *testing.T) {
+	require.False(t, stage.Legal(v1alpha1.StateRefined, v1alpha1.StateAwaitingReview),
+		"refined -> awaiting-review must stay absent: it is what forces upgrade to be minted past the gate, not through it")
+	require.True(t, stage.LegalFor(taskOfKind(v1alpha1.StateNew, "upgrade"), nil,
+		stage.Create, v1alpha1.StateUnderImplementation),
+		"the Create edge into under-implementation is how an upgrade Task starts")
+	require.True(t, stage.LegalFor(taskOfKind(v1alpha1.StateUnderImplementation, "upgrade"), nil,
+		v1alpha1.StateUnderImplementation, v1alpha1.StateAwaitingReview),
+		"submit_outcome(kind=upgrade, action=submitted) must be able to hand the MR to review")
 }

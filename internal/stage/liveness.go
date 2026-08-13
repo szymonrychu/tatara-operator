@@ -56,6 +56,7 @@ var originAgentKinds = map[string]string{
 	"incident":      AgentIncident,
 	"refine":        AgentRefine,
 	"documentation": AgentDocumentation,
+	"upgrade":       AgentUpgrade,
 }
 
 // AgentKindFor is the F.2 table, now keyed on (state, spec.kind) because the

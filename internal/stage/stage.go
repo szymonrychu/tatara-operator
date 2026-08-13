@@ -39,9 +39,11 @@ const (
 	ParkTarget = "(park)"
 )
 
-// The six agent kinds. `clarify` was the seventh and is DELETED: its three
-// decisions became action values on the implement outcome, behind the extended
-// approval gate (#521).
+// The seven agent kinds. `clarify` was one of the original seven and is
+// DELETED: its three decisions became action values on the implement outcome,
+// behind the extended approval gate (#521). `upgrade` was added in its place as
+// a distinct kind (2026-08-13): a scheduled dependency-upgrade agent that opens
+// merge requests the way implement does, with no approval gate.
 const (
 	AgentBrainstorm    = "brainstorm"
 	AgentIncident      = "incident"
@@ -49,6 +51,7 @@ const (
 	AgentImplement     = "implement"
 	AgentReview        = "review"
 	AgentDocumentation = "documentation"
+	AgentUpgrade       = "upgrade"
 )
 
 // kindReview is the Task.Spec.Kind that may NEVER reach under-implementation or
