@@ -60,8 +60,9 @@ func TestSeedSweepErrorsForProject(t *testing.T) {
 	// fail() sites the list had drifted from, issue #495; +resolve_live_owner,
 	// issue #521), brainstorm x 1 (demand-driven now, only stamp_failed can
 	// fire), documentation/issueScan x 2 each (invalid_cron, stamp_failed),
-	// refine x 3 (its own cron, Task 3).
-	const wantPerProject = 18 + 1 + 2*2 + 3
+	// refine x 3 (its own cron, Task 3), upgrade x 3 (plain cron plus its own
+	// capacity-count failure).
+	const wantPerProject = 18 + 1 + 2*2 + 3 + 3
 
 	before := testutil.CollectAndCount(SweepErrorsTotal)
 	SeedSweepErrorsForProject("seed-test-proj")

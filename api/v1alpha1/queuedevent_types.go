@@ -44,6 +44,18 @@ type QueuedEventPayload struct {
 	// but is kept for other callers.
 	Provider string `json:"provider,omitempty"`
 	PodRepo  string `json:"podRepo,omitempty"`
+	// InitialState is the Create-edge target the minted Task carries, copied
+	// verbatim onto TaskSpec.InitialState. Empty means `new`, i.e. triage.
+	//
+	// It exists for the kinds that have NO GATE TO FACE and therefore nothing to
+	// triage: an upgrade Task is minted straight into under-implementation,
+	// because refined's only exit into under-implementation is
+	// submit_outcome(action=approved) and the upgrade outcome schema has no such
+	// action. Without this the Task would sit at refined re-submitting against a
+	// transition that does not exist.
+	// +kubebuilder:validation:Enum=new;refined;under-implementation
+	// +optional
+	InitialState string `json:"initialState,omitempty"`
 	// AlertRule is carried from the incident webhook onto the built Task's
 	// Spec.AlertRules.
 	// +optional

@@ -435,6 +435,9 @@ func BuildTaskFromQueuedEvent(qe *tatarav1alpha1.QueuedEvent, proj *tatarav1alph
 		DedupKey:      p.DedupKey,
 		GroupKey:      p.GroupKey,
 		Source:        p.Source,
+		// Empty is `new` (the TaskReconciler create edge applies that default),
+		// so every existing producer keeps triaging unchanged.
+		InitialState: p.InitialState,
 	}
 	if p.AlertRule != "" {
 		spec.AlertRules = []string{p.AlertRule}

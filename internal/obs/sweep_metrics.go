@@ -339,6 +339,11 @@ var sweepSeedReasons = []string{
 var cronReasons = []string{"invalid_cron", "stamp_failed"}
 var refineReasons = []string{"invalid_cron", "stamp_failed", "refine_inflight_check_failed"}
 
+// upgrade carries the plain cron shape plus its own capacity-count failure: the
+// tick reads the live upgrade-Task count before minting, and a failed read is a
+// tick that silently minted nothing.
+var upgradeReasons = []string{"invalid_cron", "stamp_failed", "upgrade_count_failed"}
+
 // SeedSweepErrorsForProject pre-seeds the closed (activity x reason) label set of
 // SweepErrorsTotal for ONE project, so a healthy sweep with zero errors still
 // exposes a zero baseline and increase(operator_sweep_errors_total[1h]) is
@@ -364,6 +369,7 @@ func SeedSweepErrorsForProject(project string) {
 	seedLabels(seed, []string{project}, []string{"brainstorm"}, []string{"stamp_failed"})
 	seedLabels(seed, []string{project}, []string{"documentation", "issueScan"}, cronReasons)
 	seedLabels(seed, []string{project}, []string{"refine"}, refineReasons)
+	seedLabels(seed, []string{project}, []string{"upgrade"}, upgradeReasons)
 	skip := func(l ...string) { SweepSkippedTotal.WithLabelValues(l...) }
 	seedLabels(skip, []string{project}, sweepActivities, sweepSkipReasons)
 	for _, activity := range sweepActivities {
