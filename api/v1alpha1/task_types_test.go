@@ -94,3 +94,20 @@ func TestValidateTaskSpec_Incident(t *testing.T) {
 		t.Fatalf("incident with a repositoryRef must be rejected (project-scoped)")
 	}
 }
+
+// upgrade is UNCONSTRAINED-scope: it sees every enrolled repo via TATARA_REPOS
+// and opens merge requests wherever the unit needs them, exactly like implement.
+func TestUpgradeIsAnUnconstrainedKind(t *testing.T) {
+	if !v1alpha1.IsKnownKind("upgrade") {
+		t.Fatal("IsKnownKind(upgrade) must be true or the QueuedEvent validator rejects every upgrade event")
+	}
+	if err := v1alpha1.ValidateTaskSpec(v1alpha1.TaskSpec{ProjectRef: "p", Kind: "upgrade"}); err != nil {
+		t.Fatalf("upgrade with an empty repositoryRef must validate: %v", err)
+	}
+	if err := v1alpha1.ValidateTaskSpec(v1alpha1.TaskSpec{ProjectRef: "p", Kind: "upgrade", RepositoryRef: "charts"}); err != nil {
+		t.Fatalf("upgrade with a repositoryRef must also validate (unconstrained, not project-scoped): %v", err)
+	}
+	if v1alpha1.IsProjectScopedKind("upgrade") {
+		t.Fatal("upgrade must not be project-scoped: it opens merge requests")
+	}
+}

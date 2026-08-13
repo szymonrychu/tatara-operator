@@ -80,6 +80,7 @@ spec:
                     - review
                     - documentation
                     - implement
+                    - upgrade
                     type: string
                   alertRule:
                     description: |-

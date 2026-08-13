@@ -63,7 +63,7 @@ type QueuedEventPayload struct {
 	// this). Kept +optional at the CRD level (unlike the contract's bare
 	// literal) so a flat MINT payload (the sweep/webhook producers, which fill
 	// only Kind/Goal/...) keeps validating unchanged.
-	// +kubebuilder:validation:Enum=brainstorm;incident;clarify;refine;review;documentation;implement
+	// +kubebuilder:validation:Enum=brainstorm;incident;clarify;refine;review;documentation;implement;upgrade
 	// +optional
 	AgentKind string `json:"agentKind,omitempty"`
 	// TaskRef names an EXISTING Task (a stage-driven spawn).
@@ -97,10 +97,11 @@ type QueuedTaskBlueprint struct {
 	Annotations map[string]string `json:"annotations,omitempty"`
 }
 
-// validAgentKinds are the 6 AGENT kinds a QueuedEventPayload.AgentKind may name
-// (contract B.7). `clarify` was the seventh until #521 folded it into implement.
-// Deliberately narrower than IsKnownKind (task_types.go), which is the ORIGIN
-// vocabulary and also carries `takeover`.
+// validAgentKinds are the 7 AGENT kinds a QueuedEventPayload.AgentKind may name
+// (contract B.7). `clarify` was one of them until #521 folded it into implement;
+// `upgrade` took the seventh slot on 2026-08-13. Deliberately narrower than
+// IsKnownKind (task_types.go), which is the ORIGIN vocabulary and also carries
+// `takeover`.
 var validAgentKinds = map[string]bool{
 	"brainstorm":    true,
 	"incident":      true,
@@ -108,6 +109,7 @@ var validAgentKinds = map[string]bool{
 	"review":        true,
 	"documentation": true,
 	"implement":     true,
+	"upgrade":       true,
 }
 
 type QueuedEventSpec struct {
