@@ -68,9 +68,10 @@ var projectScopedKinds = map[string]bool{
 // has no clarify row, and each one parks ONCE at triage-stalled with
 // action=triage_unknown_kind before the 7-day park retention reaps it. Loud,
 // bounded, and deliberately not special-cased.
-// upgrade joined them on 2026-08-13. It is minted by the cron with no repo at
-// all and picks its own blast radius from the enrolled set, so it must validate
-// with an empty RepositoryRef; it is listed here rather than in
+//
+// upgrade joined the set on 2026-08-13. The cron mints it with no repo at all
+// and it picks its own blast radius from the enrolled set, so it must validate
+// with an empty RepositoryRef; it belongs here rather than in
 // projectScopedKinds because it DOES open merge requests, which is exactly the
 // property projectScopedKinds denies.
 var unconstrainedKinds = map[string]bool{
@@ -411,7 +412,7 @@ type Note struct {
 	// because appending a note revalidates its siblings and ratcheting only
 	// exempts unchanged keypaths. That broke enforce-live-pod-ceiling into a
 	// reconcile error loop. No writer can produce it: AgentKindFor has no clarify.
-	// +kubebuilder:validation:Enum=brainstorm;incident;refine;review;documentation;implement;operator;clarify
+	// +kubebuilder:validation:Enum=brainstorm;incident;refine;review;documentation;implement;upgrade;operator;clarify
 	Agent string `json:"agent"`
 	// +kubebuilder:validation:Enum=note;plan;handoff
 	Kind string `json:"kind"`

@@ -354,14 +354,14 @@ var upgradeReasons = []string{"invalid_cron", "stamp_failed", "upgrade_count_fai
 // This used to run in init(). It cannot any more: `project` joined the label set
 // in issue #441 and project names are not known at process start. The Project
 // reconciler calls this on every pass; WithLabelValues returns the existing child
-// for an already-seeded combination, so it is idempotent and cheap (21 map
+// for an already-seeded combination, so it is idempotent and cheap (29 map
 // lookups per Project per reconcile).
 func SeedSweepErrorsForProject(project string) {
 	seed := func(l ...string) { SweepErrorsTotal.WithLabelValues(l...) }
 	// "nightlySweep" dropped (boy-scout, this line was already being rewritten
 	// for #441): SweepNightlyActivity was deleted as dead in the 2026-07-18
 	// #325 change (no nightly sweep planned, no live producer ever existed)
-	// but the seed list carried it over verbatim, so 13 of the 44 seeded
+	// but the seed list carried it over verbatim, so 13 of the then-44 seeded
 	// series per Project were permanently zero for an activity that can never
 	// fire - 13 wasted series process-wide before this branch, 13 per Project
 	// after it labelled the metric by project.

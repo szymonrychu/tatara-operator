@@ -86,7 +86,7 @@ func TestRefinedToDoneExistsForTheNonCodeKinds(t *testing.T) {
 // Task reaching done from refined has opened no MR and faced no review - the
 // same hole GUARDS 3-5 close for their own edges.
 func TestLegalFor_RefinedToDoneIsTheNonCodeKindsOnly(t *testing.T) {
-	for _, kind := range []string{"implement", "takeover", "review", "documentation"} {
+	for _, kind := range []string{"implement", "takeover", "review", "documentation", "upgrade"} {
 		require.False(t,
 			stage.LegalFor(taskOfKind(v1alpha1.StateRefined, kind), nil,
 				v1alpha1.StateRefined, v1alpha1.StateDone),

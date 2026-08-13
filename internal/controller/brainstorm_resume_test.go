@@ -27,14 +27,15 @@ import (
 // pin-bump Tasks are excluded - because that half of the table is the one
 // that must never silently regress. implement, incident and takeover are
 // asserted TRUE in the same table (a merged MR for any of them lands real
-// code, so the project moved), so an eighth kind added later still fails
+// code, so the project moved, and upgrade with them), so a ninth kind added
+// later still fails
 // this test instead of picking a silent default, on either side of the line.
 func TestBrainstormResumeKindExcludesDocumentationAndPinBumpTasks(t *testing.T) {
 	// Task.Spec.Kind is a CLOSED CRD enum (task_types.go): brainstorm, incident,
-	// implement, refine, review, documentation, takeover. #521 merged clarify
+	// implement, refine, review, documentation, takeover, upgrade. #521 merged clarify
 	// into implement (the full proposal-to-implementation lifecycle kind);
 	// clarify is no longer a member of the enum at all. Every value is listed
-	// here on purpose, so adding an eighth kind fails this test rather than
+	// here on purpose, so adding a ninth kind fails this test rather than
 	// silently picking a default.
 	tests := []struct {
 		kind string
@@ -43,6 +44,7 @@ func TestBrainstormResumeKindExcludesDocumentationAndPinBumpTasks(t *testing.T) 
 		{"implement", true}, // the full proposal-to-implementation lifecycle
 		{"incident", true},  // an incident fix landing IS the project moving
 		{"takeover", true},  // a takeover MR lands real code - the project moved
+		{"upgrade", true},   // a dependency hop moves the pin AND the config with it
 		{"documentation", false},
 		{"refine", false},
 		{"review", false},

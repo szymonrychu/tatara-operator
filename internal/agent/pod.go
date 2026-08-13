@@ -1093,9 +1093,12 @@ const helmfileTargetRepo = "tatara-helmfile"
 
 // modelFloorKinds are the reasoning kinds pinned to their locked opus default
 // when the task targets the self-heal repo (helmfileTargetRepo). documentation
-// and refine (the cheap, freely-tierable kinds) are deliberately absent.
+// and refine (the cheap, freely-tierable kinds) are deliberately absent. upgrade
+// IS present: a dependency hop routinely opens its last merge request against
+// tatara-helmfile, which is the same repo the floor exists to protect.
 var modelFloorKinds = map[string]bool{
 	"brainstorm": true, "incident": true, "implement": true, "review": true, "takeover": true,
+	"upgrade": true,
 }
 
 // modelFloorAppliesOnRepo reports whether the tier-revert self-heal model floor

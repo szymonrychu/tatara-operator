@@ -499,6 +499,7 @@ spec:
                       - review
                       - documentation
                       - implement
+                      - upgrade
                       - operator
                       - clarify
                       type: string

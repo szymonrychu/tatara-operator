@@ -775,7 +775,7 @@ func TestTriageTargetIsAlwaysALegalEdgeOutOfNew(t *testing.T) {
 	if _, ok := triageTarget(stage.AgentDocumentation); ok {
 		t.Fatal("triageTarget has a documentation row again: new -> under-implementation is not in the table and never will be")
 	}
-	for _, kind := range []string{"brainstorm", "implement", "incident", "refine", "takeover", "review", "documentation", "nonsense"} {
+	for _, kind := range []string{"brainstorm", "implement", "incident", "refine", "takeover", "review", "documentation", "upgrade", "nonsense"} {
 		target, ok := triageTarget(kind)
 		if !ok {
 			continue // no row: reconcileTriaging parks at triage-stalled, which is legal from anywhere

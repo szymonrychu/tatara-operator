@@ -151,6 +151,7 @@ spec:
                       - review
                       - documentation
                       - implement
+                      - upgrade
                       type: string
                     author:
                       type: string

@@ -101,3 +101,47 @@ func TestProjectCRD_MaxOpenUpgradesDefaultsToOneOnCreate(t *testing.T) {
 		"an omitted upgradePolicy stays absent: a default inside a nil struct pointer is never applied, "+
 			"which is why the goal renderer resolves the default-off shape itself")
 }
+
+// THE TWO AUTHOR ENUMS THE PLAN AND THE DESIGN BOTH MISSED, and they are
+// fail-closed at the API SERVER rather than in Go, so nothing in the operator
+// would have caught them.
+//
+//   - Task.status.notes[].agent is written verbatim from the outcome's kind
+//     (restapi/outcome.go agentNote). The FIRST upgrade outcome would have had
+//     its status write rejected - and, because appending a note revalidates its
+//     siblings, the Task would then error on every subsequent write.
+//   - Issue/MergeRequest .status.comments[].agentKind is written from the owning
+//     Task's status.agentKind (controller/reviewpost.go pendingCommentAgentKind),
+//     so an upgrade Task draining a pending comment would be rejected the same
+//     way.
+//
+// A new agent kind must reach BOTH, not just the six maps the plan listed.
+func TestUpgradeIsAValidNoteAuthorAndCommentAgentKind(t *testing.T) {
+	ctx := context.Background()
+
+	tk := &tataradevv1alpha1.Task{}
+	tk.Name = "upgrade-note-author"
+	tk.Namespace = testNS
+	tk.Spec = tataradevv1alpha1.TaskSpec{ProjectRef: "p", Kind: "upgrade", Goal: "g"}
+	require.NoError(t, k8sClient.Create(ctx, tk))
+	tk.Status.AgentKind = "upgrade"
+	tk.Status.Notes = []tataradevv1alpha1.Note{{
+		At: metav1.Now(), Agent: "upgrade", Kind: "note", Body: "submitted: cilium 1.16 -> 1.17",
+	}}
+	require.NoError(t, k8sClient.Status().Update(ctx, tk),
+		"status.notes[].agent=upgrade must be admitted or the first upgrade outcome wedges the Task")
+
+	mr := &tataradevv1alpha1.MergeRequest{}
+	mr.Name = "upgrade-comment-author"
+	mr.Namespace = testNS
+	mr.Spec = tataradevv1alpha1.MergeRequestSpec{
+		ProjectRef: "p", RepositoryRef: "charts", Number: 41,
+	}
+	require.NoError(t, k8sClient.Create(ctx, mr))
+	mr.Status.Comments = []tataradevv1alpha1.Comment{{
+		ExternalID: "c1", Author: "tatara-bot", AgentKind: "upgrade", Body: "b",
+		CreatedAt: metav1.Now(),
+	}}
+	require.NoError(t, k8sClient.Status().Update(ctx, mr),
+		"status.comments[].agentKind=upgrade must be admitted or the pending-comment drain is rejected")
+}

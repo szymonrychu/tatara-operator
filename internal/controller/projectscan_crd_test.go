@@ -55,7 +55,7 @@ func TestProjectCronFieldsRoundTrip(t *testing.T) {
 
 func TestTaskKindEnum(t *testing.T) {
 	ctx := context.Background()
-	for _, kind := range []string{"brainstorm", "incident", "implement", "refine", "review", "documentation"} {
+	for _, kind := range []string{"brainstorm", "incident", "implement", "refine", "review", "documentation", "takeover", "upgrade"} {
 		tk := &tataradevv1alpha1.Task{}
 		tk.Name = "enum-" + kind
 		tk.Namespace = testNS

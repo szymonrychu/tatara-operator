@@ -980,6 +980,13 @@ func (r *TaskReconciler) reconcileTriaging(ctx context.Context, proj *tatarav1al
 // under-implementation is the one restapi's gate grants. A Task minted
 // kind=implement therefore lands in front of the gate, not past it.
 //
+// THERE IS NO `upgrade` ROW EITHER, for the same reason and with the same
+// consequence: the upgrade cron mints with InitialState = under-implementation
+// (projectscan.go createUpgradeTask), because `refined`'s only exit into
+// under-implementation is submit_outcome(action=approved) and the upgrade
+// outcome schema has no such action. An upgrade Task arriving at `new` parks at
+// triage-stalled instead of grinding against an edge it could never take.
+//
 // THERE IS NO `documentation` ROW, and its absence is the point. It used to
 // return under-implementation, which is NOT in the table's `new` row - so a
 // documentation Task that ever reached triage would have failed

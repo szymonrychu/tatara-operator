@@ -72,7 +72,7 @@ func nextExpectedUnix(proj *tatarav1alpha1.Project, schedule string, last *metav
 //
 // No "brainstorm" case: brainstorm's cron path was retired (c0a50f9, demand-
 // driven now) and no caller has passed "brainstorm" since - only "issueScan",
-// "refine" and "documentation" ever reach here. Brainstorm.Schedule stays on
+// "refine", "documentation" and "upgrade" ever reach here. Brainstorm.Schedule stays on
 // the CRD for compat (Brainstorm.Enabled still gates the event-driven refill
 // path), it is just never read through this function any more.
 func activityScheduleAndLast(proj *tatarav1alpha1.Project, activity string) (string, *metav1.Time) {
@@ -501,7 +501,8 @@ func (r *ProjectReconciler) reposDueForScan(proj *tatarav1alpha1.Project, activi
 //
 // On success it also sets obs.SweepLastSuccessTimestamp{activity} - the same
 // heartbeat gauge sweep.go's B.4 pass sets for sweep/nightlySweep, extended
-// to the brainstorm/documentation/issueScan crons. This is the successor for
+// to the brainstorm/documentation/issueScan crons (refine and upgrade stamp
+// through their own stampRefine/stampUpgrade, which set the same gauge). This is the successor for
 // tatara_scan_items_total, which the metric-wiring audit (issue #370) pruned
 // as dead-per-redesign; TataraLoopStalled's deadman alert and the
 // tatara-loop dashboard panel are repointed onto this gauge in the same

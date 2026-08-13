@@ -366,7 +366,8 @@ func Legal(from, to string) bool { return legalPairs[[2]string{from, to}] }
 // file_issue minted its tracker - and nothing else may take it. An implement,
 // takeover, review or documentation Task reaching done from refined has opened
 // no MR and faced no review either, the same hole GUARDS 3-5 close for their
-// own edges.
+// own edges - and upgrade is in that same set: it opens merge requests, so
+// `refined -> done` is closed to it too.
 //
 // GUARDS 4, 5 AND 6 WERE CALLER-GATED UNTIL #521's REVIEW (GUARD 6 slipped past
 // that same review and was only caught in the round after). The table's own

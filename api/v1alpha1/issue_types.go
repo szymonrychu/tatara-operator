@@ -72,7 +72,7 @@ type Comment struct {
 	// every agent kind, and login matching is a documented weak trust boundary.
 	// This field is the operator's own write ledger, so a bot comment with NO
 	// entry resolves to "" and triggers nothing - the rule FAILS CLOSED.
-	// +kubebuilder:validation:Enum=brainstorm;incident;clarify;refine;review;documentation;implement
+	// +kubebuilder:validation:Enum=brainstorm;incident;clarify;refine;review;documentation;implement;upgrade
 	// +optional
 	AgentKind string `json:"agentKind,omitempty"`
 	// Truncated is true when the ingest cut Body at 8192 bytes. The bundle
