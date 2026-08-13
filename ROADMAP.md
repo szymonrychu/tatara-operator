@@ -2,6 +2,22 @@
 
 Planned work not yet started. One line per item; link to plans for detail.
 
+- [x] **THE `upgrade` AGENT KIND. Phase 4 of `docs/superpowers/specs/2026-08-13-tatara-upgrade-agent-plan.md`
+  (the plan lives in the `tatara-new` workbench), landed 2026-08-13. MINOR: new opt-in fields and a
+  new kind, and nothing existing changes behaviour while every project's `scm.cron.upgrade.schedule`
+  is empty.** A scheduled agent takes ONE dependency-upgrade unit per Task, reads the release notes
+  between the current pin and its target, implements the code and config that must move with the
+  bump, and carries the change through review, merge and deploy on the existing 8-state lifecycle.
+  New on `Project.spec`: `scm.cron.upgrade` (`schedule`, `maxOpenUpgrades`) and `upgradePolicy`
+  (`engine: renovate|none`, `majorStrategy: nextHopOnly|latest`, `minimumReleaseAge.{major,minor,patch}`)
+  - every one of those names is fixed by the already-released `tatara-agent-skills` v2.1.0 skill and
+  must not drift. `internal/upgrade` renders the resolved policy into the turn-0 goal; the operator
+  never acts on it. Each due tick mints AT MOST ONE Task, only under `maxOpenUpgrades`, minted
+  straight into `under-implementation` (see MEMORY.md 2026-08-13 for why `refined` is unreachable
+  for this kind). **Requires tatara-cli >= v2.1.0 in the pod image (contract L.5).** Still open:
+  Phase 5 enrolment in `tatara-helmfile`, the Phase 6 soak, and the Phase 7 Renovate decommission in
+  `~/Documents/infrastructure`.
+
 - [x] **RESOLVED 2026-08-08 - the #521 migrator is withdrawn and the state reset is ACCEPTED.**
   The finding stands: CRD structural pruning applies on the READ path, so once the narrowed CRD is
   served no GET returns `status.stage` on any object and a one-shot migrator has nothing to read
