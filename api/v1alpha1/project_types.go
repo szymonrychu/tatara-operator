@@ -413,16 +413,16 @@ type AgentSpec struct {
 	// healthCheck's recurring classification work be tiered separately from
 	// brainstorm's creative work. A missing or empty entry falls back to Model.
 	// Values are authoritative model IDs (claude-opus-5, claude-sonnet-5).
-	// +kubebuilder:validation:MaxProperties=11
-	// +kubebuilder:validation:XValidation:rule="self.all(k, k in ['implement','review','clarify','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine','healthCheck','documentation'])",message="modelByKind keys must be one of: implement, review, clarify, triageIssue, brainstorm, issueLifecycle, incident, selfImprove, refine, healthCheck, documentation"
+	// +kubebuilder:validation:MaxProperties=12
+	// +kubebuilder:validation:XValidation:rule="self.all(k, k in ['implement','review','clarify','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine','healthCheck','documentation','upgrade'])",message="modelByKind keys must be one of: implement, review, clarify, triageIssue, brainstorm, issueLifecycle, incident, selfImprove, refine, healthCheck, documentation, upgrade"
 	// +kubebuilder:validation:XValidation:rule="self.all(k, self[k].startsWith('claude-') && self[k].size() <= 64)",message="modelByKind values must be a claude model ID (start with 'claude-', max 64 chars)"
 	// +optional
 	ModelByKind map[string]string `json:"modelByKind,omitempty"`
 	// EffortByKind overrides the project-wide Effort per Task Kind. Same keying as
 	// ModelByKind (including the "healthCheck" pseudo-key); a missing or empty
 	// entry falls back to Effort. Values are the effort enum (low|medium|high|xhigh|max).
-	// +kubebuilder:validation:MaxProperties=11
-	// +kubebuilder:validation:XValidation:rule="self.all(k, k in ['implement','review','clarify','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine','healthCheck','documentation'])",message="effortByKind keys must be one of: implement, review, clarify, triageIssue, brainstorm, issueLifecycle, incident, selfImprove, refine, healthCheck, documentation"
+	// +kubebuilder:validation:MaxProperties=12
+	// +kubebuilder:validation:XValidation:rule="self.all(k, k in ['implement','review','clarify','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine','healthCheck','documentation','upgrade'])",message="effortByKind keys must be one of: implement, review, clarify, triageIssue, brainstorm, issueLifecycle, incident, selfImprove, refine, healthCheck, documentation, upgrade"
 	// +kubebuilder:validation:XValidation:rule="self.all(k, self[k] in ['low','medium','high','xhigh','max'])",message="effortByKind values must be one of: low, medium, high, xhigh, max"
 	// +optional
 	EffortByKind map[string]string `json:"effortByKind,omitempty"`
@@ -467,7 +467,7 @@ type AgentSpec struct {
 	// PromptAppendByKind appends project-specific instruction text AFTER the
 	// built-in per-kind agentJob prompt (internal/controller/assignment.go). Keys
 	// are agent kinds (implement, review, clarify, brainstorm, incident, refine,
-	// documentation) plus the "*" wildcard, which is appended to every kind BEFORE
+	// documentation, upgrade) plus the "*" wildcard, which is appended to every kind BEFORE
 	// that kind's own entry. This is TRUSTED project config (maintainer-supplied
 	// via helmfile), never user/issue text, so assignment.go may interpolate it.
 	// +optional
@@ -780,6 +780,78 @@ type RefineActivity struct {
 	ClosedLookbackDays int `json:"closedLookbackDays,omitempty"`
 }
 
+// UpgradeActivity schedules the dependency-upgrade cron. Each due tick mints AT
+// MOST ONE upgrade Task, and only while the live upgrade-Task count is below
+// MaxOpenUpgrades. Throughput is therefore the cron FREQUENCY, not a fan-out:
+// "0 */4 * * *" yields up to six upgrade Tasks a day with at most
+// MaxOpenUpgrades in flight at once.
+//
+// Minting N Tasks per fire was rejected: each would self-scan and race for the
+// same top candidate, and there is no agent-side task-minting tool to partition
+// the work with (create_subtask was deleted in the #521 redesign).
+type UpgradeActivity struct {
+	// Schedule is a 5-field cron (robfig ParseStandard). Empty disables upgrade,
+	// matching refine. Default off for every project.
+	// +kubebuilder:validation:Pattern=`^$|^(\S+\s+){4}\S+$`
+	// +optional
+	Schedule string `json:"schedule,omitempty"`
+	// MaxOpenUpgrades caps concurrent live upgrade Tasks for this project.
+	//
+	// SET IT EXPLICITLY IN THE ENROLLMENT VALUES. A kubebuilder default is
+	// applied on WRITE and NEVER retroactively, so raising this default later
+	// does not reach a Project CR that already exists.
+	// +kubebuilder:default=1
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=10
+	// +optional
+	MaxOpenUpgrades int `json:"maxOpenUpgrades,omitempty"`
+}
+
+// ReleaseAgeSpec is the minimum age, IN DAYS, a released version must have
+// before the upgrade agent will propose it, per semver level. Zero means
+// bleeding edge: take it the moment it publishes.
+//
+// Bleeding edge is a deliberate, accepted trade, not an oversight: it means a
+// broken release reaches the cluster (grafana v13.0.0 shipped a dashboard-losing
+// migration bug and was pulled; the fix was v13.0.1). This field exists so a
+// project can be made conservative without a code change.
+type ReleaseAgeSpec struct {
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	Major int `json:"major,omitempty"`
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	Minor int `json:"minor,omitempty"`
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	Patch int `json:"patch,omitempty"`
+}
+
+// UpgradePolicySpec is the resolved policy the upgrade agent is handed in its
+// turn-0 assignment. The operator does not ACT on it: it RENDERS it. Every
+// decision it describes is the AGENT's, made against release notes the operator
+// cannot read.
+type UpgradePolicySpec struct {
+	// Engine selects the candidate-discovery mechanism. `renovate` runs the
+	// Renovate CLI read-only inside the pod and reads its report as a HINT;
+	// `none` means the agent enumerates candidates itself, which is right for a
+	// repo with no dependency manifests at all.
+	// +kubebuilder:validation:Enum=renovate;none
+	// +kubebuilder:default=none
+	// +optional
+	Engine string `json:"engine,omitempty"`
+	// MajorStrategy is how far a single Task may jump. `nextHopOnly` proposes the
+	// next mandatory release and nothing beyond it, walking a multi-hop chain one
+	// deployed Task at a time (the repo's current pin IS the cursor; no chain
+	// state is persisted anywhere). `latest` jumps straight to the newest release.
+	// +kubebuilder:validation:Enum=nextHopOnly;latest
+	// +kubebuilder:default=nextHopOnly
+	// +optional
+	MajorStrategy string `json:"majorStrategy,omitempty"`
+	// +optional
+	MinimumReleaseAge *ReleaseAgeSpec `json:"minimumReleaseAge,omitempty"`
+}
+
 // ScmCron groups the cron-driven scan activities.
 type ScmCron struct {
 	// +optional
@@ -798,6 +870,11 @@ type ScmCron struct {
 	// piggyback on any other activity's cadence. Empty Schedule disables it.
 	// +optional
 	Refine RefineActivity `json:"refine,omitempty"`
+	// Upgrade is the dependency-upgrade cron. DEFAULT OFF (empty Schedule) for
+	// every project: enabling it lets an agent open merge requests that change
+	// deployed versions, so it is opt-in per project in the enrollment values.
+	// +optional
+	Upgrade UpgradeActivity `json:"upgrade,omitempty"`
 }
 
 // ScmSpec binds a Project to one SCM provider and its board/merge policy.
@@ -1080,6 +1157,12 @@ type ProjectSpec struct {
 	Documentation *DocumentationSpec `json:"documentation,omitempty"`
 	// +optional
 	Queue *QueueSpec `json:"queue,omitempty"`
+	// UpgradePolicy configures the dependency-upgrade agent. Nil is the
+	// default-off shape (engine none, nextHopOnly, no minimum release age) - a
+	// kubebuilder default inside a nil struct pointer is never applied, so the
+	// goal renderer resolves those defaults itself rather than reading them back.
+	// +optional
+	UpgradePolicy *UpgradePolicySpec `json:"upgradePolicy,omitempty"`
 	// TokenBudget configures the token-budget admission gate (issue #189). Nil
 	// inherits the operator-wide defaults verbatim; a present block is the
 	// project's explicit budget config (its Enabled field is authoritative).
@@ -1174,9 +1257,9 @@ type TokenBudgetSpec struct {
 	// SpawnCeilingByKind gates each Task kind independently in claudeSubscription
 	// mode: work of kind K is held once account usage reaches the given percent.
 	// Keys are Task kinds; kinds absent here fall through to proactive/emergency.
-	// +kubebuilder:validation:MaxProperties=11
+	// +kubebuilder:validation:MaxProperties=12
 	// +kubebuilder:validation:XValidation:rule="self.all(k, self[k] >= 0 && self[k] <= 100)",message="spawnCeilingByKind values must be 0..100"
-	// +kubebuilder:validation:XValidation:rule="self.all(k, k in ['implement','review','clarify','selfImprove','triageIssue','brainstorm','issueLifecycle','incident','healthCheck','refine','documentation'])",message="spawnCeilingByKind keys must be valid Task kinds"
+	// +kubebuilder:validation:XValidation:rule="self.all(k, k in ['implement','review','clarify','selfImprove','triageIssue','brainstorm','issueLifecycle','incident','healthCheck','refine','documentation','upgrade'])",message="spawnCeilingByKind keys must be valid Task kinds"
 	// +optional
 	SpawnCeilingByKind map[string]int32 `json:"spawnCeilingByKind,omitempty"`
 	// PollIntervalSeconds is how often the operator polls Claude account usage
@@ -1332,6 +1415,11 @@ type ProjectStatus struct {
 	// LastRefine is the last time the project's refine pre-step completed.
 	// +optional
 	LastRefine *metav1.Time `json:"lastRefine,omitempty"`
+	// LastUpgrade is the last time the upgrade cron TICKED (not the last time an
+	// upgrade completed): the stamp advances the schedule, so an upgrade Task
+	// that never terminates must not refire the cron on every reconcile pass.
+	// +optional
+	LastUpgrade *metav1.Time `json:"lastUpgrade,omitempty"`
 	// TokenBudget carries the token-budget accumulator/snapshot (issue #189).
 	// +optional
 	TokenBudget *TokenBudgetStatus `json:"tokenBudget,omitempty"`
