@@ -877,3 +877,58 @@ func TestDeliveryWaitsForEveryOwnedMR(t *testing.T) {
 		t.Fatalf("a Task owning ZERO MergeRequests must not deliver: all([]) == true is not a licence")
 	}
 }
+
+// mergeOrder + MergeCursor are KIND-GENERIC, and the upgrade design leans on
+// that entirely: an upgrade unit spanning containers -> charts -> helmfile is
+// one Task carrying one merge request per repo, merged in exactly that order,
+// with releaseGreen blocking each repo until the previous repo's release has
+// published. That IS the "the chart pins an image tag that has not been pushed
+// yet" race, already solved for every other kind.
+//
+// The ONLY difference from TestMergeSequentialOrder is spec.Kind. If this test
+// ever needs a production change to pass, a path the design certified as
+// kind-agnostic is not.
+func TestMergeDriver_UpgradeTaskMergesReposInMergeOrder(t *testing.T) {
+	task := mdTask("t1", "upgrade", tatarav1alpha1.StateMerged)
+	task.Spec.MergeOrder = []string{"tatara-operator", "tatara-cli"}
+	mrA := mdMR(task, "tatara-operator", 7)
+	mrA.Status.ReviewedSHA = "sha-a"
+	mrB := mdMR(task, "tatara-cli", 9)
+	mrB.Status.ReviewedSHA = "sha-b"
+	c := newMirrorClient(t, mdProject(), mdSecret(),
+		mdRepo("tatara-operator"), mdRepo("tatara-cli"), task, mrA, mrB)
+
+	f := newFakeForge(t)
+	f.head[7] = "sha-a"
+	f.head[9] = "sha-b"
+
+	// The FIRST repo's release job has not published yet. fakeForge.Merge
+	// returns "merge-"+head as the merge commit, so this pins the release-job
+	// status at exactly the commit releaseGreen reads.
+	rd := mdNewReader(f)
+	rd.ci["merge-sha-a"] = "pending"
+	d := mdNewDriverWithReader(t, f, c, rd)
+
+	if _, err := d.ReconcileMerging(context.Background(), mdProject(), task); err != nil {
+		t.Fatalf("ReconcileMerging: %v", err)
+	}
+	if len(f.mergedRepos) != 1 || f.mergedRepos[0] != "https://github.com/szymonrychu/tatara-operator" {
+		t.Fatalf("merged %v, want only tatara-operator: tatara-cli must not merge against an unpublished release", f.mergedRepos)
+	}
+	if got := mdGetTask(t, c, "t1"); got.Status.State != tatarav1alpha1.StateMerged {
+		t.Fatalf("state = %q, want %q while the first repo's release is still pending", got.Status.State, tatarav1alpha1.StateMerged)
+	}
+
+	// The release published. The next pass merges the second repo, in order, and
+	// the Task advances to deployed.
+	rd.ci["merge-sha-a"] = "success"
+	if _, err := d.ReconcileMerging(context.Background(), mdProject(), mdGetTask(t, c, "t1")); err != nil {
+		t.Fatalf("ReconcileMerging (second pass): %v", err)
+	}
+	if len(f.mergedRepos) != 2 || f.mergedRepos[1] != "https://github.com/szymonrychu/tatara-cli" {
+		t.Fatalf("merged %v, want tatara-operator then tatara-cli", f.mergedRepos)
+	}
+	if got := mdGetTask(t, c, "t1"); got.Status.State != tatarav1alpha1.StateDeployed {
+		t.Fatalf("state = %q, want %q", got.Status.State, tatarav1alpha1.StateDeployed)
+	}
+}
