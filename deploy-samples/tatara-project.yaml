@@ -46,6 +46,21 @@ spec:
     #     command: ['sh', '-c', 'sleep infinity']
   memory: {pgInstances: 1, pgStorage: 10Gi, neo4jStorage: 10Gi}
   workspace: {enabled: true, storageClass: rook-ceph-rwx, size: 10Gi, cacheEnabled: true, cacheSize: 50Gi}
+  # Policy the upgrade agent is HANDED in its turn-0 assignment; the operator
+  # renders it, never acts on it. Only read when scm.cron.upgrade is enabled
+  # below. Omitting the block is the default-off shape (engine none,
+  # nextHopOnly, no minimum release age).
+  #   engine        - renovate | none. renovate runs the Renovate CLI read-only
+  #                   in the pod and its report is a HINT; none means the agent
+  #                   enumerates candidates itself.
+  #   majorStrategy - nextHopOnly | latest. nextHopOnly walks a multi-hop chain
+  #                   one deployed Task at a time; the repo's pin is the cursor.
+  #   minimumReleaseAge - days a release must have been published before it may
+  #                   be proposed, per semver level. 0 is bleeding edge.
+  # upgradePolicy:
+  #   engine: none
+  #   majorStrategy: nextHopOnly
+  #   minimumReleaseAge: {major: 7, minor: 3, patch: 0}
   # PAT-based activation (no bot account / no Project board). botLogin == the PAT
   # owner. No `board`, so issueScan covers per-repo issues only (the Repository CRs
   # below). mergePolicy/prReactionScope/approvalLabel default.
@@ -74,6 +89,18 @@ spec:
         schedule: "0 6 * * *"
         targetOpenProposals: 3
         sources: [docs, memory, internet]
+      # The dependency-upgrade cron. DEFAULT OFF: an empty/absent schedule is
+      # the off switch (there is no `enabled` flag, unlike brainstorm), and
+      # enabling it lets an agent open merge requests that change deployed
+      # versions. Uncomment to opt this project in.
+      #
+      # maxOpenUpgrades caps the concurrent open upgrade lanes (live upgrade
+      # Tasks plus enqueued-but-unminted events). It is applied on WRITE only,
+      # so SET IT EXPLICITLY - raising the CRD default later never reaches a
+      # Project CR that already exists.
+      # upgrade:
+      #   schedule: "0 */4 * * *"
+      #   maxOpenUpgrades: 2
 ---
 apiVersion: tatara.dev/v1alpha1
 kind: Repository

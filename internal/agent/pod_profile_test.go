@@ -78,6 +78,8 @@ func TestBuildPod_ToolProfileEnv(t *testing.T) {
 		{"brainstorm", "brainstorm"},
 		{"incident", "incident"},
 		{"refine", "refine"},
+		{"documentation", "documentation"},
+		{"upgrade", "upgrade"},
 		{"selfImprove", ""}, // selfImprove removed; dormant CRD enum value maps to fail-open
 		{"", ""},            // unset -> empty (fail-open)
 		{"unknown", ""},     // unknown -> empty (fail-open)

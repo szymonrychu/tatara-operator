@@ -5487,7 +5487,8 @@ spec:
                     description: |-
                       ModelByKind overrides the project-wide Model per Task Kind. Keys are the
                       Task.Spec.Kind enum values (clarify, triageIssue, review, brainstorm, refine,
-                      implement, incident, issueLifecycle, selfImprove) plus the "healthCheck"
+                      implement, incident, issueLifecycle, selfImprove, documentation, upgrade) plus
+                      the "healthCheck"
                       pseudo-key: healthCheck shares Kind=brainstorm but is resolved against this
                       key first (falling back to the brainstorm entry when absent), letting
                       healthCheck's recurring classification work be tiered separately from
@@ -6035,7 +6036,8 @@ spec:
                           maxOpenUpgrades:
                             default: 1
                             description: |-
-                              MaxOpenUpgrades caps concurrent live upgrade Tasks for this project.
+                              MaxOpenUpgrades caps the project's concurrent open upgrade lanes (live
+                              Tasks plus not-yet-minted enqueued events).
 
                               SET IT EXPLICITLY IN THE ENROLLMENT VALUES. A kubebuilder default is
                               applied on WRITE and NEVER retroactively, so raising this default later

@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -223,9 +225,17 @@ func typeAbbrev(kind string) string {
 // an issue, p<N> for a PR/MR (GitHub PR and GitLab MR fold into the single
 // "p" token per issue #507), or the pre-existing collision-avoidance
 // disambiguator for a kind with no issue/PR/MR number (incident's DedupKey,
-// documentation's short source-head-SHA, brainstorm's healthCheck marker).
+// documentation's short source-head-SHA, brainstorm's healthCheck marker,
+// upgrade's per-Task identity hash).
 // Dropped entirely (empty string, no placeholder) for every other kind with
 // no number, per the maintainer's explicit "yes, drop".
+//
+// DROPPING IT IS ONLY SAFE FOR A KIND THAT CANNOT HAVE TWO LIVE TASKS OF THE
+// SAME SHAPE IN ONE PROJECT. Every other repo-less kind is one-at-a-time or
+// keyed on something already in the name (refine is single-flight, brainstorm
+// on hc/Source.Number, incident on DedupKey, documentation on the source SHA);
+// upgrade is the first that is not, so it needs its own discriminator. Read
+// upgradeIDSegment before adding a repo-less kind here.
 func podNameIDSegment(task *tatarav1alpha1.Task) string {
 	if s := task.Spec.Source; s != nil && s.Number > 0 {
 		if s.IsPR {
@@ -242,7 +252,40 @@ func podNameIDSegment(task *tatarav1alpha1.Task) string {
 	if task.Spec.Kind == "documentation" {
 		return shortSourceHeadSHA(task)
 	}
+	if task.Spec.Kind == "upgrade" {
+		return upgradeIDSegment(task)
+	}
 	return ""
+}
+
+// upgradeIDSegmentLen is the hex width of the upgrade disambiguator: 8 chars,
+// one more than documentation's 7-char short SHA, because this one is a
+// truncated hash rather than a value that is already unique by construction.
+const upgradeIDSegmentLen = 8
+
+// upgradeIDSegment disambiguates the pod name of a REPO-LESS, project-scoped
+// upgrade Task. Without it every upgrade Task in a project collapses to
+// upg-<project>, and maxOpenUpgrades (up to 10) exists precisely to run several
+// at once: the second Task would adopt the first's pod in ensureStagePod, tear
+// it down on a stage mismatch, share its workspace PVC and answer its wrapper
+// URL - all silently.
+//
+// The seed is the Task's own name, falling back to GenerateName because
+// StampPodName runs BEFORE the Create (queue.BuildTaskFromQueuedEvent), when
+// the API server has not assigned a name yet. GenerateName is unique per mint:
+// it carries the minting QueuedEvent's name, which is derived from the per-tick
+// dedup key. Hashed rather than truncated because neither seed's distinguishing
+// characters are at a fixed offset.
+func upgradeIDSegment(t *tatarav1alpha1.Task) string {
+	seed := t.Name
+	if seed == "" {
+		seed = t.GenerateName
+	}
+	if seed == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(seed))
+	return hex.EncodeToString(sum[:])[:upgradeIDSegmentLen]
 }
 
 // BuildPodName composes the descriptive wrapper Pod/Service name for a Task:
@@ -411,12 +454,7 @@ func branchKind(t *tatarav1alpha1.Task) string {
 		return "docs"
 	case "takeover":
 		return "feat"
-	case "upgrade":
-		// Explicit, though `chore` is also the default: a later change to that
-		// default must not silently rename every upgrade Task's branch, which is
-		// the key AdoptPR and taskForBranch match on.
-		return "chore"
-	default: // review, brainstorm, clarify, refine
+	default: // review, brainstorm, clarify, refine, upgrade
 		return "chore"
 	}
 }
@@ -1093,12 +1131,22 @@ const helmfileTargetRepo = "tatara-helmfile"
 
 // modelFloorKinds are the reasoning kinds pinned to their locked opus default
 // when the task targets the self-heal repo (helmfileTargetRepo). documentation
-// and refine (the cheap, freely-tierable kinds) are deliberately absent. upgrade
-// IS present: a dependency hop routinely opens its last merge request against
-// tatara-helmfile, which is the same repo the floor exists to protect.
+// and refine (the cheap, freely-tierable kinds) are deliberately absent.
+//
+// upgrade is absent too, and the floor CANNOT be extended to reach it. The floor
+// keys on targetRepo, which BuildPod fills only from Spec.RepositoryRef; an
+// upgrade Task is repo-less by construction and its mergeOrder is declared by
+// the agent at outcome time, long after the pod was built. At the moment this
+// runs there is nothing to key on, so an entry here would be unreachable rather
+// than protective. The gap it would leave is narrow: upgrade's locked default is
+// already opus (kindDefaultModel), so only an explicit modelByKind.upgrade
+// downgrade reaches sonnet - a deliberate per-project choice, and NOT the
+// tier-revert self-heal path (a broken tier is reverted by an incident/implement
+// /review on tatara-helmfile, which the floor does still cover). Making upgrade
+// floor unconditionally instead would silently neuter a documented, CEL-allowed
+// config key, which is the worse trap.
 var modelFloorKinds = map[string]bool{
 	"brainstorm": true, "incident": true, "implement": true, "review": true, "takeover": true,
-	"upgrade": true,
 }
 
 // modelFloorAppliesOnRepo reports whether the tier-revert self-heal model floor

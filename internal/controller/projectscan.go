@@ -1197,12 +1197,22 @@ func (r *ProjectReconciler) createUpgradeTask(ctx context.Context, proj *tatarav
 	return created, nil
 }
 
-// liveUpgradeTaskCount counts upgrade Tasks that still hold a lane for the
-// project. A PARKED Task does not: it runs no pod, the reaper collects it, and
+// openUpgradeLaneCount counts the upgrade lanes the project currently owes,
+// against which maxOpenUpgrades is checked. A lane is held by a live Task OR by
+// a QueuedEvent that has been enqueued but not yet minted into one.
+//
+// Counting Tasks alone was a capacity bypass. A mint sits Queued until the
+// dispatcher admits it, which it may hold for a long time (priority ordering,
+// the project's live-pod ceiling), and the cron keeps firing meanwhile: every
+// tick in that window saw a Task count that did not yet include the work
+// already committed to, minted another event, and the whole backlog then
+// admitted at once, past the cap.
+//
+// A PARKED Task holds no lane: it runs no pod, the reaper collects it, and
 // `declined` - the correct and common answer for a scheduled kind that finds
 // nothing worth taking - parks. Counting a park as live would stop the cron for
 // the whole park retention after the first quiet cycle.
-func (r *ProjectReconciler) liveUpgradeTaskCount(ctx context.Context, proj *tatarav1alpha1.Project) (int, error) {
+func (r *ProjectReconciler) openUpgradeLaneCount(ctx context.Context, proj *tatarav1alpha1.Project) (int, error) {
 	var list tatarav1alpha1.TaskList
 	if err := r.List(ctx, &list, client.InNamespace(proj.Namespace)); err != nil {
 		return 0, err
@@ -1216,6 +1226,24 @@ func (r *ProjectReconciler) liveUpgradeTaskCount(ctx context.Context, proj *tata
 		if !tatarav1alpha1.TaskDone(t) && !tatarav1alpha1.Parked(t) {
 			n++
 		}
+	}
+	var qes tatarav1alpha1.QueuedEventList
+	if err := r.List(ctx, &qes, client.InNamespace(proj.Namespace)); err != nil {
+		return 0, err
+	}
+	for i := range qes.Items {
+		q := &qes.Items[i]
+		if q.Spec.ProjectRef != proj.Name || q.Spec.Kind != "upgrade" {
+			continue
+		}
+		// An admission TICKET spawns the next pod stage of a Task that already
+		// exists and is already counted above; counting it too would double-book
+		// the lane for that Task's whole life. Status.TaskRef is the same test one
+		// step later: once the dispatcher has minted, the Task is the lane.
+		if queue.IsAdmissionTicket(q) || q.Status.TaskRef != "" {
+			continue
+		}
+		n++
 	}
 	return n, nil
 }
@@ -1646,8 +1674,8 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 	}
 
 	// upgrade (opt-in cron): the dependency-upgrade tick. Each due fire mints AT
-	// MOST ONE upgrade Task, and only while live upgrade Tasks are under
-	// maxOpenUpgrades. Throughput is the cron FREQUENCY, not a fan-out - minting
+	// MOST ONE upgrade Task, and only while the project's open upgrade lanes
+	// (live Tasks plus not-yet-minted QueuedEvents) are under maxOpenUpgrades. Throughput is the cron FREQUENCY, not a fan-out - minting
 	// N per fire was rejected because each would self-scan and race for the same
 	// top candidate, with no agent-side tool to partition the work.
 	//
@@ -1661,9 +1689,9 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 				if maxOpen <= 0 {
 					maxOpen = 1
 				}
-				live, cerr := r.liveUpgradeTaskCount(ctx, proj)
+				live, cerr := r.openUpgradeLaneCount(ctx, proj)
 				if cerr != nil {
-					l.Error(cerr, "scan: count live upgrade tasks",
+					l.Error(cerr, "scan: count open upgrade lanes",
 						"action", "scan_upgrade_error", "resource_id", proj.Name)
 					obs.SweepErrorsTotal.WithLabelValues(proj.Name, "upgrade", "upgrade_count_failed").Inc()
 				} else if live < maxOpen {

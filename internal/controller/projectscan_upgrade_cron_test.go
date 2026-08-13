@@ -66,6 +66,27 @@ func mkUpgradeTask(t *testing.T, project, name, state string) *tatarav1alpha1.Ta
 	return tk
 }
 
+// mkUpgradeQE seeds a QueuedEvent for an upgrade mint that the dispatcher has
+// not admitted yet: Queued, no status.taskRef, so no Task exists for it.
+func mkUpgradeQE(t *testing.T, project, name string) *tatarav1alpha1.QueuedEvent {
+	t.Helper()
+	qe := &tatarav1alpha1.QueuedEvent{}
+	qe.Name = name
+	qe.Namespace = testNS
+	qe.Spec = tatarav1alpha1.QueuedEventSpec{
+		Seq: 1, Class: tatarav1alpha1.QueueClassNormal, Kind: "upgrade", ProjectRef: project,
+		DedupKey: name,
+		Payload: tatarav1alpha1.QueuedEventPayload{
+			Kind: "upgrade", Goal: "g", GenerateName: "upgrade-",
+			InitialState: tatarav1alpha1.StateUnderImplementation,
+		},
+	}
+	require.NoError(t, k8sClient.Create(context.Background(), qe))
+	qe.Status.State = tatarav1alpha1.QueueStateQueued
+	require.NoError(t, k8sClient.Status().Update(context.Background(), qe))
+	return qe
+}
+
 func TestActivityScheduleAndLast_KnowsUpgrade(t *testing.T) {
 	proj := &tatarav1alpha1.Project{}
 	proj.Spec.Scm = &tatarav1alpha1.ScmSpec{Cron: &tatarav1alpha1.ScmCron{
@@ -165,6 +186,67 @@ func TestUpgradeCron_OneTaskPerTickAndStampsOnTheTick(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, listUpgradeQEs(t, proj.Name), 1,
 		"a second pass in the same cron period must mint nothing, even with capacity to spare")
+}
+
+// A QueuedEvent that has been enqueued but NOT yet minted into a Task is
+// capacity already spoken for. Counting Tasks alone lets every tick that fires
+// while the dispatcher is still holding the event (priority ordering, the
+// project's live-pod ceiling) mint another one, and the whole backlog then
+// admits at once, past maxOpenUpgrades.
+func TestUpgradeCron_AQueuedEventHoldsALaneBeforeItsTaskExists(t *testing.T) {
+	proj := seedUpgradeCronProject(t, "upg-cron-7", 1)
+	mkUpgradeQE(t, proj.Name, "upg-cron-7-pending")
+
+	r := newScanReconciler(&fakeReader{})
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+	_, _, _, _, err := r.runScans(context.Background(), proj)
+	require.NoError(t, err)
+	require.Len(t, listUpgradeQEs(t, proj.Name), 1,
+		"an admitted-but-unminted upgrade event already holds the lane; minting a second one over-commits the cap")
+}
+
+// The counterpart: once the dispatcher HAS minted the event's Task, the event
+// must stop being counted, or every mint would occupy two lanes until the
+// QueuedEvent is garbage-collected.
+func TestUpgradeCron_AMintedEventStopsHoldingItsOwnLane(t *testing.T) {
+	proj := seedUpgradeCronProject(t, "upg-cron-8", 1)
+	qe := mkUpgradeQE(t, proj.Name, "upg-cron-8-minted")
+	tk := mkUpgradeTask(t, proj.Name, "upg-cron-8-task", tatarav1alpha1.StateUnderImplementation)
+	tk.Status.State = tatarav1alpha1.StateDone
+	require.NoError(t, k8sClient.Status().Update(context.Background(), tk))
+	qe.Status.State = tatarav1alpha1.QueueStateAdmitted
+	qe.Status.TaskRef = tk.Name
+	require.NoError(t, k8sClient.Status().Update(context.Background(), qe))
+
+	r := newScanReconciler(&fakeReader{})
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+	_, _, _, _, err := r.runScans(context.Background(), proj)
+	require.NoError(t, err)
+	require.Len(t, listUpgradeQEs(t, proj.Name), 2,
+		"an event whose Task exists is counted through that Task, never twice")
+}
+
+// An ADMISSION TICKET (payload.taskRef) spawns the next pod stage of a Task that
+// already exists and is already counted. Counting it as a pending mint would
+// double-book the lane for the whole of that Task's life.
+func TestUpgradeCron_AnAdmissionTicketDoesNotHoldASecondLane(t *testing.T) {
+	proj := seedUpgradeCronProject(t, "upg-cron-9", 2)
+	tk := mkUpgradeTask(t, proj.Name, "upg-cron-9-task", tatarav1alpha1.StateUnderImplementation)
+	ticket := &tatarav1alpha1.QueuedEvent{}
+	ticket.Name = "upg-cron-9-ticket"
+	ticket.Namespace = testNS
+	ticket.Spec = tatarav1alpha1.QueuedEventSpec{
+		Seq: 2, Class: tatarav1alpha1.QueueClassNormal, Kind: "upgrade", ProjectRef: proj.Name,
+		Payload: tatarav1alpha1.QueuedEventPayload{Kind: "upgrade", AgentKind: "upgrade", TaskRef: tk.Name},
+	}
+	require.NoError(t, k8sClient.Create(context.Background(), ticket))
+
+	r := newScanReconciler(&fakeReader{})
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+	_, _, _, _, err := r.runScans(context.Background(), proj)
+	require.NoError(t, err)
+	require.Len(t, listUpgradeQEs(t, proj.Name), 2,
+		"the ticket's Task holds the one lane it owns; the tick still has the second")
 }
 
 func TestUpgradeCron_EmptyScheduleDisablesUpgrade(t *testing.T) {

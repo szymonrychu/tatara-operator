@@ -407,7 +407,8 @@ type AgentSpec struct {
 	MaxTaskTokens int64 `json:"maxTaskTokens,omitempty"`
 	// ModelByKind overrides the project-wide Model per Task Kind. Keys are the
 	// Task.Spec.Kind enum values (clarify, triageIssue, review, brainstorm, refine,
-	// implement, incident, issueLifecycle, selfImprove) plus the "healthCheck"
+	// implement, incident, issueLifecycle, selfImprove, documentation, upgrade) plus
+	// the "healthCheck"
 	// pseudo-key: healthCheck shares Kind=brainstorm but is resolved against this
 	// key first (falling back to the brainstorm entry when absent), letting
 	// healthCheck's recurring classification work be tiered separately from
@@ -781,8 +782,9 @@ type RefineActivity struct {
 }
 
 // UpgradeActivity schedules the dependency-upgrade cron. Each due tick mints AT
-// MOST ONE upgrade Task, and only while the live upgrade-Task count is below
-// MaxOpenUpgrades. Throughput is therefore the cron FREQUENCY, not a fan-out:
+// MOST ONE upgrade Task, and only while the project's OPEN UPGRADE LANES (live
+// upgrade Tasks plus enqueued events that have not been minted into one yet)
+// are below MaxOpenUpgrades. Throughput is therefore the cron FREQUENCY, not a fan-out:
 // "0 */4 * * *" yields up to six upgrade Tasks a day with at most
 // MaxOpenUpgrades in flight at once.
 //
@@ -795,7 +797,8 @@ type UpgradeActivity struct {
 	// +kubebuilder:validation:Pattern=`^$|^(\S+\s+){4}\S+$`
 	// +optional
 	Schedule string `json:"schedule,omitempty"`
-	// MaxOpenUpgrades caps concurrent live upgrade Tasks for this project.
+	// MaxOpenUpgrades caps the project's concurrent open upgrade lanes (live
+	// Tasks plus not-yet-minted enqueued events).
 	//
 	// SET IT EXPLICITLY IN THE ENROLLMENT VALUES. A kubebuilder default is
 	// applied on WRITE and NEVER retroactively, so raising this default later
