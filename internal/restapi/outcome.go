@@ -389,15 +389,21 @@ func (s *Server) postOutcome(w http.ResponseWriter, r *http.Request) {
 		default:
 			oc.implement(p)
 		}
-	case "documentation":
+	case "documentation", "upgrade":
 		var p implementPayload
 		if !oc.decode(env.Payload, &p) {
 			return
 		}
-		// A documentation agent has NO gate to drive - it writes docs and opens
-		// an MR - so it never reaches oc.gate, and tatara-cli gives it its own
-		// schema whose action enum is submitted|declined only. This arm is the
-		// operator-side half of that split.
+		// NEITHER KIND HAS A GATE TO DRIVE - each writes a change and opens a
+		// merge request - so neither ever reaches oc.gate, and tatara-cli gives
+		// both the SAME schema whose action enum is submitted|declined only
+		// (documentationOutcomeSchema, reused verbatim for upgrade). This arm is
+		// the operator-side half of that split.
+		//
+		// It is also why an upgrade Task is minted STRAIGHT into
+		// under-implementation rather than triaged to refined: refined's only
+		// exit into under-implementation is submit_outcome(action=approved), and
+		// no such action exists on this schema.
 		oc.implement(p)
 	case "review":
 		var p reviewPayload
