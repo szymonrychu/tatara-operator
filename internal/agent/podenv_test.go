@@ -83,17 +83,17 @@ func TestAgentEnv_RepoOnlyForDocumentation(t *testing.T) {
 	}
 }
 
-// TestAgentEnv_AllSixAgentKindsResolveAProfile is the day-one wedge guard.
-// The six agent kinds MUST each resolve to a non-empty profile - clarify is
+// TestAgentEnv_AllSevenAgentKindsResolveAProfile is the day-one wedge guard.
+// The seven agent kinds MUST each resolve to a non-empty profile - clarify is
 // EXCLUDED since #521 folded it into implement (its absent profile is now
 // load-bearing fail-closed behavior, see profileForKind). resolveProfile
 // fails CLOSED: an unknown key means the cli serves only the always-on tool
 // set and never registers submit_outcome, so the pod lists 74 tools, may call
 // 4 of them, and has no terminal outcome tool at all.
-func TestAgentEnv_AllSixAgentKindsResolveAProfile(t *testing.T) {
+func TestAgentEnv_AllSevenAgentKindsResolveAProfile(t *testing.T) {
 	proj := &tatarav1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "demo"}}
-	kinds := []string{"brainstorm", "incident", "implement", "review", "refine", "documentation"}
-	require.Len(t, kinds, 6)
+	kinds := []string{"brainstorm", "incident", "implement", "review", "refine", "documentation", "upgrade"}
+	require.Len(t, kinds, 7)
 	for _, k := range kinds {
 		t.Run(k, func(t *testing.T) {
 			task := &tatarav1alpha1.Task{

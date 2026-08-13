@@ -204,6 +204,7 @@ var typeAbbrevs = map[string]string{
 	"implement":     "imp",
 	"documentation": "doc",
 	"takeover":      "tko",
+	"upgrade":       "upg",
 }
 
 // typeAbbrev resolves the fixed 3-char type token for a Task's agent kind.
@@ -410,6 +411,11 @@ func branchKind(t *tatarav1alpha1.Task) string {
 		return "docs"
 	case "takeover":
 		return "feat"
+	case "upgrade":
+		// Explicit, though `chore` is also the default: a later change to that
+		// default must not silently rename every upgrade Task's branch, which is
+		// the key AdoptPR and taskForBranch match on.
+		return "chore"
 	default: // review, brainstorm, clarify, refine
 		return "chore"
 	}
@@ -1016,6 +1022,7 @@ var kindProfiles = map[string]string{
 	"incident":      "incident",
 	"refine":        "refine",
 	"documentation": "documentation",
+	"upgrade":       "upgrade",
 }
 
 // profileForKind looks up kind in kindProfiles, returning "" (fail-CLOSED) for
@@ -1049,10 +1056,14 @@ func resolveByKind(byKind map[string]string, kind, activity, fallback string) st
 // kindDefaultModel is the locked per-kind model tier for the 7-kind model
 // (design decision, cross-repo contract). It is the fallback when the project
 // sets no per-kind ModelByKind override: opus for the reasoning kinds
-// (brainstorm/incident/implement/review), sonnet for the cheaper
+// (brainstorm/incident/implement/review/upgrade), sonnet for the cheaper
 // recurring kinds (documentation/refine). A project ModelByKind override still
 // wins (resolveByKind precedence). Kinds absent here (retired legacy kinds) fall
 // back to the project-wide Model as before.
+//
+// upgrade is opus because the judgement it makes is prose-reading: whether a
+// release between the current pin and the target is mandatory, and what has to
+// move with it. There is no machine-readable signal for either.
 var kindDefaultModel = map[string]string{
 	"brainstorm":    "claude-opus-5",
 	"incident":      "claude-opus-5",
@@ -1060,6 +1071,7 @@ var kindDefaultModel = map[string]string{
 	"review":        "claude-opus-5",
 	"documentation": "claude-sonnet-5",
 	"refine":        "claude-sonnet-5",
+	"upgrade":       "claude-opus-5",
 }
 
 // modelForKind resolves the MODEL env for a Task Kind+activity. The fallback is

@@ -39,7 +39,7 @@ func TestToolProfileForKind(t *testing.T) {
 // in the CRD enum maps to a non-empty profile, so a future new kind fails this
 // test until it is added to profileForKind. The enum is:
 //
-//	brainstorm;incident;refine;review;documentation
+//	brainstorm;incident;refine;review;documentation;upgrade
 //
 // (from +kubebuilder:validation:Enum on Status.AgentKind)
 //
@@ -56,6 +56,7 @@ func TestToolProfileForKind_AllActiveCRDKinds(t *testing.T) {
 		"incident",
 		"refine",
 		"documentation",
+		"upgrade",
 	}
 	for _, kind := range crdKinds {
 		t.Run(kind, func(t *testing.T) {

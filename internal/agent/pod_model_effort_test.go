@@ -62,11 +62,11 @@ func TestModelForKind_Exported(t *testing.T) {
 
 // TestModelForKind_PerKindDefaults asserts the locked per-kind model tiers
 // (kindDefaultModel): with no project Model and no ModelByKind override, the 7
-// kinds resolve to opus (brainstorm/incident/clarify/implement/review) or sonnet
+// kinds resolve to opus (brainstorm/incident/implement/review/upgrade) or sonnet
 // (documentation/refine). An explicit ModelByKind override still wins.
 func TestModelForKind_PerKindDefaults(t *testing.T) {
 	proj := &tatarav1alpha1.Project{} // empty Model, nil ModelByKind
-	opusKinds := []string{"brainstorm", "incident", "implement", "review"}
+	opusKinds := []string{"brainstorm", "incident", "implement", "review", "upgrade"}
 	for _, k := range opusKinds {
 		t.Run("opus/"+k, func(t *testing.T) {
 			if got := modelForKind(proj, k, ""); got != "claude-opus-5" {
