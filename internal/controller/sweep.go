@@ -816,6 +816,32 @@ func adoptableAuthor(proj *tatarav1alpha1.Project, author string) bool {
 	return slices.Contains(proj.Spec.UpgradePolicy.UpgradeEngineLogins, author)
 }
 
+// AdoptionCandidate reports whether a merge request could POSSIBLY adopt on its
+// two static facts alone: the configured branch prefix (AdoptUpgradeMR clauses
+// a+b) and an identity this project owns (clause c). It answers nothing about
+// forks, owners, refusal markers or trigger labels - AdoptUpgradeMR keeps all of
+// those, and the real disposition is still ClassifyPR's alone.
+//
+// IT EXISTS FOR THE WEBHOOK'S SELF-LOOP GATE, WHICH RUNS BEFORE ANY OF THAT.
+// handleMROpened must decide whether to drop a bot-authored delivery on its
+// first line, before it has looked up a Repository, a mirror CR or a live owner
+// - so it cannot call AdoptUpgradeMR, which needs all three. What it needs is
+// the narrower question "could this delivery be an adoption at all?", because
+// the answer NO must keep meaning "swallow it, it is the agent's own PR" and the
+// answer YES must mean "hand it to the shared funnel and let ClassifyPR rule".
+//
+// DELIBERATELY NOT A THIRD COPY OF THE AUTHOR TEST. It calls adoptableAuthor,
+// the same function AdoptUpgradeMR and ownershipForAuthor call, so the identity
+// adoption accepts, the identity the merge corridor accepts, and the identity
+// the webhook lets past its self-loop guard stay ONE fact.
+func AdoptionCandidate(proj *tatarav1alpha1.Project, headBranch, author string) bool {
+	prefix := adoptBranchPrefixOf(proj)
+	if prefix == "" || !strings.HasPrefix(headBranch, prefix) {
+		return false
+	}
+	return adoptableAuthor(proj, author)
+}
+
 // adoptionRefusedSHASep separates the two halves of AnnAdoptionRefused's value,
 // "<reason>@<headSHA>". "@" is safe as a separator because every park and state
 // reason in internal/stage is kebab-case with no "@" in it.
