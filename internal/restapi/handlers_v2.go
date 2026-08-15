@@ -1487,7 +1487,15 @@ func (s *Server) mrWrite(w http.ResponseWriter, r *http.Request) {
 func (s *Server) mrOpen(w http.ResponseWriter, r *http.Request, proj *tatarav1alpha1.Project,
 	repo *tatarav1alpha1.Repository, task *tatarav1alpha1.Task, req mrWriteReq) {
 	ctx := r.Context()
-	head := agent.TaskBranch(task)
+	// PushBranch, not TaskBranch. They are the same string for an ordinary Task,
+	// and they differ for any Task carrying AnnTakeoverHeadBranch - a takeover
+	// Task, and an adopted upgrade Task (internal/controller/upgrade_adopt.go).
+	// With TaskBranch the idempotency clause below never matches such a Task's
+	// own bound merge request, and mrOpen falls through to a REAL OpenChange
+	// against a branch that was never pushed. It is also the branch the open
+	// itself must name: opening from anything other than what the pod pushes to
+	// is the same defect one step later.
+	head := agent.PushBranch(task)
 
 	mrs, err := s.ownedMRs(ctx, task)
 	if err != nil {
