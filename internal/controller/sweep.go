@@ -903,7 +903,8 @@ func adoptableUpgradeNumbers(proj *tatarav1alpha1.Project, prs []scm.PRRef, limi
 	return out
 }
 
-// PRDisposition is the outcome of B.4's four-clause PR/MR disposition.
+// PRDisposition is the outcome of B.4's four-clause PR/MR disposition, plus
+// clause 1c's PRAdoptUpgrade.
 type PRDisposition string
 
 const (
@@ -1569,7 +1570,8 @@ func (r *ProjectReconciler) sweepIssues(ctx context.Context, proj *tatarav1alpha
 	return requeue
 }
 
-// sweepPRs applies the four-clause disposition to every open PR in one repo,
+// sweepPRs applies the four-clause disposition (plus clause 1c's adoption arm)
+// to every open PR in one repo,
 // then (OP12) drives ReconcileOwnership over the resulting MR mirror: the same
 // backfill/drift/comment-cursor-redelivery convergence the webhook fast path
 // runs on every mirror bump, so a mirror the webhook never touched (a missed
