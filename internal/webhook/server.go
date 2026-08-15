@@ -588,6 +588,47 @@ func (s *Server) minter() *controller.Minter {
 	}
 }
 
+// requestRepoSweep pulls a repository's issueScan sweep slot forward by stamping
+// SweepRequestedAnnotation, so the leader adopts a dependency-upgrade merge
+// request on its next reconcile instead of at the next four-hourly slot. Same
+// marker idiom handlePush already uses for re-ingest: an HTTP-goroutine write
+// consumed by a leader-only reconcile.
+//
+// BEST-EFFORT ON PURPOSE, AND THE CALLER STILL 202s. Every failure here - an
+// unknown repository, a conflicting Update, a lost API call - costs LATENCY and
+// nothing else: the merge request is still open, the sweep still reaches it on
+// its ordinary slot, and adoption is still exactly as correct as it was before
+// this fast path existed. Answering 500 so the forge redelivers would trade that
+// for retry pressure on a request that is only ever an optimisation, and a
+// redelivery cannot make a conflicting Update succeed.
+//
+// The Update is a plain last-writer-wins on a timestamp, which is what makes a
+// burst collapse: five deliveries racing on this key produce one annotation
+// whose value is whichever instant landed last, and any of them is new enough to
+// make the repo due.
+func (s *Server) requestRepoSweep(ctx context.Context, proj *tatarav1.Project, ev scm.WebhookEvent) {
+	repo, err := s.matchRepo(ctx, proj.Name, ev.Repo)
+	if err != nil || repo == nil {
+		s.log.InfoContext(ctx, "mr: adoptable merge request on an unmatched repository; the ordinary sweep slot still covers it",
+			"action", "mr_sweep_request_skipped", "project", proj.Name, "issue_ref", ev.IssueRef,
+			"head_branch", ev.HeadBranch, "error", err)
+		return
+	}
+	if repo.Annotations == nil {
+		repo.Annotations = map[string]string{}
+	}
+	repo.Annotations[tatarav1.SweepRequestedAnnotation] = s.now().UTC().Format(time.RFC3339)
+	if uerr := s.cfg.Client.Update(ctx, repo); uerr != nil {
+		s.log.ErrorContext(ctx, "mr: could not pull the sweep slot forward; the ordinary slot still adopts",
+			"action", "mr_sweep_request_failed", "error", uerr,
+			"project", proj.Name, "repository", repo.Name, "number", ev.Number)
+		return
+	}
+	s.log.InfoContext(ctx, "mr: adoptable dependency merge request; sweep slot pulled forward",
+		"action", "mr_sweep_requested", "project", proj.Name, "repository", repo.Name,
+		"number", ev.Number, "head_branch", ev.HeadBranch, "author", ev.ActorLogin)
+}
+
 // repoSlug returns "owner/name" for a Repository URL, or "" on error. Local
 // twin of internal/controller's unexported helper of the same name - kept
 // package-local rather than exported, matching that package's KISS precedent.
@@ -704,12 +745,65 @@ func (s *Server) handleIssueOpened(ctx context.Context, w http.ResponseWriter, p
 
 // handleMROpened mints a review Task immediately for a human-authored PR/MR
 // open (or reopen) delivery, mirroring handleIssueOpened's gates: the bot
-// self-loop guard first (an agent's own PR must never mint a review Task -
-// controller.ClassifyPR inside MintForItem already ignores a bot-authored
-// non-adoptable PR, but the explicit gate here keeps the webhook's self-loop
-// guard parallel across both handlers), then the reporter allowlist, then the
-// shared controller.Minter funnel.
+// self-loop guard first, then the reporter allowlist, then the shared
+// controller.Minter funnel. It has ONE arm in front of all of that, and that arm
+// deliberately mints NOTHING.
+//
+// THE SELF-LOOP GUARD USED TO BE UNCONDITIONAL, AND THAT COST FOUR HOURS PER
+// BUMP. Its own doc comment called it a convenience ("ClassifyPR inside
+// MintForItem already ignores a bot-authored non-adoptable PR, but the explicit
+// gate here keeps the guard parallel across both handlers"), and while every
+// bot-authored merge request WAS non-adoptable that was true. Adoption made it
+// false: the dependency engine authors as scm.botLogin, so from v2.16.0 every
+// adoptable merge request was dropped on this function's first line. The
+// deliveries arrived, answered 202, and minted nothing; the only thing that ever
+// adopted them was the 0 */4 * * * sweep.
+//
+// SO WHY NOT JUST MINT IT HERE? BECAUSE THIS HANDLER CANNOT HOLD A BUDGET.
+// Adoption is capped project-wide by maxOpenUpgrades - the cap exists to bound
+// concurrent agent pods - and enforcing it means counting live lanes and then
+// minting, two API calls with a decision between them. This server runs on EVERY
+// replica (HandlerRunnable.NeedLeaderElection() is false) behind a
+// load-balancing Service, so a Renovate run that opens five merge requests at
+// once spreads its deliveries across replicas and each one independently passes
+// the same check. No in-process lock spans processes, and a counter that must be
+// decremented when a lane frees is the kind of distributed state this repo
+// derives from reality instead. Minting here would be correct only by accident.
+//
+// THE LEADER'S SWEEP ALREADY HAS ALL OF IT: it is leader-only and serialized per
+// project (projectControllerBuilder's MaxConcurrentReconciles: 1, whose own
+// comment says "scan dedup/cap logic assumes serialised reconciles per kind"),
+// it computes the headroom once per pass and decrements it as it mints, it takes
+// the oldest merge requests first, and it re-reads the forge every pass so it
+// never acts on a merge request that was closed or superseded in the meantime.
+// So the fast path is not a second minter - it is a REQUEST that the one true
+// minter run NOW: AdoptionCandidate recognises the shape, the handler stamps
+// SweepRequestedAnnotation on the Repository, and reposDueForScan pulls that
+// repo's slot forward on the leader's next reconcile. Four hours becomes seconds
+// with exactly one minting path, one cap, and no distributed lock.
+//
+// A CANDIDATE IS A SHAPE, NOT A VERDICT. AdoptionCandidate answers only "prefix
+// configured, branch under it, author is an identity this project owns" - forks,
+// existing owners, the durable refusal marker, a stood-down mirror and the
+// trigger-label override all stay in ClassifyPR/AdoptUpgradeMR where the sweep
+// asks them. A candidate the sweep then refuses simply mints nothing, which is
+// the same answer this handler gave before, one reconcile later. It costs one
+// repo listing per debounce window, and nothing at all when adoption is disarmed.
+//
+// The arm sits AHEAD of the reporter allowlist on purpose and for no wider a
+// reason: ClassifyPR clause 1c consults no allowlist either, so an engine running
+// under an allowlisted upgradeEngineLogins identity that is not also a listed
+// reporter adopts on the sweep and must not be dropped here. adoptableAuthor is
+// itself a strict, explicit allowlist.
 func (s *Server) handleMROpened(ctx context.Context, w http.ResponseWriter, provider string, proj tatarav1.Project, ev scm.WebhookEvent) {
+	// ActorLogin, not AuthorLogin: it is the login the rest of this handler
+	// treats as the merge request's author, so the identity this arm tests and
+	// the identity ClassifyPR later rules on are one value.
+	if controller.AdoptionCandidate(&proj, ev.HeadBranch, ev.ActorLogin) {
+		s.requestRepoSweep(ctx, &proj, ev)
+		s.accept(w, provider, ev.Kind, ev.Action, "accepted")
+		return
+	}
 	if isBotActor(&proj, ev.ActorLogin) {
 		s.accept(w, provider, ev.Kind, ev.Action, "ignored")
 		return

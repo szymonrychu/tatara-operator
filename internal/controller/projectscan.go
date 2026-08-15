@@ -458,6 +458,34 @@ func (r *ProjectReconciler) activityDue(proj *tatarav1alpha1.Project, activity s
 	return base, !time.Now().Before(next), next, true
 }
 
+// sweepRequested reports whether a webhook has asked for this repo's slot to be
+// pulled forward SINCE the pass anchored at base last ran. It is the pulled-
+// forward half of reposDueForScan's due test; see SweepRequestedAnnotation for
+// why the request is a compared instant rather than a cleared flag.
+//
+// issueScan ONLY. brainstorm and documentation run through activityDue with no
+// per-repo slot at all, and nothing stamps a request for them - honouring the
+// marker for every activity would let one webhook drag unrelated crons forward.
+//
+// FAILS INERT, NOT OPEN. An absent, empty or unparseable value is simply not a
+// request: a marker that made a repo permanently due would turn the 30s project
+// reconcile into a 30s forge-listing loop, which is a worse failure than the
+// four-hour wait this whole mechanism exists to remove.
+func sweepRequested(repo *tatarav1alpha1.Repository, activity string, base time.Time) bool {
+	if activity != "issueScan" || repo == nil {
+		return false
+	}
+	raw := repo.Annotations[tatarav1alpha1.SweepRequestedAnnotation]
+	if raw == "" {
+		return false
+	}
+	at, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return false
+	}
+	return at.After(base)
+}
+
 // reposDueForScan returns the repos whose deterministic phase-shifted fire for
 // `activity` has occurred since the last project-level scan stamp, plus the
 // soonest upcoming per-repo fire (for requeue). ok=false when the schedule is
@@ -480,7 +508,7 @@ func (r *ProjectReconciler) reposDueForScan(proj *tatarav1alpha1.Project, activi
 	var soonest time.Time
 	for i := range repos {
 		off := scanOffset(proj.Name, repos[i].Name, activity, period)
-		if fire := repoNextFire(sched, off, base); !now.Before(fire) {
+		if fire := repoNextFire(sched, off, base); !now.Before(fire) || sweepRequested(&repos[i], activity, base) {
 			due = append(due, repos[i])
 		}
 		if nf := repoNextFire(sched, off, now); soonest.IsZero() || nf.Before(soonest) {
