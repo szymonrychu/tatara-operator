@@ -242,10 +242,13 @@ type Edge struct {
 //     gate - a nightly batch is the operator's own decision, already made - so
 //     routing it through `new` or `refined` would put it in front of a gate with
 //     nothing to approve.
-//   - `new -> awaiting-review`: a kind=review Task reviews a HUMAN's PR. It owns
-//     ZERO Issues by construction, so the gate at `refined` can never grant for
-//     it and routing it there would strand it. Without this edge a review Task
-//     minted ACTIVE (rather than pre-parked) can never complete triage at all.
+//   - `new -> awaiting-review`: the REVIEW LANE out of triage. A kind=review
+//     Task reviews a HUMAN's PR; an ADOPTED kind=upgrade Task (stage.AdoptedMR)
+//     reviews a third-party dependency merge request that already exists. Both
+//     own ZERO Issues by construction, so the gate at `refined` can never grant
+//     for either and routing them there would strand them. Without this edge a
+//     review Task minted ACTIVE (rather than pre-parked) can never complete
+//     triage at all, and an adopted upgrade Task could not enter at all.
 //   - `(create) -> done` and `(create) -> rejected`: THE #521 TERMINAL-RESET
 //     GUARD. Removing status.stage from the CRD prunes it on the READ path, so
 //     every pre-#521 Task is served STATELESS and takes the create edge again.
@@ -269,7 +272,7 @@ var Transitions = map[string][]Edge{
 
 	v1alpha1.StateNew: {
 		{To: v1alpha1.StateRefined, Trigger: "triage passed: spec validates and the Task is routed to its origin kind's agent"},
-		{To: v1alpha1.StateAwaitingReview, Trigger: "triage passed on a kind=review Task. It reviews a HUMAN's PR, so there is no plan to write and no approval to grant - the gate at `refined` has nothing to do for it, and GUARD 1 already refuses it every state past this one"},
+		{To: v1alpha1.StateAwaitingReview, Trigger: "the REVIEW LANE out of triage, for the two shapes with nothing to plan and nothing to approve: a kind=review Task (it reviews a HUMAN's PR) and an ADOPTED kind=upgrade Task (a third-party dependency merge request that already exists, stage.AdoptedMR). Both own ZERO Issues by construction, so the gate at `refined` can never grant for either. GUARD 1 then diverges them: it refuses the review Task every state past this one, and does not cover upgrade"},
 		{To: v1alpha1.StateRejected, Trigger: "false_positive, tracked_elsewhere, or a human closed the driving issue mid-triage"},
 	},
 
@@ -360,10 +363,25 @@ func Legal(from, to string) bool { return legalPairs[[2]string{from, to}] }
 // opens merge requests, so it must leave through review like any other code
 // kind, and a declined upgrade PARKS rather than taking a terminal here.
 //
-// GUARD 5. new -> awaiting-review is the kind=review triage target and nothing
-// else may take it. Every other kind is triaged to `refined`, which is where the
-// approval gate runs; letting another kind take the review lane out of triage is
-// a door around the gate.
+// GUARD 5. new -> awaiting-review is the REVIEW LANE out of triage, and exactly
+// two shapes may take it: a kind=review Task, and an ADOPTED kind=upgrade Task
+// (one minted onto a third-party dependency merge request that already exists -
+// see AdoptedMR and internal/controller/upgrade_adopt.go). Every other kind is
+// triaged to `refined`, which is where the approval gate runs; letting another
+// kind take the review lane out of triage is a door around the gate.
+//
+// The adopted case is not a door around the gate, it is a door around work
+// nobody needs to do: the merge request is already written, already complete and
+// already CI-tested, and the gate at `refined` has nothing to approve for it -
+// it owns zero Issue CRs by construction, exactly as a review Task does, so
+// verifyApprovalScope would refuse it with no-live-issue forever. A CRON-minted
+// upgrade Task is NOT adopted, has no merge request, and keeps its
+// Create -> under-implementation routing; AdoptedMR is what tells the two apart.
+//
+// GUARD 1 still applies past this point and is the reason the adopted case is
+// safe to admit: it is keyed on kind=review, so an adopted UPGRADE Task may go
+// on to reach merged, which is exactly the difference between a Task that can
+// only comment and one that can review, fix, merge and deploy.
 //
 // GUARD 6. refined -> done is the three non-code kinds' terminal - brainstorm
 // propose/skip, refine folds/closes/links applied and VERIFIED, incident
@@ -403,7 +421,8 @@ func LegalFor(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, from, to string) bo
 		}
 	}
 	if from == v1alpha1.StateNew && to == v1alpha1.StateAwaitingReview {
-		if t == nil || t.Spec.Kind != kindReview {
+		adoptedUpgrade := t != nil && t.Spec.Kind == AgentUpgrade && AdoptedMR(t)
+		if (t == nil || t.Spec.Kind != kindReview) && !adoptedUpgrade {
 			return false
 		}
 	}
@@ -414,6 +433,29 @@ func LegalFor(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, from, to string) bo
 		}
 	}
 	return true
+}
+
+// AdoptedMR reports whether t was minted ONTO a merge request that already
+// existed, rather than onto work that will open its own.
+//
+// This is the discriminator between the two ways an `upgrade` Task is minted,
+// and the state machine needs it because the two enter at different states. A
+// CRON-minted upgrade Task has no merge request and nothing to review, so it
+// mints straight into under-implementation. An ADOPTED one is bound to a
+// third-party dependency merge request that is already complete and already
+// CI-tested, so it is reviewed FIRST and only reaches the upgrade agent if that
+// review requests changes.
+//
+// It keys on spec.source deliberately. spec.source is IMMUTABLE, it is written
+// in the same Create call as the Task, and it already carries this exact
+// meaning everywhere else in the tree (podNameIDSegment, TaskBranch,
+// mintIssueCRs all key on Source.Number/IsPR). The annotation
+// AnnTakeoverHeadBranch was the obvious alternative and is WRONG for a state
+// guard: it is mutable by anything with edit on the Task, this CRD has no
+// validating webhook, and it means "where the pod pushes" rather than "what
+// this Task is".
+func AdoptedMR(t *v1alpha1.Task) bool {
+	return t != nil && t.Spec.Source != nil && t.Spec.Source.IsPR && t.Spec.Source.Number > 0
 }
 
 func reviewGateOpen(mrs []v1alpha1.MergeRequest) bool {
