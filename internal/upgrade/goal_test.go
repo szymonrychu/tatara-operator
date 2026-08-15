@@ -80,3 +80,59 @@ func TestUpgradeGoalNamesOnlyRealTools(t *testing.T) {
 		}
 	}
 }
+
+// The adopted goal is a DIFFERENT job from the cron goal and must not tell
+// anyone to discover or claim: the unit is already chosen, the merge request
+// already exists, and the changelog is already in its body.
+func TestGoalAdopted_NamesTheMergeRequestAndForbidsDiscovery(t *testing.T) {
+	g := GoalAdopted("szymonrychu/charts", "renovate/cilium",
+		"chore(deps): update cilium to v1.17.0", 41,
+		&v1alpha1.UpgradePolicySpec{Engine: "renovate", MajorStrategy: "nextHopOnly"})
+	for _, want := range []string{
+		"szymonrychu/charts", "renovate/cilium", "41",
+		"chore(deps): update cilium to v1.17.0",
+		"already open", "changelog", "one repo",
+	} {
+		if !strings.Contains(g, want) {
+			t.Errorf("adopted goal missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{"task_context(index=true)", "Take EXACTLY ONE upgrade unit"} {
+		if strings.Contains(g, forbidden) {
+			t.Errorf("adopted goal must not carry the cron discovery instruction %q", forbidden)
+		}
+	}
+}
+
+// BOTH agents read this goal. Naming only one of them is how the review agent
+// ends up following an implement procedure - or, worse, approving a third
+// party's merge request believing its verdict merely parks.
+func TestGoalAdopted_AddressesTheReviewTurnAndTheUpgradeTurnSeparately(t *testing.T) {
+	g := GoalAdopted("szymonrychu/charts", "renovate/cilium",
+		"chore(deps): update cilium to v1.17.0", 41, nil)
+	for _, want := range []string{
+		"IF YOU ARE THE REVIEW AGENT",
+		"IF YOU ARE THE UPGRADE AGENT",
+		"merge request BODY",
+		"approving MERGES it", // the consequence the review agent must know
+		"requested changes",   // the upgrade agent's only entry condition
+	} {
+		if !strings.Contains(g, want) {
+			t.Errorf("adopted goal missing %q", want)
+		}
+	}
+}
+
+// THE ELISION MARKER IS REAL AND THE GOAL MUST SAY SO. truncBody(s, 0) returns
+// ("", true) and the bundle template emits <body truncated="true">, so an
+// elided body is DISTINGUISHABLE from an absent one. Telling the agent
+// otherwise would teach it to distrust a body that is genuinely empty.
+func TestGoalAdopted_DescribesTheElisionMarkerAccurately(t *testing.T) {
+	g := GoalAdopted("szymonrychu/charts", "renovate/cilium", "t", 41, nil)
+	if !strings.Contains(g, `truncated="true"`) {
+		t.Error("the adopted goal must name the truncated marker the bundle actually emits")
+	}
+	if !strings.Contains(g, `scm_read(kind="mr"`) {
+		t.Error("the adopted goal must name the re-read that recovers an elided body")
+	}
+}
