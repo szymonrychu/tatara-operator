@@ -153,7 +153,11 @@ func takeoverTestSlug(t *testing.T) string {
 	if len(s) > 40 {
 		s = s[len(s)-40:]
 	}
-	return s
+	// Trim AGAIN: the truncation above cuts at a fixed offset, so a long enough
+	// test name lands it mid-separator and yields a leading "-", which is not a
+	// legal RFC 1123 name and fails the Secret create with an error that names
+	// the fixture rather than the test.
+	return strings.Trim(s, "-")
 }
 
 // seedProjectRepo creates a minimal live Project+Repository pair for the
@@ -320,5 +324,50 @@ func TestMintOrUnparkTakeoverTask_StampsPodName(t *testing.T) {
 	// survive the stamp (StampPodName adds to the map, never replaces it).
 	if task.Annotations[tatarav1alpha1.AnnTakeoverHeadBranch] != "renovate/baz" {
 		t.Fatalf("stamping clobbered the takeover head-branch annotation: %+v", task.Annotations)
+	}
+}
+
+// THE TAKEOVER BRANCH DERIVATION IS PINNED, AND THE MIRROR TITLE IT COMES FROM
+// IS NOT INERT ANY MORE.
+//
+// mirror.go assigns mr.Status.Title unconditionally, and the sweep's mrSnapshot
+// used to leave it empty - so on a live project every sweep pass BLANKED it. It
+// now carries the real title (the adopted merge request's body/title are review
+// inputs), which makes this chain live where it used to be dead:
+//
+//	mr.Status.Title -> Source.Title (frozen at mint) -> agent.TaskBranch
+//	  -> ourMR (reaper.go), the gate on CLOSING a merge request and DELETING its
+//	     head branch.
+//
+// Source.Title is IMMUTABLE spec, so a title the maintainer edits afterwards
+// cannot move a live Task's verdict - that is the property this pins, and it is
+// the reason freezing at mint is the right design rather than reading the mirror
+// at reap time. Low probability, terminal consequence: keep it pinned.
+func TestMintOrUnparkTakeoverTask_FreezesTheBranchAtTheTitleItSaw(t *testing.T) {
+	ctx := context.Background()
+	proj, repo := seedProjectRepo(t, ctx)
+	m := newTestMinter(t)
+	mr := seedOpenExternalMR(t, ctx, proj, repo, 61, "contrib/fix", "octocat")
+	mr.Status.Title = "Fix the flaky reaper test"
+
+	task, err := m.MintOrUnparkTakeoverTask(ctx, proj, repo, mr, "alice", "take over", testSpiller(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Spec.Source.Title != "Fix the flaky reaper test" {
+		t.Fatalf("Source.Title = %q, want the title the mint SAW", task.Spec.Source.Title)
+	}
+	const want = "tatara/feat-61-fix-the-flaky-reaper-test"
+	if got := agent.TaskBranch(task); got != want {
+		t.Fatalf("TaskBranch = %q, want %q: ourMR keys on this exact string", got, want)
+	}
+
+	// The forge title changes (a maintainer edits it, or the engine retargets a
+	// bump). The mirror follows; the Task's branch derivation must NOT.
+	mr.Status.Title = "Fix the flaky reaper test (v2)"
+	same := getTask(t, task.Name)
+	if got := agent.TaskBranch(same); got != want {
+		t.Fatalf("TaskBranch moved to %q after a mirror title change: a live Task's ourMR verdict "+
+			"is not stable, and ourMR gates closing a merge request and deleting its head branch", got)
 	}
 }

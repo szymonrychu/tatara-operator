@@ -37,9 +37,14 @@ import (
 func (d *StageDriver) DrainStandDownMerge(ctx context.Context, proj *tatarav1alpha1.Project,
 	repo *tatarav1alpha1.Repository, mr *tatarav1alpha1.MergeRequest) error {
 
+	// externalPushReasonPrefix EXACTLY, never isExternalPushReason: an adopted
+	// dependency merge request a human pushed to carries adoptedPushReasonPrefix
+	// and is HUMAN-MERGED ONLY. Re-driving one would merge a human's commits
+	// because a review approved them, on a merge request nobody asked the
+	// platform to take over. See adoptedPushReasonPrefix.
 	if mr.Status.State != "open" ||
 		mr.Status.Ownership != tatarav1alpha1.OwnershipExternal ||
-		!strings.HasPrefix(mr.Status.OwnershipReason, "external-push:") {
+		!strings.HasPrefix(mr.Status.OwnershipReason, externalPushReasonPrefix) {
 		return nil
 	}
 	// Merge only an APPROVED review pinned to the CURRENT external head.

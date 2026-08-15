@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -976,6 +977,38 @@ func isBotActor(proj *tatarav1.Project, login string) bool {
 		return false
 	}
 	return login == proj.Spec.Scm.BotLogin
+}
+
+// isUpgradeEngineActor reports whether login is an identity whose push to a
+// merge-request branch RE-ANCHORS the bot-head baseline rather than standing the
+// merge request down: the project's own bot, or an allowlisted
+// upgradePolicy.upgradeEngineLogins entry.
+//
+// SEPARATE FROM isBotActor ON PURPOSE. isBotActor has seven other callers and in
+// every one of them `true` means IGNORE THIS EVENT - it is the loop-breaker that
+// stops tatara reacting to its own comments, labels and issues. An upgrade
+// engine is NOT the platform for those purposes: its comments and labels are
+// things tatara should still see. The only thing it shares with the bot is the
+// answer to "is this head move attributable".
+//
+// login is the FORGE ACTOR - the authenticated account behind the token that
+// raised the webhook (scm.WebhookEvent.ActorLogin, GitLab's user.username). It
+// is NEVER a git commit author: that is a string the pusher chose, it is
+// unverified, and `git commit --amend` preserves it, so a human amending an
+// engine's commit would read as the engine. Standing a merge request down when a
+// HUMAN pushes is the entire purpose of the ownership state machine, and it must
+// not be defeated by metadata anyone can write.
+func isUpgradeEngineActor(proj *tatarav1.Project, login string) bool {
+	if login == "" {
+		return false
+	}
+	if isBotActor(proj, login) {
+		return true
+	}
+	if proj.Spec.UpgradePolicy == nil {
+		return false
+	}
+	return slices.Contains(proj.Spec.UpgradePolicy.UpgradeEngineLogins, login)
 }
 
 func (s *Server) handleGrafanaAlert(w http.ResponseWriter, r *http.Request) {

@@ -141,12 +141,19 @@ func ownedIssueCRs(ctx context.Context, c client.Client, task *tatarav1alpha1.Ta
 // per the approved stand-down decision, review AND merge-on-approve continue
 // for the human's new head. A never-taken-over external MR (reason "initial")
 // is human-merged only.
+//
+// SO IS A STOOD-DOWN ADOPTED MERGE REQUEST, and that is why the test is an
+// EXACT prefix rather than "was flipped by a push". A flip whose owner was an
+// adopted dependency merge request (stage.AdoptedMR) carries
+// adoptedPushReasonPrefix instead, which this refuses: the stand-down merge
+// semantics were granted to a takeover a maintainer explicitly ASKED for, and
+// nobody asks for an adoption. See adoptedPushReasonPrefix.
 func mergeAllowedForOwnership(mr *tatarav1alpha1.MergeRequest) bool {
 	if mr.Status.Ownership == tatarav1alpha1.OwnershipTatara {
 		return true
 	}
 	return mr.Status.Ownership == tatarav1alpha1.OwnershipExternal &&
-		strings.HasPrefix(mr.Status.OwnershipReason, "external-push:")
+		strings.HasPrefix(mr.Status.OwnershipReason, externalPushReasonPrefix)
 }
 
 func mrForRepo(mrs []tatarav1alpha1.MergeRequest, repo string) *tatarav1alpha1.MergeRequest {

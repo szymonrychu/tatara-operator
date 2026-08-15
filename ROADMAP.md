@@ -2,6 +2,23 @@
 
 Planned work not yet started. One line per item; link to plans for detail.
 
+- [x] **RENOVATE MERGE-REQUEST ADOPTION. Phase 3 of
+  `docs/superpowers/specs/2026-08-14-upgrade-agent-renovate-fanout-plan.md` (the plan lives in the
+  `tatara-new` workbench), landed 2026-08-15. MINOR: two new opt-in fields and a new intake
+  disposition that is UNREACHABLE while every Project leaves `upgradePolicy.adoptBranchPrefix`
+  empty.** A dependency-upgrade merge request the engine opened - recognised by head-branch prefix
+  AND an author that is `scm.botLogin` or an `upgradePolicy.upgradeEngineLogins` entry - is adopted
+  into its OWN `upgrade` Task bound to that existing merge request, minted at `new`, triaged into
+  the REVIEW lane. The review agent then approves (straight to `merged`) or requests changes (to
+  `under-implementation`, where the upgrade agent pushes complementary code onto the engine's own
+  branch). New on `Project.spec.upgradePolicy`: `adoptBranchPrefix` (default EMPTY - adoption off)
+  and `upgradeEngineLogins` (default empty). Adoption is paced oldest-first by the same
+  `maxOpenUpgrades` lane cap the cron competes for, and is minted by the SWEEP only. Still open:
+  Phase 4 (`tatara-agent-skills`), Phase 5 (`tatara-helmfile` enrollment: arm
+  `adoptBranchPrefix: renovate/` on `project-infrastructure`), and Phases 1/2/7 in
+  `~/Documents/infrastructure` - the token change in Phase 7 is the only thing that switches
+  behaviour.
+
 - [x] **THE `upgrade` AGENT KIND. Phase 4 of `docs/superpowers/specs/2026-08-13-tatara-upgrade-agent-plan.md`
   (the plan lives in the `tatara-new` workbench), landed 2026-08-13. MINOR: new opt-in fields and a
   new kind, and nothing existing changes behaviour while every project's `scm.cron.upgrade.schedule`

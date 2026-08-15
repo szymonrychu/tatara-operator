@@ -244,15 +244,48 @@ func (s *Server) handleMRSynchronize(ctx context.Context, w http.ResponseWriter,
 	// only the HeadSHA mirror, leaving LastBotHeadSHA stale - ReconcileOwnership
 	// sees the drift and flips.
 	//
-	// isBotActor is a string-equality check against Scm.BotLogin - the FAST
-	// PATH only, not the authoritative signal: the actual identity gate lives
-	// at outcome accept (/outcome's record_bot_head, restapi/outcome.go), which
-	// re-stamps LastBotHeadSHA from a LIVE forge read (GetPRHead) rather than
-	// trusting the webhook's reported actor. A spoofed or mismatched
-	// BotLogin/push-identity here can only cause a spurious flip whose window
-	// is bounded by the next accept - it self-corrects there, it never
-	// compounds.
-	bot := isBotActor(&proj, ev.ActorLogin)
+	// isBotActor is a string-equality check against Scm.BotLogin. On the
+	// AGENT's own merge requests it is the FAST PATH only, not the
+	// authoritative signal: the identity gate lives at outcome accept
+	// (/outcome's record_bot_head, restapi/outcome.go), which re-stamps
+	// LastBotHeadSHA from a LIVE forge read (GetPRHead) rather than trusting the
+	// webhook's reported actor. A spoofed or mismatched BotLogin/push-identity
+	// there can only cause a spurious flip whose window is bounded by the next
+	// accept - it self-corrects, it never compounds.
+	//
+	// THAT BACKSTOP DOES NOT EXIST ON AN ADOPTED MERGE REQUEST, and the comment
+	// used to imply it did. record_bot_head runs only on the implement/upgrade
+	// `submitted` path, and the COMMON adopted path - approved at first review -
+	// never runs an upgrade turn at all, so this webhook is the ONLY thing that
+	// re-anchors the baseline when the engine rebases its own branch. One
+	// dropped `synchronize` delivery therefore flips the merge request to
+	// external permanently, and since that flip now stamps
+	// adoptedPushReasonPrefix the merge request becomes human-merged-only for
+	// good.
+	//
+	// THAT IS ACCEPTED, DELIBERATELY, AND HERE IS THE ARGUMENT. Re-anchoring
+	// from the SWEEP would need the drifted head ATTRIBUTED to the engine, and
+	// there is no portable authenticated signal for that: GitLab's commit API
+	// returns author_name/author_email (git metadata, which this repo refuses to
+	// key decisions on - see UpgradeEngineLogins) and only GitHub exposes a
+	// mapped committer login. The failure mode after the flip is FAIL-SAFE: a
+	// dependency bump stops, nobody merges anything unattributed, and a human
+	// merges it or the engine opens a fresh merge request on its next run.
+	// Before adoption existed the same dropped delivery caused the OPPOSITE and
+	// worse outcome - the operator merged the unattributed commits on the next
+	// approve. Trading a stalled bump for that is the right direction, and the
+	// stall is visible: the flip logs ownership_flip with adopted=true and
+	// increments operator_ownership_flip_total.
+	//
+	// isUpgradeEngineActor, not isBotActor: a dependency-upgrade engine
+	// rebasing its OWN branch is not a human taking the branch back, and parking
+	// the adopted upgrade Task ownership-lost for it would stall a merge request
+	// nobody touched. Everything above still holds - this is still the FAST PATH
+	// and /outcome's live GetPRHead read is still the authoritative stamp - and
+	// so does everything about a non-attributable pusher: a human, an unknown
+	// login and an empty login all leave LastBotHeadSHA stale, and
+	// ReconcileOwnership flips.
+	bot := isUpgradeEngineActor(&proj, ev.ActorLogin)
 	if s.stampMRHead(ctx, &proj, repo, ev.Number, ev.HeadSHA, bot) {
 		s.log.InfoContext(ctx, "mr: mirrored new head on synchronize; no review restart",
 			"action", "mr_synchronize_mirror", "project", proj.Name, "repository", repo.Name,

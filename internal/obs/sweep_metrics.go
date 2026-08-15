@@ -284,6 +284,7 @@ var sweepSkipReasons = []string{
 	"already_minted",
 	"tombstone_deleted",
 	"mint_not_owed",
+	"upgrade_headroom_bound",
 }
 
 // mintOutcomeKinds x mintOutcomes is MintOutcomeTotal's closed label set, seeded
@@ -291,7 +292,11 @@ var sweepSkipReasons = []string{
 // WithLabelValues call has NO series at all, so increase(...[1h]) is blind to
 // the first mint after every pod roll. Kept literal (no reverse import of
 // internal/controller) exactly like sweepSeedReasons.
-var mintOutcomeKinds = []string{"implement", "review"}
+// takeover and upgrade both reach createTaskRaceSafe - the takeover endpoint
+// directly, adoption through MintAdoptedUpgradeTask - so both produce this
+// series and both must be seeded, or increase() is blind to the first mint of
+// either after every pod roll.
+var mintOutcomeKinds = []string{"implement", "review", "takeover", "upgrade"}
 var mintOutcomes = []string{"not_owed", "created", "existing_live", "tombstone_deleted", MintOutcomeError}
 
 // sweepActivities is the closed {activity} set for the two intake-funnel
@@ -324,6 +329,11 @@ var sweepSeedReasons = []string{
 	"get_owning_task", "get_mr_cr", "adopt_pr", "mint_review_task",
 	"reopen_retained_proposal", "get_mr_cr_post_classify", "list_pr_comments",
 	"reconcile_ownership", "resolve_live_owner",
+	// The adoption arm (a dependency-upgrade merge request minting its own
+	// upgrade Task): the mint itself, and the lane count that decides how many
+	// this pass may take. An uncountable lane budget adopts NOTHING, so its
+	// failure is invisible in the mint counters and only shows up here.
+	"adopt_upgrade_mr", "count_upgrade_lanes",
 }
 
 // cronReasons/refineReasons are the closed reason sets for projectscan.go's

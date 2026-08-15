@@ -2292,13 +2292,13 @@ func TestClassifyPRClaimedByAnotherTask(t *testing.T) {
 	// liveOwner is what the mirror's controller ref RESOLVES TO, not what it
 	// says: since #521 a ref naming a Task the API server does not have is a
 	// dangling string, and resolveLiveOwner has already dropped it by here.
-	if got := ClassifyPR(proj, repo, pr, owner, ""); got != PRAdopt {
+	if got := ClassifyPR(proj, repo, pr, owner, "", nil); got != PRAdopt {
 		t.Fatalf("no mirror yet: ClassifyPR = %q, want %q", got, PRAdopt)
 	}
-	if got := ClassifyPR(proj, repo, pr, owner, liveOwnerOf(t, claimedMR(t, proj, repo, 7, owner))); got != PRAdopt {
+	if got := ClassifyPR(proj, repo, pr, owner, liveOwnerOf(t, claimedMR(t, proj, repo, 7, owner)), nil); got != PRAdopt {
 		t.Fatalf("owner already owns it: ClassifyPR = %q, want %q (adoption stays idempotent)", got, PRAdopt)
 	}
-	if got := ClassifyPR(proj, repo, pr, owner, liveOwnerOf(t, claimedMR(t, proj, repo, 7, other))); got != PRClaimed {
+	if got := ClassifyPR(proj, repo, pr, owner, liveOwnerOf(t, claimedMR(t, proj, repo, 7, other)), nil); got != PRClaimed {
 		t.Fatalf("claimed by %s: ClassifyPR = %q, want %q", other.Name, got, PRClaimed)
 	}
 }

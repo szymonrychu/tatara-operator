@@ -1459,6 +1459,62 @@ func TestMRWrite_Open_IsIdempotent(t *testing.T) {
 	require.Contains(t, w.Body.String(), `"number":80`)
 }
 
+// IDEMPOTENT for a Task that pushes to a branch it did not derive. mrOpen's
+// idempotency key must be the branch the POD PUSHES TO, not the derived task
+// branch: the two differ for any Task carrying AnnTakeoverHeadBranch - an
+// adopted upgrade Task, and a takeover Task - and with the wrong key the
+// handler falls through to a REAL OpenChange against a branch that was never
+// pushed, opening a SECOND merge request.
+func TestMRWrite_Open_IsIdempotentForATaskPushingToAnAdoptedBranch(t *testing.T) {
+	adopted := taskV2("upg-charts-41", "tatara", "upgrade",
+		tatarav1alpha1.StateUnderImplementation, "upgrade")
+	adopted.Annotations = map[string]string{
+		tatarav1alpha1.AnnTakeoverHeadBranch: "renovate/cilium",
+	}
+	adopted.Spec.Source = &tatarav1alpha1.TaskSource{
+		Provider: "github", IssueRef: "https://github.com/acme/charts/pull/41",
+		IsPR: true, Number: 41, Title: "Update cilium to v1.18.2",
+	}
+	bound := mrV2("charts", 41, adopted.Name, func(m *tatarav1alpha1.MergeRequest) {
+		m.Status.HeadBranch = "renovate/cilium"
+	})
+	forge := newRecordingForge()
+	e := buildV2(t, v2Opts{writer: forge}, projectV2("tatara"), scmSecretV2(),
+		repoV2("charts", "tatara"), adopted, bound)
+
+	w := e.do(t, http.MethodPost, "/projects/tatara/scm/mr-write",
+		`{"task":"upg-charts-41","action":"open","repo":"charts","title":"T","body":"B"}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.Contains(t, w.Body.String(), `"existing":true`)
+	require.Contains(t, w.Body.String(), `"number":41`)
+	require.Empty(t, forge.openedURLs,
+		"mrOpen opened a SECOND merge request from a branch nobody pushed to")
+}
+
+// The ordinary case must not change: a Task with no adopted branch still keys
+// on its derived task branch, which for a numbered source is not the trivial
+// tatara/task-<name> fallback.
+func TestMRWrite_Open_StillKeysOnTheTaskBranchForAnOrdinaryTask(t *testing.T) {
+	task := taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement")
+	task.Spec.Source = &tatarav1alpha1.TaskSource{
+		Provider: "github", IssueRef: "https://github.com/acme/tatara-cli/issues/42",
+		Number: 42, Title: "Fix the thing",
+	}
+	bound := mrV2("tatara-cli", 80, task.Name, func(m *tatarav1alpha1.MergeRequest) {
+		m.Status.HeadBranch = agent.TaskBranch(task)
+	})
+	forge := newRecordingForge()
+	e := buildV2(t, v2Opts{writer: forge}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-cli", "tatara"), task, bound)
+
+	w := e.do(t, http.MethodPost, "/projects/tatara/scm/mr-write",
+		`{"task":"t1","action":"open","repo":"tatara-cli","title":"T","body":"B"}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.Contains(t, w.Body.String(), `"existing":true`)
+	require.Contains(t, w.Body.String(), `"number":80`)
+	require.Empty(t, forge.openedURLs)
+}
+
 // REFUSED 409 when the Task already owns a MERGED MR for that repo (fix 2).
 // This is the structural stop on the duplicate-PR path after a partial merge.
 func TestMRWrite_Open_RefusedAfterAMerge(t *testing.T) {
@@ -1838,4 +1894,28 @@ func TestV2Body_OversizeIs413(t *testing.T) {
 	big := strings.Repeat("a", (1<<20)+10)
 	w := e.do(t, http.MethodPost, "/tasks/t1/notes", `{"kind":"note","body":"`+big+`"}`)
 	require.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
+}
+
+// A TASK THAT PUSHES NOWHERE CANNOT OPEN A MERGE REQUEST. agent.PushBranch is
+// EMPTY for any Task carrying AnnReviewHeadBranch (branchEnvValues' read-only
+// review arm), and OpenChange with an empty head asks the forge to open a merge
+// request from nothing. No tool profile reaches this endpoint from such a pod
+// today, so this is a structural guard rather than a live bug - which is exactly
+// why it needs a test: nothing else would notice if a profile changed.
+func TestMRWrite_Open_RefusedForATaskThatPushesToNoBranch(t *testing.T) {
+	reviewer := taskV2("rev-charts-9", "tatara", "review",
+		tatarav1alpha1.StateUnderImplementation, "implement")
+	reviewer.Annotations = map[string]string{
+		tatarav1alpha1.AnnReviewHeadBranch: "contrib/fix",
+	}
+	require.Empty(t, agent.PushBranch(reviewer), "the fixture must push nowhere")
+
+	forge := newRecordingForge()
+	e := buildV2(t, v2Opts{writer: forge}, projectV2("tatara"), scmSecretV2(),
+		repoV2("charts", "tatara"), reviewer)
+
+	w := e.do(t, http.MethodPost, "/projects/tatara/scm/mr-write",
+		`{"task":"rev-charts-9","action":"open","repo":"charts","title":"T","body":"B"}`)
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	require.Empty(t, forge.openedURLs, "OpenChange was called with an empty head branch")
 }

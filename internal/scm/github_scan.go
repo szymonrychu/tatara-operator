@@ -11,7 +11,8 @@ import (
 )
 
 type ghPR struct {
-	Number int `json:"number"`
+	Number int    `json:"number"`
+	Title  string `json:"title"`
 	User   struct {
 		Login string `json:"login"`
 	} `json:"user"`
@@ -69,7 +70,7 @@ func (c *GitHub) ListOpenPRs(ctx context.Context, owner, repo string) ([]PRRef, 
 			headRepo = p.Head.Repo.FullName
 		}
 		out = append(out, PRRef{
-			Repo: slug, Number: p.Number, Author: p.User.Login, HeadRepo: headRepo,
+			Repo: slug, Number: p.Number, Title: p.Title, Author: p.User.Login, HeadRepo: headRepo,
 			HeadSHA: p.Head.SHA, HeadBranch: p.Head.Ref, Body: p.Body, Labels: ghLabelNames(p.Labels), UpdatedAt: p.UpdatedAt,
 		})
 	}

@@ -185,11 +185,16 @@ func (m *Minter) MintForItem(ctx context.Context, proj *tatarav1alpha1.Project,
 		if lerr != nil {
 			return mintErr(SweepReviewKind, lerr)
 		}
-		switch ClassifyPR(proj, repo, item.PR, nil, liveOwner) {
+		switch ClassifyPR(proj, repo, item.PR, nil, liveOwner, cr) {
 		case PRReview:
 			stg, reason := MintReviewStage(cr)
 			return m.MintReviewTask(ctx, proj, repo, item.PR, cr, stg, reason, sp)
-		default: // PRAdopt / PRClaimed (both sweep-only) / PRIgnore
+		default: // PRAdopt / PRClaimed / PRAdoptUpgrade (all sweep-only) / PRIgnore
+			// PRAdoptUpgrade is deliberately NOT minted here. Adoption is paced by
+			// the project-wide maxOpenUpgrades headroom, which is computed once per
+			// SWEEP PASS; a webhook delivery has no such budget in hand and would
+			// mint past the cap on every merge request the engine opens at once.
+			// The sweep picks it up oldest-first within minutes.
 			obs.MintOutcomeTotal.WithLabelValues(SweepReviewKind, string(MintNotOwed)).Inc()
 			return nil, MintNotOwed, nil
 		}

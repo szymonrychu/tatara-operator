@@ -1,12 +1,14 @@
 package agent
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
 // An agent kind missing from kindProfiles gets an EMPTY profile, the cli fails
@@ -103,4 +105,84 @@ func TestUpgrade_PodNameIsStablePerTask(t *testing.T) {
 	first := PodName(task)
 	StampPodName(task, "tatara", "")
 	require.Equal(t, first, PodName(task))
+}
+
+// The two upgrade Task shapes name their pods differently and cannot collide.
+// A cron Task is repo-less and falls to the per-Task hash; an adopted Task
+// carries Source.Number so podNameIDSegment short-circuits to p<N> BEFORE
+// reaching upgradeIDSegment. That is not a bug: (project, repo, number) is
+// exactly the identity that also makes the adopted Task's NAME unique, so one
+// merge request has one Task has one pod, by construction.
+func TestUpgrade_CronAndAdoptedPodNamesAreDistinctAndStable(t *testing.T) {
+	cron := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "upgrade-qe-abc123"},
+		Spec:       tatarav1alpha1.TaskSpec{Kind: "upgrade"},
+	}
+	adopted := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "mt-u-charts-41-deadbeefdeadbeef"},
+		Spec: tatarav1alpha1.TaskSpec{
+			Kind: "upgrade", RepositoryRef: "charts",
+			Source: &tatarav1alpha1.TaskSource{Number: 41, IsPR: true},
+		},
+	}
+	cn := BuildPodName("project-infrastructure", "", cron)
+	an := BuildPodName("project-infrastructure", "charts", adopted)
+	require.NotEqual(t, cn, an, "cron and adopted pod names collide")
+	require.True(t, strings.HasSuffix(an, "-p41"), "adopted pod name = %q, want a -p41 suffix", an)
+
+	// Two adopted Tasks on DIFFERENT merge requests never collide.
+	other := adopted.DeepCopy()
+	other.Spec.Source.Number = 42
+	require.NotEqual(t, an, BuildPodName("project-infrastructure", "charts", other),
+		"two adopted Tasks on different merge requests collide")
+}
+
+// The branch override is kind-agnostic and must stay that way: it is the whole
+// reason NEITHER pod needs a change to work on a third-party bot's branch. It
+// is checked at BOTH states an adopted Task spawns a pod in, because the review
+// turn now comes first and depends on it just as much as the upgrade turn does.
+func TestUpgrade_AdoptedTaskWorksOnTheAnnotatedBranchInBothStates(t *testing.T) {
+	adopted := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "mt-u-charts-41-deadbeefdeadbeef",
+			Annotations: map[string]string{tatarav1alpha1.AnnTakeoverHeadBranch: "renovate/cilium"},
+		},
+		Spec: tatarav1alpha1.TaskSpec{Kind: "upgrade", RepositoryRef: "charts",
+			Source: &tatarav1alpha1.TaskSource{Number: 41, IsPR: true, Title: "update cilium"}},
+	}
+	for _, st := range []string{
+		tatarav1alpha1.StateAwaitingReview,      // the REVIEW turn, agentKind=review
+		tatarav1alpha1.StateUnderImplementation, // the UPGRADE turn, agentKind=upgrade
+	} {
+		t.Run(st, func(t *testing.T) {
+			task := adopted.DeepCopy()
+			task.Status.State = st
+			task.Status.AgentKind = stage.AgentKindFor(st, task.Spec.Kind)
+			require.Equal(t, "renovate/cilium", PushBranch(task),
+				"the %s pod must work on the merge request's own branch", st)
+		})
+	}
+	require.NotEqual(t, "renovate/cilium", TaskBranch(adopted),
+		"TaskBranch must stay derived: taskForBranch keys on it and a third-party "+
+			"branch must never resolve to this Task by branch lookup")
+}
+
+// AnnReviewHeadBranch cannot substitute for AnnTakeoverHeadBranch on an adopted
+// Task, and this test exists so nobody "tidies up" by trying. Its arm in
+// branchEnvValues gates on Spec.Kind == "review" - the ORIGIN kind, not the
+// running agent kind - and an adopted Task's origin kind is "upgrade" whatever
+// state it is in. (It also has zero writers anywhere in the tree.)
+func TestUpgrade_ReviewHeadBranchDoesNotApplyToAnAdoptedTask(t *testing.T) {
+	adopted := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "mt-u-charts-41-deadbeefdeadbeef",
+			Annotations: map[string]string{tatarav1alpha1.AnnReviewHeadBranch: "renovate/cilium"},
+		},
+		Spec: tatarav1alpha1.TaskSpec{Kind: "upgrade", RepositoryRef: "charts",
+			Source: &tatarav1alpha1.TaskSource{Number: 41, IsPR: true, Title: "update cilium"}},
+		Status: tatarav1alpha1.TaskStatus{State: tatarav1alpha1.StateAwaitingReview},
+	}
+	require.NotEmpty(t, PushBranch(adopted),
+		"the review-branch arm must NOT fire for an adopted upgrade Task; "+
+			"AnnTakeoverHeadBranch is the only annotation that reaches it")
 }

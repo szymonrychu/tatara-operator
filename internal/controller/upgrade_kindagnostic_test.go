@@ -44,12 +44,12 @@ func TestClassifyPR_UpgradeMRAdoptsAndNeverMintsAReviewTask(t *testing.T) {
 
 	require.True(t, AdoptPR(proj, task, pr),
 		"AdoptPR keys on the deterministic task branch, never on spec.kind")
-	require.Equal(t, PRAdopt, ClassifyPR(proj, repo, pr, task, ""),
+	require.Equal(t, PRAdopt, ClassifyPR(proj, repo, pr, task, "", nil),
 		"an upgrade Task's own merge request adopts into that Task")
 
 	// The same merge request with NO owning task: bot-authored and
 	// non-adoptable, so ignored - never reviewed, never minting a review Task.
-	require.Equal(t, PRIgnore, ClassifyPR(proj, repo, pr, nil, ""),
+	require.Equal(t, PRIgnore, ClassifyPR(proj, repo, pr, nil, "", nil),
 		"a bot-authored merge request the sweep cannot adopt is IGNORED; PRReview is for humans' PRs only")
 }
 

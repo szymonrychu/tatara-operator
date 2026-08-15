@@ -751,7 +751,7 @@ func TestTriageNeverRoutesPastTheApprovalGate(t *testing.T) {
 		"review":     tatarav1alpha1.StateAwaitingReview,
 	}
 	for kind, wantStage := range want {
-		got, ok := triageTarget(kind)
+		got, ok := triageTarget(tsTask("t", kind, tatarav1alpha1.StateNew, time.Now()))
 		if !ok || got != wantStage {
 			t.Fatalf("triageTarget(%q) = %q,%v; want %q", kind, got, ok, wantStage)
 		}
@@ -772,11 +772,11 @@ func TestTriageNeverRoutesPastTheApprovalGate(t *testing.T) {
 // triage - docbatch.go mints it at under-implementation through the CREATE edge -
 // so the row was dead code that lied. Its absence is now the assertion.
 func TestTriageTargetIsAlwaysALegalEdgeOutOfNew(t *testing.T) {
-	if _, ok := triageTarget(stage.AgentDocumentation); ok {
+	if _, ok := triageTarget(tsTask("t", stage.AgentDocumentation, tatarav1alpha1.StateNew, time.Now())); ok {
 		t.Fatal("triageTarget has a documentation row again: new -> under-implementation is not in the table and never will be")
 	}
 	for _, kind := range []string{"brainstorm", "implement", "incident", "refine", "takeover", "review", "documentation", "upgrade", "nonsense"} {
-		target, ok := triageTarget(kind)
+		target, ok := triageTarget(tsTask("t", kind, tatarav1alpha1.StateNew, time.Now()))
 		if !ok {
 			continue // no row: reconcileTriaging parks at triage-stalled, which is legal from anywhere
 		}

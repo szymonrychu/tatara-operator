@@ -27,11 +27,56 @@ import (
 // "initial") - and knows it is safe to resume that flip's park+hand-back.
 const externalPushReasonPrefix = "external-push:"
 
-// ownershipForAuthor classifies a never-seen MR: bot author -> tatara,
-// anything else (human, Renovate, other bot, or an unknown/empty author) ->
-// external.
+// adoptedPushReasonPrefix is externalPushReasonPrefix's twin for a flip whose
+// owner is an ADOPTED dependency-upgrade Task (stage.AdoptedUpgrade), and the whole point
+// of it being a DIFFERENT string is that mergeAllowedForOwnership and
+// DrainStandDownMerge both test for `external-push:` exactly and therefore
+// REFUSE this one.
+//
+// WHY THE TWO CANNOT SHARE A REASON. Merge-after-stand-down exists for a
+// TAKEOVER: a maintainer explicitly asked the platform to take a merge request
+// over, so their later push to it is part of a collaboration they started, and
+// continuing to review and merge across it is the behaviour they asked for.
+// NOBODY ASKS FOR AN ADOPTION - the sweep does it automatically to every merge
+// request the dependency engine opens. Reusing `external-push:` there would mean
+// that a human pushing a commit onto the engine's branch hands their commit to a
+// pod-less merge corridor on the next approve, on the strength of a decision no
+// human ever made. So an adopted merge request a human pushed to becomes
+// HUMAN-MERGED-ONLY, which is the same disposition an ordinary external merge
+// request has carried all along.
+//
+// It shares no PREFIX with externalPushReasonPrefix either ("external-push-"
+// would make HasPrefix("external-push:") false but invites a future
+// HasPrefix("external-push") that silently re-admits it). isExternalPushReason
+// is the ONE place that treats them alike, and it is used only by
+// resumeFlipToExternal, which converges a half-completed flip and cares that a
+// flip happened, not which kind.
+const adoptedPushReasonPrefix = "adopted-external-push:"
+
+// isExternalPushReason reports whether reason was stamped by flipToExternal, in
+// either of its two shapes. It is deliberately NOT what the merge corridor asks:
+// mergeAllowedForOwnership and DrainStandDownMerge test externalPushReasonPrefix
+// alone, because only the takeover shape may be merged.
+func isExternalPushReason(reason string) bool {
+	return strings.HasPrefix(reason, externalPushReasonPrefix) ||
+		strings.HasPrefix(reason, adoptedPushReasonPrefix)
+}
+
+// ownershipForAuthor classifies a never-seen MR: an author this project owns -
+// the platform bot, or an allowlisted upgradePolicy.upgradeEngineLogins
+// dependency-upgrade engine - is `tatara`; anything else (a human, an
+// un-allowlisted bot, or an unknown/empty author) is `external`.
+//
+// IT DELEGATES TO adoptableAuthor ON PURPOSE, AND THE TWO MUST STAY ONE
+// FUNCTION. AdoptUpgradeMR decides which merge requests the platform TAKES and
+// this decides which it is ALLOWED TO MERGE (mergeAllowedForOwnership accepts
+// `tatara` unconditionally and refuses external/"initial" outright). An author
+// accepted by one and refused by the other adopts a merge request the merge
+// corridor then declines - after the review agent has already approved it on
+// the forge. Retiring the mint-time ownership flip is sound only while these
+// two answer the same question, so they ask it in the same place.
 func ownershipForAuthor(proj *tatarav1alpha1.Project, author string) string {
-	if author != "" && author == botLoginOf(proj) {
+	if adoptableAuthor(proj, author) {
 		return tatarav1alpha1.OwnershipTatara
 	}
 	return tatarav1alpha1.OwnershipExternal
@@ -145,7 +190,7 @@ func (d *StageDriver) ReconcileOwnership(ctx context.Context, proj *tatarav1alph
 		// the reason prefix, not unconditionally re-run: park+handBackToReviewTask
 		// both always write, so running them on every reconcile of every
 		// external MR would churn a resourceVersion for nothing once converged.
-		if strings.HasPrefix(mr.Status.OwnershipReason, externalPushReasonPrefix) {
+		if isExternalPushReason(mr.Status.OwnershipReason) {
 			if err := d.resumeFlipToExternal(ctx, proj, repo, mr); err != nil {
 				return false, err
 			}
@@ -194,7 +239,15 @@ func (d *StageDriver) flipToExternal(ctx context.Context, proj *tatarav1alpha1.P
 	repo *tatarav1alpha1.Repository, mr *tatarav1alpha1.MergeRequest, liveHead string) (bool, error) {
 
 	now := metav1.Now()
-	reason := externalPushReasonPrefix + liveHead
+	prefix := externalPushReasonPrefix
+	adopted, aerr := d.ownerIsAdoptedMR(ctx, proj, mr)
+	if aerr != nil {
+		return false, aerr
+	}
+	if adopted {
+		prefix = adoptedPushReasonPrefix
+	}
+	reason := prefix + liveHead
 	key := client.ObjectKeyFromObject(mr)
 	if err := objbudget.FitMergeRequest(ctx, d.Client, d.spiller(proj), key, func(m *tatarav1alpha1.MergeRequest) {
 		m.Status.Ownership = tatarav1alpha1.OwnershipExternal
@@ -216,8 +269,44 @@ func (d *StageDriver) flipToExternal(ctx context.Context, proj *tatarav1alpha1.P
 
 	obs.OwnershipFlip("to-external", "external-push")
 	log.FromContext(ctx).Info("ownership flipped to external", "action", "ownership_flip",
-		"resource_id", mr.Name, "direction", "to-external", "reason", reason)
+		"resource_id", mr.Name, "direction", "to-external", "reason", reason, "adopted", adopted)
 	return true, nil
+}
+
+// ownerIsAdoptedMR reports whether mr's CURRENT controller owner is an ADOPTED
+// dependency-upgrade Task (stage.AdoptedUpgrade). It is flipToExternal's only
+// discriminator, and it is keyed on the OWNER rather than on the head branch on
+// purpose: a maintainer may legitimately request a takeover of a merge request
+// that happens to sit under the adopt prefix, and that takeover keeps the
+// mergeable stand-down reason it has always had.
+//
+// stage.AdoptedUpgrade, NEVER stage.AdoptedMR: a takeover Task and a kind=review
+// Task are both minted onto a merge request and both satisfy AdoptedMR, so the
+// looser predicate would strip merge-after-stand-down from every takeover on the
+// platform.
+//
+// AN UNRESOLVABLE OWNER FALLS BACK TO THE TAKEOVER REASON, which is the
+// pre-existing behaviour rather than a new one. It is not reachable for an
+// adopted merge request in practice: the mint makes the adopted Task the
+// mirror's controller owner in the same call that creates the mirror, and the
+// only thing that removes that ref is the reap - which also orphans the mirror,
+// at which point there is no owner left for a flip to park.
+func (d *StageDriver) ownerIsAdoptedMR(ctx context.Context, proj *tatarav1alpha1.Project,
+	mr *tatarav1alpha1.MergeRequest) (bool, error) {
+
+	ownerName, ok := own.ControllerOwner(mr)
+	if !ok {
+		return false, nil
+	}
+	var task tatarav1alpha1.Task
+	err := d.Get(ctx, client.ObjectKey{Namespace: proj.Namespace, Name: ownerName}, &task)
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("flip: get owner task %s: %w", ownerName, err)
+	}
+	return stage.AdoptedUpgrade(&task), nil
 }
 
 // parkAndHandBack parks mr's current controller-owning Task (if any,

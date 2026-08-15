@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -127,8 +128,15 @@ const (
 	SweepSkipReporterNotAllowed = "issue_reporter_not_allowed"
 	// SweepSkipMintBudget: one of the two creation budgets bound, so this
 	// orphan is deferred to the next pass. Paired with
-	// obs.SweepMintCapHitTotal, which says WHICH cap bound, once per pass;
-	// this says WHICH ISSUES paid for it.
+	// obs.SweepMintCapHitTotal, which says WHICH cap bound.
+	//
+	// COUNTED ONCE PER PASS (sweepBudget.countBudgetSkip), logged per item. A
+	// cap that is full defers every remaining orphan, so counting each one made
+	// a healthy project at maxOpenTasks look like a permanent incident; the log
+	// lines are what say WHICH issues and pull requests paid for it. It is also
+	// excluded from TataraSweepSkipPersistent for that reason - the dedup fixes
+	// the series, it does not make a per-pass increment stop clearing the alert
+	// threshold.
 	SweepSkipMintBudget = "mint_budget_bound"
 	// SweepSkipAlreadyMinted: MintExistingLive. A webhook (or a concurrent
 	// pass) already minted this natural key and its Task is alive.
@@ -143,6 +151,14 @@ const (
 	// which asserts a Task exists - the two are opposite facts and a shared
 	// series cannot be alerted on.
 	SweepSkipMintNotOwed = "mint_not_owed"
+
+	// SweepSkipUpgradeHeadroom: an adoptable dependency merge request the
+	// project has no upgrade lane free for this pass. NOT an error and not
+	// metered as one: it is picked up oldest-first on a later pass as lanes
+	// free. maxOpenUpgrades is the whole point - adoption is unbounded by
+	// construction and would otherwise mint a Task per open merge request at
+	// once on the first pass after it is armed.
+	SweepSkipUpgradeHeadroom = "upgrade_headroom_bound"
 
 	// SweepIssueKind is the Task kind a sweep-minted ISSUE Task carries.
 	//
@@ -763,7 +779,186 @@ func AdoptPR(proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task, pr scm.PRR
 	return pr.HeadRepo != "" && pr.HeadRepo == pr.Repo
 }
 
-// PRDisposition is the outcome of B.4's four-clause PR/MR disposition.
+// adoptBranchPrefixOf returns the project's configured adoptable head-branch
+// prefix, or "" when adoption is not configured (the default).
+func adoptBranchPrefixOf(proj *tatarav1alpha1.Project) string {
+	if proj == nil || proj.Spec.UpgradePolicy == nil {
+		return ""
+	}
+	return proj.Spec.UpgradePolicy.AdoptBranchPrefix
+}
+
+// adoptableAuthor reports whether author is an identity this project owns: the
+// platform bot, or an explicitly allowlisted upgradePolicy.upgradeEngineLogins
+// dependency-upgrade engine. Exact match, and an EMPTY author is never adoptable
+// (a forge that will not say who opened a merge request does not get the benefit
+// of the doubt on one the platform would merge).
+//
+// IT IS ALSO ownershipForAuthor's WHOLE TEST, and that is deliberate: the
+// identity adoption accepts and the identity the merge corridor accepts must be
+// ONE fact, or an adopted merge request classifies `external` and
+// mergeAllowedForOwnership refuses it after the review agent has already
+// approved it on the forge.
+//
+// This is a FORGE LOGIN, which the forge authenticated. It is deliberately not a
+// git commit author: see UpgradeEngineLogins' own doc comment, and the three
+// places this repo already refuses to key a decision on git author metadata.
+func adoptableAuthor(proj *tatarav1alpha1.Project, author string) bool {
+	if author == "" {
+		return false
+	}
+	if author == botLoginOf(proj) {
+		return true
+	}
+	if proj == nil || proj.Spec.UpgradePolicy == nil {
+		return false
+	}
+	return slices.Contains(proj.Spec.UpgradePolicy.UpgradeEngineLogins, author)
+}
+
+// adoptionRefusedSHASep separates the two halves of AnnAdoptionRefused's value,
+// "<reason>@<headSHA>". "@" is safe as a separator because every park and state
+// reason in internal/stage is kebab-case with no "@" in it.
+const adoptionRefusedSHASep = "@"
+
+// adoptionRefused reports whether cr carries a durable adoption refusal that
+// still binds at headSHA. It is AdoptUpgradeMR clause (g), factored out because
+// parsing a two-part annotation value is not something a predicate should do
+// inline.
+//
+// IT FAILS CLOSED TWICE. A marker with no separator (nothing recorded the head)
+// and a live headSHA the forge did not report both refuse: neither can PROVE the
+// tree moved on from the one that was declined, and re-reviewing a bump the
+// platform already rejected is the failure this marker exists to prevent.
+func adoptionRefused(cr *tatarav1alpha1.MergeRequest, headSHA string) bool {
+	if cr == nil {
+		return false
+	}
+	value := cr.Annotations[AnnAdoptionRefused]
+	if value == "" {
+		return false
+	}
+	i := strings.LastIndex(value, adoptionRefusedSHASep)
+	if i < 0 || headSHA == "" {
+		return true
+	}
+	return value[i+len(adoptionRefusedSHASep):] == headSHA
+}
+
+// AdoptUpgradeMR reports whether pr is a dependency-upgrade merge request this
+// project should adopt into its own upgrade Task. ALL of:
+//
+//	a. upgradePolicy.adoptBranchPrefix is configured (empty disables adoption)
+//	b. pr.headBranch starts with it
+//	c. pr.author is adoptable                    (the bot, or an allowlisted engine)
+//	d. pr.head.repo == pr.base.repo              (NO forks, ever)
+//	e. no Task owns the branch and no live Task owns the mirror CR
+//	f. pr does NOT carry the project trigger label
+//	g. its mirror carries no durable adoption REFUSAL marker for pr's head SHA
+//	h. its mirror has not STOOD DOWN to an external push
+//
+// (c) is what makes adoption SAFE TO MERGE rather than merely possible. An
+// adopted merge request is one the operator will merge on an approve, and
+// ownershipForAuthor grants that permission on exactly this identity - so
+// requiring it here means the ownership the merge corridor checks and the
+// identity this predicate checks are the SAME fact, rather than two facts a
+// mint-time flip has to reconcile. It also means anyone who pushes a branch
+// called renovate/whatever gets a review, not a merge.
+//
+// It is ALSO the cutover mechanism. While the engine still runs with a human's
+// token this returns false, the merge request falls through to clause 3, and a
+// review Task is minted exactly as before. The instant the engine's token moves
+// to the bot, the same merge request adopts - ahead of clause 2, which would
+// otherwise ignore every bot-authored merge request outright.
+//
+// (d) is AdoptPR's clause verbatim and for the same reason: a fork merge
+// request may name its head branch anything, including the configured prefix,
+// and an UNKNOWN head repo fails CLOSED.
+//
+// (e) is what stops re-adoption. taskForBranch matches on agent.TaskBranch and
+// can never see a renovate/* branch, so `owner` is nil for every pass - but the
+// adopted Task becomes the mirror CR's controller owner, which surfaces as
+// liveOwner, and from then on ClassifyPR's existing liveOwner clause sends this
+// merge request to PRIgnore.
+//
+// (f) is the human override. Applying the trigger label to a prefixed branch is
+// an explicit ask for a review, and an explicit human signal always outranks an
+// automatic disposition. It also makes this clause safe under
+// prReactionScope:"all", where every labelled merge request is reviewable.
+//
+// (g) IS WHAT MAKES A DECLINE STICK, and without it re-adoption is unbounded.
+// The reaper orphans the mirror and deletes a parked or terminal adopted Task;
+// (e) then holds no more, because the deterministic Task name is free again and
+// the mirror has no live owner - so the very next sweep re-adopts the SAME merge
+// request into a fresh Task with a fresh review turn. A bump the upgrade agent
+// DECLINED as unsafe therefore comes back, and the next reviewer, who sees none
+// of that history, can approve and merge it. The reaper stamps
+// AnnAdoptionRefused on the still-open mirror of an adopted Task it DECLINED,
+// and this reads it: same durable-annotation mechanism as AnnTerminalClosed, and
+// the same reason - a decision the platform already made must outlive the object
+// that made it. cr may be nil (no mirror exists, so nothing was ever refused).
+//
+// IT IS SCOPED TO ONE TREE, NOT TO THE MERGE REQUEST FOREVER, and that scoping
+// is what makes it survivable. A dependency engine does NOT open a new merge
+// request per bump within a dependency line: Renovate's default branch name is
+// renovate/<dep>-<major>.x, and it FORCE-PUSHES each successive bump onto that
+// same branch, keeping the same number and the same mirror. A marker keyed on
+// the mirror alone would therefore refuse 1.4 because 1.3 was declined, and go
+// on refusing every bump of that dependency until a human deleted an annotation
+// they have no reason to know exists. adoptionRefused binds the marker to the
+// head SHA that was refused, so the declined tree stays declined and a genuinely
+// new one gets a fresh decision. Undoing a refusal outright is deleting the
+// annotation, or merging the merge request yourself.
+//
+// THE TRIGGER LABEL IS AN ESCAPE HATCH ONLY WHEN THE ENGINE IS NOT THE BOT. It
+// works by making clause (f) refuse adoption so the merge request falls through
+// to an ordinary review Task - which is reachable only via clause 3, and clause
+// 2 sends every merge request authored by Project.spec.scm.botLogin to PRIgnore
+// before clause 3 is reached. So: an engine running under an allowlisted
+// upgradeEngineLogins identity is labelled into a review Task; an engine running
+// under the bot's own login is not, and there the only recoveries are the
+// annotation and a human merge.
+//
+// (h) REFUSES WHAT THE MERGE CORRIDOR WOULD REFUSE. A human push onto an adopted
+// merge request stands its mirror down to `external` with adoptedPushReasonPrefix,
+// which mergeAllowedForOwnership rejects; flipToExternal then hands the mirror to
+// a kind=review Task, so the adopted Task's own reap sees wasController=false and
+// (g) marks nothing. When that review Task is later reaped the mirror is orphaned
+// and nothing else stops a re-adoption - which would tell a fresh review pod
+// "approving MERGES it" and then hard-error reconcileMerge on every reconcile
+// until the merging deadline parks the Task. The test is exactly the merge
+// corridor's own, so a stood-down TAKEOVER (external-push:, which IS mergeable
+// because a maintainer asked for it) is unaffected.
+func AdoptUpgradeMR(proj *tatarav1alpha1.Project, pr scm.PRRef,
+	owner *tatarav1alpha1.Task, liveOwner string, cr *tatarav1alpha1.MergeRequest) bool {
+
+	if adoptionRefused(cr, pr.HeadSHA) {
+		return false
+	}
+	if cr != nil && cr.Status.Ownership == tatarav1alpha1.OwnershipExternal && !mergeAllowedForOwnership(cr) {
+		return false
+	}
+	prefix := adoptBranchPrefixOf(proj)
+	if prefix == "" {
+		return false
+	}
+	if !strings.HasPrefix(pr.HeadBranch, prefix) {
+		return false
+	}
+	if !adoptableAuthor(proj, pr.Author) {
+		return false
+	}
+	if pr.HeadRepo == "" || pr.HeadRepo != pr.Repo {
+		return false
+	}
+	if owner != nil || liveOwner != "" {
+		return false
+	}
+	return !hasLabel(pr.Labels, proj.Spec.TriggerLabel)
+}
+
+// PRDisposition is the outcome of B.4's four-clause PR/MR disposition, plus
+// clause 1c's PRAdoptUpgrade.
 type PRDisposition string
 
 const (
@@ -774,6 +969,21 @@ const (
 	PRReview PRDisposition = "review"
 	// PRIgnore: clauses 2 and 4. No Task. No pod. No tokens.
 	PRIgnore PRDisposition = "ignore"
+	// PRAdoptUpgrade: a dependency-upgrade merge request - head branch under the
+	// project's upgradePolicy.adoptBranchPrefix AND authored by the bot or an
+	// allowlisted upgradePolicy.upgradeEngineLogins account - with no owner,
+	// adopted into its OWN upgrade Task bound to that existing merge request.
+	// This is the Renovate fan-out: Renovate opens one merge request per update
+	// with the changelog in the body, and every merge decision - including a
+	// trivial patch bump - goes through a Task rather than through automerge.
+	//
+	// BRANCH AND AUTHOR, BOTH. The branch is what distinguishes an upgrade
+	// merge request from the agent's own (clause 1 already took those); the
+	// author is what makes it safe to MERGE one, because ownershipForAuthor
+	// classifies a botLogin-authored merge request `tatara` and nothing has to
+	// flip it. Prefix alone would adopt any branch anyone chose to call
+	// renovate/something.
+	PRAdoptUpgrade PRDisposition = "adopt-upgrade"
 	// PRClaimed: clause 1b. The PR is adoptable BY SHAPE (bot-authored, on this
 	// Task's branch, same repo) but its MergeRequest CR is already
 	// controller-owned by a DIFFERENT Task, so the adoption is not this pass's
@@ -784,9 +994,13 @@ const (
 	PRClaimed PRDisposition = "claimed"
 )
 
-// ClassifyPR is B.4's PR/MR disposition. FOUR clauses:
+// ClassifyPR is B.4's PR/MR disposition. FOUR clauses, plus clause 1c:
 //
 //  1. ADOPT into owner's mrRefs iff AdoptPR
+//     1c. a DEPENDENCY-UPGRADE merge request (AdoptUpgradeMR: the configured
+//     head-branch prefix AND an engine author) with no owner -> adopt it
+//     into its OWN upgrade Task. Ahead of clauses 2 and 3, deliberately;
+//     see the clause body.
 //  2. BOT-AUTHORED and NOT ADOPTABLE  ->  IGNORE. FULL STOP.
 //  3. HUMAN-AUTHORED and its MergeRequest CR is an ORPHAN (no controller owner)
 //     ->  review Task iff prInReactionScope
@@ -843,8 +1057,12 @@ const (
 //	    platform has no business touching.
 //
 // Consequence: every review-kind Task is non-bot-authored BY CONSTRUCTION.
+// cr is the merge request's MIRROR, or nil when none exists. Only clause 1c
+// reads it, for the durable adoption-refusal marker (AdoptUpgradeMR clause g);
+// liveOwner is still taken separately because it is a RESOLVED liveness answer
+// the caller computes, not something readable off the CR (issue #521).
 func ClassifyPR(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, pr scm.PRRef,
-	owner *tatarav1alpha1.Task, liveOwner string) PRDisposition {
+	owner *tatarav1alpha1.Task, liveOwner string, cr *tatarav1alpha1.MergeRequest) PRDisposition {
 
 	if AdoptPR(proj, owner, pr) {
 		// CLAUSE 1b (issue #477). An MR already controller-owned by someone
@@ -861,6 +1079,28 @@ func ClassifyPR(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, p
 			return PRClaimed
 		}
 		return PRAdopt
+	}
+	// CLAUSE 1c. A dependency-upgrade merge request adopts into its OWN upgrade
+	// Task. Placed here, ahead of the bot-author clause and ahead of
+	// prInReactionScope, and BOTH placements are required:
+	//
+	//   - ahead of clause 2, or an upgrade engine running with the bot's token
+	//     has every merge request swallowed by `pr.Author == bot -> PRIgnore`.
+	//     That failure mints nothing, logs nothing above V(1) and counts
+	//     nothing: the engine's merge requests simply stop existing as far as
+	//     the platform is concerned;
+	//   - ahead of clause 3, so that while the engine still runs with a HUMAN's
+	//     token nothing changes at all. AdoptUpgradeMR returns false on the
+	//     author, the merge request falls through, and prInReactionScope returns
+	//     true on its FIRST line for a trusted author - minting the same review
+	//     Task it mints today. That is the dormant window, and it is what lets
+	//     this release ship before the engine's token moves.
+	//
+	// AdoptUpgradeMR itself refuses to steal (owner/liveOwner) and refuses a
+	// trigger-labelled merge request, so neither clause 1 nor an explicit human
+	// review request is shadowed.
+	if AdoptUpgradeMR(proj, pr, owner, liveOwner, cr) {
+		return PRAdoptUpgrade
 	}
 	bot := botLoginOf(proj)
 	if bot != "" && pr.Author == bot {
@@ -1015,6 +1255,29 @@ func mintedBucket(parkReason string) string {
 	return "parked"
 }
 
+// countBudgetSkip reports whether THIS pass should still increment
+// operator_sweep_skipped_total{reason="mint_budget_bound"}. True exactly once
+// per pass, the same dedup capHit already applies to its own counter, and for
+// the same reason.
+//
+// A DEFERRAL PER ITEM IS ONE FACT, NOT N. allow returns false for EVERY
+// remaining orphan once active >= maxOpen, so an unconditional counter turned
+// "the cap is full" into a series whose rate is the size of the backlog, on
+// every pass, forever - the alert-burying shape upgrade_headroom_bound was
+// excluded from TataraSweepSkipPersistent for. The LOG line is still emitted per
+// item: a counter cannot say WHICH pull request went unanswered, which is the
+// entire reason skipPR and skipIssue log at all.
+//
+// It shares b.hit with capHit; the reason strings and the cap names are disjoint
+// vocabularies (mint_budget_bound vs maxNewTasksPerSweep / maxOpenTasks).
+func (b *sweepBudget) countBudgetSkip() bool {
+	if b.hit[SweepSkipMintBudget] {
+		return false
+	}
+	b.hit[SweepSkipMintBudget] = true
+	return true
+}
+
 func (b *sweepBudget) capHit(ctx context.Context, cap string) {
 	if b.hit[cap] {
 		return
@@ -1083,6 +1346,32 @@ func (r *ProjectReconciler) SweepProject(ctx context.Context, proj *tatarav1alph
 			"action", "sweep_writer_unavailable", "resource_id", proj.Name, "activity", activity, "error", werr.Error())
 	}
 
+	// Adoption headroom for the WHOLE pass, computed once. Per-repo would let a
+	// project with five repos mint five times the cap. openUpgradeLaneCount is
+	// the same counter the upgrade cron checks, so cron mints and adoptions
+	// compete for the same lanes rather than each getting a private allowance -
+	// which is what "maxOpenUpgrades governs adoption" has to mean.
+	//
+	// The nil guard on Cron is load-bearing: adoptBranchPrefixOf reads
+	// Spec.UpgradePolicy, which is independent of Spec.Scm.Cron, so a project
+	// could configure the prefix with no upgrade cron at all and reading
+	// Cron.Upgrade unguarded would panic. In that shape the headroom stays 0 and
+	// nothing adopts, which is the right answer: a project with no
+	// maxOpenUpgrades has declared no upgrade capacity.
+	adoptHeadroom := 0
+	if adoptBranchPrefixOf(proj) != "" && proj.Spec.Scm != nil && proj.Spec.Scm.Cron != nil {
+		maxOpen := proj.Spec.Scm.Cron.Upgrade.MaxOpenUpgrades
+		if maxOpen <= 0 {
+			maxOpen = 1
+		}
+		if live, cerr := r.openUpgradeLaneCount(ctx, proj); cerr != nil {
+			// Fail CLOSED: an uncountable lane budget adopts nothing this pass.
+			fail("count_upgrade_lanes", cerr)
+		} else if live < maxOpen {
+			adoptHeadroom = maxOpen - live
+		}
+	}
+
 	for i := range repos {
 		repo := &repos[i]
 		owner, name, oerr := scm.OwnerRepo(repo.Spec.URL)
@@ -1103,7 +1392,8 @@ func (r *ProjectReconciler) SweepProject(ctx context.Context, proj *tatarav1alph
 			continue
 		}
 		requeue = soonerRequeue(requeue,
-			r.sweepPRs(ctx, proj, repo, reader, writer, token, owner, name, prs, budget, minted, sp, activity, fail))
+			r.sweepPRs(ctx, proj, repo, reader, writer, token, owner, name, prs, budget, minted, sp, activity,
+				&adoptHeadroom, fail))
 	}
 
 	// EVERY pass, including the zero: a sweep that mints nothing is the signal
@@ -1196,7 +1486,19 @@ func (r *ProjectReconciler) strandOnFailure(proj *tatarav1alpha1.Project, repo *
 func skipIssue(ctx context.Context, proj *tatarav1alpha1.Project,
 	repo *tatarav1alpha1.Repository, number int, activity, reason string) {
 
-	obs.SweepSkippedTotal.WithLabelValues(proj.Name, activity, reason).Inc()
+	skipIssueMetered(ctx, proj, repo, number, activity, reason, true)
+}
+
+// skipIssueMetered is skipIssue with the counter under the caller's control. It
+// exists for ONE caller - the creation-budget deferral, which logs per item and
+// counts once per pass (sweepBudget.countBudgetSkip). Everything else counts
+// unconditionally through skipIssue.
+func skipIssueMetered(ctx context.Context, proj *tatarav1alpha1.Project,
+	repo *tatarav1alpha1.Repository, number int, activity, reason string, count bool) {
+
+	if count {
+		obs.SweepSkippedTotal.WithLabelValues(proj.Name, activity, reason).Inc()
+	}
 	log.FromContext(ctx).Info("sweep: issue skipped",
 		"action", "sweep_skip_issue", "resource_id", tatarav1alpha1.IssueName(repo.Name, number),
 		"activity", activity, "reason", reason, "project", proj.Name,
@@ -1210,7 +1512,17 @@ func skipIssue(ctx context.Context, proj *tatarav1alpha1.Project,
 func skipPR(ctx context.Context, proj *tatarav1alpha1.Project,
 	repo *tatarav1alpha1.Repository, number int, activity, reason string, kv ...any) {
 
-	obs.SweepSkippedTotal.WithLabelValues(proj.Name, activity, reason).Inc()
+	skipPRMetered(ctx, proj, repo, number, activity, reason, true, kv...)
+}
+
+// skipPRMetered is skipIssueMetered's PR arm; see it for why the counter is
+// separable from the log line.
+func skipPRMetered(ctx context.Context, proj *tatarav1alpha1.Project,
+	repo *tatarav1alpha1.Repository, number int, activity, reason string, count bool, kv ...any) {
+
+	if count {
+		obs.SweepSkippedTotal.WithLabelValues(proj.Name, activity, reason).Inc()
+	}
 	log.FromContext(ctx).Info("sweep: PR skipped",
 		append([]any{"action", "sweep_skip_pr",
 			"resource_id", tatarav1alpha1.MergeRequestName(repo.Name, number),
@@ -1315,7 +1627,8 @@ func (r *ProjectReconciler) sweepIssues(ctx context.Context, proj *tatarav1alpha
 		live := WebhookOriginated(cr)
 		stg, reason := MintStage(proj, repo, ext, live)
 		if !budget.allow(ctx, reason) {
-			skipIssue(ctx, proj, repo, ref.Number, activity, SweepSkipMintBudget)
+			skipIssueMetered(ctx, proj, repo, ref.Number, activity, SweepSkipMintBudget,
+				budget.countBudgetSkip())
 			r.strandOrphan(proj, repo, ref, now)
 			continue
 		}
@@ -1361,7 +1674,8 @@ func (r *ProjectReconciler) sweepIssues(ctx context.Context, proj *tatarav1alpha
 	return requeue
 }
 
-// sweepPRs applies the four-clause disposition to every open PR in one repo,
+// sweepPRs applies the four-clause disposition (plus clause 1c's adoption arm)
+// to every open PR in one repo,
 // then (OP12) drives ReconcileOwnership over the resulting MR mirror: the same
 // backfill/drift/comment-cursor-redelivery convergence the webhook fast path
 // runs on every mirror bump, so a mirror the webhook never touched (a missed
@@ -1372,10 +1686,24 @@ func (r *ProjectReconciler) sweepIssues(ctx context.Context, proj *tatarav1alpha
 func (r *ProjectReconciler) sweepPRs(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository,
 	reader scm.SCMReader, writer scm.SCMWriter, token, owner, name string,
 	prs []scm.PRRef, budget *sweepBudget, minted map[string]int, sp objbudget.Spiller, activity string,
-	fail func(string, error, ...any)) time.Duration {
+	adoptHeadroom *int, fail func(string, error, ...any)) time.Duration {
 
 	l := log.FromContext(ctx)
 	requeue := time.Duration(0)
+
+	// PHASE 1: RESOLVE AND CLASSIFY, ACT ON NOTHING. Every read here used to sit
+	// at the top of the single acting loop; it is hoisted so the adoption window
+	// below can be computed over the merge requests this pass CAN adopt rather
+	// than over the ones that merely LOOK adoptable. No read is added or
+	// repeated - the acting loop consumes exactly what this one resolved.
+	type prPass struct {
+		pr        scm.PRRef
+		cr        *tatarav1alpha1.MergeRequest
+		claimedBy string
+		ownerTask *tatarav1alpha1.Task
+		disp      PRDisposition
+	}
+	passes := make([]prPass, 0, len(prs))
 	for _, pr := range prs {
 		// The mirror is read BEFORE the branch lookup, not after: its controller
 		// owner is what disambiguates a head branch that several Tasks share
@@ -1399,7 +1727,48 @@ func (r *ProjectReconciler) sweepPRs(ctx context.Context, proj *tatarav1alpha1.P
 			fail("get_owning_task", terr, "repo", repo.Name, "number", pr.Number)
 			continue
 		}
-		switch ClassifyPR(proj, repo, pr, ownerTask, claimedBy) {
+		passes = append(passes, prPass{
+			pr: pr, cr: cr, claimedBy: claimedBy, ownerTask: ownerTask,
+			disp: ClassifyPR(proj, repo, pr, ownerTask, claimedBy, cr),
+		})
+	}
+
+	// THE ADOPTION WINDOW, over the CLASSIFIED set. It is the oldest `headroom`
+	// merge requests that actually classify PRAdoptUpgrade, so a merge request
+	// this project already adopted - always the lowest-numbered, and always
+	// PRIgnore because its mirror has a live controller owner - can no longer
+	// spend a slot it could never use. Computed from an ownership-blind
+	// shape filter, the window on {42 adopted, 43 adopted, 44 free} with one free
+	// lane was {42}, and 44 was deferred upgrade_headroom_bound on every pass
+	// forever: effective utilisation capped near maxOpenUpgrades/2.
+	//
+	// Ascending, because the forge lists newest-first (GitLab's default is
+	// created_at desc and ListOpenPRs sets no ordering) and the cap is tight, so
+	// taking them in list order would starve the oldest merge request
+	// indefinitely. Number is the age proxy rather than UpdatedAt: merge-request
+	// IIDs are monotonic per project, while UpdatedAt moves every time a pipeline
+	// touches it. Fairness is oldest-first WITHIN a repo and repo-iteration-order
+	// ACROSS repos; a global oldest-first would need a cross-repo pre-pass this
+	// does not justify.
+	adoptableNums := make([]int, 0, len(passes))
+	for i := range passes {
+		if passes[i].disp == PRAdoptUpgrade {
+			adoptableNums = append(adoptableNums, passes[i].pr.Number)
+		}
+	}
+	slices.Sort(adoptableNums)
+	if len(adoptableNums) > *adoptHeadroom {
+		adoptableNums = adoptableNums[:max(*adoptHeadroom, 0)]
+	}
+	adoptable := make(map[int]bool, len(adoptableNums))
+	for _, n := range adoptableNums {
+		adoptable[n] = true
+	}
+
+	// PHASE 2: ACT. Same order the forge listed in, same body as before.
+	for _, p := range passes {
+		pr, cr, claimedBy, ownerTask := p.pr, p.cr, p.claimedBy, p.ownerTask
+		switch p.disp {
 		case PRAdopt:
 			if aerr := r.adoptPRIntoTask(ctx, proj, repo, pr, ownerTask, sp); aerr != nil {
 				fail("adopt_pr", aerr, "repo", repo.Name, "number", pr.Number)
@@ -1408,13 +1777,39 @@ func (r *ProjectReconciler) sweepPRs(ctx context.Context, proj *tatarav1alpha1.P
 			l.Info("sweep: adopted agent PR into its owning task",
 				"action", "sweep_adopt_pr", "resource_id", ownerTask.Name, "activity", activity,
 				"repo", repo.Name, "number", pr.Number, "head_branch", pr.HeadBranch)
+		case PRAdoptUpgrade:
+			if *adoptHeadroom <= 0 || !adoptable[pr.Number] {
+				skipPR(ctx, proj, repo, pr.Number, activity, SweepSkipUpgradeHeadroom,
+					"head_branch", pr.HeadBranch)
+				break
+			}
+			// The PRRef, not the MergeRequest CR: for a merge request no Task
+			// has ever bound there IS no CR, and the mint's own bindMRToTask is
+			// what creates it. pr carries everything needed - number, title,
+			// author, head branch, head SHA, body - from THIS pass's ListOpenPRs
+			// call, so there is no second round trip either.
+			tk, outcome, aerr := r.minter().MintAdoptedUpgradeTask(ctx, proj, repo, pr, sp)
+			if aerr != nil {
+				fail("adopt_upgrade_mr", aerr, "repo", repo.Name, "number", pr.Number)
+				continue
+			}
+			if outcome == MintCreated {
+				*adoptHeadroom--
+				l.Info("sweep: adopted a dependency upgrade merge request into an upgrade task",
+					"action", "sweep_adopt_upgrade_mr", "resource_id", tk.Name, "activity", activity,
+					"repo", repo.Name, "number", pr.Number, "head_branch", pr.HeadBranch,
+					"author", pr.Author)
+			}
 		case PRReview:
 			stg, reason := MintReviewStage(cr)
 			if !budget.allow(ctx, reason) {
-				// Counted AND logged. This arm used to count nothing at all, so
-				// an orphan PR deferred by the budget was the one skip in the
-				// pass with no series and no line anywhere.
-				skipPR(ctx, proj, repo, pr.Number, activity, SweepSkipMintBudget, "state", stg)
+				// LOGGED per item, COUNTED once per pass. This arm used to count
+				// nothing at all, so an orphan PR deferred by the budget was the
+				// one skip in the pass with no series and no line anywhere; it
+				// then counted every deferred item on every pass, which is the
+				// opposite mistake (see sweepBudget.countBudgetSkip).
+				skipPRMetered(ctx, proj, repo, pr.Number, activity, SweepSkipMintBudget,
+					budget.countBudgetSkip(), "state", stg)
 				continue
 			}
 			task, outcome, merr := r.minter().MintReviewTask(ctx, proj, repo, pr, cr, stg, reason, sp)
@@ -1567,6 +1962,7 @@ func mrSnapshot(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, p
 	return scm.MergeRequest{
 		Number:     pr.Number,
 		URL:        mrURLFromRepoURL(repo.Spec.URL, providerOf(proj), pr.Repo, pr.Number),
+		Title:      pr.Title,
 		Author:     pr.Author,
 		Body:       pr.Body,
 		State:      "open",

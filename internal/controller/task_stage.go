@@ -958,7 +958,7 @@ func (r *TaskReconciler) reconcileTriaging(ctx context.Context, proj *tatarav1al
 		return ctrl.Result{}, err
 	}
 
-	next, ok := triageTarget(task.Spec.Kind)
+	next, ok := triageTarget(task)
 	if !ok {
 		log.FromContext(ctx).Info("triage: no state for this task kind",
 			"action", "triage_unknown_kind", "resource_id", task.Name, "kind", task.Spec.Kind)
@@ -980,12 +980,17 @@ func (r *TaskReconciler) reconcileTriaging(ctx context.Context, proj *tatarav1al
 // under-implementation is the one restapi's gate grants. A Task minted
 // kind=implement therefore lands in front of the gate, not past it.
 //
-// THERE IS NO `upgrade` ROW EITHER, for the same reason and with the same
-// consequence: the upgrade cron mints with InitialState = under-implementation
-// (projectscan.go createUpgradeTask), because `refined`'s only exit into
-// under-implementation is submit_outcome(action=approved) and the upgrade
-// outcome schema has no such action. An upgrade Task arriving at `new` parks at
-// triage-stalled instead of grinding against an edge it could never take.
+// THE `upgrade` ROW IS CONDITIONAL, and it is the only one that is. An ADOPTED
+// upgrade Task - minted onto a third-party dependency merge request that already
+// exists (stage.AdoptedMR) - takes the REVIEW LANE: the merge request is already
+// written and CI-tested, so a review turn decides whether it needs anything from
+// us at all, and only a request_changes sends it to the upgrade agent. A trivial
+// pin bump therefore costs one review turn instead of an implement turn plus a
+// review turn. A CRON-minted upgrade Task has NO row and still parks
+// triage-stalled if it ever arrives here: it mints with InitialState =
+// under-implementation (projectscan.go createUpgradeTask), because `refined`'s
+// only exit into under-implementation is submit_outcome(action=approved) and the
+// upgrade outcome schema has no such action, so it never reaches triage at all.
 //
 // THERE IS NO `documentation` ROW, and its absence is the point. It used to
 // return under-implementation, which is NOT in the table's `new` row - so a
@@ -997,14 +1002,26 @@ func (r *TaskReconciler) reconcileTriaging(ctx context.Context, proj *tatarav1al
 // through to the no-row branch means a documentation Task that somehow does
 // arrive at `new` parks at triage-stalled, loudly and once, instead of grinding
 // against an edge that does not exist.
-func triageTarget(kind string) (string, bool) {
-	switch kind {
+func triageTarget(task *tatarav1alpha1.Task) (string, bool) {
+	if task == nil {
+		return "", false
+	}
+	switch task.Spec.Kind {
 	case stage.AgentBrainstorm, stage.AgentIncident, stage.AgentRefine, stage.AgentImplement:
 		return tatarav1alpha1.StateRefined, true
 	case "takeover":
 		return tatarav1alpha1.StateRefined, true
 	case stage.AgentReview:
 		return tatarav1alpha1.StateAwaitingReview, true
+	case stage.AgentUpgrade:
+		// AdoptedUpgrade, not AdoptedMR. The enclosing case already supplies the
+		// kind half, so the looser predicate happens to be correct here - which
+		// is exactly the foot-gun stage.AdoptedMR's own doc block warns about,
+		// and the reason an adoption-keyed caller must never spell it that way.
+		if stage.AdoptedUpgrade(task) {
+			return tatarav1alpha1.StateAwaitingReview, true
+		}
+		return "", false
 	default:
 		return "", false
 	}
