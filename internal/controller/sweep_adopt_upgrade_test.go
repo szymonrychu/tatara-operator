@@ -1,7 +1,13 @@
 package controller
 
 import (
+	"fmt"
 	"testing"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/szymonrychu/tatara-operator/internal/obs"
+	"github.com/szymonrychu/tatara-operator/internal/stage"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
@@ -248,5 +254,166 @@ func TestClassifyPR_ClauseOneStillWins(t *testing.T) {
 	}
 	if got := ClassifyPR(proj, adoptRepo(), pr, task, ""); got != PRAdopt {
 		t.Fatalf("ClassifyPR = %v, want PRAdopt", got)
+	}
+}
+
+// sweepAdoptProject is the sweep-harness project ARMED for adoption: the
+// prefix, and an upgrade cron carrying the lane cap adoption competes for.
+func sweepAdoptProject(name string, maxOpen int) *tatarav1alpha1.Project {
+	p := sweepProject(name)
+	p.Spec.UpgradePolicy = &tatarav1alpha1.UpgradePolicySpec{AdoptBranchPrefix: "renovate/"}
+	p.Spec.Scm.Cron = &tatarav1alpha1.ScmCron{
+		Upgrade: tatarav1alpha1.UpgradeActivity{Schedule: "0 */4 * * *", MaxOpenUpgrades: maxOpen},
+	}
+	return p
+}
+
+// sweepRenovatePR is a listing row shaped like the sweep's own repo fixture.
+func sweepRenovatePR(number int, branch string) scm.PRRef {
+	return scm.PRRef{
+		Repo: "szymonrychu/tatara-operator", HeadRepo: "szymonrychu/tatara-operator",
+		Number: number, Author: "tatara-bot", HeadBranch: branch,
+		Title: "chore(deps): update something", HeadSHA: "sha", Body: "notes",
+	}
+}
+
+// Capacity. Adoption is unbounded by construction - the engine opens as many
+// merge requests as there are updates - so maxOpenUpgrades must govern it or
+// the first run after arming mints a Task per open merge request at once. The
+// counter is openUpgradeLaneCount, SHARED with the cron: the two sources
+// compete for the same lanes rather than each getting their own.
+func TestSweepAdoption_MintsAtMostTheRemainingUpgradeHeadroom(t *testing.T) {
+	proj := sweepAdoptProject("adopt-headroom-proj", 2)
+	repo := sweepRepo("adopt-headroom-proj")
+	// One live CRON-minted upgrade Task already holds a lane.
+	cron := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "upgrade-cron-live", Namespace: testNS},
+		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: proj.Name, Kind: "upgrade", Goal: "g"},
+	}
+	cron.Status.State = tatarav1alpha1.StateUnderImplementation
+	c := newMirrorClient(t, proj, repo, cron)
+	rd := &sweepReader{}
+	for n := 41; n <= 45; n++ {
+		rd.prs = append(rd.prs, sweepRenovatePR(n, fmt.Sprintf("renovate/dep-%d", n)))
+	}
+	before := testutil.ToFloat64(obs.SweepSkippedTotal.WithLabelValues(
+		proj.Name, SweepActivity, SweepSkipUpgradeHeadroom))
+
+	runSweep(t, c, proj, repo, rd)
+
+	adopted := adoptedTasksIn(t, c, proj.Name)
+	if len(adopted) != 1 {
+		t.Fatalf("adopted %d Tasks, want exactly 1 (maxOpenUpgrades 2 minus the live cron lane)", len(adopted))
+	}
+	if adopted[0].Spec.Source.Number != 41 {
+		t.Errorf("adopted merge request %d, want the OLDEST (41)", adopted[0].Spec.Source.Number)
+	}
+	after := testutil.ToFloat64(obs.SweepSkippedTotal.WithLabelValues(
+		proj.Name, SweepActivity, SweepSkipUpgradeHeadroom))
+	if after-before != 4 {
+		t.Errorf("upgrade_headroom_bound skips = %v, want 4 (the merge requests deferred to a later pass)", after-before)
+	}
+
+	// A SECOND pass with the first adopted Task still live creates none.
+	runSweep(t, c, proj, repo, rd)
+	if n := len(adoptedTasksIn(t, c, proj.Name)); n != 1 {
+		t.Fatalf("adopted %d Tasks after a second pass, want still 1: the lane is full", n)
+	}
+}
+
+// adoptedTasksIn returns the ADOPTED upgrade Tasks in the project (the cron
+// fixture is kind=upgrade too, so the discriminator is stage.AdoptedMR).
+func adoptedTasksIn(t *testing.T, c client.Client, proj string) []tatarav1alpha1.Task {
+	t.Helper()
+	out := []tatarav1alpha1.Task{}
+	for _, tk := range sweepTasks(t, c, proj) {
+		if tk.Spec.Kind == "upgrade" && stage.AdoptedMR(&tk) {
+			out = append(out, tk)
+		}
+	}
+	return out
+}
+
+// Fairness. The forge lists newest-first and the sweep does not sort, so
+// without an explicit ordering the newest merge request would be adopted first
+// and the oldest could starve indefinitely under a tight cap.
+func TestAdoptableUpgradeNumbers_TakesTheOldestFirst(t *testing.T) {
+	proj := projectWithAdoptPrefix("szymonrychu-bot", "renovate/")
+	prs := []scm.PRRef{ // as the forge returns them: newest first
+		{Number: 90, Repo: "charts", HeadRepo: "charts", Author: "szymonrychu-bot", HeadBranch: "renovate/loki"},
+		{Number: 41, Repo: "charts", HeadRepo: "charts", Author: "szymonrychu-bot", HeadBranch: "renovate/cilium"},
+		{Number: 77, Repo: "charts", HeadRepo: "charts", Author: "szymonrychu-bot", HeadBranch: "renovate/grafana"},
+		{Number: 55, Repo: "charts", HeadRepo: "charts", Author: "szymonrychu", HeadBranch: "feat/human-work"},
+	}
+	got := adoptableUpgradeNumbers(proj, prs, 2)
+	if !got[41] || !got[77] {
+		t.Fatalf("want the two lowest adoptable numbers 41 and 77, got %v", got)
+	}
+	if got[90] {
+		t.Error("90 is newer than both and must not be in a limit-2 selection")
+	}
+	if got[55] {
+		t.Error("a non-prefixed, human-authored branch must never be selected")
+	}
+	if n := len(adoptableUpgradeNumbers(proj, prs, 0)); n != 0 {
+		t.Errorf("limit 0 must select nothing, got %d", n)
+	}
+	off := projectWithAdoptPrefix("szymonrychu-bot", "")
+	if n := len(adoptableUpgradeNumbers(off, prs, 5)); n != 0 {
+		t.Errorf("adoption unconfigured must select nothing, got %d", n)
+	}
+}
+
+// Adoption must not consume the sweepBudget that mints review and issue Tasks.
+// They are different capacity dimensions: maxNewTasksPerSweep protects the
+// forge and the token spend for NEW work, maxOpenUpgrades protects the upgrade
+// lane. Coupling them would let a busy engine run starve issue triage.
+func TestSweepAdoption_DoesNotConsumeTheReviewMintBudget(t *testing.T) {
+	proj := sweepAdoptProject("adopt-budget-proj", 2)
+	proj.Spec.MaxNewTasksPerSweep = 1
+	proj.Spec.TriggerLabel = "tatara"
+	proj.Spec.Scm.PRReactionScope = "labeledOrMentioned"
+	repo := sweepRepo("adopt-budget-proj")
+	c := newMirrorClient(t, proj, repo)
+	rd := &sweepReader{prs: []scm.PRRef{
+		sweepRenovatePR(41, "renovate/cilium"),
+		{Repo: "szymonrychu/tatara-operator", HeadRepo: "szymonrychu/tatara-operator",
+			Number: 42, Author: "alice", HeadBranch: "feat/thing", Labels: []string{"tatara"}},
+	}}
+
+	runSweep(t, c, proj, repo, rd)
+
+	tasks := sweepTasks(t, c, proj.Name)
+	var adopted, review int
+	for i := range tasks {
+		switch tasks[i].Spec.Kind {
+		case "upgrade":
+			adopted++
+		case SweepReviewKind:
+			review++
+		}
+	}
+	if adopted != 1 {
+		t.Errorf("adopted = %d, want 1", adopted)
+	}
+	if review != 1 {
+		t.Errorf("review Tasks = %d, want 1: adoption must not eat maxNewTasksPerSweep", review)
+	}
+}
+
+// A project that configures the prefix but has NO upgrade cron adopts nothing,
+// and must not panic reading Cron.Upgrade through a nil Cron. No declared
+// upgrade capacity means no adoption.
+func TestSweepAdoption_NoUpgradeCronMeansNoHeadroomAndNoPanic(t *testing.T) {
+	proj := sweepProject("adopt-nocron-proj")
+	proj.Spec.UpgradePolicy = &tatarav1alpha1.UpgradePolicySpec{AdoptBranchPrefix: "renovate/"}
+	repo := sweepRepo("adopt-nocron-proj")
+	c := newMirrorClient(t, proj, repo)
+	rd := &sweepReader{prs: []scm.PRRef{sweepRenovatePR(41, "renovate/cilium")}}
+
+	runSweep(t, c, proj, repo, rd)
+
+	if n := len(adoptedTasksIn(t, c, proj.Name)); n != 0 {
+		t.Fatalf("adopted %d Tasks with no upgrade cron configured, want 0", n)
 	}
 }

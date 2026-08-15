@@ -145,6 +145,14 @@ const (
 	// series cannot be alerted on.
 	SweepSkipMintNotOwed = "mint_not_owed"
 
+	// SweepSkipUpgradeHeadroom: an adoptable dependency merge request the
+	// project has no upgrade lane free for this pass. NOT an error and not
+	// metered as one: it is picked up oldest-first on a later pass as lanes
+	// free. maxOpenUpgrades is the whole point - adoption is unbounded by
+	// construction and would otherwise mint a Task per open merge request at
+	// once on the first pass after it is armed.
+	SweepSkipUpgradeHeadroom = "upgrade_headroom_bound"
+
 	// SweepIssueKind is the Task kind a sweep-minted ISSUE Task carries.
 	//
 	// It was "clarify" until #521 folded that kind away. It is NOT a hole in the
@@ -861,6 +869,40 @@ func AdoptUpgradeMR(proj *tatarav1alpha1.Project, pr scm.PRRef,
 	return !hasLabel(pr.Labels, proj.Spec.TriggerLabel)
 }
 
+// adoptableUpgradeNumbers returns the merge-request numbers, from one repo's
+// listing, that this pass may adopt: shape-matching per AdoptUpgradeMR's
+// branch/author/fork/label tests, sorted ASCENDING and capped at limit.
+//
+// Ascending, because the forge lists newest-first (GitLab's default is
+// created_at desc and ListOpenPRs sets no ordering) and the cap is tight, so
+// taking them in list order would starve the oldest merge request indefinitely.
+// Number is the age proxy rather than UpdatedAt: merge-request IIDs are
+// monotonic per project, while UpdatedAt moves every time a pipeline touches it.
+//
+// It deliberately does NOT test owner/liveOwner - those need per-merge-request
+// CR reads the caller already does. This is a shape-and-order filter; the real
+// guard is AdoptUpgradeMR inside ClassifyPR.
+func adoptableUpgradeNumbers(proj *tatarav1alpha1.Project, prs []scm.PRRef, limit int) map[int]bool {
+	out := map[int]bool{}
+	if limit <= 0 || adoptBranchPrefixOf(proj) == "" {
+		return out
+	}
+	nums := make([]int, 0, len(prs))
+	for _, pr := range prs {
+		if AdoptUpgradeMR(proj, pr, nil, "") {
+			nums = append(nums, pr.Number)
+		}
+	}
+	slices.Sort(nums)
+	if len(nums) > limit {
+		nums = nums[:limit]
+	}
+	for _, n := range nums {
+		out[n] = true
+	}
+	return out
+}
+
 // PRDisposition is the outcome of B.4's four-clause PR/MR disposition.
 type PRDisposition string
 
@@ -1222,6 +1264,32 @@ func (r *ProjectReconciler) SweepProject(ctx context.Context, proj *tatarav1alph
 			"action", "sweep_writer_unavailable", "resource_id", proj.Name, "activity", activity, "error", werr.Error())
 	}
 
+	// Adoption headroom for the WHOLE pass, computed once. Per-repo would let a
+	// project with five repos mint five times the cap. openUpgradeLaneCount is
+	// the same counter the upgrade cron checks, so cron mints and adoptions
+	// compete for the same lanes rather than each getting a private allowance -
+	// which is what "maxOpenUpgrades governs adoption" has to mean.
+	//
+	// The nil guard on Cron is load-bearing: adoptBranchPrefixOf reads
+	// Spec.UpgradePolicy, which is independent of Spec.Scm.Cron, so a project
+	// could configure the prefix with no upgrade cron at all and reading
+	// Cron.Upgrade unguarded would panic. In that shape the headroom stays 0 and
+	// nothing adopts, which is the right answer: a project with no
+	// maxOpenUpgrades has declared no upgrade capacity.
+	adoptHeadroom := 0
+	if adoptBranchPrefixOf(proj) != "" && proj.Spec.Scm != nil && proj.Spec.Scm.Cron != nil {
+		maxOpen := proj.Spec.Scm.Cron.Upgrade.MaxOpenUpgrades
+		if maxOpen <= 0 {
+			maxOpen = 1
+		}
+		if live, cerr := r.openUpgradeLaneCount(ctx, proj); cerr != nil {
+			// Fail CLOSED: an uncountable lane budget adopts nothing this pass.
+			fail("count_upgrade_lanes", cerr)
+		} else if live < maxOpen {
+			adoptHeadroom = maxOpen - live
+		}
+	}
+
 	for i := range repos {
 		repo := &repos[i]
 		owner, name, oerr := scm.OwnerRepo(repo.Spec.URL)
@@ -1242,7 +1310,8 @@ func (r *ProjectReconciler) SweepProject(ctx context.Context, proj *tatarav1alph
 			continue
 		}
 		requeue = soonerRequeue(requeue,
-			r.sweepPRs(ctx, proj, repo, reader, writer, token, owner, name, prs, budget, minted, sp, activity, fail))
+			r.sweepPRs(ctx, proj, repo, reader, writer, token, owner, name, prs, budget, minted, sp, activity,
+				&adoptHeadroom, fail))
 	}
 
 	// EVERY pass, including the zero: a sweep that mints nothing is the signal
@@ -1511,10 +1580,16 @@ func (r *ProjectReconciler) sweepIssues(ctx context.Context, proj *tatarav1alpha
 func (r *ProjectReconciler) sweepPRs(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository,
 	reader scm.SCMReader, writer scm.SCMWriter, token, owner, name string,
 	prs []scm.PRRef, budget *sweepBudget, minted map[string]int, sp objbudget.Spiller, activity string,
-	fail func(string, error, ...any)) time.Duration {
+	adoptHeadroom *int, fail func(string, error, ...any)) time.Duration {
 
 	l := log.FromContext(ctx)
 	requeue := time.Duration(0)
+	// Selected once per repo against the CURRENT shared headroom, so the loop
+	// visits the oldest adoptable merge requests first even though the forge
+	// listed them newest-first. Fairness is oldest-first WITHIN a repo and
+	// repo-iteration-order ACROSS repos; a global oldest-first would need a
+	// cross-repo pre-pass this does not justify.
+	adoptable := adoptableUpgradeNumbers(proj, prs, *adoptHeadroom)
 	for _, pr := range prs {
 		// The mirror is read BEFORE the branch lookup, not after: its controller
 		// owner is what disambiguates a head branch that several Tasks share
@@ -1547,6 +1622,29 @@ func (r *ProjectReconciler) sweepPRs(ctx context.Context, proj *tatarav1alpha1.P
 			l.Info("sweep: adopted agent PR into its owning task",
 				"action", "sweep_adopt_pr", "resource_id", ownerTask.Name, "activity", activity,
 				"repo", repo.Name, "number", pr.Number, "head_branch", pr.HeadBranch)
+		case PRAdoptUpgrade:
+			if *adoptHeadroom <= 0 || !adoptable[pr.Number] {
+				skipPR(ctx, proj, repo, pr.Number, activity, SweepSkipUpgradeHeadroom,
+					"head_branch", pr.HeadBranch)
+				break
+			}
+			// The PRRef, not the MergeRequest CR: for a merge request no Task
+			// has ever bound there IS no CR, and the mint's own bindMRToTask is
+			// what creates it. pr carries everything needed - number, title,
+			// author, head branch, head SHA, body - from THIS pass's ListOpenPRs
+			// call, so there is no second round trip either.
+			tk, outcome, aerr := r.minter().MintAdoptedUpgradeTask(ctx, proj, repo, pr, sp)
+			if aerr != nil {
+				fail("adopt_upgrade_mr", aerr, "repo", repo.Name, "number", pr.Number)
+				continue
+			}
+			if outcome == MintCreated {
+				*adoptHeadroom--
+				l.Info("sweep: adopted a dependency upgrade merge request into an upgrade task",
+					"action", "sweep_adopt_upgrade_mr", "resource_id", tk.Name, "activity", activity,
+					"repo", repo.Name, "number", pr.Number, "head_branch", pr.HeadBranch,
+					"author", pr.Author)
+			}
 		case PRReview:
 			stg, reason := MintReviewStage(cr)
 			if !budget.allow(ctx, reason) {
