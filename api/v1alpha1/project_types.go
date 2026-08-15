@@ -851,6 +851,63 @@ type UpgradePolicySpec struct {
 	// +kubebuilder:default=nextHopOnly
 	// +optional
 	MajorStrategy string `json:"majorStrategy,omitempty"`
+	// AdoptBranchPrefix is the head-branch prefix that marks a dependency-upgrade
+	// merge request this project adopts into its own upgrade Task. Empty (the
+	// default) disables adoption entirely.
+	//
+	// THE PREFIX IS HALF THE TEST. The other half is the AUTHOR, which must be
+	// scm.botLogin or an UpgradeEngineLogins entry (see below and
+	// AdoptUpgradeMR). Prefix alone would adopt any branch anyone chose to name
+	// renovate/something, and an adopted merge request is one the platform will
+	// merge. The author is also what makes the merge LEGAL without any operator
+	// intervention: ownershipForAuthor classifies a botLogin-authored merge
+	// request `tatara`, so it is platform-owned from its first reconcile and
+	// nothing has to flip it.
+	//
+	// DEFAULT EMPTY ON PURPOSE, and set explicitly in the enrollment values. A
+	// structural-schema default is applied on EVERY write, including an
+	// unrelated helm upgrade, so a "renovate/" default would arm adoption on
+	// whichever apply happened next rather than at a moment somebody chose - and
+	// it would arm it on every enrolled project at once, which makes the
+	// Renovate-stops-merging cutover unschedulable. Same rule as
+	// MaxOpenUpgrades above, for the same reason.
+	//
+	// The trailing slash is enforced: a bare "renovate" would also match a human
+	// branch named renovate-experiment.
+	// +kubebuilder:validation:Pattern=`^$|^[A-Za-z0-9][A-Za-z0-9._-]*/$`
+	// +kubebuilder:validation:MaxLength=63
+	// +optional
+	AdoptBranchPrefix string `json:"adoptBranchPrefix,omitempty"`
+	// UpgradeEngineLogins are FORGE LOGINS, beyond scm.botLogin, that this
+	// project accepts as its dependency-upgrade engine. They mean two things,
+	// and both are identity statements the forge authenticated:
+	//
+	//  1. a merge request they AUTHORED under AdoptBranchPrefix is adoptable
+	//     (AdoptUpgradeMR). Prefix alone is not enough: anyone can push a branch
+	//     called renovate/anything, and an adopted merge request is one the
+	//     platform will merge.
+	//  2. a push they made to such a branch RE-ANCHORS the head baseline instead
+	//     of standing the merge request down (internal/webhook isUpgradeEngineActor).
+	//     A routine engine rebase is not a human taking the branch back.
+	//
+	// LEAVE IT EMPTY WHEN THE ENGINE RUNS WITH THE PLATFORM BOT'S OWN TOKEN,
+	// which is the shape project-infrastructure uses: botLogin already covers
+	// both meanings, and listing the bot again buys nothing.
+	//
+	// THESE ARE LOGINS, NOT GIT AUTHORS, AND THE DIFFERENCE IS THE WHOLE POINT.
+	// A forge login is the authenticated account behind a token; a git commit's
+	// author is a string the pusher chose, is not verified by anything, and
+	// survives `git commit --amend` unchanged - so a human amending an engine's
+	// commit reads as the engine. This repo has refused to key decisions on it
+	// three times already (MergeRequestStatus.MergedSHA, OperatorLandedSHA,
+	// brainstormResumeKind). Do not add a git-author variant of this field.
+	//
+	// NEVER put a human maintainer here. It would make every push that human
+	// makes to a prefixed branch re-anchor rather than hand the merge request
+	// back, which is the one thing the ownership state machine exists to do.
+	// +kubebuilder:validation:MaxItems=8
+	// +optional
+	UpgradeEngineLogins []string `json:"upgradeEngineLogins,omitempty"`
 	// +optional
 	MinimumReleaseAge *ReleaseAgeSpec `json:"minimumReleaseAge,omitempty"`
 }

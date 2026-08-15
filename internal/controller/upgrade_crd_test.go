@@ -102,6 +102,78 @@ func TestProjectCRD_MaxOpenUpgradesDefaultsToOneOnCreate(t *testing.T) {
 			"which is why the goal renderer resolves the default-off shape itself")
 }
 
+// Adoption is OFF by default. The CRD default is deliberately EMPTY, not
+// "renovate/": a structural-schema default is applied on EVERY write, so a
+// non-empty default would arm adoption on whichever unrelated helm apply
+// happens next, at a moment nobody chose. It is armed explicitly in the
+// enrollment values instead, exactly like maxOpenUpgrades.
+func TestProjectCRD_AdoptBranchPrefixDefaultsToEmpty(t *testing.T) {
+	ctx := context.Background()
+	proj := upgradeProject(t, "p-adopt-default")
+	proj.Spec.UpgradePolicy = &tataradevv1alpha1.UpgradePolicySpec{Engine: "renovate"}
+	require.NoError(t, k8sClient.Create(ctx, proj))
+
+	var got tataradevv1alpha1.Project
+	require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(proj), &got))
+	require.Empty(t, got.Spec.UpgradePolicy.AdoptBranchPrefix,
+		"adoptBranchPrefix must default to empty: adoption is off until an enrollment value arms it")
+}
+
+func TestProjectCRD_AcceptsAdoptBranchPrefix(t *testing.T) {
+	ctx := context.Background()
+	proj := upgradeProject(t, "p-adopt-set")
+	proj.Spec.UpgradePolicy = &tataradevv1alpha1.UpgradePolicySpec{
+		Engine: "renovate", AdoptBranchPrefix: "renovate/",
+	}
+	require.NoError(t, k8sClient.Create(ctx, proj))
+
+	var got tataradevv1alpha1.Project
+	require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(proj), &got))
+	require.Equal(t, "renovate/", got.Spec.UpgradePolicy.AdoptBranchPrefix)
+}
+
+// The trailing slash is REQUIRED. Without it a prefix of "renovate" would also
+// match a human branch called renovate-experiment, and adoption would take a
+// merge request nobody meant it to have.
+func TestProjectCRD_RejectsAPrefixWithNoTrailingSlash(t *testing.T) {
+	ctx := context.Background()
+	proj := upgradeProject(t, "p-adopt-noslash")
+	proj.Spec.UpgradePolicy = &tataradevv1alpha1.UpgradePolicySpec{AdoptBranchPrefix: "renovate"}
+	require.Error(t, k8sClient.Create(ctx, proj),
+		"a prefix with no trailing slash must be rejected by the pattern")
+}
+
+// The allowlist is OPTIONAL and defaults EMPTY. On project-infrastructure it
+// STAYS empty: Renovate runs with the platform bot's own token, so its merge
+// requests and its pushes are already botLogin and need no allowlisting. The
+// field exists for the deployment shape where the engine has its own account.
+func TestProjectCRD_UpgradeEngineLoginsDefaultsToEmpty(t *testing.T) {
+	ctx := context.Background()
+	proj := upgradeProject(t, "p-engine-default")
+	proj.Spec.UpgradePolicy = &tataradevv1alpha1.UpgradePolicySpec{
+		Engine: "renovate", AdoptBranchPrefix: "renovate/",
+	}
+	require.NoError(t, k8sClient.Create(ctx, proj))
+
+	var got tataradevv1alpha1.Project
+	require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(proj), &got))
+	require.Empty(t, got.Spec.UpgradePolicy.UpgradeEngineLogins)
+}
+
+func TestProjectCRD_AcceptsUpgradeEngineLogins(t *testing.T) {
+	ctx := context.Background()
+	proj := upgradeProject(t, "p-engine-set")
+	proj.Spec.UpgradePolicy = &tataradevv1alpha1.UpgradePolicySpec{
+		AdoptBranchPrefix:   "renovate/",
+		UpgradeEngineLogins: []string{"renovate-bot"},
+	}
+	require.NoError(t, k8sClient.Create(ctx, proj))
+
+	var got tataradevv1alpha1.Project
+	require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(proj), &got))
+	require.Equal(t, []string{"renovate-bot"}, got.Spec.UpgradePolicy.UpgradeEngineLogins)
+}
+
 // THE TWO AUTHOR ENUMS THE PLAN AND THE DESIGN BOTH MISSED, and they are
 // fail-closed at the API SERVER rather than in Go, so nothing in the operator
 // would have caught them.
