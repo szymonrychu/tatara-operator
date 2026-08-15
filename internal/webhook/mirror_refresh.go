@@ -252,7 +252,16 @@ func (s *Server) handleMRSynchronize(ctx context.Context, w http.ResponseWriter,
 	// BotLogin/push-identity here can only cause a spurious flip whose window
 	// is bounded by the next accept - it self-corrects there, it never
 	// compounds.
-	bot := isBotActor(&proj, ev.ActorLogin)
+	//
+	// isUpgradeEngineActor, not isBotActor: a dependency-upgrade engine
+	// rebasing its OWN branch is not a human taking the branch back, and parking
+	// the adopted upgrade Task ownership-lost for it would stall a merge request
+	// nobody touched. Everything above still holds - this is still the FAST PATH
+	// and /outcome's live GetPRHead read is still the authoritative stamp - and
+	// so does everything about a non-attributable pusher: a human, an unknown
+	// login and an empty login all leave LastBotHeadSHA stale, and
+	// ReconcileOwnership flips.
+	bot := isUpgradeEngineActor(&proj, ev.ActorLogin)
 	if s.stampMRHead(ctx, &proj, repo, ev.Number, ev.HeadSHA, bot) {
 		s.log.InfoContext(ctx, "mr: mirrored new head on synchronize; no review restart",
 			"action", "mr_synchronize_mirror", "project", proj.Name, "repository", repo.Name,
