@@ -66,8 +66,13 @@ type CreatedIssue struct {
 
 // PRRef is one open PR/MR listed for cron MR-triage.
 type PRRef struct {
-	Repo       string `json:"repo"`
-	Number     int    `json:"number"`
+	Repo   string `json:"repo"`
+	Number int    `json:"number"`
+	// Title is the merge request's own title. It is what the mirror's
+	// Status.Title is fed from on the intake path (mrSnapshot), and on a
+	// dependency-upgrade merge request it is the one place the unit and the
+	// target version are stated in a single line.
+	Title      string `json:"title,omitempty"`
 	Author     string `json:"author"`
 	HeadSHA    string `json:"headSha"`
 	HeadBranch string `json:"headBranch,omitempty"` // source/head branch; set when available from list API

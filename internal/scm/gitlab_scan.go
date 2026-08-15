@@ -14,6 +14,7 @@ import (
 
 type glMR struct {
 	IID          int    `json:"iid"`
+	Title        string `json:"title"`
 	SHA          string `json:"sha"`
 	SourceBranch string `json:"source_branch"` // head/source branch name
 	// GitLab reports the fork relationship as project IDs, not paths: an MR whose
@@ -77,7 +78,7 @@ func (c *GitLab) ListOpenPRs(ctx context.Context, owner, repo string) ([]PRRef, 
 			}
 		}
 		out = append(out, PRRef{
-			Repo: proj, Number: m.IID, Author: m.Author.Username, HeadRepo: headRepo,
+			Repo: proj, Number: m.IID, Title: m.Title, Author: m.Author.Username, HeadRepo: headRepo,
 			HeadSHA: m.SHA, HeadBranch: m.SourceBranch, Body: m.Description, Labels: m.Labels, UpdatedAt: m.UpdatedAt,
 		})
 	}

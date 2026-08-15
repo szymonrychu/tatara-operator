@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -763,6 +764,97 @@ func AdoptPR(proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task, pr scm.PRR
 	return pr.HeadRepo != "" && pr.HeadRepo == pr.Repo
 }
 
+// adoptBranchPrefixOf returns the project's configured adoptable head-branch
+// prefix, or "" when adoption is not configured (the default).
+func adoptBranchPrefixOf(proj *tatarav1alpha1.Project) string {
+	if proj == nil || proj.Spec.UpgradePolicy == nil {
+		return ""
+	}
+	return proj.Spec.UpgradePolicy.AdoptBranchPrefix
+}
+
+// adoptableAuthor reports whether author is an identity this project accepts as
+// its dependency-upgrade engine: the platform bot, or an explicitly allowlisted
+// upgradePolicy.upgradeEngineLogins entry. Exact match, and an EMPTY author is
+// never adoptable (a forge that will not say who opened a merge request does not
+// get the benefit of the doubt on one the platform would merge).
+//
+// This is a FORGE LOGIN, which the forge authenticated. It is deliberately not a
+// git commit author: see UpgradeEngineLogins' own doc comment, and the three
+// places this repo already refuses to key a decision on git author metadata.
+func adoptableAuthor(proj *tatarav1alpha1.Project, author string) bool {
+	if author == "" {
+		return false
+	}
+	if author == botLoginOf(proj) {
+		return true
+	}
+	if proj == nil || proj.Spec.UpgradePolicy == nil {
+		return false
+	}
+	return slices.Contains(proj.Spec.UpgradePolicy.UpgradeEngineLogins, author)
+}
+
+// AdoptUpgradeMR reports whether pr is a dependency-upgrade merge request this
+// project should adopt into its own upgrade Task. ALL of:
+//
+//	a. upgradePolicy.adoptBranchPrefix is configured (empty disables adoption)
+//	b. pr.headBranch starts with it
+//	c. pr.author is adoptable                    (the bot, or an allowlisted engine)
+//	d. pr.head.repo == pr.base.repo              (NO forks, ever)
+//	e. no Task owns the branch and no live Task owns the mirror CR
+//	f. pr does NOT carry the project trigger label
+//
+// (c) is what makes adoption SAFE TO MERGE rather than merely possible. An
+// adopted merge request is one the operator will merge on an approve, and
+// ownershipForAuthor grants that permission on exactly this identity - so
+// requiring it here means the ownership the merge corridor checks and the
+// identity this predicate checks are the SAME fact, rather than two facts a
+// mint-time flip has to reconcile. It also means anyone who pushes a branch
+// called renovate/whatever gets a review, not a merge.
+//
+// It is ALSO the cutover mechanism. While the engine still runs with a human's
+// token this returns false, the merge request falls through to clause 3, and a
+// review Task is minted exactly as before. The instant the engine's token moves
+// to the bot, the same merge request adopts - ahead of clause 2, which would
+// otherwise ignore every bot-authored merge request outright.
+//
+// (d) is AdoptPR's clause verbatim and for the same reason: a fork merge
+// request may name its head branch anything, including the configured prefix,
+// and an UNKNOWN head repo fails CLOSED.
+//
+// (e) is what stops re-adoption. taskForBranch matches on agent.TaskBranch and
+// can never see a renovate/* branch, so `owner` is nil for every pass - but the
+// adopted Task becomes the mirror CR's controller owner, which surfaces as
+// liveOwner, and from then on ClassifyPR's existing liveOwner clause sends this
+// merge request to PRIgnore.
+//
+// (f) is the human override. Applying the trigger label to a prefixed branch is
+// an explicit ask for a review, and an explicit human signal always outranks an
+// automatic disposition. It also makes this clause safe under
+// prReactionScope:"all", where every labelled merge request is reviewable.
+func AdoptUpgradeMR(proj *tatarav1alpha1.Project, pr scm.PRRef,
+	owner *tatarav1alpha1.Task, liveOwner string) bool {
+
+	prefix := adoptBranchPrefixOf(proj)
+	if prefix == "" {
+		return false
+	}
+	if !strings.HasPrefix(pr.HeadBranch, prefix) {
+		return false
+	}
+	if !adoptableAuthor(proj, pr.Author) {
+		return false
+	}
+	if pr.HeadRepo == "" || pr.HeadRepo != pr.Repo {
+		return false
+	}
+	if owner != nil || liveOwner != "" {
+		return false
+	}
+	return !hasLabel(pr.Labels, proj.Spec.TriggerLabel)
+}
+
 // PRDisposition is the outcome of B.4's four-clause PR/MR disposition.
 type PRDisposition string
 
@@ -774,6 +866,21 @@ const (
 	PRReview PRDisposition = "review"
 	// PRIgnore: clauses 2 and 4. No Task. No pod. No tokens.
 	PRIgnore PRDisposition = "ignore"
+	// PRAdoptUpgrade: a dependency-upgrade merge request - head branch under the
+	// project's upgradePolicy.adoptBranchPrefix AND authored by the bot or an
+	// allowlisted upgradePolicy.upgradeEngineLogins account - with no owner,
+	// adopted into its OWN upgrade Task bound to that existing merge request.
+	// This is the Renovate fan-out: Renovate opens one merge request per update
+	// with the changelog in the body, and every merge decision - including a
+	// trivial patch bump - goes through a Task rather than through automerge.
+	//
+	// BRANCH AND AUTHOR, BOTH. The branch is what distinguishes an upgrade
+	// merge request from the agent's own (clause 1 already took those); the
+	// author is what makes it safe to MERGE one, because ownershipForAuthor
+	// classifies a botLogin-authored merge request `tatara` and nothing has to
+	// flip it. Prefix alone would adopt any branch anyone chose to call
+	// renovate/something.
+	PRAdoptUpgrade PRDisposition = "adopt-upgrade"
 	// PRClaimed: clause 1b. The PR is adoptable BY SHAPE (bot-authored, on this
 	// Task's branch, same repo) but its MergeRequest CR is already
 	// controller-owned by a DIFFERENT Task, so the adoption is not this pass's
@@ -784,9 +891,13 @@ const (
 	PRClaimed PRDisposition = "claimed"
 )
 
-// ClassifyPR is B.4's PR/MR disposition. FOUR clauses:
+// ClassifyPR is B.4's PR/MR disposition. FOUR clauses, plus clause 1c:
 //
 //  1. ADOPT into owner's mrRefs iff AdoptPR
+//     1c. a DEPENDENCY-UPGRADE merge request (AdoptUpgradeMR: the configured
+//     head-branch prefix AND an engine author) with no owner -> adopt it
+//     into its OWN upgrade Task. Ahead of clauses 2 and 3, deliberately;
+//     see the clause body.
 //  2. BOT-AUTHORED and NOT ADOPTABLE  ->  IGNORE. FULL STOP.
 //  3. HUMAN-AUTHORED and its MergeRequest CR is an ORPHAN (no controller owner)
 //     ->  review Task iff prInReactionScope
@@ -861,6 +972,28 @@ func ClassifyPR(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, p
 			return PRClaimed
 		}
 		return PRAdopt
+	}
+	// CLAUSE 1c. A dependency-upgrade merge request adopts into its OWN upgrade
+	// Task. Placed here, ahead of the bot-author clause and ahead of
+	// prInReactionScope, and BOTH placements are required:
+	//
+	//   - ahead of clause 2, or an upgrade engine running with the bot's token
+	//     has every merge request swallowed by `pr.Author == bot -> PRIgnore`.
+	//     That failure mints nothing, logs nothing above V(1) and counts
+	//     nothing: the engine's merge requests simply stop existing as far as
+	//     the platform is concerned;
+	//   - ahead of clause 3, so that while the engine still runs with a HUMAN's
+	//     token nothing changes at all. AdoptUpgradeMR returns false on the
+	//     author, the merge request falls through, and prInReactionScope returns
+	//     true on its FIRST line for a trusted author - minting the same review
+	//     Task it mints today. That is the dormant window, and it is what lets
+	//     this release ship before the engine's token moves.
+	//
+	// AdoptUpgradeMR itself refuses to steal (owner/liveOwner) and refuses a
+	// trigger-labelled merge request, so neither clause 1 nor an explicit human
+	// review request is shadowed.
+	if AdoptUpgradeMR(proj, pr, owner, liveOwner) {
+		return PRAdoptUpgrade
 	}
 	bot := botLoginOf(proj)
 	if bot != "" && pr.Author == bot {
@@ -1567,6 +1700,7 @@ func mrSnapshot(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, p
 	return scm.MergeRequest{
 		Number:     pr.Number,
 		URL:        mrURLFromRepoURL(repo.Spec.URL, providerOf(proj), pr.Repo, pr.Number),
+		Title:      pr.Title,
 		Author:     pr.Author,
 		Body:       pr.Body,
 		State:      "open",
