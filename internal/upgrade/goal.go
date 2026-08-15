@@ -95,6 +95,8 @@ Invoke `+"`tatara-review-checklist`"+` and read its ADOPTED MERGE REQUEST row be
 - `+"`approve`"+` means the changelog obliges nothing beyond the pin and the change is ready: approving MERGES it. That is the COMMON case and it is correct - most of these merge requests need nothing from us, and routing a trivial bump through an implement turn is the cost this design exists to avoid.
 - `+"`request_changes`"+` means the changelog obliges complementary work. It hands the merge request to the upgrade agent, which pushes onto this same branch. Your findings ARE its work order, so name the key, the migration or the manifest, not just "check the release notes".
 
+The release level is already set to `+"`patch`"+` and you may RAISE it. Nothing else on this path declares one - there is no implement turn - so the platform seeds `+"`patch`"+` when it adopts the merge request, which is what makes an approve cut a release tag at all. If the changelog names a breaking change, a required migration or a raised minimum version, pass `+"`change_significance=minor`"+` or `+"`change_significance=major`"+` with your verdict and it is raised. A LOWER value is ignored.
+
 Read the diff as well as the body. It is usually one line; if it is not - a vendored manifest, a lockfile, a generated file - that is a signal, not noise.
 
 ## IF YOU ARE THE UPGRADE AGENT

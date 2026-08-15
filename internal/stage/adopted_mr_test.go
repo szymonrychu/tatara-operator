@@ -107,3 +107,38 @@ func TestLegalFor_AdoptedUpgradeTakesBothAwaitingReviewExits(t *testing.T) {
 			"an adopted upgrade Task must be able to take awaiting-review -> %s", to)
 	}
 }
+
+// AdoptedMR IS A SUPERSET AND THAT IS THE TRAP. A takeover Task and a kind=review
+// Task are BOTH minted onto an existing merge request and BOTH carry
+// spec.source.isPR with a number, so AdoptedMR is true for them. Every
+// behavioural difference of the adoption path must key on AdoptedUpgrade
+// instead: keying on AdoptedMR strips merge-after-stand-down from every takeover
+// and tells every review pod that approving merges the change.
+func TestAdoptedUpgrade_IsNarrowerThanAdoptedMR(t *testing.T) {
+	onAnMR := func(kind string) *v1alpha1.Task {
+		return &v1alpha1.Task{Spec: v1alpha1.TaskSpec{
+			Kind:   kind,
+			Source: &v1alpha1.TaskSource{IsPR: true, Number: 41},
+		}}
+	}
+	for _, kind := range []string{"takeover", "review", "implement"} {
+		tk := onAnMR(kind)
+		if !stage.AdoptedMR(tk) {
+			t.Fatalf("kind %q on a merge request is not AdoptedMR; the test premise is wrong", kind)
+		}
+		if stage.AdoptedUpgrade(tk) {
+			t.Errorf("AdoptedUpgrade is true for kind %q", kind)
+		}
+	}
+	if !stage.AdoptedUpgrade(onAnMR(stage.AgentUpgrade)) {
+		t.Error("AdoptedUpgrade is false for an adopted upgrade Task")
+	}
+	// A CRON-minted upgrade Task has no merge request and must stay out.
+	cron := &v1alpha1.Task{Spec: v1alpha1.TaskSpec{Kind: stage.AgentUpgrade}}
+	if stage.AdoptedUpgrade(cron) {
+		t.Error("AdoptedUpgrade is true for a cron-minted upgrade Task")
+	}
+	if stage.AdoptedUpgrade(nil) {
+		t.Error("AdoptedUpgrade is true for nil")
+	}
+}

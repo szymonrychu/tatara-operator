@@ -578,16 +578,16 @@ func TestClassifyPRTakesTheLIVEOwner(t *testing.T) {
 		Number: 7, Author: "tatara-bot", HeadBranch: agent.TaskBranch(owner),
 	}
 
-	if got := ClassifyPR(proj, repo, botPR, owner, "some-live-other-task"); got != PRClaimed {
+	if got := ClassifyPR(proj, repo, botPR, owner, "some-live-other-task", nil); got != PRClaimed {
 		t.Fatalf("a LIVE claimant: ClassifyPR = %q, want %q", got, PRClaimed)
 	}
-	if got := ClassifyPR(proj, repo, botPR, owner, ""); got != PRAdopt {
+	if got := ClassifyPR(proj, repo, botPR, owner, "", nil); got != PRAdopt {
 		t.Fatalf("a REAPED claimant: ClassifyPR = %q, want %q (a dangling ref is not a claim)", got, PRAdopt)
 	}
-	if got := ClassifyPR(proj, repo, humanPR(60), nil, "some-live-review-task"); got != PRIgnore {
+	if got := ClassifyPR(proj, repo, humanPR(60), nil, "some-live-review-task", nil); got != PRIgnore {
 		t.Fatalf("a LIVE reviewer: ClassifyPR = %q, want %q", got, PRIgnore)
 	}
-	if got := ClassifyPR(proj, repo, humanPR(60), nil, ""); got != PRReview {
+	if got := ClassifyPR(proj, repo, humanPR(60), nil, "", nil); got != PRReview {
 		t.Fatalf("a REAPED reviewer: ClassifyPR = %q, want %q", got, PRReview)
 	}
 }

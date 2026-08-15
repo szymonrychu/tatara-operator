@@ -185,7 +185,7 @@ func (m *Minter) MintForItem(ctx context.Context, proj *tatarav1alpha1.Project,
 		if lerr != nil {
 			return mintErr(SweepReviewKind, lerr)
 		}
-		switch ClassifyPR(proj, repo, item.PR, nil, liveOwner) {
+		switch ClassifyPR(proj, repo, item.PR, nil, liveOwner, cr) {
 		case PRReview:
 			stg, reason := MintReviewStage(cr)
 			return m.MintReviewTask(ctx, proj, repo, item.PR, cr, stg, reason, sp)

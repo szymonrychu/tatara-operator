@@ -1895,3 +1895,27 @@ func TestV2Body_OversizeIs413(t *testing.T) {
 	w := e.do(t, http.MethodPost, "/tasks/t1/notes", `{"kind":"note","body":"`+big+`"}`)
 	require.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
 }
+
+// A TASK THAT PUSHES NOWHERE CANNOT OPEN A MERGE REQUEST. agent.PushBranch is
+// EMPTY for any Task carrying AnnReviewHeadBranch (branchEnvValues' read-only
+// review arm), and OpenChange with an empty head asks the forge to open a merge
+// request from nothing. No tool profile reaches this endpoint from such a pod
+// today, so this is a structural guard rather than a live bug - which is exactly
+// why it needs a test: nothing else would notice if a profile changed.
+func TestMRWrite_Open_RefusedForATaskThatPushesToNoBranch(t *testing.T) {
+	reviewer := taskV2("rev-charts-9", "tatara", "review",
+		tatarav1alpha1.StateUnderImplementation, "implement")
+	reviewer.Annotations = map[string]string{
+		tatarav1alpha1.AnnReviewHeadBranch: "contrib/fix",
+	}
+	require.Empty(t, agent.PushBranch(reviewer), "the fixture must push nowhere")
+
+	forge := newRecordingForge()
+	e := buildV2(t, v2Opts{writer: forge}, projectV2("tatara"), scmSecretV2(),
+		repoV2("charts", "tatara"), reviewer)
+
+	w := e.do(t, http.MethodPost, "/projects/tatara/scm/mr-write",
+		`{"task":"rev-charts-9","action":"open","repo":"charts","title":"T","body":"B"}`)
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	require.Empty(t, forge.openedURLs, "OpenChange was called with an empty head branch")
+}

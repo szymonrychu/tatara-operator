@@ -61,7 +61,7 @@ func renovatePRAuthoredByTheHuman() scm.PRRef {
 // The headline case. Branch prefix AND an adoptable author, together.
 func TestClassifyPR_RenovateMRWithNoOwnerAdoptsAsUpgrade(t *testing.T) {
 	proj := projectWithAdoptPrefix("szymonrychu-bot", "renovate/")
-	if got := ClassifyPR(proj, adoptRepo(), renovatePR(), nil, ""); got != PRAdoptUpgrade {
+	if got := ClassifyPR(proj, adoptRepo(), renovatePR(), nil, "", nil); got != PRAdoptUpgrade {
 		t.Fatalf("ClassifyPR = %v, want PRAdoptUpgrade", got)
 	}
 }
@@ -76,12 +76,12 @@ func TestClassifyPR_AdoptionSitsAheadOfTheBotAuthorIgnore(t *testing.T) {
 	// Without adoption configured, a bot-authored MR on a branch no Task owns
 	// is exactly what clause 2 exists to swallow.
 	off := projectWithAdoptPrefix("szymonrychu-bot", "")
-	if got := ClassifyPR(off, repo, renovatePR(), nil, ""); got != PRIgnore {
+	if got := ClassifyPR(off, repo, renovatePR(), nil, "", nil); got != PRIgnore {
 		t.Fatalf("baseline ClassifyPR = %v, want PRIgnore (clause 2)", got)
 	}
 	// With it configured, the same merge request adopts instead.
 	on := projectWithAdoptPrefix("szymonrychu-bot", "renovate/")
-	if got := ClassifyPR(on, repo, renovatePR(), nil, ""); got != PRAdoptUpgrade {
+	if got := ClassifyPR(on, repo, renovatePR(), nil, "", nil); got != PRAdoptUpgrade {
 		t.Fatalf("ClassifyPR = %v, want PRAdoptUpgrade", got)
 	}
 }
@@ -98,7 +98,7 @@ func TestClassifyPR_AHumanAuthoredRenovateMRStillMintsAReviewTask(t *testing.T) 
 	proj.Spec.Scm.MaintainerLogins = []string{"szymonrychu"}
 	proj.Spec.Scm.ReporterLogins = []string{"szymonrychu"}
 
-	if got := ClassifyPR(proj, repo, renovatePRAuthoredByTheHuman(), nil, ""); got != PRReview {
+	if got := ClassifyPR(proj, repo, renovatePRAuthoredByTheHuman(), nil, "", nil); got != PRReview {
 		t.Fatalf("ClassifyPR = %v, want PRReview: adoption must stay dormant until the "+
 			"token change moves the author (sequencing constraint 7)", got)
 	}
@@ -107,7 +107,7 @@ func TestClassifyPR_AHumanAuthoredRenovateMRStillMintsAReviewTask(t *testing.T) 
 	off := projectWithAdoptPrefix("szymonrychu-bot", "")
 	off.Spec.Scm.MaintainerLogins = []string{"szymonrychu"}
 	off.Spec.Scm.ReporterLogins = []string{"szymonrychu"}
-	if got := ClassifyPR(off, repo, renovatePRAuthoredByTheHuman(), nil, ""); got != PRReview {
+	if got := ClassifyPR(off, repo, renovatePRAuthoredByTheHuman(), nil, "", nil); got != PRReview {
 		t.Fatalf("baseline ClassifyPR = %v, want PRReview (see plan deviation 2)", got)
 	}
 }
@@ -118,7 +118,7 @@ func TestAdoptUpgradeMR_AcceptsAnAllowlistedEngineLogin(t *testing.T) {
 	proj.Spec.UpgradePolicy.UpgradeEngineLogins = []string{"renovate-bot"}
 	pr := renovatePR()
 	pr.Author = "renovate-bot"
-	if !AdoptUpgradeMR(proj, pr, nil, "") {
+	if !AdoptUpgradeMR(proj, pr, nil, "", nil) {
 		t.Fatal("an allowlisted engine login must be adoptable")
 	}
 }
@@ -149,7 +149,7 @@ func TestAdoptUpgradeMR_RefusesEveryNonRenovateShape(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			pr := renovatePR()
 			tc.mut(&pr)
-			if AdoptUpgradeMR(tc.proj, pr, nil, "") {
+			if AdoptUpgradeMR(tc.proj, pr, nil, "", nil) {
 				t.Errorf("%s: AdoptUpgradeMR = true, want false", tc.name)
 			}
 		})
@@ -183,10 +183,10 @@ func TestAdoptableAuthor_IsExactMatchOnly(t *testing.T) {
 func TestAdoptUpgradeMR_NeverStealsAndNeverReAdopts(t *testing.T) {
 	proj := projectWithAdoptPrefix("szymonrychu-bot", "renovate/")
 	owned := &tatarav1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: "mt-u-charts-41-abc"}}
-	if AdoptUpgradeMR(proj, renovatePR(), owned, "") {
+	if AdoptUpgradeMR(proj, renovatePR(), owned, "", nil) {
 		t.Error("must not adopt a merge request whose branch already has an owning Task")
 	}
-	if AdoptUpgradeMR(proj, renovatePR(), nil, "mt-u-charts-41-abc") {
+	if AdoptUpgradeMR(proj, renovatePR(), nil, "mt-u-charts-41-abc", nil) {
 		t.Error("must not re-adopt: a controller-owned mirror CR means it is already adopted")
 	}
 }
@@ -206,7 +206,7 @@ func TestAdoptedAuthorsAreExactlyTheOwnershipTataraAuthors(t *testing.T) {
 	for _, author := range []string{"szymonrychu-bot", "renovate-bot"} {
 		pr := renovatePR()
 		pr.Author = author
-		if !AdoptUpgradeMR(proj, pr, nil, "") {
+		if !AdoptUpgradeMR(proj, pr, nil, "", nil) {
 			t.Fatalf("%s must be adoptable", author)
 		}
 		if got := ownershipForAuthor(proj, author); got != tatarav1alpha1.OwnershipTatara {
@@ -235,7 +235,7 @@ func TestAdoptedAuthorsAreExactlyTheOwnershipTataraAuthors(t *testing.T) {
 // clause is needed for the steady state and none may be added.
 func TestClassifyPR_AnAlreadyAdoptedMRIsIgnoredNotReAdopted(t *testing.T) {
 	proj := projectWithAdoptPrefix("szymonrychu-bot", "renovate/")
-	if got := ClassifyPR(proj, adoptRepo(), renovatePR(), nil, "mt-u-charts-41-abc"); got != PRIgnore {
+	if got := ClassifyPR(proj, adoptRepo(), renovatePR(), nil, "mt-u-charts-41-abc", nil); got != PRIgnore {
 		t.Fatalf("ClassifyPR = %v, want PRIgnore", got)
 	}
 }
@@ -252,7 +252,7 @@ func TestClassifyPR_ClauseOneStillWins(t *testing.T) {
 		Author: "szymonrychu-bot", HeadBranch: agent.TaskBranch(task),
 		Repo: "charts", HeadRepo: "charts",
 	}
-	if got := ClassifyPR(proj, adoptRepo(), pr, task, ""); got != PRAdopt {
+	if got := ClassifyPR(proj, adoptRepo(), pr, task, "", nil); got != PRAdopt {
 		t.Fatalf("ClassifyPR = %v, want PRAdopt", got)
 	}
 }
@@ -334,33 +334,55 @@ func adoptedTasksIn(t *testing.T, c client.Client, proj string) []tatarav1alpha1
 	return out
 }
 
-// Fairness. The forge lists newest-first and the sweep does not sort, so
-// without an explicit ordering the newest merge request would be adopted first
-// and the oldest could starve indefinitely under a tight cap.
-func TestAdoptableUpgradeNumbers_TakesTheOldestFirst(t *testing.T) {
-	proj := projectWithAdoptPrefix("szymonrychu-bot", "renovate/")
-	prs := []scm.PRRef{ // as the forge returns them: newest first
-		{Number: 90, Repo: "charts", HeadRepo: "charts", Author: "szymonrychu-bot", HeadBranch: "renovate/loki"},
-		{Number: 41, Repo: "charts", HeadRepo: "charts", Author: "szymonrychu-bot", HeadBranch: "renovate/cilium"},
-		{Number: 77, Repo: "charts", HeadRepo: "charts", Author: "szymonrychu-bot", HeadBranch: "renovate/grafana"},
-		{Number: 55, Repo: "charts", HeadRepo: "charts", Author: "szymonrychu", HeadBranch: "feat/human-work"},
+// Fairness. The forge lists newest-first and the acting loop keeps that order,
+// so without an explicit ordering on the adoption WINDOW the newest merge
+// request would be adopted first and the oldest could starve indefinitely under
+// a tight cap.
+//
+// It drives the whole sweep rather than a shape-only helper (which is what it
+// used to do, and which is exactly how the window came to be computed without
+// ownership - see TestSweepPRs_AlreadyAdoptedMergeRequestsDoNotConsumeTheAdoptionWindow).
+// A human's non-prefixed branch and an unconfigured project are both here for
+// the same reason: neither may ever consume a lane.
+func TestSweepAdoption_TakesTheOldestMergeRequestsFirst(t *testing.T) {
+	proj := sweepAdoptProject("adopt-oldest-proj", 2)
+	proj.Spec.Scm.PRReactionScope = "labeledOrMentioned"
+	repo := sweepRepo("adopt-oldest-proj")
+	c := newMirrorClient(t, proj, repo)
+	rd := &sweepReader{prs: []scm.PRRef{ // as the forge returns them: newest first
+		sweepRenovatePR(90, "renovate/loki"),
+		sweepRenovatePR(41, "renovate/cilium"),
+		sweepRenovatePR(77, "renovate/grafana"),
+		{Repo: "szymonrychu/tatara-operator", HeadRepo: "szymonrychu/tatara-operator",
+			Number: 55, Author: "alice", HeadBranch: "feat/human-work"},
+	}}
+
+	runSweep(t, c, proj, repo, rd)
+
+	got := map[int]bool{}
+	for _, tk := range adoptedTasksIn(t, c, proj.Name) {
+		got[tk.Spec.Source.Number] = true
 	}
-	got := adoptableUpgradeNumbers(proj, prs, 2)
 	if !got[41] || !got[77] {
-		t.Fatalf("want the two lowest adoptable numbers 41 and 77, got %v", got)
+		t.Fatalf("want the two OLDEST adoptable merge requests 41 and 77 adopted, got %v", got)
 	}
 	if got[90] {
-		t.Error("90 is newer than both and must not be in a limit-2 selection")
+		t.Error("90 is newer than both and must not be adopted into a two-lane cap")
 	}
 	if got[55] {
-		t.Error("a non-prefixed, human-authored branch must never be selected")
+		t.Error("a non-prefixed, human-authored branch must never be adopted")
 	}
-	if n := len(adoptableUpgradeNumbers(proj, prs, 0)); n != 0 {
-		t.Errorf("limit 0 must select nothing, got %d", n)
-	}
-	off := projectWithAdoptPrefix("szymonrychu-bot", "")
-	if n := len(adoptableUpgradeNumbers(off, prs, 5)); n != 0 {
-		t.Errorf("adoption unconfigured must select nothing, got %d", n)
+
+	// The same listing against a project with adoption unconfigured adopts
+	// nothing at all - the release-inert shape.
+	off := sweepAdoptProject("adopt-oldest-off-proj", 2)
+	off.Spec.UpgradePolicy.AdoptBranchPrefix = ""
+	off.Spec.Scm.PRReactionScope = "labeledOrMentioned"
+	offRepo := sweepRepo("adopt-oldest-off-proj")
+	offC := newMirrorClient(t, off, offRepo)
+	runSweep(t, offC, off, offRepo, &sweepReader{prs: rd.prs})
+	if n := len(adoptedTasksIn(t, offC, off.Name)); n != 0 {
+		t.Errorf("adoption unconfigured adopted %d merge requests, want 0", n)
 	}
 }
 
@@ -415,5 +437,45 @@ func TestSweepAdoption_NoUpgradeCronMeansNoHeadroomAndNoPanic(t *testing.T) {
 
 	if n := len(adoptedTasksIn(t, c, proj.Name)); n != 0 {
 		t.Fatalf("adopted %d Tasks with no upgrade cron configured, want 0", n)
+	}
+}
+
+// A DECLINE MUST OUTLIVE THE TASK THAT MADE IT.
+//
+// The reaper orphans the mirror and deletes a parked or terminal adopted Task,
+// which frees the deterministic Task name and leaves the mirror with no live
+// owner - so AdoptUpgradeMR clause (e) stops refusing and the next sweep
+// re-adopts the SAME merge request into a fresh Task with a fresh review turn.
+// A bump the upgrade agent declined as unsafe therefore comes back, and the next
+// reviewer sees none of that history. Clause (g) reads the durable marker the
+// reap stamps.
+func TestAdoptUpgradeMR_RefusesAMirrorMarkedAdoptionRefused(t *testing.T) {
+	proj := projectWithAdoptPrefix("szymonrychu-bot", "renovate/")
+	pr := renovatePR()
+
+	fresh := &tatarav1alpha1.MergeRequest{}
+	if !AdoptUpgradeMR(proj, pr, nil, "", fresh) {
+		t.Fatal("a mirror with no marker must still be adoptable")
+	}
+	refused := &tatarav1alpha1.MergeRequest{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{AnnAdoptionRefused: "implement-declined"},
+		},
+	}
+	if AdoptUpgradeMR(proj, pr, nil, "", refused) {
+		t.Fatal("a merge request the upgrade agent already declined was re-adopted: " +
+			"the decline is erased and a fresh review turn can approve and merge it")
+	}
+	if got := ClassifyPR(proj, adoptRepo(), pr, nil, "", refused); got != PRIgnore {
+		t.Fatalf("ClassifyPR = %v, want PRIgnore for a refused mirror", got)
+	}
+	// The marker is scoped to the MIRROR it is stamped on: a DIFFERENT merge
+	// request from the same engine is untouched, so one refusal never stops the
+	// lane.
+	other := renovatePR()
+	other.Number = 42
+	other.HeadBranch = "renovate/loki"
+	if got := ClassifyPR(proj, adoptRepo(), other, nil, "", nil); got != PRAdoptUpgrade {
+		t.Fatalf("ClassifyPR = %v on an unmarked sibling, want PRAdoptUpgrade", got)
 	}
 }

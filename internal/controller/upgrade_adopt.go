@@ -23,6 +23,43 @@ import (
 // upgrade outcome schema, and it must count against maxOpenUpgrades.
 const adoptedUpgradeKind = "upgrade"
 
+// adoptedSignificanceFloor is the change significance an adopted merge request's
+// mirror is seeded with at mint.
+//
+// WITHOUT IT THE COMMON PATH PUBLISHES NOTHING. Significance has exactly two
+// writers - the implement/upgrade `submitted` outcome and the review outcome's
+// OPTIONAL escalation - and on an adopted merge request APPROVED AT FIRST
+// REVIEW neither runs: there is no upgrade turn at all, and a reviewer that
+// declares no change_significance writes nothing (the escalation clause is
+// `if sig != ""`). reconcileMerge then finds an empty significance, calls it an
+// operator bug, and merges anyway: no semver label lands at the merge commit,
+// CI cuts NO tag, nothing publishes, no pin propagates, deployedAt is never
+// stamped, and the Task sits in `deploying` until its budget parks it. That is
+// the COMMON case, not an edge - most adopted bumps are trivial and approved on
+// the first review.
+//
+// WHY A DEFAULT AND NOT A REQUIREMENT. The alternative was to make
+// change_significance MANDATORY on a review outcome for an adopted Task. It was
+// rejected on three counts:
+//
+//  1. it puts a NEW hard refusal on the highest-consequence common path, driven
+//     by an agent this repo documents as flaky. A refused approve costs a whole
+//     review turn and can loop; a conservative tag cannot.
+//  2. under-tagging is RECOVERABLE and not-tagging is the wedge. A patch tag on
+//     a bump that deserved minor is corrected by the next release; no tag at all
+//     leaves a merged commit that never publishes and a Task that never
+//     resolves.
+//  3. `patch` is the honest floor for what the REPO ITSELF changed: one pin
+//     moved, which is a patch-level change to this repo's own artifact
+//     regardless of the dependency's own version jump.
+//
+// The reviewer keeps its say: `patch` is the LOWEST rank in restapi's
+// significanceRank table, so the review escalation clause outranks it for every
+// value a reviewer can declare, and both GoalAdopted and the review assignment
+// paragraph now tell the review agent so. An upgrade turn's `submitted` outcome
+// overwrites it outright, exactly as it does for any other Task.
+const adoptedSignificanceFloor = "patch"
+
 // THERE IS NO adoptedOwnershipReasonPrefix, AND THAT IS THE POINT. An earlier
 // draft stamped Status.Ownership=tatara with an "upgrade-adopted:" reason here,
 // because a dependency merge request authored by a human classifies `external`
@@ -200,6 +237,21 @@ func (m *Minter) MintAdoptedUpgradeTask(ctx context.Context, proj *tatarav1alpha
 		}
 	}); err != nil {
 		return nil, MintNotOwed, err
+	}
+
+	// SEED THE SEMVER FLOOR. See adoptedSignificanceFloor for why this exists at
+	// all and why it is a default rather than a requirement on the review
+	// outcome. IF-EMPTY, never an overwrite: a re-mint after a reap must not
+	// undo an escalation a review already recorded, and SyncMergeRequest never
+	// touches this field so the seed survives every mirror sync.
+	if err := objbudget.FitMergeRequest(ctx, m.Client, sp,
+		client.ObjectKey{Namespace: proj.Namespace, Name: mrName},
+		func(fresh *tatarav1alpha1.MergeRequest) {
+			if fresh.Status.Significance == "" {
+				fresh.Status.Significance = adoptedSignificanceFloor
+			}
+		}); err != nil {
+		return nil, MintNotOwed, fmt.Errorf("adopt: seed the semver floor on %s: %w", mrName, err)
 	}
 
 	// AND THAT IS THE WHOLE MINT. No ownership write of any kind: the merge

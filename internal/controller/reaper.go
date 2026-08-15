@@ -455,6 +455,21 @@ const (
 	// closed it (value: the Task name). ClosePR posts a comment with the reason,
 	// so re-closing an already-closed PR is not free.
 	AnnTerminalClosed = "tatara.dev/terminal-closed"
+	// AnnAdoptionRefused is stamped on a MERGEREQUEST CR when the ADOPTED
+	// upgrade Task bound to it is reaped without delivering it (value: the park
+	// or state reason that ended the Task). AdoptUpgradeMR clause (g) refuses a
+	// marked mirror, which is what makes a refusal DURABLE.
+	//
+	// Without it re-adoption is unbounded and a decline is ERASED. The reap
+	// orphans the mirror and frees the deterministic Task name, so the next
+	// sweep re-adopts the same merge request into a fresh Task with a fresh
+	// review turn - and the reviewer that turn sees none of the history, so a
+	// bump the upgrade agent declined as UNSAFE can be approved and merged on
+	// its second lap. Same mechanism and same reasoning as AnnTerminalClosed:
+	// the mirror outlives the Task, so a decision the Task made lives on the
+	// mirror. A human who disagrees applies the trigger label, which routes the
+	// merge request to an ordinary review Task (AdoptUpgradeMR clause f).
+	AnnAdoptionRefused = "tatara.dev/adoption-refused"
 	// AnnTerminalReleased is stamped on the TASK once its whole B.6 terminal
 	// sequence has completed. The Task then survives its retention window as a
 	// DEBUGGING ARTIFACT - owning nothing, blocking nothing.
@@ -1070,6 +1085,13 @@ func (r *ProjectReconciler) releaseTerminal(ctx context.Context, proj *tatarav1a
 		}
 	}
 
+	// Step 2a: an ADOPTED dependency merge request this Task never delivered is
+	// marked REFUSED. BEFORE step 3, which drops the very ownerRef that says
+	// which merge requests were this Task's. See AnnAdoptionRefused.
+	if err := r.markAdoptionRefused(ctx, t, mrs, wasController); err != nil {
+		return err
+	}
+
 	// Step 3: the B.5 handover, or an outright DROP.
 	survivors, err := r.releaseOwnership(ctx, proj, t, issues, mrs, live)
 	if err != nil {
@@ -1426,6 +1448,46 @@ func (r *ProjectReconciler) carryHumanReviewRounds(ctx context.Context, t *tatar
 	}
 	log.FromContext(ctx).Info("carried the human-review-round count onto a surviving mirror",
 		"action", "reap_carry_review_rounds", "resource_id", mr.Name, "task", t.Name, "rounds", rounds)
+	return nil
+}
+
+// markAdoptionRefused is B.6 step 2a: the durable refusal marker for an ADOPTED
+// dependency merge request whose Task is being reaped without delivering it.
+//
+// It is a MIRROR-ONLY write. The merge request is NOT closed and its branch is
+// NOT deleted - it belongs to the dependency engine, ourMR refuses it on both
+// clauses, and step 4 leaves it completely alone. All this says is "the platform
+// has already looked at this one and is not adopting it again".
+//
+// A MERGED merge request is skipped by the open-state test, so a delivered
+// adoption never marks anything. The value is the reason the Task ended
+// (implement-declined, stage-deadline, ownership-lost, ...) so a human reading
+// the mirror can see WHY without archaeology.
+func (r *ProjectReconciler) markAdoptionRefused(ctx context.Context, t *tatarav1alpha1.Task,
+	mrs []tatarav1alpha1.MergeRequest, wasController map[string]bool) error {
+
+	if !stage.AdoptedUpgrade(t) {
+		return nil
+	}
+	reason := t.Status.ParkReason
+	if reason == "" {
+		reason = t.Status.StateReason
+	}
+	if reason == "" {
+		reason = t.Status.State
+	}
+	for i := range mrs {
+		mr := &mrs[i]
+		if !wasController[mr.Name] || mr.Status.State != "open" || mr.Annotations[AnnAdoptionRefused] != "" {
+			continue
+		}
+		if err := r.annotateMR(ctx, mr, AnnAdoptionRefused, reason); err != nil {
+			return err
+		}
+		log.FromContext(ctx).Info("marked an adopted dependency merge request as refused; the sweep will not adopt it again",
+			"action", "reap_adoption_refused", "resource_id", t.Name,
+			"repo", mr.Spec.RepositoryRef, "number", mr.Spec.Number, "reason", reason)
+	}
 	return nil
 }
 

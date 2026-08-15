@@ -1496,6 +1496,18 @@ func (s *Server) mrOpen(w http.ResponseWriter, r *http.Request, proj *tatarav1al
 	// itself must name: opening from anything other than what the pod pushes to
 	// is the same defect one step later.
 	head := agent.PushBranch(task)
+	if head == "" {
+		// PushBranch is EMPTY for a Task that pushes nowhere: branchEnvValues'
+		// read-only review arm returns ("", checkoutBranch) for any Task
+		// carrying AnnReviewHeadBranch. Such a pod has no MCP profile that can
+		// reach this endpoint today, so this is unreachable - but "unreachable"
+		// is not "harmless": OpenChange with an empty head asks the forge to
+		// open a merge request from nothing, and on a Task whose whole design is
+		// that it never pushes. Refuse it here rather than discover what each
+		// provider does with it.
+		writeError(w, http.StatusBadRequest, "this task pushes to no branch; it cannot open a merge request")
+		return
+	}
 
 	mrs, err := s.ownedMRs(ctx, task)
 	if err != nil {

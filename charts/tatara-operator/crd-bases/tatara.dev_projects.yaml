@@ -6345,6 +6345,13 @@ spec:
                     maxItems: 8
                     type: array
                 type: object
+                x-kubernetes-validations:
+                - message: 'upgradeEngineLogins requires a non-empty adoptBranchPrefix:
+                    the allowlist widens merge ownership and head-baseline attribution
+                    for those logins and is meaningless without adoption'
+                  rule: '!has(self.upgradeEngineLogins) || size(self.upgradeEngineLogins)
+                    == 0 || (has(self.adoptBranchPrefix) && self.adoptBranchPrefix
+                    != "")'
               workspace:
                 description: |-
                   WorkspaceSpec configures the PERSISTENT agent workspace: a per-Task volume

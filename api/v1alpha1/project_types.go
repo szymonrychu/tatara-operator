@@ -834,6 +834,16 @@ type ReleaseAgeSpec struct {
 // turn-0 assignment. The operator does not ACT on it: it RENDERS it. Every
 // decision it describes is the AGENT's, made against release notes the operator
 // cannot read.
+//
+// THE CEL RULE TIES THE ENGINE ALLOWLIST TO THE ADOPTION SWITCH. UpgradeEngineLogins
+// widens TWO permissions on its own - ownershipForAuthor classifies that login's
+// merge requests `tatara` (which mergeAllowedForOwnership then merges), and
+// isUpgradeEngineActor lets that login's pushes re-anchor the bot-head baseline
+// instead of standing the merge request down. Both are meaningless without
+// adoption and both are live the moment the field is set, so a values file that
+// lists the engine and forgets adoptBranchPrefix hands merge authority to an
+// account for no purpose. Requiring the prefix makes the two arm together.
+// +kubebuilder:validation:XValidation:rule="!has(self.upgradeEngineLogins) || size(self.upgradeEngineLogins) == 0 || (has(self.adoptBranchPrefix) && self.adoptBranchPrefix != \"\")",message="upgradeEngineLogins requires a non-empty adoptBranchPrefix: the allowlist widens merge ownership and head-baseline attribution for those logins and is meaningless without adoption"
 type UpgradePolicySpec struct {
 	// Engine selects the candidate-discovery mechanism. `renovate` runs the
 	// Renovate CLI read-only inside the pod and reads its report as a HINT;

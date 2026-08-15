@@ -421,7 +421,7 @@ func LegalFor(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, from, to string) bo
 		}
 	}
 	if from == v1alpha1.StateNew && to == v1alpha1.StateAwaitingReview {
-		adoptedUpgrade := t != nil && t.Spec.Kind == AgentUpgrade && AdoptedMR(t)
+		adoptedUpgrade := AdoptedUpgrade(t)
 		if (t == nil || t.Spec.Kind != kindReview) && !adoptedUpgrade {
 			return false
 		}
@@ -454,8 +454,26 @@ func LegalFor(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, from, to string) bo
 // guard: it is mutable by anything with edit on the Task, this CRD has no
 // validating webhook, and it means "where the pod pushes" rather than "what
 // this Task is".
+// IT IS NOT TRUE ONLY OF AN ADOPTED UPGRADE TASK, AND IT NEVER WAS. A takeover
+// Task and a kind=review Task are BOTH minted onto a merge request and BOTH
+// carry spec.source.isPR with a number, so this answers "was this Task minted
+// onto an existing merge request", which is a superset. LegalFor pairs it with
+// kind == AgentUpgrade for exactly that reason. Any NEW caller that means "this
+// is an adopted dependency merge request" must use AdoptedUpgrade below -
+// keying on this alone strips merge-after-stand-down from every takeover on the
+// platform and puts "approving MERGES it" in front of every review pod.
 func AdoptedMR(t *v1alpha1.Task) bool {
 	return t != nil && t.Spec.Source != nil && t.Spec.Source.IsPR && t.Spec.Source.Number > 0
+}
+
+// AdoptedUpgrade reports whether t is an ADOPTED DEPENDENCY-UPGRADE Task: kind
+// `upgrade` AND minted onto a merge request that already existed. It is the
+// predicate every behavioural difference of the adoption path keys on - the
+// stand-down reason, the review assignment's adopted paragraphs, the reaper's
+// refusal marker - and it exists because AdoptedMR alone is a superset that
+// includes takeover and review Tasks (see above).
+func AdoptedUpgrade(t *v1alpha1.Task) bool {
+	return t != nil && t.Spec.Kind == AgentUpgrade && AdoptedMR(t)
 }
 
 func reviewGateOpen(mrs []v1alpha1.MergeRequest) bool {

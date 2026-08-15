@@ -818,6 +818,7 @@ func adoptableAuthor(proj *tatarav1alpha1.Project, author string) bool {
 //	d. pr.head.repo == pr.base.repo              (NO forks, ever)
 //	e. no Task owns the branch and no live Task owns the mirror CR
 //	f. pr does NOT carry the project trigger label
+//	g. its mirror carries no durable adoption REFUSAL marker
 //
 // (c) is what makes adoption SAFE TO MERGE rather than merely possible. An
 // adopted merge request is one the operator will merge on an approve, and
@@ -847,9 +848,33 @@ func adoptableAuthor(proj *tatarav1alpha1.Project, author string) bool {
 // an explicit ask for a review, and an explicit human signal always outranks an
 // automatic disposition. It also makes this clause safe under
 // prReactionScope:"all", where every labelled merge request is reviewable.
+//
+// (g) IS WHAT MAKES A REFUSAL STICK, and without it re-adoption is unbounded.
+// The reaper orphans the mirror and deletes a parked or terminal adopted Task;
+// (e) then holds no more, because the deterministic Task name is free again and
+// the mirror has no live owner - so the very next sweep re-adopts the SAME merge
+// request into a fresh Task with a fresh review turn. A bump the upgrade agent
+// DECLINED as unsafe therefore comes back, and the next reviewer, who sees none
+// of that history, can approve and merge it. The reaper stamps
+// AnnAdoptionRefused on the still-open mirror of an adopted Task it reaps, and
+// this reads it: same durable-annotation mechanism as AnnTerminalClosed, and the
+// same reason - a decision the platform already made must outlive the object
+// that made it. cr may be nil (no mirror exists, so nothing was ever refused).
+//
+// IT IS SCOPED TO ONE MIRROR AND IT IS MEANT TO BE PERMANENT. A refusal stops
+// this merge request being re-adopted and nothing else - the engine's other
+// merge requests are untouched, and a new merge request for the same dependency
+// (which is what the engine opens after a rebase or a retarget) is a different
+// number, a different mirror and a fresh decision. Undoing one is a deliberate
+// human act: delete the annotation, or merge the merge request yourself. The
+// trigger label does NOT undo it - clause 2 ignores a bot-authored merge
+// request whatever labels it carries, which is pre-existing and unchanged.
 func AdoptUpgradeMR(proj *tatarav1alpha1.Project, pr scm.PRRef,
-	owner *tatarav1alpha1.Task, liveOwner string) bool {
+	owner *tatarav1alpha1.Task, liveOwner string, cr *tatarav1alpha1.MergeRequest) bool {
 
+	if cr != nil && cr.Annotations[AnnAdoptionRefused] != "" {
+		return false
+	}
 	prefix := adoptBranchPrefixOf(proj)
 	if prefix == "" {
 		return false
@@ -867,40 +892,6 @@ func AdoptUpgradeMR(proj *tatarav1alpha1.Project, pr scm.PRRef,
 		return false
 	}
 	return !hasLabel(pr.Labels, proj.Spec.TriggerLabel)
-}
-
-// adoptableUpgradeNumbers returns the merge-request numbers, from one repo's
-// listing, that this pass may adopt: shape-matching per AdoptUpgradeMR's
-// branch/author/fork/label tests, sorted ASCENDING and capped at limit.
-//
-// Ascending, because the forge lists newest-first (GitLab's default is
-// created_at desc and ListOpenPRs sets no ordering) and the cap is tight, so
-// taking them in list order would starve the oldest merge request indefinitely.
-// Number is the age proxy rather than UpdatedAt: merge-request IIDs are
-// monotonic per project, while UpdatedAt moves every time a pipeline touches it.
-//
-// It deliberately does NOT test owner/liveOwner - those need per-merge-request
-// CR reads the caller already does. This is a shape-and-order filter; the real
-// guard is AdoptUpgradeMR inside ClassifyPR.
-func adoptableUpgradeNumbers(proj *tatarav1alpha1.Project, prs []scm.PRRef, limit int) map[int]bool {
-	out := map[int]bool{}
-	if limit <= 0 || adoptBranchPrefixOf(proj) == "" {
-		return out
-	}
-	nums := make([]int, 0, len(prs))
-	for _, pr := range prs {
-		if AdoptUpgradeMR(proj, pr, nil, "") {
-			nums = append(nums, pr.Number)
-		}
-	}
-	slices.Sort(nums)
-	if len(nums) > limit {
-		nums = nums[:limit]
-	}
-	for _, n := range nums {
-		out[n] = true
-	}
-	return out
 }
 
 // PRDisposition is the outcome of B.4's four-clause PR/MR disposition, plus
@@ -1003,8 +994,12 @@ const (
 //	    platform has no business touching.
 //
 // Consequence: every review-kind Task is non-bot-authored BY CONSTRUCTION.
+// cr is the merge request's MIRROR, or nil when none exists. Only clause 1c
+// reads it, for the durable adoption-refusal marker (AdoptUpgradeMR clause g);
+// liveOwner is still taken separately because it is a RESOLVED liveness answer
+// the caller computes, not something readable off the CR (issue #521).
 func ClassifyPR(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, pr scm.PRRef,
-	owner *tatarav1alpha1.Task, liveOwner string) PRDisposition {
+	owner *tatarav1alpha1.Task, liveOwner string, cr *tatarav1alpha1.MergeRequest) PRDisposition {
 
 	if AdoptPR(proj, owner, pr) {
 		// CLAUSE 1b (issue #477). An MR already controller-owned by someone
@@ -1041,7 +1036,7 @@ func ClassifyPR(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, p
 	// AdoptUpgradeMR itself refuses to steal (owner/liveOwner) and refuses a
 	// trigger-labelled merge request, so neither clause 1 nor an explicit human
 	// review request is shadowed.
-	if AdoptUpgradeMR(proj, pr, owner, liveOwner) {
+	if AdoptUpgradeMR(proj, pr, owner, liveOwner, cr) {
 		return PRAdoptUpgrade
 	}
 	bot := botLoginOf(proj)
@@ -1586,12 +1581,20 @@ func (r *ProjectReconciler) sweepPRs(ctx context.Context, proj *tatarav1alpha1.P
 
 	l := log.FromContext(ctx)
 	requeue := time.Duration(0)
-	// Selected once per repo against the CURRENT shared headroom, so the loop
-	// visits the oldest adoptable merge requests first even though the forge
-	// listed them newest-first. Fairness is oldest-first WITHIN a repo and
-	// repo-iteration-order ACROSS repos; a global oldest-first would need a
-	// cross-repo pre-pass this does not justify.
-	adoptable := adoptableUpgradeNumbers(proj, prs, *adoptHeadroom)
+
+	// PHASE 1: RESOLVE AND CLASSIFY, ACT ON NOTHING. Every read here used to sit
+	// at the top of the single acting loop; it is hoisted so the adoption window
+	// below can be computed over the merge requests this pass CAN adopt rather
+	// than over the ones that merely LOOK adoptable. No read is added or
+	// repeated - the acting loop consumes exactly what this one resolved.
+	type prPass struct {
+		pr        scm.PRRef
+		cr        *tatarav1alpha1.MergeRequest
+		claimedBy string
+		ownerTask *tatarav1alpha1.Task
+		disp      PRDisposition
+	}
+	passes := make([]prPass, 0, len(prs))
 	for _, pr := range prs {
 		// The mirror is read BEFORE the branch lookup, not after: its controller
 		// owner is what disambiguates a head branch that several Tasks share
@@ -1615,7 +1618,48 @@ func (r *ProjectReconciler) sweepPRs(ctx context.Context, proj *tatarav1alpha1.P
 			fail("get_owning_task", terr, "repo", repo.Name, "number", pr.Number)
 			continue
 		}
-		switch ClassifyPR(proj, repo, pr, ownerTask, claimedBy) {
+		passes = append(passes, prPass{
+			pr: pr, cr: cr, claimedBy: claimedBy, ownerTask: ownerTask,
+			disp: ClassifyPR(proj, repo, pr, ownerTask, claimedBy, cr),
+		})
+	}
+
+	// THE ADOPTION WINDOW, over the CLASSIFIED set. It is the oldest `headroom`
+	// merge requests that actually classify PRAdoptUpgrade, so a merge request
+	// this project already adopted - always the lowest-numbered, and always
+	// PRIgnore because its mirror has a live controller owner - can no longer
+	// spend a slot it could never use. Computed from an ownership-blind
+	// shape filter, the window on {42 adopted, 43 adopted, 44 free} with one free
+	// lane was {42}, and 44 was deferred upgrade_headroom_bound on every pass
+	// forever: effective utilisation capped near maxOpenUpgrades/2.
+	//
+	// Ascending, because the forge lists newest-first (GitLab's default is
+	// created_at desc and ListOpenPRs sets no ordering) and the cap is tight, so
+	// taking them in list order would starve the oldest merge request
+	// indefinitely. Number is the age proxy rather than UpdatedAt: merge-request
+	// IIDs are monotonic per project, while UpdatedAt moves every time a pipeline
+	// touches it. Fairness is oldest-first WITHIN a repo and repo-iteration-order
+	// ACROSS repos; a global oldest-first would need a cross-repo pre-pass this
+	// does not justify.
+	adoptableNums := make([]int, 0, len(passes))
+	for i := range passes {
+		if passes[i].disp == PRAdoptUpgrade {
+			adoptableNums = append(adoptableNums, passes[i].pr.Number)
+		}
+	}
+	slices.Sort(adoptableNums)
+	if len(adoptableNums) > *adoptHeadroom {
+		adoptableNums = adoptableNums[:max(*adoptHeadroom, 0)]
+	}
+	adoptable := make(map[int]bool, len(adoptableNums))
+	for _, n := range adoptableNums {
+		adoptable[n] = true
+	}
+
+	// PHASE 2: ACT. Same order the forge listed in, same body as before.
+	for _, p := range passes {
+		pr, cr, claimedBy, ownerTask := p.pr, p.cr, p.claimedBy, p.ownerTask
+		switch p.disp {
 		case PRAdopt:
 			if aerr := r.adoptPRIntoTask(ctx, proj, repo, pr, ownerTask, sp); aerr != nil {
 				fail("adopt_pr", aerr, "repo", repo.Name, "number", pr.Number)

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
@@ -309,8 +310,14 @@ func TestMintAdoptedUpgradeTask_AHumanPushStillStandsItDown(t *testing.T) {
 	if got.Status.Ownership != tatarav1alpha1.OwnershipExternal {
 		t.Fatalf("ownership = %q, want external", got.Status.Ownership)
 	}
-	if got.Status.OwnershipReason != externalPushReasonPrefix+"H1" {
-		t.Fatalf("ownership reason = %q, want %q", got.Status.OwnershipReason, externalPushReasonPrefix+"H1")
+	// The ADOPTED reason, not the takeover one: this stand-down ends in
+	// human-merged-only. See adoptedPushReasonPrefix and
+	// TestReconcileOwnership_AnAdoptedMRStandsDownIntoHumanMergedOnly.
+	if got.Status.OwnershipReason != adoptedPushReasonPrefix+"H1" {
+		t.Fatalf("ownership reason = %q, want %q", got.Status.OwnershipReason, adoptedPushReasonPrefix+"H1")
+	}
+	if mergeAllowedForOwnership(got) {
+		t.Fatal("the operator may still merge an adopted merge request a human pushed to")
 	}
 	parked := getTask(t, task.Name)
 	if parked.Status.ParkReason != stage.ReasonOwnershipLost {
@@ -380,5 +387,37 @@ func TestMintAdoptedUpgradeTask_WithoutTheBindTheCorridorParks(t *testing.T) {
 		Namespace: proj.Namespace, Name: tatarav1alpha1.MergeRequestName(repo.Name, 49)}, &mr)
 	if !apierrors.IsNotFound(err) {
 		t.Fatalf("get unbound mirror: %v, want NotFound (nothing else creates one)", err)
+	}
+}
+
+// THE REAP IS WHERE THE REFUSAL IS RECORDED. releaseTerminal (B.6) orphans the
+// mirror and frees the deterministic Task name; without a marker stamped in that
+// same sequence the next sweep re-adopts the identical merge request and the
+// decline is gone. Step 2a runs BEFORE step 3, because step 3 drops the very
+// ownerRef that says which merge requests were this Task's.
+func TestReleaseTerminal_MarksARefusedAdoptedMergeRequest(t *testing.T) {
+	ctx := context.Background()
+	proj, repo := adoptProject(t, ctx)
+	task, _, err := newTestMinter(t).MintAdoptedUpgradeTask(ctx, proj, repo, adoptedPR(51), testSpiller(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The upgrade agent declined the bump as unsafe, and the Task aged out.
+	stampTaskStatus(t, ctx, task, tatarav1alpha1.StateUnderImplementation, stage.ReasonImplementDeclined)
+
+	r := &ProjectReconciler{Client: k8sClient, APIReader: k8sClient, Scheme: k8sClient.Scheme(),
+		Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry())}
+	if err := r.releaseTerminal(ctx, proj, getTask(t, task.Name), map[string]bool{}); err != nil {
+		t.Fatalf("releaseTerminal: %v", err)
+	}
+
+	mr := getMR(t, ctx, proj, repo, 51)
+	if got := mr.Annotations[AnnAdoptionRefused]; got != stage.ReasonImplementDeclined {
+		t.Fatalf("mirror annotation %s = %q, want %q: the sweep re-adopts this merge request "+
+			"on its next pass and a fresh review turn can approve the bump the upgrade agent refused",
+			AnnAdoptionRefused, got, stage.ReasonImplementDeclined)
+	}
+	if AdoptUpgradeMR(proj, adoptedPR(51), nil, "", mr) {
+		t.Fatal("the refused merge request is still adoptable")
 	}
 }

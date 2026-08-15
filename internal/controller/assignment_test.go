@@ -182,7 +182,7 @@ func TestRequiredSkills_UpgradeDemandsTheWorkflowAndTDD(t *testing.T) {
 }
 
 func TestAgentJob_UpgradeCarriesTheOneUnitAndReleaseNotesRules(t *testing.T) {
-	job := agentJob(stage.AgentUpgrade, &tatarav1alpha1.Project{}, false)
+	job := agentJob(stage.AgentUpgrade, &tatarav1alpha1.Task{}, &tatarav1alpha1.Project{}, false)
 	for _, want := range []string{
 		"EXACTLY ONE",
 		"task_context(index=true)",
@@ -209,7 +209,7 @@ func TestAgentJob_UpgradeCarriesTheOneUnitAndReleaseNotesRules(t *testing.T) {
 // The upgrade agent pushes code, so it carries the resumed-branch merge rule
 // like every other code-pushing kind.
 func TestAgentJob_UpgradeCarriesTheResumedBranchRule(t *testing.T) {
-	job := agentJob(stage.AgentUpgrade, &tatarav1alpha1.Project{}, false)
+	job := agentJob(stage.AgentUpgrade, &tatarav1alpha1.Task{}, &tatarav1alpha1.Project{}, false)
 	if !strings.Contains(job, "resolving that merge is your FIRST action") {
 		t.Error("upgrade pushes code and must carry the resumed-branch merge rule")
 	}

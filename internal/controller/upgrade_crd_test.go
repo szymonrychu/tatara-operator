@@ -217,3 +217,33 @@ func TestUpgradeIsAValidNoteAuthorAndCommentAgentKind(t *testing.T) {
 	require.NoError(t, k8sClient.Status().Update(ctx, mr),
 		"status.comments[].agentKind=upgrade must be admitted or the pending-comment drain is rejected")
 }
+
+// upgradeEngineLogins WIDENS MERGE PERMISSION, and it must not be armable on its
+// own. Setting it makes ownershipForAuthor classify that login's merge requests
+// `tatara` (which the merge corridor merges) and makes isUpgradeEngineActor
+// re-anchor that login's pushes instead of standing the merge request down -
+// both live the moment the field is written, and both pointless without
+// adoption. The CEL rule ties them together at admission.
+func TestUpgradePolicy_EngineLoginsRequireTheAdoptionPrefix(t *testing.T) {
+	ctx := context.Background()
+	proj, _ := seedProjectRepo(t, ctx)
+
+	proj.Spec.UpgradePolicy = &tataradevv1alpha1.UpgradePolicySpec{
+		UpgradeEngineLogins: []string{"renovate-bot"},
+	}
+	if err := k8sClient.Update(ctx, proj); err == nil {
+		t.Fatal("the API server accepted upgradeEngineLogins with no adoptBranchPrefix: " +
+			"merge ownership is widened for an account with adoption switched off")
+	}
+
+	proj.Spec.UpgradePolicy.AdoptBranchPrefix = "renovate/"
+	if err := k8sClient.Update(ctx, proj); err != nil {
+		t.Fatalf("the pair must be accepted together: %v", err)
+	}
+	// And the field stays optional: adoption armed with the bot's own token
+	// lists nobody.
+	proj.Spec.UpgradePolicy.UpgradeEngineLogins = nil
+	if err := k8sClient.Update(ctx, proj); err != nil {
+		t.Fatalf("adoptBranchPrefix alone must stay legal: %v", err)
+	}
+}

@@ -136,3 +136,16 @@ func TestGoalAdopted_DescribesTheElisionMarkerAccurately(t *testing.T) {
 		t.Error("the adopted goal must name the re-read that recovers an elided body")
 	}
 }
+
+// The review agent is the ONLY writer of a change significance on the
+// approve-at-first-review path, which is the common one. If the goal does not
+// say the floor exists and that raising it is the reviewer's call, nobody ever
+// raises it and a breaking bump ships as a patch.
+func TestGoalAdopted_TellsTheReviewerAboutTheSemverFloor(t *testing.T) {
+	got := GoalAdopted("o/r", "renovate/cilium", "chore(deps): update cilium", 41, nil)
+	for _, want := range []string{"`patch`", "change_significance=minor", "change_significance=major", "RAISE"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("GoalAdopted missing %q", want)
+		}
+	}
+}
