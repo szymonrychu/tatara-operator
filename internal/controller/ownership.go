@@ -27,11 +27,21 @@ import (
 // "initial") - and knows it is safe to resume that flip's park+hand-back.
 const externalPushReasonPrefix = "external-push:"
 
-// ownershipForAuthor classifies a never-seen MR: bot author -> tatara,
-// anything else (human, Renovate, other bot, or an unknown/empty author) ->
-// external.
+// ownershipForAuthor classifies a never-seen MR: an author this project owns -
+// the platform bot, or an allowlisted upgradePolicy.upgradeEngineLogins
+// dependency-upgrade engine - is `tatara`; anything else (a human, an
+// un-allowlisted bot, or an unknown/empty author) is `external`.
+//
+// IT DELEGATES TO adoptableAuthor ON PURPOSE, AND THE TWO MUST STAY ONE
+// FUNCTION. AdoptUpgradeMR decides which merge requests the platform TAKES and
+// this decides which it is ALLOWED TO MERGE (mergeAllowedForOwnership accepts
+// `tatara` unconditionally and refuses external/"initial" outright). An author
+// accepted by one and refused by the other adopts a merge request the merge
+// corridor then declines - after the review agent has already approved it on
+// the forge. Retiring the mint-time ownership flip is sound only while these
+// two answer the same question, so they ask it in the same place.
 func ownershipForAuthor(proj *tatarav1alpha1.Project, author string) string {
-	if author != "" && author == botLoginOf(proj) {
+	if adoptableAuthor(proj, author) {
 		return tatarav1alpha1.OwnershipTatara
 	}
 	return tatarav1alpha1.OwnershipExternal

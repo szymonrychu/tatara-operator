@@ -773,11 +773,17 @@ func adoptBranchPrefixOf(proj *tatarav1alpha1.Project) string {
 	return proj.Spec.UpgradePolicy.AdoptBranchPrefix
 }
 
-// adoptableAuthor reports whether author is an identity this project accepts as
-// its dependency-upgrade engine: the platform bot, or an explicitly allowlisted
-// upgradePolicy.upgradeEngineLogins entry. Exact match, and an EMPTY author is
-// never adoptable (a forge that will not say who opened a merge request does not
-// get the benefit of the doubt on one the platform would merge).
+// adoptableAuthor reports whether author is an identity this project owns: the
+// platform bot, or an explicitly allowlisted upgradePolicy.upgradeEngineLogins
+// dependency-upgrade engine. Exact match, and an EMPTY author is never adoptable
+// (a forge that will not say who opened a merge request does not get the benefit
+// of the doubt on one the platform would merge).
+//
+// IT IS ALSO ownershipForAuthor's WHOLE TEST, and that is deliberate: the
+// identity adoption accepts and the identity the merge corridor accepts must be
+// ONE fact, or an adopted merge request classifies `external` and
+// mergeAllowedForOwnership refuses it after the review agent has already
+// approved it on the forge.
 //
 // This is a FORGE LOGIN, which the forge authenticated. It is deliberately not a
 // git commit author: see UpgradeEngineLogins' own doc comment, and the three

@@ -185,6 +185,46 @@ func TestAdoptUpgradeMR_NeverStealsAndNeverReAdopts(t *testing.T) {
 	}
 }
 
+// THE TWO PREDICATES ARE ONE FACT AND MUST NOT DRIFT. AdoptUpgradeMR decides
+// which merge requests the platform TAKES; ownershipForAuthor decides which it
+// is ALLOWED TO MERGE, and mergeAllowedForOwnership refuses external/"initial"
+// outright. An author accepted by the first and refused by the second produces
+// the worst possible shape: the review agent approves, the Task walks to
+// merged, and the merge driver refuses it - after the verdict is already posted
+// on the forge. Retiring the mint-time ownership flip is only sound while these
+// two agree, so they share adoptableAuthor and this test says so.
+func TestAdoptedAuthorsAreExactlyTheOwnershipTataraAuthors(t *testing.T) {
+	proj := projectWithAdoptPrefix("szymonrychu-bot", "renovate/")
+	proj.Spec.UpgradePolicy.UpgradeEngineLogins = []string{"renovate-bot"}
+
+	for _, author := range []string{"szymonrychu-bot", "renovate-bot"} {
+		pr := renovatePR()
+		pr.Author = author
+		if !AdoptUpgradeMR(proj, pr, nil, "") {
+			t.Fatalf("%s must be adoptable", author)
+		}
+		if got := ownershipForAuthor(proj, author); got != tatarav1alpha1.OwnershipTatara {
+			t.Errorf("ownershipForAuthor(%q) = %q, want tatara: an adopted merge request the "+
+				"corridor cannot merge is worse than one never adopted", author, got)
+		}
+		mr := &tatarav1alpha1.MergeRequest{}
+		mr.Status.Ownership = ownershipForAuthor(proj, author)
+		mr.Status.OwnershipReason = "initial"
+		if !mergeAllowedForOwnership(mr) {
+			t.Errorf("%s: mergeAllowedForOwnership = false on the backfill classification", author)
+		}
+	}
+
+	// And the negative that gives it meaning: a human stays external, so the
+	// corridor still refuses to merge a human's merge request.
+	if got := ownershipForAuthor(proj, "szymonrychu"); got != tatarav1alpha1.OwnershipExternal {
+		t.Errorf("ownershipForAuthor(human) = %q, want external", got)
+	}
+	if got := ownershipForAuthor(proj, ""); got != tatarav1alpha1.OwnershipExternal {
+		t.Errorf("ownershipForAuthor(empty) = %q, want external", got)
+	}
+}
+
 // After adoption, the existing clause sends it to PRIgnore forever. No new
 // clause is needed for the steady state and none may be added.
 func TestClassifyPR_AnAlreadyAdoptedMRIsIgnoredNotReAdopted(t *testing.T) {
