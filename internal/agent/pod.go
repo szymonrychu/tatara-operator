@@ -236,6 +236,10 @@ func typeAbbrev(kind string) string {
 // on hc/Source.Number, incident on DedupKey, documentation on the source SHA);
 // upgrade is the first that is not, so it needs its own discriminator. Read
 // upgradeIDSegment before adding a repo-less kind here.
+//
+// An ADOPTED upgrade Task carries Source.Number and therefore takes the p<N>
+// branch above, never upgradeIDSegment. That is correct: (repo, number) is the
+// same identity that makes its Task name unique.
 func podNameIDSegment(task *tatarav1alpha1.Task) string {
 	if s := task.Spec.Source; s != nil && s.Number > 0 {
 		if s.IsPR {
@@ -1133,12 +1137,15 @@ const helmfileTargetRepo = "tatara-helmfile"
 // when the task targets the self-heal repo (helmfileTargetRepo). documentation
 // and refine (the cheap, freely-tierable kinds) are deliberately absent.
 //
-// upgrade is absent too, and the floor CANNOT be extended to reach it. The floor
-// keys on targetRepo, which BuildPod fills only from Spec.RepositoryRef; an
-// upgrade Task is repo-less by construction and its mergeOrder is declared by
-// the agent at outcome time, long after the pod was built. At the moment this
-// runs there is nothing to key on, so an entry here would be unreachable rather
-// than protective. The gap it would leave is narrow: upgrade's locked default is
+// upgrade is absent too, and deliberately. A CRON-minted upgrade Task is
+// repo-less - the floor keys on targetRepo, which BuildPod fills only from
+// Spec.RepositoryRef, and a cron Task's mergeOrder is declared by the agent at
+// outcome time, long after the pod was built - so a floor could never fire for
+// it at all. An ADOPTED upgrade Task (a third-party dependency merge request,
+// see internal/controller/upgrade_adopt.go) IS repo-bound and a floor WOULD
+// apply to it, which is precisely why there is none: the two shapes are the
+// same kind and must not resolve to different models depending on how the Task
+// happened to be minted. The gap it would leave is narrow: upgrade's locked default is
 // already opus (kindDefaultModel), so only an explicit modelByKind.upgrade
 // downgrade reaches sonnet - a deliberate per-project choice, and NOT the
 // tier-revert self-heal path (a broken tier is reverted by an incident/implement
