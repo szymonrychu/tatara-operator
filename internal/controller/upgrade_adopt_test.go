@@ -412,10 +412,11 @@ func TestReleaseTerminal_MarksARefusedAdoptedMergeRequest(t *testing.T) {
 	}
 
 	mr := getMR(t, ctx, proj, repo, 51)
-	if got := mr.Annotations[AnnAdoptionRefused]; got != stage.ReasonImplementDeclined {
+	want := stage.ReasonImplementDeclined + adoptionRefusedSHASep + adoptedPR(51).HeadSHA
+	if got := mr.Annotations[AnnAdoptionRefused]; got != want {
 		t.Fatalf("mirror annotation %s = %q, want %q: the sweep re-adopts this merge request "+
 			"on its next pass and a fresh review turn can approve the bump the upgrade agent refused",
-			AnnAdoptionRefused, got, stage.ReasonImplementDeclined)
+			AnnAdoptionRefused, got, want)
 	}
 	if AdoptUpgradeMR(proj, adoptedPR(51), nil, "", mr) {
 		t.Fatal("the refused merge request is still adoptable")

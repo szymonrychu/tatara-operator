@@ -153,7 +153,11 @@ func takeoverTestSlug(t *testing.T) string {
 	if len(s) > 40 {
 		s = s[len(s)-40:]
 	}
-	return s
+	// Trim AGAIN: the truncation above cuts at a fixed offset, so a long enough
+	// test name lands it mid-separator and yields a leading "-", which is not a
+	// legal RFC 1123 name and fails the Secret create with an error that names
+	// the fixture rather than the test.
+	return strings.Trim(s, "-")
 }
 
 // seedProjectRepo creates a minimal live Project+Repository pair for the

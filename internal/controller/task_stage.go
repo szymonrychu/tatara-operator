@@ -1014,7 +1014,11 @@ func triageTarget(task *tatarav1alpha1.Task) (string, bool) {
 	case stage.AgentReview:
 		return tatarav1alpha1.StateAwaitingReview, true
 	case stage.AgentUpgrade:
-		if stage.AdoptedMR(task) {
+		// AdoptedUpgrade, not AdoptedMR. The enclosing case already supplies the
+		// kind half, so the looser predicate happens to be correct here - which
+		// is exactly the foot-gun stage.AdoptedMR's own doc block warns about,
+		// and the reason an adoption-keyed caller must never spell it that way.
+		if stage.AdoptedUpgrade(task) {
 			return tatarav1alpha1.StateAwaitingReview, true
 		}
 		return "", false

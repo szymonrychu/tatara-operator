@@ -23,7 +23,7 @@ import (
 // upgrade outcome schema, and it must count against maxOpenUpgrades.
 const adoptedUpgradeKind = "upgrade"
 
-// adoptedSignificanceFloor is the change significance an adopted merge request's
+// AdoptedSignificanceFloor is the change significance an adopted merge request's
 // mirror is seeded with at mint.
 //
 // WITHOUT IT THE COMMON PATH PUBLISHES NOTHING. Significance has exactly two
@@ -58,7 +58,7 @@ const adoptedUpgradeKind = "upgrade"
 // value a reviewer can declare, and both GoalAdopted and the review assignment
 // paragraph now tell the review agent so. An upgrade turn's `submitted` outcome
 // overwrites it outright, exactly as it does for any other Task.
-const adoptedSignificanceFloor = "patch"
+const AdoptedSignificanceFloor = "patch"
 
 // THERE IS NO adoptedOwnershipReasonPrefix, AND THAT IS THE POINT. An earlier
 // draft stamped Status.Ownership=tatara with an "upgrade-adopted:" reason here,
@@ -124,22 +124,27 @@ func (m *Minter) MintAdoptedUpgradeTask(ctx context.Context, proj *tatarav1alpha
 
 	name := AdoptedUpgradeTaskName(proj.Name, repo.Name, pr.Number)
 
+	// The mirror snapshot the bind upserts, built from the listing row the sweep
+	// already has. It also derives the merge request URL the same way the review
+	// mint does, since a PRRef carries no URL of its own.
+	ext := mrSnapshot(proj, repo, pr)
+
 	var existing tatarav1alpha1.Task
 	err := m.Client.Get(ctx, client.ObjectKey{Namespace: proj.Namespace, Name: name}, &existing)
 	if err == nil {
 		// Already adopted. No unpark arm, unlike takeover: a parked adopted Task
 		// is the reaper's, and re-adopting it would restart work a human may have
-		// deliberately stopped.
+		// deliberately stopped. It DOES converge the bind and the floor, which is
+		// not work and not a restart - see convergeAdoptedMint.
+		if cerr := m.convergeAdoptedMint(ctx, proj, repo, ext, &existing, sp); cerr != nil {
+			return nil, MintNotOwed, cerr
+		}
 		return &existing, MintExistingLive, nil
 	}
 	if !apierrors.IsNotFound(err) {
 		return nil, MintNotOwed, fmt.Errorf("adopt: get task %s: %w", name, err)
 	}
 
-	// The mirror snapshot the bind upserts, built from the listing row the sweep
-	// already has. It also derives the merge request URL the same way the review
-	// mint does, since a PRRef carries no URL of its own.
-	ext := mrSnapshot(proj, repo, pr)
 	slug := repo.Name
 	if o, n, oerr := scm.OwnerRepo(repo.Spec.URL); oerr == nil {
 		slug = o + "/" + n
@@ -215,6 +220,9 @@ func (m *Minter) MintAdoptedUpgradeTask(ctx context.Context, proj *tatarav1alpha
 		return nil, MintNotOwed, err
 	}
 	if outcome == MintExistingLive {
+		if cerr := m.convergeAdoptedMint(ctx, proj, repo, ext, twin, sp); cerr != nil {
+			return nil, MintNotOwed, cerr
+		}
 		return twin, MintExistingLive, nil
 	}
 	if outcome == MintTombstoneDeleted {
@@ -238,20 +246,8 @@ func (m *Minter) MintAdoptedUpgradeTask(ctx context.Context, proj *tatarav1alpha
 	}); err != nil {
 		return nil, MintNotOwed, err
 	}
-
-	// SEED THE SEMVER FLOOR. See adoptedSignificanceFloor for why this exists at
-	// all and why it is a default rather than a requirement on the review
-	// outcome. IF-EMPTY, never an overwrite: a re-mint after a reap must not
-	// undo an escalation a review already recorded, and SyncMergeRequest never
-	// touches this field so the seed survives every mirror sync.
-	if err := objbudget.FitMergeRequest(ctx, m.Client, sp,
-		client.ObjectKey{Namespace: proj.Namespace, Name: mrName},
-		func(fresh *tatarav1alpha1.MergeRequest) {
-			if fresh.Status.Significance == "" {
-				fresh.Status.Significance = adoptedSignificanceFloor
-			}
-		}); err != nil {
-		return nil, MintNotOwed, fmt.Errorf("adopt: seed the semver floor on %s: %w", mrName, err)
+	if err := m.seedAdoptedSemverFloor(ctx, proj, mrName, sp); err != nil {
+		return nil, MintNotOwed, err
 	}
 
 	// AND THAT IS THE WHOLE MINT. No ownership write of any kind: the merge
@@ -261,4 +257,57 @@ func (m *Minter) MintAdoptedUpgradeTask(ctx context.Context, proj *tatarav1alpha
 	// ownership stamp here would make this a second writer of a field with one
 	// owner.
 	return task, MintCreated, nil
+}
+
+// convergeAdoptedMint re-runs the two writes that happen AFTER the Task exists -
+// the mirror bind and the semver floor - for an adopted Task the mint found
+// already live.
+//
+// IT EXISTS BECAUSE A MINT IS THREE WRITES AND ONLY THE FIRST IS ATOMIC. The
+// Task create, the bind that creates the mirror, and the floor seed are separate
+// API calls; any of the last two can fail (a conflict-exhausted
+// FitMergeRequest, an ErrObjectTooLarge on a fat mirror, a lost lease) and leave
+// the Task persisted with the rest undone. The Task name is deterministic, so
+// the very next sweep pass Gets it and takes the MintExistingLive arm - which
+// used to return immediately and therefore NEVER retried either write. The
+// resulting merge request merges with an empty significance, CI cuts no tag,
+// nothing publishes, and the Task sits in `deploying` until its budget parks it:
+// the exact wedge AdoptedSignificanceFloor was added to close.
+//
+// IT IS NOT A RE-ADOPTION AND IT RESTARTS NOTHING. repairMRBinding never steals
+// a controller-owned mirror and the seed is if-empty, so on the steady state
+// this is two Gets and no writes. It cannot even be reached for a mirror a live
+// Task owns - AdoptUpgradeMR clause (e) refuses that merge request before the
+// mint is called - so reaching here means the bind is genuinely incomplete.
+func (m *Minter) convergeAdoptedMint(ctx context.Context, proj *tatarav1alpha1.Project,
+	repo *tatarav1alpha1.Repository, ext scm.MergeRequest, task *tatarav1alpha1.Task,
+	sp objbudget.Spiller) error {
+
+	if err := m.repairMRBinding(ctx, proj, repo, ext, task, sp); err != nil {
+		return err
+	}
+	return m.seedAdoptedSemverFloor(ctx, proj, tatarav1alpha1.MergeRequestName(repo.Name, ext.Number), sp)
+}
+
+// seedAdoptedSemverFloor writes AdoptedSignificanceFloor onto an adopted merge
+// request's mirror. See AdoptedSignificanceFloor for why this exists at all and
+// why it is a default rather than a requirement on the review outcome.
+//
+// IF-EMPTY, never an overwrite: a re-mint after a reap must not undo an
+// escalation a review already recorded, and SyncMergeRequest never touches this
+// field so the seed survives every mirror sync. That is also what makes it safe
+// to run on EVERY pass, which convergeAdoptedMint does.
+func (m *Minter) seedAdoptedSemverFloor(ctx context.Context, proj *tatarav1alpha1.Project,
+	mrName string, sp objbudget.Spiller) error {
+
+	if err := objbudget.FitMergeRequest(ctx, m.Client, sp,
+		client.ObjectKey{Namespace: proj.Namespace, Name: mrName},
+		func(fresh *tatarav1alpha1.MergeRequest) {
+			if fresh.Status.Significance == "" {
+				fresh.Status.Significance = AdoptedSignificanceFloor
+			}
+		}); err != nil {
+		return fmt.Errorf("adopt: seed the semver floor on %s: %w", mrName, err)
+	}
+	return nil
 }

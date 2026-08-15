@@ -5,7 +5,9 @@ import (
 	"testing"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/own"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -34,10 +36,10 @@ func TestMintAdoptedUpgradeTask_SeedsTheSemverFloorOnItsMirror(t *testing.T) {
 		Name: tatarav1alpha1.MergeRequestName(repo.Name, 61)}, &mr); err != nil {
 		t.Fatalf("get mirror: %v", err)
 	}
-	if mr.Status.Significance != adoptedSignificanceFloor {
+	if mr.Status.Significance != AdoptedSignificanceFloor {
 		t.Fatalf("mirror significance = %q, want %q: an adopted merge request approved on "+
 			"its first review has no other writer, and an empty significance means CI cuts no tag",
-			mr.Status.Significance, adoptedSignificanceFloor)
+			mr.Status.Significance, AdoptedSignificanceFloor)
 	}
 }
 
@@ -92,28 +94,63 @@ func TestAdoptedUpgradeApprovedOnFirstReviewReachesMergedWithASignificance(t *te
 	}
 }
 
-// THE FLOOR IS A FLOOR, NOT A CEILING. A reviewer who reads a breaking change in
-// the changelog raises it with change_significance, and the escalation clause
-// that already exists must still win over the seeded patch.
-func TestAdoptedSemverFloorIsRaisedByAReviewEscalation(t *testing.T) {
+// THE FLOOR IS A FLOOR, NOT A CEILING - see
+// TestOutcome_Review_EscalatesTheSeededAdoptedFloor (internal/restapi), which
+// drives the REAL review outcome handler against a mirror seeded at this floor.
+// It lives there and not here because the escalation clause and its rank table
+// are restapi's, and a copy of that table asserted against itself proves
+// nothing about either.
+
+// THE SEED MUST CONVERGE, because everything else about the mint already does.
+//
+// The seed is a SEPARATE write after the Task and the mirror both exist, so an
+// interrupted mint - FitMergeRequest exhausting its conflict retries, or
+// ErrObjectTooLarge on a fat mirror - leaves both objects persisted with no
+// floor on them. The next sweep then finds the Task by its deterministic name
+// and, on the early MintExistingLive return, never retries anything: the merge
+// request merges with an empty significance, CI cuts no tag and the Task sits in
+// `deploying`. That is the exact CRITICAL wedge the floor was added to close,
+// reintroduced through the back door.
+func TestMintAdoptedUpgradeTask_ConvergesAnInterruptedMintOnTheNextPass(t *testing.T) {
 	ctx := context.Background()
 	proj, repo := adoptProject(t, ctx)
 	m := newTestMinter(t)
-	pr := adoptedPR(63)
+	pr := adoptedPR(64)
 
-	if _, _, err := m.MintAdoptedUpgradeTask(ctx, proj, repo, pr, testSpiller(t)); err != nil {
+	// The state an interrupted mint leaves behind: the Task is live under its
+	// deterministic natural key, and NOTHING else happened.
+	task, _, err := m.MintAdoptedUpgradeTask(ctx, proj, repo, pr, testSpiller(t))
+	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}
 	key := client.ObjectKey{Namespace: proj.Namespace, Name: tatarav1alpha1.MergeRequestName(repo.Name, pr.Number)}
+	if err := k8sClient.Delete(ctx, &tatarav1alpha1.MergeRequest{
+		ObjectMeta: metav1.ObjectMeta{Namespace: key.Namespace, Name: key.Name}}); err != nil {
+		t.Fatalf("drop the mirror to simulate the interrupted mint: %v", err)
+	}
+	if err := m.stampMintStatus(ctx, task, func(fresh *tatarav1alpha1.Task) {
+		fresh.Status.MRRefs = nil
+	}); err != nil {
+		t.Fatalf("clear mrRefs: %v", err)
+	}
+
+	// The next sweep pass, byte-identical to the first.
+	if _, outcome, err := m.MintAdoptedUpgradeTask(ctx, proj, repo, pr, testSpiller(t)); err != nil {
+		t.Fatalf("second mint: %v", err)
+	} else if outcome != MintExistingLive {
+		t.Fatalf("second mint outcome = %q, want existing_live", outcome)
+	}
+
 	var mr tatarav1alpha1.MergeRequest
 	if err := k8sClient.Get(ctx, key, &mr); err != nil {
-		t.Fatalf("get mirror: %v", err)
+		t.Fatalf("the interrupted mint never re-created its mirror: %v", err)
 	}
-	// restapi's rank table is {patch:1, minor:2, major:3}; the seeded floor is
-	// the LOWEST rank precisely so every escalation the reviewer can declare
-	// outranks it.
-	if rank := map[string]int{"patch": 1, "minor": 2, "major": 3}; rank["major"] <= rank[mr.Status.Significance] {
-		t.Fatalf("the seeded floor %q is not outranked by major; a review could never escalate it",
-			mr.Status.Significance)
+	if mr.Status.Significance != AdoptedSignificanceFloor {
+		t.Fatalf("mirror significance = %q, want %q: the seed is never retried, so this merge "+
+			"request merges with no semver label, CI cuts no tag and the Task wedges in deploying",
+			mr.Status.Significance, AdoptedSignificanceFloor)
+	}
+	if owner, ok := own.ControllerOwner(&mr); !ok || owner != task.Name {
+		t.Fatalf("mirror controller owner = %q (owned=%v), want %q", owner, ok, task.Name)
 	}
 }

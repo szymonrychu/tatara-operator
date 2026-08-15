@@ -74,7 +74,7 @@ func seedAdoptedUpgradeMR(t *testing.T, ctx context.Context, proj *tatarav1alpha
 		LastBotHeadSHA:  lastBotHeadSHA,
 		Ownership:       tatarav1alpha1.OwnershipTatara,
 		OwnershipReason: "initial",
-		Significance:    adoptedSignificanceFloor,
+		Significance:    AdoptedSignificanceFloor,
 	}
 	if err := k8sClient.Status().Update(ctx, mr); err != nil {
 		t.Fatalf("stamp adopted mirror status: %v", err)

@@ -644,6 +644,39 @@ func TestOutcome_Review_ChangeSignificanceEscalatesOnly(t *testing.T) {
 	}
 }
 
+// THE ADOPTED SEMVER FLOOR IS A FLOOR, NOT A CEILING.
+//
+// MintAdoptedUpgradeTask seeds every adopted dependency merge request's mirror
+// with controller.AdoptedSignificanceFloor so the common path - approved at
+// first review, no upgrade turn, no declared change_significance - still cuts a
+// tag. The floor is only safe if the reviewer keeps its say, which means the
+// escalation clause below must outrank it for EVERY value a review can declare.
+// That is a property of restapi's own rank table and its `sig != "" &&
+// rank[sig] > rank[current]` clause, so it is asserted HERE, against the real
+// handler, and not against a copy of the table in the package that seeds it.
+func TestOutcome_Review_EscalatesTheSeededAdoptedFloor(t *testing.T) {
+	for _, declared := range []string{"minor", "major"} {
+		t.Run(declared, func(t *testing.T) {
+			forge := &reviewPanicForge{heads: map[int]string{295: "sha1"}}
+			mr := mrV2("tatara-operator", 295, "t1", func(m *tatarav1alpha1.MergeRequest) {
+				m.Status.Significance = controller.AdoptedSignificanceFloor
+			})
+			e := buildV2(t, v2Opts{writer: forge}, projectV2("tatara"), scmSecretV2(),
+				repoV2("tatara-operator", "tatara"),
+				taskV2("t1", "tatara", "upgrade", tatarav1alpha1.StateAwaitingReview, "review"), mr)
+
+			w := e.do(t, http.MethodPost, "/tasks/t1/outcome", fmt.Sprintf(`{"kind":"review","payload":{
+			  "verdict":"approve","changeSignificance":%q,
+			  "reviewedSHAs":[{"repo":"tatara-operator","number":295,"sha":"sha1"}]}}`, declared))
+			require.Equal(t, http.StatusOK, w.Code)
+			require.Equal(t, declared,
+				e.mr(t, tatarav1alpha1.MergeRequestName("tatara-operator", 295)).Status.Significance,
+				"the seeded adoption floor must be the LOWEST rank, or a reviewer who reads a "+
+					"breaking change in the changelog cannot raise the release off patch")
+		})
+	}
+}
+
 // I2: RecordReviewOutcome must be WIRED into the review-verdict path, and
 // its "request_changes" -> "changes_requested" label must match what
 // tatara-quality.yaml's rubber-stamp alert selects

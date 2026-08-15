@@ -456,9 +456,8 @@ const (
 	// so re-closing an already-closed PR is not free.
 	AnnTerminalClosed = "tatara.dev/terminal-closed"
 	// AnnAdoptionRefused is stamped on a MERGEREQUEST CR when the ADOPTED
-	// upgrade Task bound to it is reaped without delivering it (value: the park
-	// or state reason that ended the Task). AdoptUpgradeMR clause (g) refuses a
-	// marked mirror, which is what makes a refusal DURABLE.
+	// upgrade Task bound to it is reaped after DECLINING it. AdoptUpgradeMR
+	// clause (g) refuses a marked mirror, which is what makes a refusal DURABLE.
 	//
 	// Without it re-adoption is unbounded and a decline is ERASED. The reap
 	// orphans the mirror and frees the deterministic Task name, so the next
@@ -467,8 +466,24 @@ const (
 	// bump the upgrade agent declined as UNSAFE can be approved and merged on
 	// its second lap. Same mechanism and same reasoning as AnnTerminalClosed:
 	// the mirror outlives the Task, so a decision the Task made lives on the
-	// mirror. A human who disagrees applies the trigger label, which routes the
-	// merge request to an ordinary review Task (AdoptUpgradeMR clause f).
+	// mirror.
+	//
+	// THE VALUE IS "<reason>@<headSHA>", and BOTH halves are load-bearing:
+	//
+	//	reason   the decline that ended the Task (implement-declined, declined,
+	//	         or a rejected terminal), so a human reading the mirror sees WHY
+	//	         without archaeology. Only a DECLINE is ever written here - see
+	//	         adoptionRefusalReason for why a stage-deadline or a merge-timeout
+	//	         must not.
+	//	headSHA  the mirror's head at the moment of the decline. adoptionRefused
+	//	         binds the refusal to THAT TREE: the engine force-pushing the next
+	//	         bump onto the same reused branch clears it, because what comes
+	//	         back is a different change and deserves a fresh decision.
+	//
+	// A value with no "@" is refused UNCONDITIONALLY (the head was unknown, so
+	// nothing can prove the tree moved). Undoing a refusal by hand is deleting
+	// the annotation. The trigger label is NOT a general escape hatch - see
+	// AdoptUpgradeMR clause (g) for exactly when it is one and when it is not.
 	AnnAdoptionRefused = "tatara.dev/adoption-refused"
 	// AnnTerminalReleased is stamped on the TASK once its whole B.6 terminal
 	// sequence has completed. The Task then survives its retention window as a
@@ -1451,42 +1466,72 @@ func (r *ProjectReconciler) carryHumanReviewRounds(ctx context.Context, t *tatar
 	return nil
 }
 
+// adoptionRefusalReason returns the reason to stamp as a durable adoption
+// refusal for t, or "" when t's ending was not a REFUSAL of the bump at all.
+//
+// ONLY A DELIBERATE DECLINE COUNTS, and the narrowness is the whole point. The
+// marker is PERMANENT for the tree it names, and its one job is to stop a bump
+// the platform DECIDED against coming back for a second review that approves it.
+// implement-declined, declined and a rejected terminal are decisions. Every
+// other way an adopted Task dies is an infrastructure outcome that says nothing
+// about the bump: stage-deadline is a review pod that never answered,
+// merge-timeout / merge-blocked are the forge, ci-red is the dependency's own
+// pipeline, and no-outcome / operator-error / object-too-large /
+// admission-starved are the platform's own faults.
+//
+// The earlier form fell back ParkReason -> StateReason -> State and therefore
+// stamped for ALL of them, so one flaky review pod retired a merge request
+// forever - and, because a dependency engine reuses one branch per dependency
+// line, the whole line behind it.
+func adoptionRefusalReason(t *tatarav1alpha1.Task) string {
+	if t.Status.State == tatarav1alpha1.StateRejected {
+		if t.Status.StateReason != "" {
+			return t.Status.StateReason
+		}
+		return tatarav1alpha1.StateRejected
+	}
+	switch t.Status.ParkReason {
+	case stage.ReasonImplementDeclined, stage.ReasonDeclined:
+		return t.Status.ParkReason
+	}
+	return ""
+}
+
 // markAdoptionRefused is B.6 step 2a: the durable refusal marker for an ADOPTED
-// dependency merge request whose Task is being reaped without delivering it.
+// dependency merge request whose Task is being reaped after DECLINING it.
 //
 // It is a MIRROR-ONLY write. The merge request is NOT closed and its branch is
 // NOT deleted - it belongs to the dependency engine, ourMR refuses it on both
 // clauses, and step 4 leaves it completely alone. All this says is "the platform
-// has already looked at this one and is not adopting it again".
+// has already decided against THIS TREE and is not reviewing it again".
 //
 // A MERGED merge request is skipped by the open-state test, so a delivered
-// adoption never marks anything. The value is the reason the Task ended
-// (implement-declined, stage-deadline, ownership-lost, ...) so a human reading
-// the mirror can see WHY without archaeology.
+// adoption never marks anything, and a Task that died for any reason other than
+// a decline marks nothing either (adoptionRefusalReason). The value is
+// "<reason>@<headSHA>" - see AnnAdoptionRefused.
 func (r *ProjectReconciler) markAdoptionRefused(ctx context.Context, t *tatarav1alpha1.Task,
 	mrs []tatarav1alpha1.MergeRequest, wasController map[string]bool) error {
 
 	if !stage.AdoptedUpgrade(t) {
 		return nil
 	}
-	reason := t.Status.ParkReason
+	reason := adoptionRefusalReason(t)
 	if reason == "" {
-		reason = t.Status.StateReason
-	}
-	if reason == "" {
-		reason = t.Status.State
+		return nil
 	}
 	for i := range mrs {
 		mr := &mrs[i]
 		if !wasController[mr.Name] || mr.Status.State != "open" || mr.Annotations[AnnAdoptionRefused] != "" {
 			continue
 		}
-		if err := r.annotateMR(ctx, mr, AnnAdoptionRefused, reason); err != nil {
+		value := reason + adoptionRefusedSHASep + mr.Status.HeadSHA
+		if err := r.annotateMR(ctx, mr, AnnAdoptionRefused, value); err != nil {
 			return err
 		}
-		log.FromContext(ctx).Info("marked an adopted dependency merge request as refused; the sweep will not adopt it again",
+		log.FromContext(ctx).Info("marked an adopted dependency merge request as refused; the sweep will not adopt this tree again",
 			"action", "reap_adoption_refused", "resource_id", t.Name,
-			"repo", mr.Spec.RepositoryRef, "number", mr.Spec.Number, "reason", reason)
+			"repo", mr.Spec.RepositoryRef, "number", mr.Spec.Number,
+			"reason", reason, "head_sha", mr.Status.HeadSHA)
 	}
 	return nil
 }

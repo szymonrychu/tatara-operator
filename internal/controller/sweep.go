@@ -128,8 +128,15 @@ const (
 	SweepSkipReporterNotAllowed = "issue_reporter_not_allowed"
 	// SweepSkipMintBudget: one of the two creation budgets bound, so this
 	// orphan is deferred to the next pass. Paired with
-	// obs.SweepMintCapHitTotal, which says WHICH cap bound, once per pass;
-	// this says WHICH ISSUES paid for it.
+	// obs.SweepMintCapHitTotal, which says WHICH cap bound.
+	//
+	// COUNTED ONCE PER PASS (sweepBudget.countBudgetSkip), logged per item. A
+	// cap that is full defers every remaining orphan, so counting each one made
+	// a healthy project at maxOpenTasks look like a permanent incident; the log
+	// lines are what say WHICH issues and pull requests paid for it. It is also
+	// excluded from TataraSweepSkipPersistent for that reason - the dedup fixes
+	// the series, it does not make a per-pass increment stop clearing the alert
+	// threshold.
 	SweepSkipMintBudget = "mint_budget_bound"
 	// SweepSkipAlreadyMinted: MintExistingLive. A webhook (or a concurrent
 	// pass) already minted this natural key and its Task is alive.
@@ -809,6 +816,35 @@ func adoptableAuthor(proj *tatarav1alpha1.Project, author string) bool {
 	return slices.Contains(proj.Spec.UpgradePolicy.UpgradeEngineLogins, author)
 }
 
+// adoptionRefusedSHASep separates the two halves of AnnAdoptionRefused's value,
+// "<reason>@<headSHA>". "@" is safe as a separator because every park and state
+// reason in internal/stage is kebab-case with no "@" in it.
+const adoptionRefusedSHASep = "@"
+
+// adoptionRefused reports whether cr carries a durable adoption refusal that
+// still binds at headSHA. It is AdoptUpgradeMR clause (g), factored out because
+// parsing a two-part annotation value is not something a predicate should do
+// inline.
+//
+// IT FAILS CLOSED TWICE. A marker with no separator (nothing recorded the head)
+// and a live headSHA the forge did not report both refuse: neither can PROVE the
+// tree moved on from the one that was declined, and re-reviewing a bump the
+// platform already rejected is the failure this marker exists to prevent.
+func adoptionRefused(cr *tatarav1alpha1.MergeRequest, headSHA string) bool {
+	if cr == nil {
+		return false
+	}
+	value := cr.Annotations[AnnAdoptionRefused]
+	if value == "" {
+		return false
+	}
+	i := strings.LastIndex(value, adoptionRefusedSHASep)
+	if i < 0 || headSHA == "" {
+		return true
+	}
+	return value[i+len(adoptionRefusedSHASep):] == headSHA
+}
+
 // AdoptUpgradeMR reports whether pr is a dependency-upgrade merge request this
 // project should adopt into its own upgrade Task. ALL of:
 //
@@ -818,7 +854,8 @@ func adoptableAuthor(proj *tatarav1alpha1.Project, author string) bool {
 //	d. pr.head.repo == pr.base.repo              (NO forks, ever)
 //	e. no Task owns the branch and no live Task owns the mirror CR
 //	f. pr does NOT carry the project trigger label
-//	g. its mirror carries no durable adoption REFUSAL marker
+//	g. its mirror carries no durable adoption REFUSAL marker for pr's head SHA
+//	h. its mirror has not STOOD DOWN to an external push
 //
 // (c) is what makes adoption SAFE TO MERGE rather than merely possible. An
 // adopted merge request is one the operator will merge on an approve, and
@@ -849,30 +886,56 @@ func adoptableAuthor(proj *tatarav1alpha1.Project, author string) bool {
 // automatic disposition. It also makes this clause safe under
 // prReactionScope:"all", where every labelled merge request is reviewable.
 //
-// (g) IS WHAT MAKES A REFUSAL STICK, and without it re-adoption is unbounded.
+// (g) IS WHAT MAKES A DECLINE STICK, and without it re-adoption is unbounded.
 // The reaper orphans the mirror and deletes a parked or terminal adopted Task;
 // (e) then holds no more, because the deterministic Task name is free again and
 // the mirror has no live owner - so the very next sweep re-adopts the SAME merge
 // request into a fresh Task with a fresh review turn. A bump the upgrade agent
 // DECLINED as unsafe therefore comes back, and the next reviewer, who sees none
 // of that history, can approve and merge it. The reaper stamps
-// AnnAdoptionRefused on the still-open mirror of an adopted Task it reaps, and
-// this reads it: same durable-annotation mechanism as AnnTerminalClosed, and the
-// same reason - a decision the platform already made must outlive the object
+// AnnAdoptionRefused on the still-open mirror of an adopted Task it DECLINED,
+// and this reads it: same durable-annotation mechanism as AnnTerminalClosed, and
+// the same reason - a decision the platform already made must outlive the object
 // that made it. cr may be nil (no mirror exists, so nothing was ever refused).
 //
-// IT IS SCOPED TO ONE MIRROR AND IT IS MEANT TO BE PERMANENT. A refusal stops
-// this merge request being re-adopted and nothing else - the engine's other
-// merge requests are untouched, and a new merge request for the same dependency
-// (which is what the engine opens after a rebase or a retarget) is a different
-// number, a different mirror and a fresh decision. Undoing one is a deliberate
-// human act: delete the annotation, or merge the merge request yourself. The
-// trigger label does NOT undo it - clause 2 ignores a bot-authored merge
-// request whatever labels it carries, which is pre-existing and unchanged.
+// IT IS SCOPED TO ONE TREE, NOT TO THE MERGE REQUEST FOREVER, and that scoping
+// is what makes it survivable. A dependency engine does NOT open a new merge
+// request per bump within a dependency line: Renovate's default branch name is
+// renovate/<dep>-<major>.x, and it FORCE-PUSHES each successive bump onto that
+// same branch, keeping the same number and the same mirror. A marker keyed on
+// the mirror alone would therefore refuse 1.4 because 1.3 was declined, and go
+// on refusing every bump of that dependency until a human deleted an annotation
+// they have no reason to know exists. adoptionRefused binds the marker to the
+// head SHA that was refused, so the declined tree stays declined and a genuinely
+// new one gets a fresh decision. Undoing a refusal outright is deleting the
+// annotation, or merging the merge request yourself.
+//
+// THE TRIGGER LABEL IS AN ESCAPE HATCH ONLY WHEN THE ENGINE IS NOT THE BOT. It
+// works by making clause (f) refuse adoption so the merge request falls through
+// to an ordinary review Task - which is reachable only via clause 3, and clause
+// 2 sends every merge request authored by Project.spec.scm.botLogin to PRIgnore
+// before clause 3 is reached. So: an engine running under an allowlisted
+// upgradeEngineLogins identity is labelled into a review Task; an engine running
+// under the bot's own login is not, and there the only recoveries are the
+// annotation and a human merge.
+//
+// (h) REFUSES WHAT THE MERGE CORRIDOR WOULD REFUSE. A human push onto an adopted
+// merge request stands its mirror down to `external` with adoptedPushReasonPrefix,
+// which mergeAllowedForOwnership rejects; flipToExternal then hands the mirror to
+// a kind=review Task, so the adopted Task's own reap sees wasController=false and
+// (g) marks nothing. When that review Task is later reaped the mirror is orphaned
+// and nothing else stops a re-adoption - which would tell a fresh review pod
+// "approving MERGES it" and then hard-error reconcileMerge on every reconcile
+// until the merging deadline parks the Task. The test is exactly the merge
+// corridor's own, so a stood-down TAKEOVER (external-push:, which IS mergeable
+// because a maintainer asked for it) is unaffected.
 func AdoptUpgradeMR(proj *tatarav1alpha1.Project, pr scm.PRRef,
 	owner *tatarav1alpha1.Task, liveOwner string, cr *tatarav1alpha1.MergeRequest) bool {
 
-	if cr != nil && cr.Annotations[AnnAdoptionRefused] != "" {
+	if adoptionRefused(cr, pr.HeadSHA) {
+		return false
+	}
+	if cr != nil && cr.Status.Ownership == tatarav1alpha1.OwnershipExternal && !mergeAllowedForOwnership(cr) {
 		return false
 	}
 	prefix := adoptBranchPrefixOf(proj)
@@ -1192,6 +1255,29 @@ func mintedBucket(parkReason string) string {
 	return "parked"
 }
 
+// countBudgetSkip reports whether THIS pass should still increment
+// operator_sweep_skipped_total{reason="mint_budget_bound"}. True exactly once
+// per pass, the same dedup capHit already applies to its own counter, and for
+// the same reason.
+//
+// A DEFERRAL PER ITEM IS ONE FACT, NOT N. allow returns false for EVERY
+// remaining orphan once active >= maxOpen, so an unconditional counter turned
+// "the cap is full" into a series whose rate is the size of the backlog, on
+// every pass, forever - the alert-burying shape upgrade_headroom_bound was
+// excluded from TataraSweepSkipPersistent for. The LOG line is still emitted per
+// item: a counter cannot say WHICH pull request went unanswered, which is the
+// entire reason skipPR and skipIssue log at all.
+//
+// It shares b.hit with capHit; the reason strings and the cap names are disjoint
+// vocabularies (mint_budget_bound vs maxNewTasksPerSweep / maxOpenTasks).
+func (b *sweepBudget) countBudgetSkip() bool {
+	if b.hit[SweepSkipMintBudget] {
+		return false
+	}
+	b.hit[SweepSkipMintBudget] = true
+	return true
+}
+
 func (b *sweepBudget) capHit(ctx context.Context, cap string) {
 	if b.hit[cap] {
 		return
@@ -1400,7 +1486,19 @@ func (r *ProjectReconciler) strandOnFailure(proj *tatarav1alpha1.Project, repo *
 func skipIssue(ctx context.Context, proj *tatarav1alpha1.Project,
 	repo *tatarav1alpha1.Repository, number int, activity, reason string) {
 
-	obs.SweepSkippedTotal.WithLabelValues(proj.Name, activity, reason).Inc()
+	skipIssueMetered(ctx, proj, repo, number, activity, reason, true)
+}
+
+// skipIssueMetered is skipIssue with the counter under the caller's control. It
+// exists for ONE caller - the creation-budget deferral, which logs per item and
+// counts once per pass (sweepBudget.countBudgetSkip). Everything else counts
+// unconditionally through skipIssue.
+func skipIssueMetered(ctx context.Context, proj *tatarav1alpha1.Project,
+	repo *tatarav1alpha1.Repository, number int, activity, reason string, count bool) {
+
+	if count {
+		obs.SweepSkippedTotal.WithLabelValues(proj.Name, activity, reason).Inc()
+	}
 	log.FromContext(ctx).Info("sweep: issue skipped",
 		"action", "sweep_skip_issue", "resource_id", tatarav1alpha1.IssueName(repo.Name, number),
 		"activity", activity, "reason", reason, "project", proj.Name,
@@ -1414,7 +1512,17 @@ func skipIssue(ctx context.Context, proj *tatarav1alpha1.Project,
 func skipPR(ctx context.Context, proj *tatarav1alpha1.Project,
 	repo *tatarav1alpha1.Repository, number int, activity, reason string, kv ...any) {
 
-	obs.SweepSkippedTotal.WithLabelValues(proj.Name, activity, reason).Inc()
+	skipPRMetered(ctx, proj, repo, number, activity, reason, true, kv...)
+}
+
+// skipPRMetered is skipIssueMetered's PR arm; see it for why the counter is
+// separable from the log line.
+func skipPRMetered(ctx context.Context, proj *tatarav1alpha1.Project,
+	repo *tatarav1alpha1.Repository, number int, activity, reason string, count bool, kv ...any) {
+
+	if count {
+		obs.SweepSkippedTotal.WithLabelValues(proj.Name, activity, reason).Inc()
+	}
 	log.FromContext(ctx).Info("sweep: PR skipped",
 		append([]any{"action", "sweep_skip_pr",
 			"resource_id", tatarav1alpha1.MergeRequestName(repo.Name, number),
@@ -1519,7 +1627,8 @@ func (r *ProjectReconciler) sweepIssues(ctx context.Context, proj *tatarav1alpha
 		live := WebhookOriginated(cr)
 		stg, reason := MintStage(proj, repo, ext, live)
 		if !budget.allow(ctx, reason) {
-			skipIssue(ctx, proj, repo, ref.Number, activity, SweepSkipMintBudget)
+			skipIssueMetered(ctx, proj, repo, ref.Number, activity, SweepSkipMintBudget,
+				budget.countBudgetSkip())
 			r.strandOrphan(proj, repo, ref, now)
 			continue
 		}
@@ -1694,10 +1803,13 @@ func (r *ProjectReconciler) sweepPRs(ctx context.Context, proj *tatarav1alpha1.P
 		case PRReview:
 			stg, reason := MintReviewStage(cr)
 			if !budget.allow(ctx, reason) {
-				// Counted AND logged. This arm used to count nothing at all, so
-				// an orphan PR deferred by the budget was the one skip in the
-				// pass with no series and no line anywhere.
-				skipPR(ctx, proj, repo, pr.Number, activity, SweepSkipMintBudget, "state", stg)
+				// LOGGED per item, COUNTED once per pass. This arm used to count
+				// nothing at all, so an orphan PR deferred by the budget was the
+				// one skip in the pass with no series and no line anywhere; it
+				// then counted every deferred item on every pass, which is the
+				// opposite mistake (see sweepBudget.countBudgetSkip).
+				skipPRMetered(ctx, proj, repo, pr.Number, activity, SweepSkipMintBudget,
+					budget.countBudgetSkip(), "state", stg)
 				continue
 			}
 			task, outcome, merr := r.minter().MintReviewTask(ctx, proj, repo, pr, cr, stg, reason, sp)
