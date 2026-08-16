@@ -7,6 +7,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	tatarav1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
@@ -14,6 +15,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/own"
+	"github.com/szymonrychu/tatara-operator/internal/queue"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
 
@@ -302,7 +304,194 @@ func (s *Server) handleMRSynchronize(ctx context.Context, w http.ResponseWriter,
 			"action", "mr_synchronize_mirror", "project", proj.Name, "repository", repo.Name,
 			"number", ev.Number, "head_sha", ev.HeadSHA, "bot_push", bot)
 	}
+	s.refreshQueuedAdoption(ctx, &proj, repo, ev)
 	s.accept(w, provider, ev.Kind, ev.Action, "accepted")
+}
+
+// queuedAdoption returns the STILL-QUEUED adoption event for (proj, repo,
+// number), or nil when there is none or it has already been admitted.
+//
+// It is a single Get on the DETERMINISTIC name, not a list: QueuedEventName is a
+// pure function of (project, dedupKey) and AdoptUpgradeDedupKey is a pure
+// function of (repository CR name, number), both of which this handler already
+// holds. Every merge request in the platform receives synchronize and closed
+// deliveries and almost none has a queued adoption, so the miss path has to be
+// one cheap read.
+//
+// THE READ IS UNCACHED (s.reader(), the manager's APIReader), for the same
+// reason the review guards are and the dispatcher's own mintedTask is (fix
+// M28): the QueuedEvent this looks for was created SECONDS earlier by
+// handleMROpened, possibly on a DIFFERENT one of the three non-leader-elected
+// webhook replicas. A merge/close delivery arriving before that Create has
+// propagated into this replica's informer would find nothing through the cached
+// client, dropQueuedAdoption would no-op silently, and the admit-time backstop
+// cannot cover it - a FIRST adoption has no MergeRequest mirror CR at all, so
+// admitAdoptedUpgrade's merged/closed check sees nothing either (its own doc
+// comment says so). The cost of that miss is an agent pod burned reviewing an
+// already-merged merge request, which is exactly what design D4 exists to
+// prevent.
+func (s *Server) queuedAdoption(ctx context.Context, proj *tatarav1.Project,
+	repo *tatarav1.Repository, number int) *tatarav1.QueuedEvent {
+
+	if repo == nil || number <= 0 {
+		return nil
+	}
+	name := queue.QueuedEventName(proj.Name, queue.AdoptUpgradeDedupKey(repo.Name, number))
+	var qe tatarav1.QueuedEvent
+	if err := s.reader().Get(ctx, objKey(s.cfg.Namespace, name), &qe); err != nil {
+		return nil
+	}
+	if !stillQueuedAdoption(&qe) {
+		return nil
+	}
+	return &qe
+}
+
+// stillQueuedAdoption is queuedAdoption's own predicate, factored out so
+// refreshQueuedAdoption's retry loop - which must re-Get inside the
+// RetryOnConflict closure rather than reuse an outer read - can apply the
+// IDENTICAL rule to its own fresh read.
+//
+// The empty state is a QueuedEvent whose post-Create status update was lost,
+// which is still effectively Queued (isQueued's own rule). Anything else -
+// Admitted, or any other non-empty state - is spent work this belongs to
+// neither refresh nor drop.
+func stillQueuedAdoption(qe *tatarav1.QueuedEvent) bool {
+	if qe.Spec.Payload.AdoptedUpgrade == nil {
+		return false
+	}
+	return qe.Status.State == "" || qe.Status.State == tatarav1.QueueStateQueued
+}
+
+// refreshQueuedAdoption re-snapshots a still-queued adoption from a synchronize
+// delivery. Renovate FORCE-PUSHES each successive bump onto the same branch,
+// keeping the same number and the same merge request, so an event that waits
+// behind a full pool is pointing at a tree that no longer exists - and
+// AdoptUpgradeMR clause (g) binds its refusal marker to a head SHA, so minting
+// against a stale one rules on the wrong tree.
+//
+// GET-MUTATE-UPDATE UNDER retry.RetryOnConflict, re-Getting fresh INSIDE the
+// closure THROUGH THE UNCACHED READER, mirroring fitMR/objbudget.FitIssue in
+// this same file and patchQueuedEventStatus in queue_controller.go. The reader
+// is what makes the retry mean anything: a re-Get through the informer cache
+// hands back the SAME stale resourceVersion the losing Update was built on, so
+// every retry re-submits the identical losing write and the loop just burns its
+// four attempts. It is also what lets this handler see an event a sibling
+// replica created moments ago at all (see queuedAdoption). Production runs 3 webhook
+// replicas with no leader election on this path, so two near-simultaneous
+// synchronize deliveries - literally "Renovate force-pushes each successive
+// bump", the case this whole handler exists for - can land on different
+// replicas and race this same write. A LOST update here is not cosmetic:
+// admitAdoptedUpgrade's refusal check (AdoptUpgradeMR clause g) is keyed on the
+// stored HeadSHA, so losing the newer one makes a human's refusal of it
+// invisible at admission and the merge corridor never sees it - the Task has
+// already minted by then. A plain single Get-then-Update, as this used to be,
+// drops the newer write silently on every conflict instead of retrying it.
+func (s *Server) refreshQueuedAdoption(ctx context.Context, proj *tatarav1.Project,
+	repo *tatarav1.Repository, ev scm.WebhookEvent) {
+
+	if repo == nil || ev.Number <= 0 {
+		return
+	}
+	key := objKey(s.cfg.Namespace, queue.QueuedEventName(proj.Name, queue.AdoptUpgradeDedupKey(repo.Name, ev.Number)))
+	refreshed := false
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		refreshed = false
+		var qe tatarav1.QueuedEvent
+		if gerr := s.reader().Get(ctx, key, &qe); gerr != nil {
+			if apierrors.IsNotFound(gerr) {
+				return nil // no queued adoption at all: the normal case
+			}
+			return gerr
+		}
+		if !stillQueuedAdoption(&qe) {
+			return nil // admitted, or already dropped, between deliveries
+		}
+		qe.Spec.Payload.AdoptedUpgrade.HeadSHA = ev.HeadSHA
+		if ev.Title != "" {
+			qe.Spec.Payload.AdoptedUpgrade.Title = ev.Title
+		}
+		if ev.Body != "" {
+			// CLAMPED, exactly as the enqueue funnel clamps it
+			// (controller.AdoptedUpgradeRefFromPR). This is the SECOND writer of
+			// this bounded field, and an unclamped write here would 422 the Update
+			// for precisely the grouped bumps whose per-dependency release notes are
+			// longest - ending design D4's freshness guarantee for them silently,
+			// since this handler's failure policy is best-effort.
+			qe.Spec.Payload.AdoptedUpgrade.Body = controller.ClampAdoptedUpgradeBody(ev.Body)
+		}
+		if uerr := s.cfg.Client.Update(ctx, &qe); uerr != nil {
+			if apierrors.IsNotFound(uerr) {
+				// BENIGN RACE, not a failure: a concurrent dropQueuedAdoption (a
+				// synchronize immediately followed by a close/merge, on either the
+				// same or a different replica) deleted the event between this Get
+				// and this Update. There is nothing left to refresh.
+				return nil
+			}
+			return uerr
+		}
+		refreshed = true
+		return nil
+	})
+	if err != nil {
+		// BEST EFFORT, and unlike the enqueue this one really is: the event is
+		// still queued, the dispatcher still adopts, and the worst case after every
+		// retry is exhausted is a mint at the previous head - which the merge
+		// corridor's own head pin catches for a review-path Task, though NOT for
+		// the adoption-refusal race this handler exists to close (see the doc
+		// comment above).
+		s.log.ErrorContext(ctx, "mr: refresh of a queued adoption failed after retry; the stale snapshot still mints",
+			"action", "mr_adopt_refresh_failed", "error", err,
+			"project", proj.Name, "repository", repo.Name, "number", ev.Number)
+		return
+	}
+	if refreshed {
+		s.log.InfoContext(ctx, "mr: refreshed a queued dependency-upgrade adoption",
+			"action", "mr_adopt_refreshed", "resource_id", key.Name, "project", proj.Name,
+			"repository", repo.Name, "number", ev.Number, "head_sha", ev.HeadSHA)
+	}
+}
+
+// dropQueuedAdoption deletes a still-queued adoption for a merge request that
+// merged or closed while it waited. Admitting it would spend an agent pod on a
+// merge request there is nothing left to review.
+//
+// Delete needs no RetryOnConflict: unlike Update, a plain Delete carries no
+// resourceVersion precondition, so it cannot itself conflict - it either
+// succeeds or, on a race with another deleter, returns NotFound, which is
+// already handled below as the benign outcome it is.
+func (s *Server) dropQueuedAdoption(ctx context.Context, proj *tatarav1.Project,
+	repo *tatarav1.Repository, number int, reason string) {
+
+	qe := s.queuedAdoption(ctx, proj, repo, number)
+	if qe == nil {
+		return
+	}
+	if err := s.cfg.Client.Delete(ctx, qe); err != nil && !apierrors.IsNotFound(err) {
+		// A FAILED DELETE HERE IS NOT RETRIED BY THE FORGE: handleMRClosed still
+		// answers 202 regardless of this error (the same best-effort policy as
+		// every other mirror write in this file), so the event stays Queued with
+		// no redelivery to try this again.
+		//
+		// admitAdoptedUpgrade (queue_controller.go) IS a real second gate, and it
+		// costs nothing new: it already fetches this same MergeRequest mirror CR
+		// for clause (e)'s live-owner check, and now refuses to mint when that
+		// mirror's State is merged or closed, dropping the event there instead
+		// under this SAME reason. But that backstop is NOT universal - fitMR
+		// (this file) only UPDATES an existing MergeRequest mirror, it never
+		// CREATES one, so an adoption that has never been admitted before has no
+		// mirror CR yet and admitAdoptedUpgrade cannot see this merge request's
+		// real state at all. For that common case, a Delete failure here has no
+		// second gate before mint.
+		s.log.ErrorContext(ctx, "mr: dropping a queued adoption failed; only a merge request with an existing mirror CR gets a second gate at admit",
+			"action", "mr_adopt_drop_failed", "error", err,
+			"project", proj.Name, "repository", repo.Name, "number", number)
+		return
+	}
+	obs.AdoptionEventDroppedTotal.WithLabelValues(proj.Name, reason).Inc()
+	s.log.InfoContext(ctx, "mr: dropped a queued dependency-upgrade adoption",
+		"action", "mr_adopt_dropped", "resource_id", qe.Name, "project", proj.Name,
+		"repository", repo.Name, "number", number, "reason", reason)
 }
 
 // handleMRClosed refreshes the mirror MergeRequest state on an out-of-band PR/MR
@@ -326,6 +515,19 @@ func (s *Server) handleMRClosed(ctx context.Context, w http.ResponseWriter, prov
 	if s.stampMRState(ctx, &proj, repo, ev.Number, state) {
 		s.log.InfoContext(ctx, "mr: mirrored out-of-band close/merge; reconcile converges",
 			"action", "mr_closed_mirror", "project", proj.Name, "repository", repo.Name, "number", ev.Number, "state", state)
+	}
+	// LITERAL AT THIS CALL SITE, not `state` reused: a merged bump is the happy
+	// path racing the queue, a closed one is a withdrawal, and
+	// TestAdoptionDropReasonsMatchTheirProducers (internal/obs) scans for a
+	// literal string argument passed directly to dropQueuedAdoption - the same
+	// shape it already scans the dispatcher's drop(...) and the webhook's
+	// pre-enqueue refusal in. Passing the shared `state` local through instead
+	// would let a future third reason, added some OTHER way than a variable
+	// literally named `state`, go unseen by that scan.
+	if state == "merged" {
+		s.dropQueuedAdoption(ctx, &proj, repo, ev.Number, "merged")
+	} else {
+		s.dropQueuedAdoption(ctx, &proj, repo, ev.Number, "closed")
 	}
 	// RESUME TRIGGER (maintainer close). Same signal as the comment trigger:
 	// a maintainer disposing of an item is engagement.
