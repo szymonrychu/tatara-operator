@@ -12,13 +12,11 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/event"
-	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 )
 
 // adoptionEngineBot is the login the dependency engine authors as, which is what
@@ -119,21 +117,15 @@ func adoptionQE(t *testing.T, ctx context.Context, proj *tatarav1alpha1.Project,
 func startAdoptionDispatcher(t *testing.T, ctx context.Context, ns string) *DispatcherReconciler {
 	t.Helper()
 	skipNameValidation := true
-	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme:                 scheme.Scheme,
-		Metrics:                metricsserver.Options{BindAddress: "0"},
-		HealthProbeBindAddress: "0",
-		Cache:                  cache.Options{DefaultNamespaces: map[string]cache.Config{ns: {}}},
+	mgr := newTestManager(t, func(o *ctrl.Options) {
+		o.Cache = cache.Options{DefaultNamespaces: map[string]cache.Config{ns: {}}}
 		// The controller-name registry is process-wide and this binary already
 		// registers a "queuedevent" controller elsewhere; skipping the check is
 		// what lets the PRODUCTION SetupWithManager run here unmodified.
-		Controller: config.Controller{SkipNameValidation: &skipNameValidation},
+		o.Controller = config.Controller{SkipNameValidation: &skipNameValidation}
 	})
-	if err != nil {
-		t.Fatalf("new manager: %v", err)
-	}
 	r := &DispatcherReconciler{
-		Client: mgr.GetClient(), Scheme: scheme.Scheme,
+		Client: mgr.GetClient(), Scheme: mgr.GetScheme(),
 		BackstopEvents: make(chan event.GenericEvent),
 	}
 	if err := r.SetupWithManager(mgr); err != nil {
@@ -294,7 +286,13 @@ func occupyTheLane(t *testing.T, ctx context.Context, proj *tatarav1alpha1.Proje
 	}
 }
 
-// THE MEASURED DEFECT, AS A TEST.
+// THE ADMISSION HALF OF THE MEASURED DEFECT, AS A TEST - and only that half.
+// Both tests in this file hand-create their adoption QueuedEvents, so NOTHING
+// here exercises the producers: re-instating an enqueue-side headroom bound,
+// which is the actual production cause, would slip past this file entirely. The
+// enqueue half is pinned by internal/webhook/upgrade_adoption_test.go (Task 6)
+// and internal/controller/sweep_adopt_upgrade_test.go (Task 8). What this file
+// owns is what happens once the work IS in the queue.
 //
 // 2026-08-16 on szymonrychu/charts: three Renovate merge requests arrived within
 // 30 seconds, the pass that ran adopted !1024 and !1025 and skipped !1026
@@ -420,9 +418,19 @@ func TestDispatcher_ThirdQueuedAdoptionAdmitsOnTheFirstTaskGoingTerminal(t *test
 // adoption enqueue); this pins the CONSEQUENCE inside the dispatcher: with equal
 // priority, admitPool falls back to seq, so the older admission ticket of a
 // half-done Task takes the slot its next pod needs and the newer adoption waits.
+//
+// THE POOL MUST BE THE ONLY THING THAT BINDS, which is why maxConcurrentAgents
+// is 3 while spec.queue.capacity stays 1. At maxConcurrentAgents 1 this test was
+// VACUOUS: MaxLivePods clamps to maxConcurrentAgents-1 (floored at 1), the live
+// Task below consumes it, and a priority-1 adoption - one that DID sort first -
+// was then skipped on the live-mint ceiling with its slot unburned, leaving the
+// ticket admitted next and all three assertions below green under the very
+// design they exist to refuse. Raising the ceiling to 2 takes it out of the
+// answer, so the ONLY reason the ticket wins is the (priority, seq) order.
 func TestDispatcher_QueuedAdoptionsDoNotOutrankAnInFlightTaskTicket(t *testing.T) {
 	ctx := context.Background()
 	proj := adoptionProject("adopt-priority-proj", testNS)
+	proj.Spec.MaxConcurrentAgents = 3
 	proj.Spec.Queue = &tatarav1alpha1.QueueSpec{Capacity: 1, AlertCapacity: 1}
 	mustCreate(t, ctx, proj)
 	repo := adoptionRepository(proj, "charts-priority")
