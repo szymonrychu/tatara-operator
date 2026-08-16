@@ -15,26 +15,36 @@ import (
 
 // WebhookEvent is the provider-agnostic parse of an inbound SCM webhook.
 type WebhookEvent struct {
-	Kind         string // "push" | "issue" | "mr" | "ci" | "other"
-	Repo         string // remote URL
-	Branch       string // for push
-	Labels       []string
-	Title        string
-	Body         string // issue/PR/MR description body
-	CommentBody  string // the comment text for issue_comment/note (created) events
-	CommentID    int    // provider comment id for idempotency (0 when not a comment event)
-	IsComment    bool   // true only for issue_comment/Note-Hook events (not label/state events)
-	IssueRef     string // owner/repo#123 (github) or group/proj!iid (gitlab)
-	URL          string
-	AuthorLogin  string // login of the issue/PR/MR author (the resource author)
-	ActorLogin   string // login of the user who triggered the event (the sender)
-	Action       string // opened|labeled|unlabeled|closed|synchronize|submitted|created|other
-	Number       int    // issue/PR/MR number (github) or iid (gitlab)
-	IsPR         bool   // true for mr/pull_request events
-	Merged       bool   // true when a PR/MR-close delivery is a MERGE (GitHub pull_request.merged / GitLab action=merge)
-	HeadSHA      string // PR/MR head commit (for CI lookup); push after-SHA (documentation agent diff head)
-	BaseSHA      string // push before-SHA (documentation agent diff base); empty for non-push events
-	HeadBranch   string // PR/MR source branch
+	Kind        string // "push" | "issue" | "mr" | "ci" | "other"
+	Repo        string // remote URL
+	Branch      string // for push
+	Labels      []string
+	Title       string
+	Body        string // issue/PR/MR description body
+	CommentBody string // the comment text for issue_comment/note (created) events
+	CommentID   int    // provider comment id for idempotency (0 when not a comment event)
+	IsComment   bool   // true only for issue_comment/Note-Hook events (not label/state events)
+	IssueRef    string // owner/repo#123 (github) or group/proj!iid (gitlab)
+	URL         string
+	AuthorLogin string // login of the issue/PR/MR author (the resource author)
+	ActorLogin  string // login of the user who triggered the event (the sender)
+	Action      string // opened|labeled|unlabeled|closed|synchronize|submitted|created|other
+	Number      int    // issue/PR/MR number (github) or iid (gitlab)
+	IsPR        bool   // true for mr/pull_request events
+	Merged      bool   // true when a PR/MR-close delivery is a MERGE (GitHub pull_request.merged / GitLab action=merge)
+	HeadSHA     string // PR/MR head commit (for CI lookup); push after-SHA (documentation agent diff head)
+	BaseSHA     string // push before-SHA (documentation agent diff base); empty for non-push events
+	HeadBranch  string // PR/MR source branch
+
+	// HeadRepo identifies the repository the HEAD branch lives in, in the same
+	// namespace as WebhookEvent.Repo's slug (a GitHub full_name, a GitLab
+	// path_with_namespace). It is the webhook-path input to AdoptUpgradeMR
+	// clause (d): a merge request whose head is NOT the base repo is a FORK
+	// merge request and is never adopted, whatever its head branch is named.
+	// EMPTY means the forge did not report it, and every consumer fails CLOSED
+	// on empty - it is never defaulted to the base repo.
+	HeadRepo string // PR/MR source repository slug; empty when unreported
+
 	ChangedLabel string // for labeled/unlabeled: the single label added/removed
 
 	// CIStatus is set ONLY on Kind:"ci" deliveries (GitHub check_suite /
