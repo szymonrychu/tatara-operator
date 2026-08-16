@@ -191,10 +191,18 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 	// the gate was refusing the most routine event in a takeover's life. That is
 	// fixed where it belongs, in the flip: parkOwnerTask upgrades a takeover's
 	// implement-declined park to ownership-lost (stage.UpgradeDeclineToOwnership
-	// Lost), so a divergence decline resumes and a DELIBERATE one - never followed
-	// by a flip - stays terminal. What this gate is left holding is the genuine
-	// terminals: exhaustion caps, operator errors, contract mismatches. A human
-	// push must not launder any of those into a resumable Task.
+	// Lost). So the rule a declined takeover actually follows is TERMINAL WHILE
+	// THE BRANCH IS STILL TATARA'S, RESUMABLE ONCE IT IS THE HUMAN'S AGAIN -
+	// deliberate declines included. "A deliberate decline is never followed by a
+	// flip" is FALSE and must not be reinstated here: the takeover job text
+	// requires the agent to comment on the merge request explaining itself before
+	// declining, so a maintainer reading that comment and pushing a fix is the
+	// EXPECTED response, and that push flips ownership exactly as a divergence
+	// does. What this gate is left holding is every OTHER UnparkNever and
+	// UnparkRetired reason - a set, not an enumeration, but each member is reached
+	// without any judgement about the merge request at all (exhaustion caps,
+	// operator errors, contract mismatches, and the CI/merge/deploy terminals). A
+	// human push must not launder any of them into a resumable Task.
 	//
 	// UnparkHuman reasons (awaiting-human and friends) are deliberately NOT
 	// refused: those parks DO clear on a human comment. Note the timing though -
@@ -206,8 +214,10 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 	// THE REACHABLE SHAPE, spelled out because the ownership gate above hides it:
 	// an unresumable takeover still controller-owns its merge request and runs no
 	// pod, so nothing can call this endpoint at all until the human PUSHES. That
-	// push runs flipToExternal -> parkOwnerTask (which leaves every reason in
-	// this set alone) and then hands the controller ref to a review Task. THAT
+	// push runs flipToExternal -> parkOwnerTask - which leaves every reason THIS
+	// GATE STILL REFUSES alone, implement-declined having just been carved out of
+	// that set by the upgrade above - and then hands the controller ref to a
+	// review Task. THAT
 	// review agent is the caller here, with ownership back at `external` - which
 	// is why this gate sits ahead of the already-tatara branch AND ahead of the
 	// flip, rather than inside either.

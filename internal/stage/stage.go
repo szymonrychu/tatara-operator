@@ -435,7 +435,13 @@ func Legal(from, to string) bool { return legalPairs[[2]string{from, to}] }
 // forward edges and a zero-Issue kind can take neither: the gate refuses
 // no-live-issue, and this guard refuses anything outside refinedDoneKinds. A
 // kind that owns no Issue and is not in that set MUST NOT be minted or triaged
-// into `refined` - see the mint-routing table test in this package.
+// into `refined` - see TestNoOriginKindCanReachAGateItCannotLeave in
+// internal/controller. It is NOT in this package because triage is half of
+// "minted or triaged" and triageTarget is UNEXPORTED in internal/controller -
+// not because of an import cycle: mint_routing_test.go here is package
+// stage_test, which could legally import controller. This package's
+// mint_routing_test.go holds only the Create-edge pin, which is a claim about
+// the transition table itself.
 //
 // GUARDS 4, 5 AND 6 WERE CALLER-GATED UNTIL #521's REVIEW (GUARD 6 slipped past
 // that same review and was only caught in the round after). The table's own

@@ -283,9 +283,23 @@ func repark(t *v1alpha1.Task, reason string, now time.Time) {
 // UnparkForMRTerminal is a THIRD exit and does NOT (it guards on the target
 // state and the state reason, never on the park reason), but it clears the park
 // into a terminal via Enter, so stampEnter runs there too. Unpark/reArm, the one
-// path that DOES preserve the carry, refuses ownership-lost by class. Nothing
-// reads the carry while the Task is parked either (task_stage.go checks
-// residency only on an UN-parked Task).
+// path that DOES preserve the carry, refuses ownership-lost by class.
+//
+// NO DECISION reads the carry while the Task is parked (task_stage.go checks
+// residency only on an UN-parked Task), but a READER does, so do not restate
+// that as an absolute either: project_controller.go's updateTaskStageGauges
+// calls StateElapsedSeconds for every Task with StateEnteredAt set, with no
+// Parked filter, and Park leaves StateEnteredAt set. A re-fold is nonetheless
+// INVISIBLE there, and the arithmetic is the point: Park folds
+// now.Sub(StateEnteredAt) into the carry and re-stamps StateEnteredAt to the
+// same instant, so StateElapsedSeconds - now.Sub(StateEnteredAt) + carry -
+// moves the identical quantity from the first term to the second and reads the
+// same before and after (that continuity is what operator_task_state_age_seconds
+// is carry-adjusted FOR). The only thing a second fold would move is the raw
+// Status.StageElapsedCarrySeconds field, which nothing exposes and nothing
+// decides on. So the gauge is neither a reason to repark nor a reason not to;
+// the reason is the one given above, that a Task which parked once must not be
+// booked two park events.
 //
 // changed is false, with no error, when the Task is ALREADY parked
 // ownership-lost. That is a converged state, not a misuse: every caller is a
