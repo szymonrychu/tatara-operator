@@ -194,8 +194,10 @@ func addWebhookServer(ctx context.Context, mgr ctrl.Manager, cfg config.Config, 
 		},
 	}).Mount(httpMux, auth.Middleware(verifier, metrics))
 
-	// The adoption counters the WEBHOOK produces, seeded on every replica before
-	// the listener starts. See adoptionSeedRunnable.
+	// The adoption counters the WEBHOOK produces, seeded on every replica at
+	// manager start. See adoptionSeedRunnable - this runnable and the listener
+	// are both non-leader-election "Others" runnables that start concurrently,
+	// so there is no ordering guarantee between them.
 	if err := mgr.Add(adoptionSeedRunnable{reader: mgr.GetAPIReader(), namespace: cfg.Namespace}); err != nil {
 		return fmt.Errorf("add adoption metric seeder: %w", err)
 	}
@@ -219,11 +221,14 @@ func addWebhookServer(ctx context.Context, mgr ctrl.Manager, cfg config.Config, 
 // WHY START AND NOT PER-DELIVERY. Seeding inside the handler would not help the
 // event it is handling - no scrape falls between the seed and the increment in
 // the same call - so the seed has to precede the first delivery, and the only
-// point that does is start. A Project enrolled AFTER start is covered by the
-// leader's Project reconcile on the leader replica; the residual gap is that
-// project's first adoption delivery landing on a non-leader replica within one
-// scrape of its enrollment, which is a strictly smaller hole than the one this
-// closes and not worth a watch to shave.
+// point that does is start. A Project enrolled AFTER start gets the leader's
+// Project reconcile seed on the LEADER replica only; the residual gap on the
+// other two replicas is NOT time-bounded to one scrape - that Project's series
+// are never seeded there for the life of the pod, so each non-leader replica's
+// first webhook-produced adoption event for that Project is invisible to
+// increase(...) whenever it happens to land. Still a strictly smaller hole than
+// the one this closes (every enrolled Project at start, not just ones enrolled
+// afterward) and not worth a watch to shave.
 //
 // A FAILED LIST IS NOT FATAL. Start returning an error stops the whole manager,
 // and a metrics baseline is not worth trading the control plane for; the series

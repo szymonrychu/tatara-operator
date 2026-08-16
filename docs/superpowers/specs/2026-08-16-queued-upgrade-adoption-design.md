@@ -113,12 +113,15 @@ that give an ALREADY RUNNING Task its next pod - are also priority 2
 Webhook-originated mints are priority 1.
 
 Enqueueing adoptions at priority 1 would let a twelve-MR Renovate run leapfrog
-the next stage of every task already underway, INCLUDING an incident Task's
-downstream tickets, which `ensureTicket` puts at priority 0 only for the
-`incident` stage itself. `admitPool` sorts by `(EffectivePriority, Seq)`, so
-those twelve would drain before any half-done implement or review task got its
-next pod, and the one-hour starvation guard would reserve exactly one slot after
-an hour of that.
+the next stage of every NON-INCIDENT task already underway. An incident Task's
+downstream tickets already rank ahead of priority 1: `task_stage.go:2032`
+applies `WithPriority(0)` to EVERY stage ticket of a Task whose `Spec.Kind` is
+`"incident"`, not only its investigating stage - what keys on the stage itself
+(`agentKind == stage.AgentIncident`) is the queue CLASS (alert vs normal), a
+separate axis from priority. `admitPool` sorts by `(EffectivePriority, Seq)`, so
+those twelve would still drain before any half-done implement or review task on
+a non-incident Task got its next pod, and the one-hour starvation guard would
+reserve exactly one slot after an hour of that.
 
 **Correction (whole-branch review): priority 2 does NOT decline to jump ahead of
 work already started.** An earlier draft of this section said it did, and that
@@ -127,24 +130,34 @@ time, not at Task-creation time, and `queueOrderBefore` sorts `(priority, seq)`
 ascending. Twelve adoptions enqueued at 06:35 therefore all carry a LOWER seq
 than a review ticket cut at 06:36 for a Task that started hours earlier, and each
 adoption that finds mint room takes a normal-pool slot ahead of it. What priority
-2 actually declines is jumping ahead of priorities 0 and 1 - incidents, an
-incident Task's downstream tickets, and human-originated webhook mints. That is
-still the right tier and the priority does not change: priority 1 would add the
-overtake of those tiers on top of the one that already exists, and no human waits
-on a Renovate bump.
+2 actually declines is jumping ahead of priority 0 - incidents AND an incident
+Task's downstream tickets alike, both covered by the same `WithPriority(0)`
+keyed on `task.Spec.Kind == "incident"`. Priority 1 is a documented tier -
+reserved for a human-originated webhook mint - but `grep -rn "WithPriority"`
+finds exactly three call sites (adoption's two, both priority 2, and the
+incident override at priority 0) and no producer sets it, so nothing today
+actually competes at priority 1. That is still the right tier for adoptions and
+the priority does not change: were priority 1 ever to gain a producer, it would
+add the overtake of every non-incident Task's next-stage ticket REGARDLESS OF
+SEQ, on top of the seq-bounded overtake priority 2 already has, and no human
+waits on a Renovate bump.
 
 The overtake is BOUNDED, which is why it stays acceptable: `liveMintBudget` caps
 concurrent mints at `MaxLivePods`, so a starved ticket waits a few adopted-task
 lifetimes, not indefinitely.
 
-**Consequence of D1 nobody had written down.** Removing the two-lane adoption cap
-means a Renovate backlog can now hold priority-2 events in the normal pool for
-hours. A queued adoption older than `starvationBudget` (1h) trips
-`hasStarvingPriority2`, which permanently reserves ONE normal-pool slot
-(`QueueCapacity` minus `AlertCapacity`) for priority 2 for as long as the backlog
-persists - capacity taken away from priority-0/1 work by a mechanism that exists
-to protect the nightly doc batch, now driven by dependency bumps. Accepted: it is
-one slot, and the guard fires only after an hour of genuine starvation.
+**Consequence of D1 nobody had written down.** `hasStarvingPriority2` already
+covers every non-incident stage ticket - all priority 2, same as adoptions - so
+the guard is not a NEW trigger; removing the two-lane adoption cap adds volume,
+not the mechanism. What changes is that a Renovate backlog can now hold
+priority-2 events in the normal pool for hours. A queued adoption older than
+`starvationBudget` (1h) trips the guard, which permanently reserves ONE of the
+normal pool's `QueueCapacity` slots (`internal/controller/queue_controller.go:714`;
+the alert pool is separate, capped by `AlertCapacity` and drained at `:711`) for
+priority 2 for as long as the backlog persists - capacity taken away from
+priority-0 work by a mechanism that exists to protect the nightly doc batch, now
+driven more often by dependency bumps. Accepted: it is one slot, and the guard
+fires only after an hour of genuine starvation.
 
 ### D4 - The webhook keeps queued events fresh
 

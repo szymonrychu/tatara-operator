@@ -1765,7 +1765,7 @@ func (r *ProjectReconciler) sweepPRs(ctx context.Context, proj *tatarav1alpha1.P
 			//
 			// Priority 2 for the same reason and with the same narrow meaning the
 			// webhook's enqueueAdoption spells out (design D3): it declines to jump
-			// ahead of priority 0/1, not ahead of work already started, since a
+			// ahead of priority 0, not ahead of work already started, since a
 			// ticket's seq is allocated at transition time.
 			//
 			// NO Provider AND NO PodRepo: see enqueueAdoption. The adoption path never

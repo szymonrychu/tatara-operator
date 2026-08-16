@@ -682,13 +682,19 @@ func (s *Server) enqueueAdoption(ctx context.Context, w http.ResponseWriter, pro
 	// task_stage.go), so twelve adoptions enqueued at 06:35 all carry a lower seq
 	// than a review ticket cut at 06:36 for a Task already underway - and each
 	// adoption that finds mint room takes a normal-pool slot ahead of it.
-	// Priority 2 declines to jump ahead of priority 0 and 1 (incidents, and an
-	// incident Task's downstream tickets), NOT ahead of work already started.
-	// The overtake is bounded by MaxLivePods via liveMintBudget, so it is a delay
-	// of a few adopted-task lifetimes rather than an unbounded one, and priority 1
-	// would have been strictly worse: it would ALSO outrank every already-running
-	// incident Task's next stage. No human waits on a Renovate bump, and priority
-	// 2 still admits the instant a slot frees, which is the objective.
+	// Priority 2 declines to jump ahead of priority 0, NOT ahead of work already
+	// started. Priority 0 covers an incident Task's downstream tickets too, not
+	// only its investigating stage: task_stage.go:2032 applies WithPriority(0) to
+	// every stage ticket of a Task whose Spec.Kind is "incident" (what keys on the
+	// stage itself, agentKind == stage.AgentIncident, is the queue CLASS, a
+	// separate axis from priority). The overtake priority 2 does have is bounded
+	// by MaxLivePods via liveMintBudget, so it is a delay of a few adopted-task
+	// lifetimes rather than an unbounded one. Priority 1 has no producer anywhere
+	// in this tree today, but the argument against using it holds regardless: it
+	// would outrank every non-incident Task's next-stage ticket REGARDLESS OF SEQ,
+	// where priority 2 only outranks tickets cut later. No human waits on a
+	// Renovate bump, and priority 2 still admits the instant a slot frees, which
+	// is the objective.
 	_, created, eerr := queue.EnqueueEvent(ctx, s.cfg.Client, s.cfg.Seq, proj,
 		tatarav1.QueueClassNormal, true, dedupKey, payload, queue.WithPriority(2))
 	if eerr != nil {
