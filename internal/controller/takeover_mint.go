@@ -47,20 +47,52 @@ func TakeoverTaskName(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Reposit
 // full-lifecycle takeover Task bound to mr:
 //
 //   - No Task exists yet for (proj, takeover, repo, mr.Spec.Number): mint one
-//     straight into `approved` (the Create->approved edge stage.go carries for
-//     exactly this), carrying the MR's existing head branch as
-//     AnnTakeoverHeadBranch so the implement pod PUSHES to it instead of a
-//     derived tatara/* branch, and controller-own the MR mirror.
+//     straight into `under-implementation` (the Create->under-implementation
+//     edge stage.go carries for every kind with no gate to face), carrying the
+//     MR's existing head branch as AnnTakeoverHeadBranch so the implement pod
+//     PUSHES to it instead of a derived tatara/* branch, and controller-own the
+//     MR mirror.
 //   - The Task already exists and is parked(ownership-lost) - a re-take after
-//     a stand-down: re-enter `approved` (parked->approved(ownership-lost)) so
-//     the SAME Task resumes pushing, rather than minting a duplicate.
-//   - The Task already exists in any OTHER live stage (including a fresh
-//     mint that raced us here): return it unchanged. Idempotent.
+//     a stand-down: re-enter `under-implementation` so the SAME Task resumes
+//     pushing, rather than minting a duplicate.
+//   - The Task already exists in any OTHER live state (including a fresh
+//     mint that raced us here): return it unchanged. Idempotent - except for the
+//     mrRefs backfill described under INTERRUPTED MINT below.
 //
-// The OTHER exit from parked(ownership-lost) - parked->merging - is driven by
+// The OTHER exit from parked(ownership-lost) - parked->`merged` - is driven by
 // DrainStandDownMerge (OP11) on an approved review; that is a different
 // trigger (a maintainer's REVIEW, not a maintainer's COMMENT) and does not
-// belong on this path, which always targets approved (RESUME PUSHING).
+// belong on this path, which always targets under-implementation (RESUME
+// PUSHING).
+//
+// WHY NOT `refined` (#604). It was minted there until #604, on the reading that
+// a takeover "still faces the gate". It cannot: `refined`'s only forward edge is
+// submit_outcome(action=approved) -> verifyApprovalScope, which refuses
+// no-live-issue for a Task owning zero Issue CRs, and a takeover owns zero BY
+// CONSTRUCTION - Source.IsPR is always true below, and mintIssueCRs bails on
+// exactly that. Every takeover therefore burned a pod at `refined` and then
+// parked awaiting-human, permanently, with the human's merge request already
+// flipped to tatara ownership and no Task able to advance it. The authorisation
+// the gate would have looked for has already been performed, and more strictly:
+// restapi.mrTakeover refuses unless the triggering comment exists in the mirror
+// AND its recorded author is a verified MAINTAINER, before it flips anything.
+//
+// A DECLINE IS TERMINAL FOR A TAKEOVER, and that is deliberate rather than
+// unnoticed. At `under-implementation` the implement outcome schema's only
+// non-code action is `declined`, which parks(implement-declined) - UnparkNever -
+// and stage.go's GUARD 4 closes under-implementation -> done to every kind but
+// documentation, so a declined takeover parks rather than reaching a terminal
+// state. Nothing in this file hands the merge request back: the ONLY writer of
+// Ownership=external is ownership.go's flipToExternal, which fires on a HUMAN
+// PUSH, and the un-park branch below only fires on ReasonOwnershipLost. So a
+// re-take comment on a DECLINED takeover returns 200 and does nothing, forever.
+// The two ways the MR does come back are both real and both outside this path:
+// the human pushes to it (flipToExternal stamps `external` regardless of the
+// Task already being parked), or the reaper collects the parked Task at
+// ParkRetention and releases ownership with it. The takeover job text
+// (assignment.go) therefore requires the agent to COMMENT on the merge request
+// explaining itself before it declines - a decline the maintainer never sees is
+// the failure mode this terminal would otherwise produce.
 // expectFrom (optional, see MintReviewTask/bindMRToTask) is forwarded to the
 // fresh-mint path's bindMRToTask call unchanged - fix #408: the takeover REST
 // endpoint's caller Task is the MR's current controller owner by the time
@@ -119,7 +151,11 @@ func (m *Minter) mintOrUnparkTakeoverTask(ctx context.Context, proj *tatarav1alp
 			RepositoryRef: repo.Name,
 			Kind:          takeoverKind,
 			Goal:          takeoverGoal(mr, requestingUser, commentBody),
-			InitialState:  tatarav1alpha1.StateRefined,
+			// #604: the WORK, not the gate. A takeover owns zero Issue CRs
+			// (Source.IsPR below is what makes mintIssueCRs bail), so the gate at
+			// `refined` could never grant for it and the Task stranded there. This
+			// is also exactly where the re-take un-park above already lands.
+			InitialState: tatarav1alpha1.StateUnderImplementation,
 			// InitialParkReason is left empty: a takeover mint is NOT parked - a
 			// maintainer just asked for it - and "requested by <user>" is not a
 			// park reason anyway, so stamping it would make the create edge's

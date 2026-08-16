@@ -1002,14 +1002,21 @@ func (r *TaskReconciler) reconcileTriaging(ctx context.Context, proj *tatarav1al
 // through to the no-row branch means a documentation Task that somehow does
 // arrive at `new` parks at triage-stalled, loudly and once, instead of grinding
 // against an edge that does not exist.
+//
+// THERE IS NO `takeover` ROW EITHER, for the same reason, since #604. It used to
+// return `refined` - the SECOND enforcement site for a routing that could never
+// work, because a takeover owns zero Issue CRs and the gate at `refined` refuses
+// no-live-issue forever. Deleting only the mint would have left this row able to
+// put a takeover back in front of that gate, which is the two-enforcement-sites
+// trap MEMORY.md records. takeover_mint.go mints straight into
+// under-implementation and a takeover never reaches triage; one that somehow
+// does now parks triage-stalled, loudly, exactly as documentation does.
 func triageTarget(task *tatarav1alpha1.Task) (string, bool) {
 	if task == nil {
 		return "", false
 	}
 	switch task.Spec.Kind {
 	case stage.AgentBrainstorm, stage.AgentIncident, stage.AgentRefine, stage.AgentImplement:
-		return tatarav1alpha1.StateRefined, true
-	case "takeover":
 		return tatarav1alpha1.StateRefined, true
 	case stage.AgentReview:
 		return tatarav1alpha1.StateAwaitingReview, true

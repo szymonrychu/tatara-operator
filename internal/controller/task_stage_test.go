@@ -747,7 +747,6 @@ func TestTriageNeverRoutesPastTheApprovalGate(t *testing.T) {
 		"implement":  tatarav1alpha1.StateRefined,
 		"incident":   tatarav1alpha1.StateRefined,
 		"refine":     tatarav1alpha1.StateRefined,
-		"takeover":   tatarav1alpha1.StateRefined,
 		"review":     tatarav1alpha1.StateAwaitingReview,
 	}
 	for kind, wantStage := range want {
@@ -762,6 +761,17 @@ func TestTriageNeverRoutesPastTheApprovalGate(t *testing.T) {
 			tatarav1alpha1.StateNew, wantStage) {
 			t.Fatalf("triaging -> %s is not a legal edge for kind %q", wantStage, kind)
 		}
+	}
+
+	// #604: `takeover` is NOT in the map above, and its absence is the
+	// assertion. Landing a takeover in FRONT of the gate is landing it somewhere
+	// it can never leave - it owns zero Issue CRs, so verifyApprovalScope
+	// refuses no-live-issue forever. It is minted straight into
+	// under-implementation instead, and a takeover that somehow reaches triage
+	// must park triage-stalled rather than acquire a row back to `refined`.
+	if got, ok := triageTarget(tsTask("t", "takeover", tatarav1alpha1.StateNew, time.Now())); ok {
+		t.Fatalf("triageTarget(\"takeover\") = %q,true; want no row: a takeover routed to the gate "+
+			"strands there, and this is the SECOND enforcement site that has to agree with the mint", got)
 	}
 }
 

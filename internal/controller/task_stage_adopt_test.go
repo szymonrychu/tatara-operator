@@ -53,13 +53,18 @@ func TestTriageTarget_RoutesAnAdoptedUpgradeTaskIntoTheReviewLane(t *testing.T) 
 	_, ok = triageTarget(cron)
 	require.False(t, ok, "a cron-minted upgrade Task must still have no triage row")
 
+	// #604 removed the `takeover` row for the same reason the cron-upgrade row
+	// never existed: it owns zero Issue CRs, so a triage that lands it at
+	// `refined` lands it in front of a gate that can never grant.
+	_, ok = triageTarget(&tatarav1alpha1.Task{Spec: tatarav1alpha1.TaskSpec{Kind: "takeover"}})
+	require.False(t, ok, "a takeover Task must have no triage row: it is minted into the work")
+
 	// Every pre-existing row is unchanged.
 	for kind, want := range map[string]string{
 		"implement":  tatarav1alpha1.StateRefined,
 		"brainstorm": tatarav1alpha1.StateRefined,
 		"incident":   tatarav1alpha1.StateRefined,
 		"refine":     tatarav1alpha1.StateRefined,
-		"takeover":   tatarav1alpha1.StateRefined,
 		"review":     tatarav1alpha1.StateAwaitingReview,
 	} {
 		got, ok := triageTarget(&tatarav1alpha1.Task{Spec: tatarav1alpha1.TaskSpec{Kind: kind}})

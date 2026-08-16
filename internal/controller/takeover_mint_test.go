@@ -17,7 +17,14 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
-func TestMintOrUnparkTakeoverTask_MintsBoundIntoApproved(t *testing.T) {
+// A FRESH TAKEOVER IS MINTED STRAIGHT INTO THE WORK (#604), not into the gate.
+// It owns zero Issue CRs by construction - Source.IsPR is always true, so
+// mintIssueCRs bails - and `refined`'s only forward edge is the approval gate,
+// which refuses no-live-issue for a Task owning zero Issues. Minted there it
+// burned a pod and parked awaiting-human, forever. under-implementation is also
+// exactly where the re-take un-park below already landed, so the two takeover
+// entry paths now agree instead of one of them being unreachable.
+func TestMintOrUnparkTakeoverTask_MintsBoundIntoUnderImplementation(t *testing.T) {
 	ctx := context.Background()
 	proj, repo := seedProjectRepo(t, ctx)
 	mr := seedOpenExternalMR(t, ctx, proj, repo, 7, "renovate/foo", "octocat") // author != bot
@@ -30,8 +37,9 @@ func TestMintOrUnparkTakeoverTask_MintsBoundIntoApproved(t *testing.T) {
 	if task.Spec.Kind != "takeover" {
 		t.Fatalf("kind = %q", task.Spec.Kind)
 	}
-	if task.Spec.InitialState != tatarav1alpha1.StateRefined {
-		t.Fatalf("initial stage = %q, want approved", task.Spec.InitialState)
+	if task.Spec.InitialState != tatarav1alpha1.StateUnderImplementation {
+		t.Fatalf("initial state = %q, want under-implementation: a takeover owns zero Issues, so a "+
+			"mint into refined can never pass the gate", task.Spec.InitialState)
 	}
 	if task.Annotations[tatarav1alpha1.AnnTakeoverHeadBranch] != "renovate/foo" {
 		t.Fatalf("push branch annotation = %q", task.Annotations[tatarav1alpha1.AnnTakeoverHeadBranch])
@@ -88,7 +96,7 @@ func TestMintOrUnparkTakeoverTask_ExistingNotOwnershipLostPark_ReturnedUnchanged
 		stg    string
 		reason string
 	}{
-		{"live approved task is returned unchanged", tatarav1alpha1.StateRefined, ""},
+		{"live task mid-review is returned unchanged", tatarav1alpha1.StateAwaitingReview, ""},
 		{"parked for a non-ownership-lost reason is returned unchanged", tatarav1alpha1.StateUnderImplementation, stage.ReasonAwaitingHuman},
 	}
 	for i, tc := range cases {
@@ -252,7 +260,7 @@ func ownerControllerName(obj client.Object) (string, bool) {
 
 // parkTaskOwnershipLost stamps task directly into parked(ownership-lost),
 // simulating an external-push stand-down (OP3) without driving the full
-// approved->implementing->parked(ownership-lost) transition sequence: that
+// under-implementation->parked(ownership-lost) transition sequence: that
 // sequence is OP3's own coverage, and re-deriving it here would just be
 // exercising the same edges a second time under a different test's name.
 func parkTaskOwnershipLost(t *testing.T, ctx context.Context, task *tatarav1alpha1.Task) {

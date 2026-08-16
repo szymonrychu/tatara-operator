@@ -58,6 +58,25 @@ const (
 // merged. There is no path, no condition, no exception. It does not exist.
 const kindReview = "review"
 
+// refinedDoneKinds are the three NON-CODE kinds whose whole job finishes at the
+// gate state: brainstorm ends on propose/skip, refine on folds/closes/links
+// applied and verified, incident on file_issue minting its tracker. None of the
+// three ever opens a merge request, so `refined -> done` is their ONLY path to a
+// terminal - see GUARD 6, which reads this set rather than restating it.
+//
+// It is a set, not a switch arm, because it is the OTHER half of the zero-Issue
+// routing invariant (#604): these three own no Issue CR either, so the approval
+// gate can never grant for them - this edge is what stops them stranding at
+// `refined` the way takeover did. A kind added here gains a terminal that skips
+// review entirely; a zero-Issue kind added to the machine WITHOUT being added
+// here has no way out of `refined` at all. internal/stage's mint-routing table
+// test derives canLeaveRefined from exactly these two facts.
+var refinedDoneKinds = map[string]bool{
+	AgentBrainstorm: true,
+	AgentRefine:     true,
+	AgentIncident:   true,
+}
+
 // The three clocks (contract F.4). Exactly ONE is armed at a time, and WHICH
 // one is armed is decided by which timestamps are set - never by the state
 // alone.
@@ -224,9 +243,9 @@ type Edge struct {
 // *IllegalTransitionError, off which the reconciler labels
 // operator_illegal_state_transition_total{from,to}).
 //
-// TWENTY-SIX EDGES. Four of the six amendments to the #521 design's 20 are work
-// that never opens an MR, or never faces the gate; the last two are the #521
-// terminal-reset guard, and they are the only edges in the table that exist
+// TWENTY-FIVE EDGES. Three of the five amendments to the #521 design's 20 are
+// work that never opens an MR, or never faces the gate; the last two are the
+// #521 terminal-reset guard, and they are the only edges in the table that exist
 // because of a MIGRATION rather than because of the lifecycle:
 //
 //   - `refined -> done`: a brainstorm Task's outcome is propose/skip, a refine
@@ -241,7 +260,15 @@ type Edge struct {
 //     implementation work. It has no driving issue to triage and no approval to
 //     gate - a nightly batch is the operator's own decision, already made - so
 //     routing it through `new` or `refined` would put it in front of a gate with
-//     nothing to approve.
+//     nothing to approve. Cron-minted UPGRADE and maintainer-gated TAKEOVER ride
+//     the same edge for the same reason. THERE IS DELIBERATELY NO
+//     `(create) -> refined`: it existed for the takeover mint alone, and takeover
+//     owns ZERO Issue CRs by construction (its Source is always IsPR, so
+//     controller.mintIssueCRs bails), so the gate that state exists to run could
+//     never grant for the only kind the edge served. It burned a pod and parked
+//     awaiting-human, permanently (#604). A takeover is authorised BEFORE the
+//     mint instead, and more strictly than the gate would: the takeover endpoint
+//     refuses unless a verified MAINTAINER's comment asked for it.
 //   - `new -> awaiting-review`: the REVIEW LANE out of triage. A kind=review
 //     Task reviews a HUMAN's PR; an ADOPTED kind=upgrade Task (stage.AdoptedMR)
 //     reviews a third-party dependency merge request that already exists. Both
@@ -264,8 +291,7 @@ type Edge struct {
 var Transitions = map[string][]Edge{
 	Create: {
 		{To: v1alpha1.StateNew, Trigger: "Task minted for triage: webhook-originated, a sweep-discovered backlog issue (minted parked(backlog-sweep) alongside), or a human has the last word on the thread (B.4)"},
-		{To: v1alpha1.StateRefined, Trigger: "a maintainer-gated takeover mints a Task already bound to an existing MR: the MR exists, so there is nothing to triage, but the work still faces the gate"},
-		{To: v1alpha1.StateUnderImplementation, Trigger: "a CRON-MINTED kind with no gate to face - the nightly documentation batch, or a dependency-upgrade tick - is minted straight into implementation work. No triage (neither has a driving issue) and no gate (a scheduled fire is the operator's own decision, already made). For upgrade the routing is also forced: refined's only exit into under-implementation is submit_outcome(action=approved), and the upgrade outcome schema's action enum is submitted|declined"},
+		{To: v1alpha1.StateUnderImplementation, Trigger: "a kind with no gate to face is minted straight into implementation work: the nightly documentation batch, a dependency-upgrade tick, or a maintainer-gated TAKEOVER. Neither cron kind has a driving issue to triage, and a scheduled fire is the operator's own decision, already made. For upgrade the routing is also forced, and for takeover it is forced the same way: refined's only exit into under-implementation is submit_outcome(action=approved), the upgrade outcome schema's action enum is submitted|declined, and a takeover owns ZERO Issues so that gate can never grant for it (#604). A takeover's authorisation was already performed, more strictly, by the takeover endpoint: it requires a MAINTAINER-authored comment in the mirror before it flips ownership at all"},
 		{To: v1alpha1.StateDone, Trigger: "THE #521 TERMINAL-RESET GUARD: a Task served stateless by the narrowed CRD carries proof it already DELIVERED (status.deliveredAt, status.documentedBy, or every owned Issue mirror stamped done). It is stamped where it finished instead of being re-triaged"},
 		{To: v1alpha1.StateRejected, Trigger: "THE #521 TERMINAL-RESET GUARD: a Task served stateless by the narrowed CRD carries proof it already STOPPED (an owned Issue mirror declined, or every owned mirror closed on the forge with no platform verdict). It is stamped where it finished instead of being re-triaged"},
 	},
@@ -385,11 +411,19 @@ func Legal(from, to string) bool { return legalPairs[[2]string{from, to}] }
 //
 // GUARD 6. refined -> done is the three non-code kinds' terminal - brainstorm
 // propose/skip, refine folds/closes/links applied and VERIFIED, incident
-// file_issue minted its tracker - and nothing else may take it. An implement,
+// file_issue minted its tracker - and nothing else may take it. The set is
+// refinedDoneKinds, declared once above rather than restated here. An implement,
 // takeover, review or documentation Task reaching done from refined has opened
 // no MR and faced no review either, the same hole GUARDS 3-5 close for their
 // own edges - and upgrade is in that same set: it opens merge requests, so
 // `refined -> done` is closed to it too.
+//
+// This guard is half of the #604 invariant, and reading it as a licence to route
+// a new kind into `refined` is the mistake takeover embodied. `refined` has TWO
+// forward edges and a zero-Issue kind can take neither: the gate refuses
+// no-live-issue, and this guard refuses anything outside refinedDoneKinds. A
+// kind that owns no Issue and is not in that set MUST NOT be minted or triaged
+// into `refined` - see the mint-routing table test in this package.
 //
 // GUARDS 4, 5 AND 6 WERE CALLER-GATED UNTIL #521's REVIEW (GUARD 6 slipped past
 // that same review and was only caught in the round after). The table's own
@@ -427,8 +461,7 @@ func LegalFor(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, from, to string) bo
 		}
 	}
 	if from == v1alpha1.StateRefined && to == v1alpha1.StateDone {
-		if t == nil ||
-			(t.Spec.Kind != AgentBrainstorm && t.Spec.Kind != AgentRefine && t.Spec.Kind != AgentIncident) {
+		if t == nil || !refinedDoneKinds[t.Spec.Kind] {
 			return false
 		}
 	}
