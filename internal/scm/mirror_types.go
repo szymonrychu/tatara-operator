@@ -92,3 +92,26 @@ func MirrorCIStatus(s string) string {
 		return CIMirrorNone
 	}
 }
+
+// gateCIStatus is MirrorCIStatus's inverse: it narrows the mirror vocabulary
+// back onto the gate one. It is lossy in exactly one place - the mirror's
+// running and pending both fold onto the gate's pending, because the gate has
+// no word for "started" - and that loss is why the two vocabularies exist.
+//
+// It lets a provider derive CI ONCE, in the richer mirror vocabulary, and hand
+// the gate its narrowed view, instead of two derivations of one fact drifting
+// apart (which is what shipped scm_read(kind="ci")=green on a failed pipeline).
+// An unrecognised value maps to "" for the same reason MirrorCIStatus maps it
+// to none: no observation beats a guess.
+func gateCIStatus(s string) string {
+	switch s {
+	case CIMirrorGreen:
+		return "success"
+	case CIMirrorRed:
+		return "failure"
+	case CIMirrorPending, CIMirrorRunning:
+		return "pending"
+	default:
+		return ""
+	}
+}

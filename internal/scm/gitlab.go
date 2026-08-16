@@ -498,9 +498,57 @@ func (c *GitLab) RemoveLabel(ctx context.Context, token, issueRef, label string)
 	return glDo(ctx, c.base(), http.MethodPut, path, token, map[string]string{"remove_labels": label}, nil)
 }
 
+// glHeadPipeline is an MR's head_pipeline object. Both CI derivations - the
+// merge gate's GetPRState and the agent-facing PRChecks - decode it into this
+// one shape and hand it to headCIStatus, so there is exactly one place where
+// "what is this MR's CI" is answered.
+type glHeadPipeline struct {
+	ID     int64  `json:"id"`
+	SHA    string `json:"sha"`
+	Status string `json:"status"`
+}
+
+// headCIStatus is THE GitLab CI derivation, in the MIRROR vocabulary
+// (none|pending|running|green|red). It answers from the pipeline object's OWN
+// aggregate status, which GitLab computes across bridges (child pipelines),
+// retries, allow_failure and manual gates.
+//
+// Do not re-derive this by folding a job list. /pipelines/{id}/jobs excludes
+// bridge jobs, so on any repo that generates its real gating into a child
+// pipeline (containers, charts, helmfile via .parse.py's trigger:template) a
+// job fold sees four green jobs and answers green while the pipeline itself is
+// failed. That was #609.
+//
+// sha is the MR's current head; head may be nil.
+func (c *GitLab) headCIStatus(ctx context.Context, proj, sha, token string, head *glHeadPipeline) (string, error) {
+	switch {
+	case head == nil:
+		// No pipeline attached yet; fall back to commit statuses so external CI
+		// reporters (commit-status-only) are visible. Use the per-call token, not
+		// c.token: the writer client from ByProvider has an empty c.token, so
+		// GetCommitCIStatus (which reads c.token) would issue an unauthenticated
+		// read and 401 on private projects.
+		gate, err := c.commitCIStatus(ctx, proj, sha, token)
+		if err != nil {
+			return "", err
+		}
+		// commitCIStatus folds EVERY status on the commit before it answers, so
+		// its success is an aggregate claim and MirrorCIStatus's contract holds.
+		return MirrorCIStatus(gate), nil
+	case head.SHA != "" && head.SHA != sha:
+		// Pipeline is present but belongs to a previous commit (lag window after
+		// a push). Treat as pending so nobody acts on a stale success.
+		return CIMirrorPending, nil
+	default:
+		// Pipeline is for the current SHA (or SHA field not reported by the API).
+		return glPipelineCIStatus(head.Status), nil
+	}
+}
+
 // GetPRState reads an MR and its head pipeline status.
-// When head_pipeline is null (pipeline not yet attached) or its SHA does not
-// match the MR's current SHA (stale pipeline), the status falls back to the
+// CI comes from headCIStatus, narrowed to the gate vocabulary: when
+// head_pipeline is null (pipeline not yet attached) or its SHA does not match
+// the MR's current SHA (stale pipeline), the status falls back to the
 // commit-statuses endpoint so external CI reporters are visible and the merge
 // gate does not act on a stale success.
 func (c *GitLab) GetPRState(ctx context.Context, repoURL, token string, number int) (PRState, error) {
@@ -512,46 +560,26 @@ func (c *GitLab) GetPRState(ctx context.Context, repoURL, token string, number i
 		Author struct {
 			Username string `json:"username"`
 		} `json:"author"`
-		SHA          string `json:"sha"`
-		SourceBranch string `json:"source_branch"`
-		State        string `json:"state"`
-		HeadPipeline *struct {
-			SHA    string `json:"sha"`
-			Status string `json:"status"`
-		} `json:"head_pipeline"`
+		SHA          string          `json:"sha"`
+		SourceBranch string          `json:"source_branch"`
+		State        string          `json:"state"`
+		HeadPipeline *glHeadPipeline `json:"head_pipeline"`
 	}
 	path := "/projects/" + url.PathEscape(proj) + "/merge_requests/" + strconv.Itoa(number)
 	if err := glDo(ctx, c.base(), http.MethodGet, path, token, nil, &mr); err != nil {
 		return PRState{}, err
 	}
 
-	ciStatus := ""
-	switch {
-	case mr.HeadPipeline == nil:
-		// No pipeline attached yet; fall back to commit statuses so external CI
-		// reporters (commit-status-only) are visible through the merge gate. Use
-		// the per-call token, not c.token: the writer client from ByProvider has
-		// an empty c.token, so GetCommitCIStatus (which reads c.token) would issue
-		// an unauthenticated read and 401 on private projects.
-		ciStatus, err = c.commitCIStatus(ctx, proj, mr.SHA, token)
-		if err != nil {
-			return PRState{}, err
-		}
-	case mr.HeadPipeline.SHA != "" && mr.HeadPipeline.SHA != mr.SHA:
-		// Pipeline is present but belongs to a previous commit (lag window after
-		// a push). Treat as pending so the merge gate waits for the new pipeline
-		// rather than acting on a stale success.
-		ciStatus = "pending"
-	default:
-		// Pipeline is for the current SHA (or SHA field not reported by the API).
-		ciStatus = glCIStatus(mr.HeadPipeline.Status)
+	mirror, err := c.headCIStatus(ctx, proj, mr.SHA, token, mr.HeadPipeline)
+	if err != nil {
+		return PRState{}, err
 	}
 
 	return PRState{
 		Author:     mr.Author.Username,
 		HeadSHA:    mr.SHA,
 		HeadBranch: mr.SourceBranch,
-		CIStatus:   ciStatus,
+		CIStatus:   gateCIStatus(mirror),
 		Merged:     mr.State == "merged",
 		Closed:     mr.State == "closed",
 	}, nil
