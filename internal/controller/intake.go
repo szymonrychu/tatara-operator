@@ -586,8 +586,9 @@ func (m *Minter) repairMRBinding(ctx context.Context, proj *tatarav1alpha1.Proje
 	if err := m.bindMRToTask(ctx, proj, repo, ext, task, sp); err != nil {
 		return err
 	}
-	log.FromContext(ctx).Info("intake: repaired interrupted review mint binding",
-		"action", "intake_repair_bind", "resource_id", task.Name, "mr", name)
+	log.FromContext(ctx).Info("intake: repaired interrupted mint binding",
+		"action", "intake_repair_bind", "resource_id", task.Name, "mr", name,
+		"kind", task.Spec.Kind)
 	return m.stampMRRef(ctx, task, name)
 }
 

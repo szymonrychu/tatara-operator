@@ -81,17 +81,21 @@ func TakeoverTaskName(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Reposit
 // non-code action is `declined`, which parks(implement-declined) - UnparkNever -
 // and stage.go's GUARD 4 closes under-implementation -> done to every kind but
 // documentation, so a declined takeover parks rather than reaching a terminal
-// state. Nothing in this file hands the merge request back: the ONLY writer of
-// Ownership=external is ownership.go's flipToExternal, which fires on a HUMAN
-// PUSH, and the un-park branch below only fires on ReasonOwnershipLost. So a
-// re-take comment on a DECLINED takeover returns 200 and does nothing, forever.
-// The two ways the MR does come back are both real and both outside this path:
-// the human pushes to it (flipToExternal stamps `external` regardless of the
-// Task already being parked), or the reaper collects the parked Task at
-// ParkRetention and releases ownership with it. The takeover job text
-// (assignment.go) therefore requires the agent to COMMENT on the merge request
-// explaining itself before it declines - a decline the maintainer never sees is
-// the failure mode this terminal would otherwise produce.
+// state. Nothing in this file hands the merge request back either: the ONLY
+// writer of Ownership=external is ownership.go's flipToExternal, which fires on
+// a HUMAN PUSH, and the un-park branch below only fires on ReasonOwnershipLost -
+// so a re-take comment on a DECLINED takeover cannot resume it. That case is
+// REFUSED at the door rather than silently accepted: restapi.mrTakeover answers
+// 409 for any UnparkNever park that is not ownership-lost (it used to answer 200
+// while doing nothing, forever). The two ways the MR does come back are both
+// real and both outside this path: the human pushes to it (flipToExternal stamps
+// `external` regardless of the Task already being parked), or the reaper
+// collects the parked Task at ParkRetention and releases ownership with it. The
+// takeover job text (assignment.go) therefore requires the agent to COMMENT on
+// the merge request explaining itself before it declines - a decline the
+// maintainer never sees is the failure mode this terminal would otherwise
+// produce.
+//
 // expectFrom (optional, see MintReviewTask/bindMRToTask) is forwarded to the
 // fresh-mint path's bindMRToTask call unchanged - fix #408: the takeover REST
 // endpoint's caller Task is the MR's current controller owner by the time

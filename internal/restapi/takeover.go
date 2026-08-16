@@ -36,28 +36,15 @@ func takeoverTaskName(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Reposit
 	return controller.TakeoverTaskName(proj, repo, number)
 }
 
-// mrTakeover is the consumer end of the OP6 (webhook fast path) / OP12 (sweep
-// convergence) comment->task pipeline: a maintainer's "take over" comment has
-// already reached a review Task - which, by the time this endpoint is called,
-// controller-owns the MR mirror - and the review agent judged intent and
-// called mr_takeover_request. This endpoint NEVER trusts that judgment: the
-// referenced comment must exist in the MR CR mirror, and its recorded author
-// must be a verified MAINTAINER (never the bot, never merely a listed
-// reporter - takeover is a privilege grant, not intake trust), and the caller
-// Task must currently controller-own the MR. Only then does it
-// flip ownership external -> tatara, mint/unpark the single full-lifecycle
-// takeover Task (OP5's Minter.MintOrUnparkTakeoverTask), and move the MR
-// mirror's controller ownership onto it. The stand-down/takeover announcement
-// is posted by the MergeRequest reconcile drain (OP11), not here.
 // liveTakeoverTask reads the ONE deterministic takeover Task for (proj, repo,
 // number), if it exists. found=false means no takeover has ever been minted for
 // this merge request, which is the ordinary first-take case.
 func (s *Server) liveTakeoverTask(ctx context.Context, proj *tatarav1alpha1.Project,
 	repo *tatarav1alpha1.Repository, number int) (*tatarav1alpha1.Task, bool, error) {
 
-	name := controller.TakeoverTaskName(proj, repo, number)
 	var task tatarav1alpha1.Task
-	err := s.c.Get(ctx, types.NamespacedName{Namespace: s.ns, Name: name}, &task)
+	key := types.NamespacedName{Namespace: s.ns, Name: takeoverTaskName(proj, repo, number)}
+	err := s.c.Get(ctx, key, &task)
 	if apierrors.IsNotFound(err) {
 		return nil, false, nil
 	}
@@ -85,6 +72,19 @@ func unresumableTakeoverPark(t *tatarav1alpha1.Task) bool {
 	return ok && class == stage.UnparkNever
 }
 
+// mrTakeover is the consumer end of the OP6 (webhook fast path) / OP12 (sweep
+// convergence) comment->task pipeline: a maintainer's "take over" comment has
+// already reached a review Task - which, by the time this endpoint is called,
+// controller-owns the MR mirror - and the review agent judged intent and
+// called mr_takeover_request. This endpoint NEVER trusts that judgment: the
+// referenced comment must exist in the MR CR mirror, and its recorded author
+// must be a verified MAINTAINER (never the bot, never merely a listed
+// reporter - takeover is a privilege grant, not intake trust), and the caller
+// Task must currently controller-own the MR. Only then does it
+// flip ownership external -> tatara, mint/unpark the single full-lifecycle
+// takeover Task (OP5's Minter.MintOrUnparkTakeoverTask), and move the MR
+// mirror's controller ownership onto it. The stand-down/takeover announcement
+// is posted by the MergeRequest reconcile drain (OP11), not here.
 func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 	if !authorizeCaller(w, r) {
 		return
