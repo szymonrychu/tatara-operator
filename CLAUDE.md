@@ -201,7 +201,6 @@ is local to this repo and is never touched by the sync, which is where a repo
 records how these rules apply to it.
 <!-- END tatara-shared-contract -->
 
-
 ## Local notes
 
 - The operator is the only component that merges. Rule 7 is not advice here, it
