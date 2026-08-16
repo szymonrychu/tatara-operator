@@ -9,48 +9,43 @@ import (
 	"testing"
 )
 
-// upgradeHeadroomSkipReason is controller.SweepSkipUpgradeHeadroom and
 // mintBudgetSkipReason is controller.SweepSkipMintBudget. Literal here for the
-// same no-reverse-import reason as sweepSkipReasons, and both are members of
-// that list, so TestSweepSkipReasonsMatchSweepConstants already pins the strings
-// against the constants in sweep.go.
-const (
-	upgradeHeadroomSkipReason = "upgrade_headroom_bound"
-	mintBudgetSkipReason      = "mint_budget_bound"
-)
+// same no-reverse-import reason as sweepSkipReasons, and it is a member of
+// that list, so TestSweepSkipReasonsMatchSweepConstants already pins the string
+// against the constant in sweep.go.
+const mintBudgetSkipReason = "mint_budget_bound"
 
 // steadyStateSkipReasons are the skip reasons a HEALTHY project emits on every
 // pass forever, and therefore the only ones TataraSweepSkipPersistent may
-// exclude. Both are CAPS DOING THEIR JOB, not failures:
+// exclude. upgrade_headroom_bound was the other member of this set until Task
+// 8 retired the per-pass adoption headroom entirely - the sweep now ENQUEUES
+// an adoptable dependency merge request under the same dedup key the webhook
+// uses, so there is no lane cap left to defer against and nothing left to skip.
 //
-//	upgrade_headroom_bound  maxOpenUpgrades has no free lane for a deferred
-//	                        dependency merge request
-//	mint_budget_bound       maxOpenTasks (6 in prod) is full and an orphan is
-//	                        deferred to the next pass
+//	mint_budget_bound  maxOpenTasks (6 in prod) is full and an orphan is
+//	                   deferred to the next pass - a CAP DOING ITS JOB, not a
+//	                   failure.
 //
 // A cap that never frees is still visible - as a Task whose
 // operator_task_state_age_seconds keeps climbing, which is the signal that
-// actually names the stuck object - and both deferrals stay on
+// actually names the stuck object - and the deferral stays on
 // operator_sweep_skipped_total for a dashboard to read.
-var steadyStateSkipReasons = []string{upgradeHeadroomSkipReason, mintBudgetSkipReason}
+var steadyStateSkipReasons = []string{mintBudgetSkipReason}
 
 // A NORMAL STEADY STATE MUST NOT FIRE A PERSISTENT ALERT.
 //
-// operator_sweep_skipped_total{reason="upgrade_headroom_bound"} is emitted once
-// per DEFERRED dependency merge request per sweep pass. A dependency engine
-// opens more merge requests than maxOpenUpgrades has lanes by construction -
-// that is what the cap is for - so a backlog of ten deferred bumps increments
-// this ten times per pass, thousands of times a day, forever. TataraSweepSkipPersistent
+// operator_sweep_skipped_total{reason="mint_budget_bound"} is emitted once per
+// pass in which maxOpenTasks (6 in prod) is full and an orphan is deferred to
+// the next pass - a CAP DOING ITS JOB, not a failure. TataraSweepSkipPersistent
 // alerts on ANY reason at >= sweepSkipPassThreshold increases in its window, so
-// it fires permanently and buries the ONE signal it was written for
-// (reason="mr_claimed_by_other_task": a live Task that has stopped progressing).
+// an unexcluded steady-state reason fires it permanently and buries the ONE
+// signal it was written for (reason="mr_claimed_by_other_task": a live Task
+// that has stopped progressing).
 //
 // The reason is excluded in the ALERT rather than metered on its own counter:
 // that keeps the alert meaningful for every other member of the closed reason
 // set, and keeps the deferral visible on the series a dashboard already reads.
-//
-// mint_budget_bound is the SAME SHAPE and is excluded for the same reason. It
-// is deduped to ONE increment per pass (sweepBudget.countBudgetSkip), which
+// It is deduped to ONE increment per pass (sweepBudget.countBudgetSkip), which
 // fixes the metric - a backlog no longer inflates the series by its own size -
 // but does NOT clear the alert: the window is 24h at threshold 6 and the sweep
 // runs the 4h issueScan cron, so a project parked at its task cap emits exactly

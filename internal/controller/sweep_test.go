@@ -12,6 +12,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/own"
+	"github.com/szymonrychu/tatara-operator/internal/queue"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 	corev1 "k8s.io/api/core/v1"
@@ -112,10 +113,16 @@ func humanComment(id, author, body string, at time.Time) scm.IssueComment {
 	return scm.IssueComment{ExternalID: id, Author: author, Body: body, CreatedAt: at}
 }
 
-// runSweep drives one full SweepProject pass against the fake forge.
+// runSweep drives one full SweepProject pass against the fake forge. Seq is
+// wired for every caller now (not only the adoption tests): the PRAdoptUpgrade
+// arm enqueues via queue.EnqueueEvent, which needs a live SeqSource to
+// allocate the per-project sequence number.
 func runSweep(t *testing.T, c client.Client, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, rd scm.SCMReader) {
 	t.Helper()
-	r := &ProjectReconciler{Client: c, Scheme: c.Scheme(), Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry())}
+	r := &ProjectReconciler{
+		Client: c, Scheme: c.Scheme(), Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		Seq: &queue.SeqSource{Client: c, Namespace: testNS},
+	}
 	if _, err := r.SweepProject(context.Background(), proj, rd, []tatarav1alpha1.Repository{*repo}, nil, SweepActivity); err != nil {
 		t.Fatalf("SweepProject: %v", err)
 	}

@@ -16,9 +16,10 @@ import (
 // capHit, which records the same fact once per pass. A project sitting at
 // maxOpenTasks with a backlog therefore drove one series up by the size of the
 // backlog on EVERY pass, which is the same alert-burying shape
-// upgrade_headroom_bound was excluded from TataraSweepSkipPersistent for: it
-// fires permanently and hides reason=mr_claimed_by_other_task, the one
-// condition the alert exists for.
+// mint_budget_bound is EXCLUDED from TataraSweepSkipPersistent for today
+// (upgrade_headroom_bound was the other exclusion until Task 8 retired the
+// per-pass adoption headroom entirely): it fires permanently and hides
+// reason=mr_claimed_by_other_task, the one condition the alert exists for.
 //
 // The LOG line stays per item - a counter cannot say which pull request went
 // unanswered, which is the whole point of skipPR - and only the counter dedups.

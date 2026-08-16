@@ -40,8 +40,11 @@ type ghWorkItem struct {
 	Labels  []ghLabel `json:"labels"`
 	HTMLURL string    `json:"html_url"`
 	Head    struct {
-		SHA string `json:"sha"`
-		Ref string `json:"ref"`
+		SHA  string `json:"sha"`
+		Ref  string `json:"ref"`
+		Repo struct {
+			FullName string `json:"full_name"`
+		} `json:"repo"`
 	} `json:"head"`
 	Merged      bool `json:"merged"` // pull_request.merged: true when a PR-close delivery is a merge
 	PullRequest *struct {
@@ -255,6 +258,7 @@ func ghWorkItemEvent(kind string, isPR bool, p ghPayload, wi *ghWorkItem) Webhoo
 		IsPR:         isPR,
 		HeadSHA:      wi.Head.SHA,
 		HeadBranch:   wi.Head.Ref,
+		HeadRepo:     wi.Head.Repo.FullName,
 		ChangedLabel: p.Label.Name,
 		Merged:       wi.Merged,
 	}
