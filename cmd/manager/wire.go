@@ -537,6 +537,7 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		BudgetDefaults:    cfg.BudgetDefaults(),
 		Usage:             usageStore,
 		UsagePollInterval: cfg.UsagePollInterval,
+		SpillerFor:        spillerFor,
 		BackstopEvents:    backstopEvents,
 	}
 	if err := dispatcher.SetupWithManager(mgr); err != nil {

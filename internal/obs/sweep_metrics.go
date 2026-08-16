@@ -271,6 +271,23 @@ var MintOutcomeTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Help: "Intake mint attempts by task kind and typed outcome (contract B.4).",
 }, []string{"kind", "outcome"})
 
+// AdoptionEventDroppedTotal counts QUEUED dependency-upgrade adoptions that never
+// became a Task, by reason. A queued snapshot is a POINTER to a live forge
+// object, and the dispatcher re-asks the adoption question at admit time rather
+// than trusting the snapshot - so a non-zero rate is the mechanism WORKING: it is
+// the count of agent pods not burned on merge requests that stopped being
+// adoptable while they waited.
+var AdoptionEventDroppedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "operator_adoption_event_dropped_total",
+	Help: "Queued dependency-upgrade adoptions dropped before minting, by project and reason.",
+}, []string{"project", "reason"})
+
+// adoptionDropReasons is AdoptionEventDroppedTotal's closed reason set, seeded
+// for the same reason every counter here is: a CounterVec with no
+// WithLabelValues call has NO series, so increase(...[1h]) is blind to the first
+// increment after every pod roll.
+var adoptionDropReasons = []string{"not_adoptable", "mint_not_owed", "repository_gone"}
+
 // sweepSkipReasons is the closed skip-reason set. Keep in sync with sweep.go's
 // SweepSkip* constants - enforced by TestSweepSkipReasonsMatchSweepConstants,
 // which scans them out of the source, because the identical prose instruction
@@ -386,6 +403,8 @@ func SeedSweepErrorsForProject(project string) {
 		SweepStaleOwnerRepairedTotal.WithLabelValues(project, activity)
 		SweepTerminalOwnerReleasedTotal.WithLabelValues(project, activity)
 	}
+	drop := func(l ...string) { AdoptionEventDroppedTotal.WithLabelValues(l...) }
+	seedLabels(drop, []string{project}, adoptionDropReasons)
 	// MintOutcomeTotal carries NO project label, so this is process-global and
 	// idempotent - seeded here rather than in init() only because this is where
 	// its neighbours are, and its absence was the gap the #521 review found.
@@ -404,6 +423,7 @@ func init() {
 		SweepStaleOwnerRepairedTotal,
 		SweepTerminalOwnerReleasedTotal,
 		MintOutcomeTotal,
+		AdoptionEventDroppedTotal,
 		SweepOrphanStrandedSeconds,
 	)
 }
