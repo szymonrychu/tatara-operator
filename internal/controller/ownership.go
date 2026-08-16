@@ -365,11 +365,15 @@ func (d *StageDriver) parkAndHandBack(ctx context.Context, proj *tatarav1alpha1.
 // THE DISCRIMINATOR IS THE RECORDED BOT HEAD, NOT THE PUSHER, and the rule this
 // upgrade implements ("terminal while the branch is still tatara's") is only as
 // good as that baseline. ReconcileOwnership never sees a pusher identity: the
-// flip fires on liveHead != Status.LastBotHeadSHA, and exactly two writers keep
-// that baseline fresh - the synchronize webhook when the actor matches
-// (webhook.stampMRHead) and /outcome's record_bot_head, which is on the
-// SUBMITTED path only. So a takeover that pushed, lost its synchronize delivery
-// or pushed under a login that is not spec.scm.botLogin, and then DELIBERATELY
+// flip fires on liveHead != Status.LastBotHeadSHA, and exactly two writers
+// ADVANCE that baseline after a push - the synchronize webhook when
+// isUpgradeEngineActor matches the pusher (webhook.stampMRHead) and /outcome's
+// record_bot_head, which is on the SUBMITTED path only. (Three more SEED it
+// once: restapi.mrTakeover at the takeover itself, and this function's own
+// classification backfill and empty-baseline seed. A seed is not a refresh -
+// mrTakeover's is the very value that goes stale below.) So a takeover that
+// pushed, lost its synchronize delivery or pushed under a login
+// isUpgradeEngineActor does not match, and then DELIBERATELY
 // declined, is flipped against tatara's OWN sha - and its deliberate decline is
 // upgraded here with no human having touched the branch, after which
 // DrainStandDownMerge may merge, on an approved review, commits the agent

@@ -275,13 +275,17 @@ func repark(t *v1alpha1.Task, reason string, now time.Time) {
 //
 // THE JUSTIFICATION THAT USED TO BE HERE WAS FALSE; do not reinstate it. It
 // said a repark would charge the resumed Task for the days it sat parked and so
-// blow ResidencyExceeded on its first pass back. It cannot: both exits from
-// parked(ownership-lost) - MintOrUnparkTakeoverTask and DrainStandDownMerge - go
-// through UnparkTakeover -> stampEnter, which zeroes StageElapsedCarrySeconds
-// and nils StateWorkStartedAt, and ResidencyExceeded returns false outright on a
-// nil StateWorkStartedAt. Unpark/reArm, the one path that DOES preserve the
-// carry, refuses ownership-lost by class. Nothing reads the carry while the Task
-// is parked either (task_stage.go checks residency only on an UN-parked Task).
+// blow ResidencyExceeded on its first pass back. It cannot: every way out of
+// parked(ownership-lost) writes a state entry in the same pass, and stampEnter
+// zeroes StageElapsedCarrySeconds and nils StateWorkStartedAt, on which
+// ResidencyExceeded returns false outright. The two that resume the work -
+// MintOrUnparkTakeoverTask and DrainStandDownMerge - go through UnparkTakeover;
+// UnparkForMRTerminal is a THIRD exit and does NOT (it guards on the target
+// state and the state reason, never on the park reason), but it clears the park
+// into a terminal via Enter, so stampEnter runs there too. Unpark/reArm, the one
+// path that DOES preserve the carry, refuses ownership-lost by class. Nothing
+// reads the carry while the Task is parked either (task_stage.go checks
+// residency only on an UN-parked Task).
 //
 // changed is false, with no error, when the Task is ALREADY parked
 // ownership-lost. That is a converged state, not a misuse: every caller is a

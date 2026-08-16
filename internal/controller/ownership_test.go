@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -712,6 +713,14 @@ func parkOwnerTaskForTest(t *testing.T, ctx context.Context, task *tatarav1alpha
 func TestUpgradeDeclinedTakeoverPark_IsIdempotent(t *testing.T) {
 	ctx := context.Background()
 	d, proj, repo := newOwnershipDriver(t, ctx)
+	// An EXPLICIT clock that ADVANCES between the two calls. Left on the wall
+	// clock, the ParkedAt assertion below would pin only "the field was
+	// re-assigned" - and would pin it by sub-second precision, since the stamp
+	// that came back through the API server is second-truncated. The property it
+	// is there for is "the caller is not handed an instant no object holds", so
+	// the second pass needs a now that is distinguishable from the first's.
+	clock := time.Date(2026, 8, 16, 9, 0, 0, 0, time.UTC)
+	d.Now = func() time.Time { return clock }
 	mr := seedTataraOwnedMRWithTakeoverTask(t, ctx, proj, repo, 44, "feat/human-44", "bot-head")
 	task := ownerTaskOf(t, ctx, mr)
 	parkOwnerTaskForTest(t, ctx, task, stage.ReasonImplementDeclined)
@@ -721,7 +730,10 @@ func TestUpgradeDeclinedTakeoverPark_IsIdempotent(t *testing.T) {
 		t.Fatalf("first upgrade: %v", err)
 	}
 	// The second call is handed a STALE caller copy on purpose - the shape the
-	// cached Get produces - and must still succeed.
+	// cached Get produces - and must still succeed. The clock moves first, so
+	// the timestamp a restamp would write is a different second from the one the
+	// first call persisted.
+	clock = clock.Add(2 * time.Hour)
 	stale := ownerTaskOf(t, ctx, mr)
 	stale.Status.ParkReason = stage.ReasonImplementDeclined
 	staleParkedAt := stale.Status.ParkedAt.DeepCopy()
@@ -740,6 +752,9 @@ func TestUpgradeDeclinedTakeoverPark_IsIdempotent(t *testing.T) {
 	if !stale.Status.ParkedAt.Equal(staleParkedAt) {
 		t.Fatalf("a converged no-op must not restamp the caller's ParkedAt: %v -> %v",
 			staleParkedAt, stale.Status.ParkedAt)
+	}
+	if stale.Status.ParkedAt.Time.Equal(clock) {
+		t.Fatalf("the caller must not be handed THIS pass's now (%v); the server holds the first pass's stamp", clock)
 	}
 	if after := testutil.ToFloat64(obs.OwnershipDeclineUpgradedTotal); after-before != 1 {
 		t.Fatalf("the upgrade counter must fire once per real upgrade, got %v", after-before)
