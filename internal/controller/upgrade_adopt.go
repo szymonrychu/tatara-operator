@@ -346,9 +346,13 @@ func AdoptedUpgradeRefFromPR(pr scm.PRRef) *tatarav1alpha1.AdoptedUpgradeRef {
 	}
 }
 
-// prRefFromAdopted is AdoptedUpgradeRefFromPR's inverse, used at admit time.
+// PRRefFromAdopted is AdoptedUpgradeRefFromPR's inverse, used at admit time.
+// Exported for the same reason its inverse is: the webhook's own tests assert
+// that the snapshot they enqueue survives AdoptUpgradeMR, and they must ask that
+// question through the EXACT conversion admission uses. A hand-copied twin in a
+// test would answer a question about itself the moment this drifts.
 // UpdatedAt is deliberately left zero: nothing on the adoption path reads it.
-func prRefFromAdopted(a *tatarav1alpha1.AdoptedUpgradeRef) scm.PRRef {
+func PRRefFromAdopted(a *tatarav1alpha1.AdoptedUpgradeRef) scm.PRRef {
 	if a == nil {
 		return scm.PRRef{}
 	}

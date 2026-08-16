@@ -641,13 +641,17 @@ func (s *Server) enqueueAdoption(ctx context.Context, w http.ResponseWriter, pro
 		s.accept(w, provider, ev.Kind, ev.Action, "ignored")
 		return
 	}
-	// scm.RepoSlugFromURL, not this file's repoSlug: the latter is GitHub-only
-	// (scm.OwnerRepo), and a GitLab group/project URL would yield "" - which the
-	// fork clause reads as a fork and refuses forever.
-	slug, serr := scm.RepoSlugFromURL(repo.Spec.URL)
+	// COUNTED, not merely logged. A Repository URL this provider cannot turn into
+	// a slug refuses every adoption for that repository forever - the fork clause
+	// fails closed on the empty value - and a silent 202 is exactly the
+	// "looks healthy, adopts nothing" shape this whole change exists to remove.
+	// It is a 202 and not a 500 because a malformed URL is a configuration fault
+	// no redelivery can repair; the ERROR log and this series are what carry it.
+	slug, serr := repoSlug(provider, repo)
 	if serr != nil {
+		obs.AdoptionEventDroppedTotal.WithLabelValues(proj.Name, "repo_slug_unknown").Inc()
 		s.log.ErrorContext(ctx, "mr: adoptable merge request whose repository URL yields no slug; ignoring",
-			"action", "mr_adopt_unsluggable", "error", serr,
+			"action", "mr_adopt_drop", "error", serr, "reason", "repo_slug_unknown",
 			"project", proj.Name, "repo", repo.Name, "number", ev.Number)
 		s.accept(w, provider, ev.Kind, ev.Action, "ignored")
 		return
@@ -689,18 +693,40 @@ func (s *Server) enqueueAdoption(ctx context.Context, w http.ResponseWriter, pro
 	s.accept(w, provider, ev.Kind, ev.Action, "accepted")
 }
 
-// repoSlug returns "owner/name" for a Repository URL, or "" on error. Local
-// twin of internal/controller's unexported helper of the same name - kept
+// repoSlug returns the PROVIDER-CORRECT forge slug for a Repository URL:
+// "owner/name" on GitHub, the full group/subgroup/project path on GitLab. Local
+// twin of internal/controller's unexported repoSlugFromURL - kept
 // package-local rather than exported, matching that package's KISS precedent.
-func repoSlug(repo *tatarav1.Repository) string {
+//
+// THE PROVIDER IS AN INPUT, NOT A GUESS, and that is the whole reason this is
+// not a call to scm.RepoSlugFromURL. That helper infers the provider from the
+// URL containing the literal string "gitlab", so a self-hosted GitLab at
+// git.example.com falls through to scm.OwnerRepo, which rejects any path that
+// is not exactly two segments - group/subgroup/project errors, and a plain
+// group/project only works by accident. Every caller here already holds the
+// authoritative provider, decided by scm.Select from the delivery's own
+// headers. The final fallback stays RepoSlugFromURL for a provider name neither
+// arm knows, which is the same default providerForRemote applies.
+//
+// IT RETURNS AN ERROR RATHER THAN "", which the previous version swallowed. An
+// empty slug is not a benign value on either call site: the review mint hands it
+// to the forge as the repository to write to, and AdoptUpgradeMR's fork clause
+// reads it as "head repo != base repo" and refuses the adoption forever.
+func repoSlug(provider string, repo *tatarav1.Repository) (string, error) {
 	if repo == nil {
-		return ""
+		return "", errors.New("webhook: no repository to derive a slug from")
 	}
-	owner, name, err := scm.OwnerRepo(repo.Spec.URL)
-	if err != nil {
-		return ""
+	switch provider {
+	case "gitlab":
+		return scm.GitLabProjectPath(repo.Spec.URL)
+	case "github":
+		owner, name, err := scm.OwnerRepo(repo.Spec.URL)
+		if err != nil {
+			return "", err
+		}
+		return owner + "/" + name, nil
 	}
-	return owner + "/" + name
+	return scm.RepoSlugFromURL(repo.Spec.URL)
 }
 
 // handleIssueOpened marks a freshly opened (or reopened) issue as LIVE.
@@ -820,15 +846,17 @@ func (s *Server) handleIssueOpened(ctx context.Context, w http.ResponseWriter, p
 // adopted them was the 0 */4 * * * sweep.
 //
 // SO WHY NOT JUST MINT IT HERE? BECAUSE THIS HANDLER CANNOT HOLD A BUDGET.
-// Adoption is capped project-wide by maxOpenUpgrades - the cap exists to bound
-// concurrent agent pods - and enforcing it means counting live lanes and then
-// minting, two API calls with a decision between them. This server runs on EVERY
-// replica (HandlerRunnable.NeedLeaderElection() is false) behind a
-// load-balancing Service, so a Renovate run that opens five merge requests at
-// once spreads its deliveries across replicas and each one independently passes
-// the same check. No in-process lock spans processes, and a counter that must be
-// decremented when a lane frees is the kind of distributed state this repo
-// derives from reality instead. Minting here would be correct only by accident.
+// Minting means counting what is already live and then creating, two API calls
+// with a decision between them. This server runs on EVERY replica
+// (HandlerRunnable.NeedLeaderElection() is false) behind a load-balancing
+// Service, so a Renovate run that opens five merge requests at once spreads its
+// deliveries across replicas and each one independently passes the same check.
+// No in-process lock spans processes, and a counter that must be decremented
+// when a lane frees is the kind of distributed state this repo derives from
+// reality instead. Minting here would be correct only by accident. (The budget
+// that binds an adoption is now the queue's own admission ceiling.
+// maxOpenUpgrades governs the upgrade CRON only - design D1/D2 - so it is not a
+// project-wide adoption cap this handler could spend even if it were serialized.)
 //
 // THE LEADER-ELECTED DISPATCHER ALREADY HAS ALL OF IT: it is the single
 // serialized writer of admission, it re-asks the adoption question against a
@@ -849,10 +877,12 @@ func (s *Server) handleIssueOpened(ctx context.Context, w http.ResponseWriter, p
 // A CANDIDATE IS A SHAPE, NOT A VERDICT. AdoptionCandidate answers only "prefix
 // configured, branch under it, author is an identity this project owns" - forks,
 // existing owners, the durable refusal marker, a stood-down mirror and the
-// trigger-label override all stay in ClassifyPR/AdoptUpgradeMR where the sweep
-// asks them. A candidate the sweep then refuses simply mints nothing, which is
-// the same answer this handler gave before, one reconcile later. It costs one
-// repo listing per debounce window, and nothing at all when adoption is disarmed.
+// trigger-label override all stay in AdoptUpgradeMR, which the DISPATCHER re-asks
+// at admission against a fresh mirror and live owner. A candidate it then refuses
+// mints nothing, at a cost of one QueuedEvent created and deleted plus an
+// AdoptionEventDroppedTotal{not_adoptable}. The candidate arm itself costs one
+// repository listing and one create per delivery, and nothing at all when
+// adoption is disarmed.
 //
 // The arm sits AHEAD of the reporter allowlist on purpose and for no wider a
 // reason: ClassifyPR clause 1c consults no allowlist either, so an engine running
@@ -884,9 +914,21 @@ func (s *Server) handleMROpened(ctx context.Context, w http.ResponseWriter, prov
 		s.accept(w, provider, ev.Kind, ev.Action, "ignored")
 		return
 	}
+	// The slug is what every forge write this review Task makes is addressed by,
+	// so a Repository URL that yields none must not mint. It used to pass ""
+	// silently into the mint (repoSlug swallowed the error), which produced a
+	// Task whose merge request nothing could ever find.
+	slug, serr := repoSlug(provider, repo)
+	if serr != nil {
+		s.log.ErrorContext(ctx, "mr: repository URL yields no slug; not minting",
+			"action", "mr_slug_failed", "error", serr,
+			"project", proj.Name, "repo", repo.Name, "number", ev.Number)
+		s.accept(w, provider, ev.Kind, ev.Action, "ignored")
+		return
+	}
 	item := controller.ForgeItem{IsPR: true, PR: scm.PRRef{
 		Number: ev.Number, Author: ev.ActorLogin, HeadSHA: ev.HeadSHA,
-		HeadBranch: ev.HeadBranch, Repo: repoSlug(repo), Body: ev.Body, Labels: ev.Labels,
+		HeadBranch: ev.HeadBranch, Repo: slug, Body: ev.Body, Labels: ev.Labels,
 	}}
 	_, outcome, merr := s.minter().MintForItem(ctx, &proj, repo, item, false, s.cfg.SpillerFor(&proj))
 	if merr != nil {

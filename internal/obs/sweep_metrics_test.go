@@ -264,37 +264,55 @@ func TestRetainSweepOrphanStranded(t *testing.T) {
 	}
 }
 
-// TestAdoptionDropReasonsMatchTheDispatcher is TestSweepSkipReasonsMatchSweepConstants
-// for the adoption half. The dispatcher's drop reasons are inline literals at its
-// drop(...) call sites rather than named constants, so nothing but this scan ties
-// them to the seeded set: an unseeded reason has NO series until its first drop
-// and increase(...[1h]) is blind to it, and a seeded reason no drop site produces
-// is a permanently dead zero series. Fails both ways.
-func TestAdoptionDropReasonsMatchTheDispatcher(t *testing.T) {
-	src, err := os.ReadFile(filepath.Join("..", "controller", "queue_controller.go"))
-	if err != nil {
-		t.Fatalf("read queue_controller.go: %v", err)
+// TestAdoptionDropReasonsMatchTheirProducers is TestSweepSkipReasonsMatchSweepConstants
+// for the adoption half. Every drop reason is an inline literal at its call site
+// rather than a named constant, so nothing but this scan ties them to the seeded
+// set: an unseeded reason has NO series until its first drop and
+// increase(...[1h]) is blind to it, and a seeded reason no site produces is a
+// permanently dead zero series. Fails both ways.
+//
+// TWO PRODUCERS, NOT ONE. The dispatcher drops a QUEUED adoption via drop(...);
+// the webhook refuses one BEFORE the enqueue, on the same counter, when the
+// repository URL yields no forge slug. Scanning only the dispatcher would have
+// called that second producer's reason a dead series.
+func TestAdoptionDropReasonsMatchTheirProducers(t *testing.T) {
+	producers := []struct {
+		file string
+		path []string
+		re   *regexp.Regexp
+	}{
+		{"queue_controller.go", []string{"..", "controller", "queue_controller.go"},
+			regexp.MustCompile(`drop\("([a-z_]+)"\)`)},
+		{"webhook/server.go", []string{"..", "webhook", "server.go"},
+			regexp.MustCompile(`AdoptionEventDroppedTotal\.WithLabelValues\([^)]*"([a-z_]+)"\)`)},
 	}
 	seeded := map[string]bool{}
 	for _, r := range adoptionDropReasons {
 		seeded[r] = true
 	}
 	produced := map[string]bool{}
-	for _, m := range regexp.MustCompile(`drop\("([a-z_]+)"\)`).FindAllStringSubmatch(string(src), -1) {
-		produced[m[1]] = true
-	}
-	if len(produced) == 0 {
-		t.Fatal("found no drop(\"...\") call sites in queue_controller.go - the scan is broken, not the seed list")
+	for _, p := range producers {
+		src, err := os.ReadFile(filepath.Join(p.path...))
+		if err != nil {
+			t.Fatalf("read %s: %v", p.file, err)
+		}
+		found := p.re.FindAllStringSubmatch(string(src), -1)
+		if len(found) == 0 {
+			t.Fatalf("found no adoption-drop call sites in %s - the scan is broken, not the seed list", p.file)
+		}
+		for _, m := range found {
+			produced[m[1]] = true
+		}
 	}
 	for reason := range produced {
 		if !seeded[reason] {
-			t.Errorf("the dispatcher drops adoptions with reason %q but adoptionDropReasons does not seed it: "+
+			t.Errorf("an adoption is dropped with reason %q but adoptionDropReasons does not seed it: "+
 				"increase() cannot see its first increment", reason)
 		}
 	}
 	for reason := range seeded {
 		if !produced[reason] {
-			t.Errorf("adoptionDropReasons seeds %q but no drop(...) site produces it: "+
+			t.Errorf("adoptionDropReasons seeds %q but no producer emits it: "+
 				"a permanently dead zero series", reason)
 		}
 	}

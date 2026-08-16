@@ -78,7 +78,7 @@ func TestAdoptedUpgradeRefRoundTripsThePRRef(t *testing.T) {
 		Title: "chore(deps): bump", Author: "tatara-bot", HeadSHA: "abc",
 		HeadBranch: "renovate/cilium", Body: "notes", Labels: []string{"deps"},
 	}
-	got := prRefFromAdopted(AdoptedUpgradeRefFromPR(pr))
+	got := PRRefFromAdopted(AdoptedUpgradeRefFromPR(pr))
 	if got.Repo != pr.Repo || got.HeadRepo != pr.HeadRepo || got.Number != pr.Number ||
 		got.Title != pr.Title || got.Author != pr.Author || got.HeadSHA != pr.HeadSHA ||
 		got.HeadBranch != pr.HeadBranch || got.Body != pr.Body || len(got.Labels) != 1 {

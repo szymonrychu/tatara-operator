@@ -798,7 +798,7 @@ func (r *DispatcherReconciler) admitAdoptedUpgrade(ctx context.Context, proj *ta
 		return nil, adoptRetry, err
 	}
 
-	pr := prRefFromAdopted(q.Spec.Payload.AdoptedUpgrade)
+	pr := PRRefFromAdopted(q.Spec.Payload.AdoptedUpgrade)
 	m := r.minter()
 	cr, err := m.mergeRequestCR(ctx, proj, &repo, pr.Number)
 	if err != nil {
@@ -862,7 +862,7 @@ func (r *DispatcherReconciler) convergeAdoptedAdmission(ctx context.Context, pro
 		return err
 	}
 	m := r.minter()
-	pr := prRefFromAdopted(q.Spec.Payload.AdoptedUpgrade)
+	pr := PRRefFromAdopted(q.Spec.Payload.AdoptedUpgrade)
 	return m.convergeAdoptedMint(ctx, proj, &repo, mrSnapshot(proj, &repo, pr), task, m.spillerFor(proj))
 }
 

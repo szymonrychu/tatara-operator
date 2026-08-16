@@ -303,11 +303,18 @@ var AdoptionEventDroppedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 // adoptionDropReasons is AdoptionEventDroppedTotal's closed reason set, seeded
 // for the same reason every counter here is: a CounterVec with no
 // WithLabelValues call has NO series, so increase(...[1h]) is blind to the first
-// increment after every pod roll. Kept in sync with the dispatcher's drop(...)
-// call sites by TestAdoptionDropReasonsMatchTheDispatcher, which scans them out
-// of the source - sweepSkipReasons carried the prose version of that instruction
-// and drifted from four call sites anyway (issue #495).
-var adoptionDropReasons = []string{"not_adoptable", "repository_gone"}
+// increment after every pod roll. Kept in sync with BOTH producers - the
+// dispatcher's drop(...) call sites and the webhook's pre-enqueue refusal - by
+// TestAdoptionDropReasonsMatchTheirProducers, which scans them out of the source;
+// sweepSkipReasons carried the prose version of that instruction and drifted from
+// four call sites anyway (issue #495).
+//
+// repo_slug_unknown is the webhook's alone and it is a CONFIGURATION fault, not a
+// freshness one: a Repository URL its provider cannot turn into a forge slug
+// refuses every adoption for that repository forever, because AdoptUpgradeMR's
+// fork clause fails closed on the empty value. Unlike the dispatcher's reasons,
+// a sustained rate here is never the mechanism working.
+var adoptionDropReasons = []string{"not_adoptable", "repository_gone", "repo_slug_unknown"}
 
 // sweepSkipReasons is the closed skip-reason set. Keep in sync with sweep.go's
 // SweepSkip* constants - enforced by TestSweepSkipReasonsMatchSweepConstants,

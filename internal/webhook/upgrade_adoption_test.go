@@ -27,6 +27,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 
@@ -40,7 +41,6 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/controller"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/queue"
-	"github.com/szymonrychu/tatara-operator/internal/scm"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -136,6 +136,13 @@ func TestPROpened_AdoptableUpgradeMR_EnqueuesAQueuedAdoption(t *testing.T) {
 	// priority 1 would drain ahead of the next stage of every task already
 	// underway, with the starvation guard reserving exactly one slot after an
 	// hour of it. No human waits on a bump.
+	//
+	// ASSERTED ON THE FIELD, NOT ON EffectiveQueuePriority: that helper returns 2
+	// for a nil Priority and EnqueueEvent's own class default for
+	// QueueClassNormal is 2 as well, so a test that only reads the effective
+	// value passes just as happily with WithPriority(2) deleted.
+	require.NotNil(t, qe.Spec.Priority, "the priority is set EXPLICITLY, not inherited from the class default")
+	require.Equal(t, 2, *qe.Spec.Priority)
 	require.Equal(t, 2, tatarav1.EffectiveQueuePriority(qe.Spec))
 
 	require.Empty(t, allTasks(t, c, "ad1"),
@@ -162,7 +169,7 @@ func TestPROpened_AdoptableUpgradeMR_QueuedSnapshotPassesTheForkGuard(t *testing
 	a := adoptionEvent(t, c, "ad1b", "charts", 41).Spec.Payload.AdoptedUpgrade
 	require.Equal(t, "o/r", a.Repo, "payload.repo is the forge SLUG, never the clone URL")
 	require.Equal(t, "o/r", a.HeadRepo)
-	require.True(t, controller.AdoptUpgradeMR(proj, prRefFrom(a), nil, "", nil),
+	require.True(t, controller.AdoptUpgradeMR(proj, controller.PRRefFromAdopted(a), nil, "", nil),
 		"the queued snapshot must be adoptable by the very predicate the dispatcher re-asks")
 }
 
@@ -181,19 +188,73 @@ func TestPROpened_ForkedUpgradeMR_QueuedSnapshotIsRefusedByTheForkGuard(t *testi
 
 	a := adoptionEvent(t, c, "ad1c", "charts", 42).Spec.Payload.AdoptedUpgrade
 	require.Equal(t, "stranger/r", a.HeadRepo)
-	require.False(t, controller.AdoptUpgradeMR(proj, prRefFrom(a), nil, "", nil),
+	require.False(t, controller.AdoptUpgradeMR(proj, controller.PRRefFromAdopted(a), nil, "", nil),
 		"a head repo that is not the base repo is a fork and must never adopt")
 }
 
-// prRefFrom is the dispatcher's own prRefFromAdopted, rebuilt here because that
-// helper is unexported: the point of these two tests is to ask AdoptUpgradeMR
-// exactly what admission asks it, off exactly the fields the payload carries.
-func prRefFrom(a *tatarav1.AdoptedUpgradeRef) scm.PRRef {
-	return scm.PRRef{
-		Number: a.Number, Title: a.Title, Author: a.Author,
-		HeadSHA: a.HeadSHA, HeadBranch: a.HeadBranch, Body: a.Body,
-		Labels: a.Labels, Repo: a.Repo, HeadRepo: a.HeadRepo,
-	}
+// A GITLAB PROJECT PATH IS NOT owner/name, AND THE PROVIDER SAYS SO. This is the
+// case the host-sniffing scm.RepoSlugFromURL gets wrong on a self-hosted GitLab
+// (no "gitlab" in git.example.com, so a group/subgroup/project path falls
+// through to the two-segment GitHub parser and errors). enqueueAdoption is
+// handed the authoritative provider by scm.Select and must use it: the slug it
+// stores has to equal the HeadRepo GitLab's own webhook reports
+// (object_attributes.source.path_with_namespace), or the fork clause refuses
+// every adoption in that project forever.
+func TestMROpened_GitLabSubgroupRepo_QueuedSnapshotPassesTheForkGuard(t *testing.T) {
+	const secretVal = "whsec-a1d"
+	proj := adoptionProject("ad1d", "ad1d-scm", "tatara-bot", "renovate/", 2, nil)
+	proj.Spec.Scm.Provider = "gitlab"
+	const url = "https://git.example.com/g/sub/p.git"
+	c := seedClient(t, proj, secret("ad1d-scm", secretVal), repository("charts", "ad1d", url, "main"))
+	h, _ := newServer(t, c)
+
+	body := []byte(`{"object_kind":"merge_request","user":{"username":"tatara-bot"},` +
+		`"project":{"git_http_url":"` + url + `","path_with_namespace":"g/sub/p"},` +
+		`"object_attributes":{"iid":43,"title":"chore(deps): bump","description":"notes",` +
+		`"action":"open","state":"opened","last_commit":{"id":"sha-43"},` +
+		`"source_branch":"renovate/cilium","source":{"path_with_namespace":"g/sub/p"},` +
+		`"url":"https://git.example.com/g/sub/p/-/merge_requests/43"}}`)
+	hdr := http.Header{}
+	hdr.Set("X-Gitlab-Event", "Merge Request Hook")
+	hdr.Set("X-Gitlab-Token", secretVal)
+	require.Equal(t, http.StatusAccepted, post(t, h, "ad1d", hdr, body).Code)
+
+	a := adoptionEvent(t, c, "ad1d", "charts", 43).Spec.Payload.AdoptedUpgrade
+	require.Equal(t, "g/sub/p", a.Repo, "the full group/subgroup/project path, not owner/name")
+	require.Equal(t, "g/sub/p", a.HeadRepo)
+	require.True(t, controller.AdoptUpgradeMR(proj, controller.PRRefFromAdopted(a), nil, "", nil))
+}
+
+// A REPOSITORY URL THIS PROVIDER CANNOT SLUG DROPS, LOUDLY. A deep GitHub path
+// is not owner/name, so the snapshot would carry an empty repo and the fork
+// clause would refuse it at admission - forever, on every redelivery, with no
+// series to say so. It is counted rather than merely logged, and it stays a 202
+// because no redelivery fixes a malformed URL.
+func TestPROpened_AdoptableUpgradeMR_UnsluggableRepoURLIsCountedAndDropped(t *testing.T) {
+	const secretVal = "whsec-a1e"
+	const url = "https://github.com/enterprise/o/r.git"
+	c := seedClient(t,
+		adoptionProject("ad1e", "ad1e-scm", "tatara-bot", "renovate/", 2, nil),
+		secret("ad1e-scm", secretVal),
+		repository("charts", "ad1e", url, "main"),
+	)
+	before := testutil.ToFloat64(
+		obs.AdoptionEventDroppedTotal.WithLabelValues("ad1e", "repo_slug_unknown"))
+	h, _ := newServer(t, c)
+
+	body := prOpenedOnBranch("tatara-bot", "renovate/cilium", 44)
+	body = []byte(strings.ReplaceAll(string(body),
+		`"clone_url":"https://github.com/o/r.git"`, `"clone_url":"`+url+`"`))
+	hdr := http.Header{}
+	hdr.Set("X-GitHub-Event", "pull_request")
+	hdr.Set("X-Hub-Signature-256", ghSign(secretVal, body))
+	require.Equal(t, http.StatusAccepted, post(t, h, "ad1e", hdr, body).Code,
+		"a malformed repository URL is a config fault; redelivering it changes nothing")
+
+	noAdoptionEvent(t, c, "ad1e")
+	require.Equal(t, before+1, testutil.ToFloat64(
+		obs.AdoptionEventDroppedTotal.WithLabelValues("ad1e", "repo_slug_unknown")),
+		"a drop nothing counts is the silent-refusal failure this design exists to remove")
 }
 
 // An allowlisted upgradeEngineLogins author takes the same path. It is not the
@@ -352,6 +413,53 @@ func TestPROpened_AdoptionArmed_HumanAuthorOnPrefixedBranchStillReviews(t *testi
 	require.Len(t, tasks, 1)
 	require.Equal(t, "review", tasks[0].Spec.Kind, "an unowned author on the prefix is a review, never an adoption")
 	noAdoptionEvent(t, c, "ad6")
+	// The review mint's own slug is now provider-derived too. GitHub is the case
+	// that must not move: owner/name, exactly as scm.OwnerRepo produced before.
+	require.Equal(t, "https://github.com/o/r/pull/6", mrCRURL(t, c, 6))
+}
+
+// THE REVIEW MINT'S SLUG WAS GITHUB-ONLY TOO, and on any GitLab group path it
+// was "" - so the merge request mirror got a URL with a hole in it and every
+// forge write addressed by that slug went to the wrong place. Same one-line fix
+// as the adoption arm, same provider, asserted through the mirror URL that
+// carries it.
+func TestMROpened_GitLabSubgroupRepo_ReviewMintCarriesTheFullProjectPath(t *testing.T) {
+	const secretVal = "whsec-a6b"
+	proj := adoptionProject("ad6b", "ad6b-scm", "tatara-bot", "renovate/", 2, nil)
+	proj.Spec.Scm.Provider = "gitlab"
+	proj.Spec.Scm.ReporterLogins = []string{"mallory"}
+	const url = "https://git.example.com/g/sub/p.git"
+	c := seedClient(t, proj, secret("ad6b-scm", secretVal), repository("charts", "ad6b", url, "main"))
+	h, _ := newServer(t, c)
+
+	body := []byte(`{"object_kind":"merge_request","user":{"username":"mallory"},` +
+		`"project":{"git_http_url":"` + url + `","path_with_namespace":"g/sub/p"},` +
+		`"object_attributes":{"iid":66,"title":"a change","description":"why",` +
+		`"action":"open","state":"opened","last_commit":{"id":"sha-66"},` +
+		`"source_branch":"feature/x","source":{"path_with_namespace":"g/sub/p"},` +
+		`"url":"https://git.example.com/g/sub/p/-/merge_requests/66"}}`)
+	hdr := http.Header{}
+	hdr.Set("X-Gitlab-Event", "Merge Request Hook")
+	hdr.Set("X-Gitlab-Token", secretVal)
+	require.Equal(t, http.StatusAccepted, post(t, h, "ad6b", hdr, body).Code)
+
+	require.Len(t, allTasks(t, c, "ad6b"), 1)
+	require.Equal(t, "https://git.example.com/g/sub/p/-/merge_requests/66", mrCRURL(t, c, 66))
+}
+
+// mrCRURL reads the one MergeRequest mirror for number, whose URL is built from
+// the slug the handler derived (controller.mrURLFromRepoURL).
+func mrCRURL(t *testing.T, c client.Client, number int) string {
+	t.Helper()
+	var mrl tatarav1.MergeRequestList
+	require.NoError(t, c.List(context.Background(), &mrl, client.InNamespace(ns)))
+	for i := range mrl.Items {
+		if mrl.Items[i].Spec.Number == number {
+			return mrl.Items[i].Spec.URL
+		}
+	}
+	t.Fatalf("no MergeRequest mirror for number %d", number)
+	return ""
 }
 
 // INERTNESS 3: a bot-authored merge request on a branch OUTSIDE the prefix is
