@@ -513,13 +513,39 @@ func (m *Minter) mergeRequestCR(ctx context.Context, proj *tatarav1alpha1.Projec
 // C5). mutate must be idempotent (it runs on every retry against the fresh
 // object).
 func (m *Minter) stampMintStatus(ctx context.Context, task *tatarav1alpha1.Task, mutate func(*tatarav1alpha1.Task)) error {
+	return m.stampMintStatusIfChanged(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
+		mutate(fresh)
+		return true
+	})
+}
+
+// stampMintStatusIfChanged is stampMintStatus with a mutator that REPORTS
+// whether it changed anything. A false return skips the Status().Update
+// entirely and still refreshes the caller's copy.
+//
+// The distinction is only worth having because the decision must be made
+// against the FRESH object, never the caller's in-memory one. Since #604,
+// repairMRBinding's owned-by-us branch reaches the mrRefs stamp on paths that
+// run per open merge request per sweep pass, so an unconditional Update spent
+// an apiserver round trip - and a RetryOnConflict path under contention - on
+// every already-converged object, writing bytes identical to the ones there.
+// Short-circuiting on the CALLER's copy instead would be a correctness bug, not
+// an optimisation: a stale copy that still lists the ref is exactly the state an
+// interrupted mint leaves behind, and skipping there would decline to perform
+// the repair this function exists for.
+func (m *Minter) stampMintStatusIfChanged(ctx context.Context, task *tatarav1alpha1.Task,
+	mutate func(*tatarav1alpha1.Task) bool) error {
+
 	key := client.ObjectKeyFromObject(task)
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.Task{}
 		if err := m.Client.Get(ctx, key, fresh); err != nil {
 			return err
 		}
-		mutate(fresh)
+		if !mutate(fresh) {
+			*task = *fresh
+			return nil
+		}
 		if err := m.Client.Status().Update(ctx, fresh); err != nil {
 			return err
 		}
@@ -597,11 +623,17 @@ func (m *Minter) repairMRBinding(ctx context.Context, proj *tatarav1alpha1.Proje
 // mrRefs is what submit_outcome(action=submitted)'s open-MR gate and mr_write's
 // open-idempotency both read, so a Task missing it can neither finish nor
 // safely re-open.
+//
+// It writes only when the ref is genuinely absent from the FRESH object - see
+// stampMintStatusIfChanged for why that distinction is load-bearing rather than
+// a micro-optimisation.
 func (m *Minter) stampMRRef(ctx context.Context, task *tatarav1alpha1.Task, name string) error {
-	return m.stampMintStatus(ctx, task, func(fresh *tatarav1alpha1.Task) {
-		if !slices.Contains(fresh.Status.MRRefs, name) {
-			fresh.Status.MRRefs = append(fresh.Status.MRRefs, name)
+	return m.stampMintStatusIfChanged(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
+		if slices.Contains(fresh.Status.MRRefs, name) {
+			return false
 		}
+		fresh.Status.MRRefs = append(fresh.Status.MRRefs, name)
+		return true
 	})
 }
 

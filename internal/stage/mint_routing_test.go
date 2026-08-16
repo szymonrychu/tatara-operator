@@ -30,6 +30,17 @@ import (
 // originAgentKinds with no row here FAILS, which is the forcing function: the
 // next author has to say where their kind is minted and whether it owns an
 // Issue, rather than discovering the answer from a stranded Task in production.
+//
+// WHAT THIS TABLE CANNOT DO, stated so nobody trusts it for more than it is: the
+// mintStates are DECLARED here, not read back from each minter, because
+// internal/stage is pure and cannot import the controllers that do the minting.
+// So flipping takeover_mint.go back to StateRefined does not fail this test -
+// the row would simply have become a lie. Two other things catch that: the
+// per-minter tests pin each real minter's InitialState directly
+// (TestMintOrUnparkTakeoverTask_MintsBoundIntoUnderImplementation), and
+// TestCreateEdgeCannotMintIntoTheGate below refuses the edge outright, so there
+// is nowhere for a refined mint to land. This table's job is the NEW kind that
+// has no test yet, and the invariant it must answer before it gets one.
 var mintRouting = map[string]struct {
 	// mintStates is every Create-edge target a minter picks for this kind.
 	// Empty spec.initialState means `new`, so `new` is spelled out here.

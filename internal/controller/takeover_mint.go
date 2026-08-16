@@ -206,6 +206,19 @@ func (m *Minter) mintOrUnparkTakeoverTask(ctx context.Context, proj *tatarav1alp
 	}
 	switch outcome {
 	case MintExistingLive:
+		// THE SECOND EXISTING-TASK PATH, and it needs the same mrRefs backfill as
+		// the cached-Get one above. It is reached precisely when two endpoint
+		// calls race: m.Client.Get is the CACHED reader, so a Task another
+		// request created seconds ago 404s there, the create then collides here,
+		// and the twin arrives with whatever state that other request had got to
+		// - including, if it died mid-mint, empty mrRefs. Returning it unrepaired
+		// left the repair to depend on the maintainer commenting a THIRD time,
+		// after the cache had warmed.
+		if len(twin.Status.MRRefs) == 0 {
+			if rerr := m.bindAndStampTakeoverMR(ctx, proj, repo, mr, twin, sp, expectFrom...); rerr != nil {
+				return nil, rerr
+			}
+		}
 		return twin, nil
 	case MintTombstoneDeleted:
 		// createTaskRaceSafe collided with a DEAD twin and just deleted the
@@ -234,6 +247,16 @@ func (m *Minter) mintOrUnparkTakeoverTask(ctx context.Context, proj *tatarav1alp
 // Both halves are idempotent - ownMergeRequest returns early when the Task
 // already controller-owns the CR, and the stamp checks for the ref first - which
 // is what makes it safe to re-run on an endpoint retry.
+//
+// PRECONDITION: mr IS OPEN, and since #604 that is load-bearing rather than
+// incidental. mrExtFromMR hardcodes State:"open" and SyncMergeRequest assigns
+// mr.Status.State from it unconditionally, so calling this for a CLOSED merge
+// request would force its mirror back to `open`. On the fresh-mint path that
+// could never happen; the repair fall-throughs above re-run it on a Task that
+// already exists, which is new. It holds because restapi.mrTakeover refuses a
+// non-open merge request before it ever reaches the minter - the ONLY caller
+// chain into here. Any future caller must preserve that check or re-read the
+// live state instead of trusting this snapshot.
 func (m *Minter) bindAndStampTakeoverMR(ctx context.Context, proj *tatarav1alpha1.Project,
 	repo *tatarav1alpha1.Repository, mr *tatarav1alpha1.MergeRequest, task *tatarav1alpha1.Task,
 	sp objbudget.Spiller, expectFrom ...string) error {

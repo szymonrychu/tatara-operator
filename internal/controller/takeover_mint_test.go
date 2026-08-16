@@ -266,6 +266,36 @@ func TestRepairMRBinding_LeavesAForeignOwnedMRAlone(t *testing.T) {
 	}
 }
 
+// THE REPAIR MUST NOT WRITE ON AN ALREADY-CONVERGED OBJECT. repairMRBinding's
+// owned-by-us branch runs per open merge request per sweep pass (MintReviewTask's
+// existing-twin arm, convergeAdoptedMint), so an unconditional Status().Update
+// there spends an apiserver round trip on every converged Task, every pass, to
+// write bytes identical to the ones already stored.
+//
+// resourceVersion is the observable: it changes on a write and not otherwise.
+func TestRepairMRBinding_ConvergedTaskIsNotRewritten(t *testing.T) {
+	ctx := context.Background()
+	proj, repo := seedProjectRepo(t, ctx)
+	mr := seedOpenExternalMR(t, ctx, proj, repo, 34, "renovate/converged", "octocat")
+	m := newTestMinter(t)
+
+	task, err := m.MintOrUnparkTakeoverTask(ctx, proj, repo, mr, "alice", "take over", testSpiller(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := getTask(t, task.Name).ResourceVersion
+
+	for i := 0; i < 3; i++ {
+		if err := m.repairMRBinding(ctx, proj, repo, mrExtFromMR(mr), task, testSpiller(t)); err != nil {
+			t.Fatalf("repair pass %d: %v", i, err)
+		}
+	}
+	if after := getTask(t, task.Name).ResourceVersion; after != before {
+		t.Fatalf("resourceVersion moved %s -> %s: the repair rewrote a Task whose mrRefs were "+
+			"already correct, on a path that runs every sweep pass", before, after)
+	}
+}
+
 // --- envtest fixtures local to the takeover minter tests ---
 
 // clearTaskMRRefs wipes status.mrRefs, reproducing a mint that errored between

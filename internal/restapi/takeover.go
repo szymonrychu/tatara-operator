@@ -54,13 +54,25 @@ func (s *Server) liveTakeoverTask(ctx context.Context, proj *tatarav1alpha1.Proj
 	return &task, true, nil
 }
 
-// unresumableTakeoverPark reports whether t is parked in a way the takeover
-// endpoint can never clear: parked, for a reason that is NOT ownership-lost (the
-// one reason MintOrUnparkTakeoverTask acts on) and whose UnparkClass is
-// UnparkNever (so no human comment and no timer will clear it either).
+// unresumableTakeoverPark reports whether t is parked in a way NOTHING will
+// clear: not this endpoint, not a human comment, not a timer.
 //
 // implement-declined is the member that matters and the reason this exists: see
 // the decline-terminal note on controller.MintOrUnparkTakeoverTask.
+//
+// THE ownership-lost EARLY RETURN IS LOAD-BEARING, NOT DEFENSIVE. That reason is
+// ITSELF UnparkNever (stage/park.go) - it is special only because
+// MintOrUnparkTakeoverTask has an explicit arm for it. Delete this line as
+// redundant and every re-take, the whole point of the endpoint, starts 409ing.
+//
+// The class test is stated as "not the two that DO resume" rather than
+// "== UnparkNever", because there are FOUR classes: UnparkRetired (the O3
+// migration reasons) resumes only via a one-shot sweep that skips anything
+// already stamped, so a takeover carrying one is just as stuck - and an
+// == UnparkNever test would silently answer it 200 and do nothing, which is the
+// exact behaviour this gate exists to eliminate. An UNKNOWN reason (ok==false)
+// is deliberately NOT refused: refusing a maintainer's takeover on a reason we
+// cannot classify is the worse error of the two.
 func unresumableTakeoverPark(t *tatarav1alpha1.Task) bool {
 	if t == nil || !tatarav1alpha1.Parked(t) {
 		return false
@@ -69,7 +81,7 @@ func unresumableTakeoverPark(t *tatarav1alpha1.Task) bool {
 		return false // THE re-take path
 	}
 	class, ok := stage.UnparkClassFor(t.Status.ParkReason)
-	return ok && class == stage.UnparkNever
+	return ok && class != stage.UnparkHuman && class != stage.UnparkTimer
 }
 
 // mrTakeover is the consumer end of the OP6 (webhook fast path) / OP12 (sweep
@@ -175,8 +187,21 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 	// #604 is about - just moved one state right.
 	//
 	// UnparkHuman reasons (awaiting-human and friends) are deliberately NOT
-	// refused: the maintainer's comment drives the ordinary comment un-park
-	// path, so 200 stays honest for them.
+	// refused: those parks DO clear on a human comment. Note the timing though -
+	// comment routing goes to the MR's CONTROLLER OWNER, which in the shape
+	// below is still the review Task, so it is a LATER comment that un-parks the
+	// takeover, not the one that triggered this call. 200 is right; the reason is
+	// "this park is clearable", not "this call clears it".
+	//
+	// THE REACHABLE SHAPE, spelled out because the ownership gate above hides it:
+	// a declined takeover still controller-owns its merge request and runs no
+	// pod, so nothing can call this endpoint at all until the human PUSHES. That
+	// push runs flipToExternal -> parkOwnerTask, which returns early on an
+	// already-parked Task (so the reason stays implement-declined, NOT
+	// ownership-lost) and then hands the controller ref to a review Task. THAT
+	// review agent is the caller here, with ownership back at `external` - which
+	// is why this gate sits ahead of the already-tatara branch AND ahead of the
+	// flip, rather than inside either.
 	if existing, found, err := s.liveTakeoverTask(ctx, proj, repo, req.Number); err != nil {
 		s.log.ErrorContext(ctx, "restapi: read existing takeover task failed",
 			append(reqLogFields(r), "mr", mr.Name, "error", err)...)
@@ -186,10 +211,15 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 		s.log.WarnContext(ctx, "restapi: takeover requested on a parked task that can never resume",
 			append(reqLogFields(r), "action", "mr_takeover_unresumable", "resource_id", mr.Name,
 				"user", cmt.Author, "task", existing.Name, "park_reason", existing.Status.ParkReason)...)
+		// The remedy deliberately does NOT say "push to take it back": by the
+		// time this can fire, the human has already pushed (that push is what
+		// produced this shape), and pushing again returns the same 409. Ageing
+		// out at ParkRetention is the only thing that actually clears it.
 		writeError(w, http.StatusConflict,
 			"the takeover task for this merge request is parked "+existing.Status.ParkReason+
-				" and cannot resume: only parked(ownership-lost) re-takes. Push to the branch to take "+
-				"it back, or wait for the parked task to be collected")
+				" and can never resume: only parked(ownership-lost) re-takes. Nothing clears this "+
+				"park - the task ages out at ParkRetention and is collected, after which a fresh "+
+				"take-over can be minted. The merge request is yours in the meantime")
 		return
 	}
 

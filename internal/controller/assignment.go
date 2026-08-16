@@ -131,6 +131,11 @@ func assignmentFor(agentKind string, task *tatarav1alpha1.Task, proj *tatarav1al
 	b.WriteString(agentJob(agentKind, task, proj, workspaceInherited))
 	// Project-specific append: TRUSTED maintainer config from the Project CR
 	// (never user/issue text). Wildcard first, then the kind entry.
+	//
+	// DELIBERATELY agentKind, not pk. PromptAppendByKind's keys are documented as
+	// AGENT kinds and do not include takeover (ModelByKind is keyed the same
+	// way), so passing pk here would invent a third kind vocabulary for one pod
+	// and silently drop the `implement` append a maintainer had configured.
 	if ap := proj.Spec.Agent.PromptAppendFor(agentKind); ap != "" {
 		b.WriteString("\n\n")
 		b.WriteString(ap)
