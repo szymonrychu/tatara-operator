@@ -800,20 +800,39 @@ func (r *DispatcherReconciler) admitAdoptedUpgrade(ctx context.Context, proj *ta
 			"resource_id", q.Name, "project", proj.Name, "reason", adoptAdmitErrorReason)
 		return nil, adoptRetry, err
 	}
-	// COUNTED ONLY ONCE THE EVENT IS ACTUALLY GONE. A transient Delete failure
-	// leaves the event Queued and this whole function re-runs next pass, so
-	// counting before the delete would count one refusal twice - it goes
-	// through fail, not obs.AdoptionEventDroppedTotal, since the event was NOT
-	// dropped.
+	// COUNTED ONLY WHEN THIS CALL ITSELF DISPOSED OF THE EVENT. A transient
+	// Delete failure leaves the event Queued and this whole function re-runs
+	// next pass, so counting before the delete would count one refusal twice -
+	// it goes through fail, not obs.AdoptionEventDroppedTotal, since the event
+	// was NOT dropped.
+	//
+	// A NotFound means someone ELSE already disposed of it - in practice the
+	// webhook's dropQueuedAdoption (mirror_refresh.go), which deletes a still-
+	// Queued adoption on merged/closed and counts it under ITS OWN reason.
+	// Counting it again here under THIS reason would double-count one merge
+	// request's drop across two different reason labels, which is exactly what
+	// AdoptionEventDroppedTotal's "how many drops, and why" contract cannot
+	// tolerate. The control flow is still correct - the event is gone, there is
+	// nothing left to admit, so this still returns the dropped verdict - it
+	// just must not increment a second time. Do not simplify this branch back
+	// to unconditionally counting; that reintroduces the double count.
 	drop := func(reason string) (*tatarav1alpha1.Task, adoptVerdict, error) {
-		if err := r.Delete(ctx, q); err != nil && !apierrors.IsNotFound(err) {
+		err := r.Delete(ctx, q)
+		switch {
+		case err == nil:
+			obs.AdoptionEventDroppedTotal.WithLabelValues(proj.Name, reason).Inc()
+			lg.Info("queue: dropped a queued dependency-upgrade adoption",
+				"action", "queue_adopt_drop", "resource_id", q.Name, "project", proj.Name,
+				"repo", q.Spec.RepositoryRef, "number", q.Spec.Payload.AdoptedUpgrade.Number,
+				"reason", reason)
+		case apierrors.IsNotFound(err):
+			lg.Info("queue: adoption event already gone before this drop's own delete, not double-counted",
+				"action", "queue_adopt_drop_already_gone", "resource_id", q.Name, "project", proj.Name,
+				"repo", q.Spec.RepositoryRef, "number", q.Spec.Payload.AdoptedUpgrade.Number,
+				"reason", reason)
+		default:
 			return fail(err)
 		}
-		obs.AdoptionEventDroppedTotal.WithLabelValues(proj.Name, reason).Inc()
-		lg.Info("queue: dropped a queued dependency-upgrade adoption",
-			"action", "queue_adopt_drop", "resource_id", q.Name, "project", proj.Name,
-			"repo", q.Spec.RepositoryRef, "number", q.Spec.Payload.AdoptedUpgrade.Number,
-			"reason", reason)
 		return nil, adoptDropped, nil
 	}
 

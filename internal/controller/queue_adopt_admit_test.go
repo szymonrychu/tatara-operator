@@ -355,6 +355,53 @@ func TestAdmit_AdoptedUpgradeWithAnOpenMirrorIsNotRefusedByTheFreshnessBackstop(
 	}
 }
 
+// A DROP WHOSE DELETE RETURNS NOTFOUND MUST NOT DOUBLE-COUNT. The webhook's
+// dropQueuedAdoption (mirror_refresh.go) can delete a still-Queued adoption on
+// merged/closed and count it under ITS OWN reason before this dispatcher pass
+// ever reaches it; if drop() then counted again under repository_gone, one
+// disposed merge request would show up under two different reason labels.
+// The verdict must still be adoptDropped - the event is gone, there is
+// nothing left to admit - but the metric must not move. Seeding the event ONLY
+// in the in-memory admitAdoptedUpgrade argument (never in the fake client)
+// reproduces exactly that race: Delete finds nothing and returns NotFound.
+func TestAdmit_AdoptedUpgradeDropAlreadyGoneDoesNotDoubleCount(t *testing.T) {
+	tests := []struct {
+		name      string
+		seedEvent bool
+		wantDelta float64
+	}{
+		{"normal drop still counts", true, 1},
+		{"already-gone drop does not double-count", false, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			proj := adoptAdmitProject()
+			qe := adoptionEvent(proj, adoptRepo(), 49) // repo deliberately never seeded: drops repository_gone
+			var seed []client.Object
+			seed = append(seed, proj)
+			if tt.seedEvent {
+				seed = append(seed, qe)
+			}
+			c := newMirrorClient(t, seed...)
+			r := &DispatcherReconciler{Client: c, Scheme: c.Scheme()}
+
+			before := testutil.ToFloat64(obs.AdoptionEventDroppedTotal.WithLabelValues(proj.Name, "repository_gone"))
+			_, verdict, err := r.admitAdoptedUpgrade(ctx, proj, qe)
+			if err != nil {
+				t.Fatalf("admitAdoptedUpgrade: %v", err)
+			}
+			if verdict != adoptDropped {
+				t.Errorf("verdict = %v, want adoptDropped", verdict)
+			}
+			after := testutil.ToFloat64(obs.AdoptionEventDroppedTotal.WithLabelValues(proj.Name, "repository_gone"))
+			if after-before != tt.wantDelta {
+				t.Errorf("repository_gone drops counted = %v, want %v", after-before, tt.wantDelta)
+			}
+		})
+	}
+}
+
 // BACKWARD COMPATIBILITY. An event already Queued when this ships carries no
 // adoptedUpgrade and must still take BuildTaskFromQueuedEvent unchanged.
 func TestAdmit_LegacyMintPayloadIsUnaffected(t *testing.T) {
