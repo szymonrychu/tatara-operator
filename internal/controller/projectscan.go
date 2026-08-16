@@ -1225,6 +1225,25 @@ func (r *ProjectReconciler) createUpgradeTask(ctx context.Context, proj *tatarav
 	return created, nil
 }
 
+// isAdoptedUpgradeTask reports whether an upgrade Task was born from an EXISTING
+// third-party merge request rather than from the cron.
+//
+// TWO TESTS, AND THE SECOND IS THE UPGRADE PATH. The label is the explicit
+// marker MintAdoptedUpgradeTask stamps from now on. The Source shape is the
+// structural fallback for every adopted Task minted BEFORE this label existed:
+// on a live cluster several are in flight at upgrade time, and without the
+// fallback the cron would be suppressed by them for their whole remaining
+// lifetime - the exact D2 failure the label exists to prevent, arriving through
+// the one door a label cannot cover. It is exact rather than heuristic:
+// createUpgradeTask sets NO Source at all, and every adopted mint sets one with
+// IsPR true and a merge request number.
+func isAdoptedUpgradeTask(t *tatarav1alpha1.Task) bool {
+	if t.Labels[tatarav1alpha1.LabelUpgradeOrigin] == tatarav1alpha1.UpgradeOriginAdopted {
+		return true
+	}
+	return t.Spec.Source != nil && t.Spec.Source.IsPR && t.Spec.Source.Number > 0
+}
+
 // openUpgradeLaneCount counts the upgrade lanes the project currently owes,
 // against which maxOpenUpgrades is checked. A lane is held by a live Task OR by
 // a QueuedEvent that has been enqueued but not yet minted into one.
@@ -1240,6 +1259,13 @@ func (r *ProjectReconciler) createUpgradeTask(ctx context.Context, proj *tatarav
 // `declined` - the correct and common answer for a scheduled kind that finds
 // nothing worth taking - parks. Counting a park as live would stop the cron for
 // the whole park retention after the first quiet cycle.
+//
+// IT COUNTS THE CRON'S OWN WORK ONLY (design D2). maxOpenUpgrades governs the
+// CRON - the agent that proactively hunts for dependency bumps - and nothing
+// else. Adopted third-party merge requests are ordinary queue citizens bounded
+// by QueueCapacity and MaxLivePods, and counting them here would make a draining
+// Renovate backlog read as "lanes full": the cron would fall silent for as long
+// as the backlog lasted, with no error, no log and no counter.
 func (r *ProjectReconciler) openUpgradeLaneCount(ctx context.Context, proj *tatarav1alpha1.Project) (int, error) {
 	var list tatarav1alpha1.TaskList
 	if err := r.List(ctx, &list, client.InNamespace(proj.Namespace)); err != nil {
@@ -1250,6 +1276,9 @@ func (r *ProjectReconciler) openUpgradeLaneCount(ctx context.Context, proj *tata
 		t := &list.Items[i]
 		if t.Spec.ProjectRef != proj.Name || t.Spec.Kind != "upgrade" {
 			continue
+		}
+		if isAdoptedUpgradeTask(t) {
+			continue // adopted work is bounded by the general pool (design D2)
 		}
 		if !tatarav1alpha1.TaskDone(t) && !tatarav1alpha1.Parked(t) {
 			n++
@@ -1263,6 +1292,9 @@ func (r *ProjectReconciler) openUpgradeLaneCount(ctx context.Context, proj *tata
 		q := &qes.Items[i]
 		if q.Spec.ProjectRef != proj.Name || q.Spec.Kind != "upgrade" {
 			continue
+		}
+		if queue.IsAdoptedUpgradeMint(q) {
+			continue // the not-yet-minted half of the same exclusion
 		}
 		// An admission TICKET spawns the next pod stage of a Task that already
 		// exists and is already counted above; counting it too would double-book
