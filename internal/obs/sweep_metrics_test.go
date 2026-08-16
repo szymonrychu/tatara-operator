@@ -56,14 +56,17 @@ func assertLabelNames(t *testing.T, got, want []string) {
 // the Project reconcile path (issue #441). It must be idempotent: Reconcile
 // calls it on every pass.
 func TestSeedSweepErrorsForProject(t *testing.T) {
-	// sweep x 20 (nightlySweep dropped: dead, no live producer; +4 for the
+	// sweep x 19 (nightlySweep dropped: dead, no live producer; +4 for the
 	// fail() sites the list had drifted from, issue #495; +resolve_live_owner,
-	// issue #521; +adopt_upgrade_mr and +count_upgrade_lanes, the two failure
-	// sites of the dependency-MR adoption arm), brainstorm x 1 (demand-driven
-	// now, only stamp_failed can fire), documentation/issueScan x 2 each
-	// (invalid_cron, stamp_failed), refine x 3 (its own cron, Task 3), upgrade
-	// x 3 (plain cron plus its own capacity-count failure).
-	const wantPerProject = 20 + 1 + 2*2 + 3 + 3
+	// issue #521; +enqueue_adopt_upgrade, the sweep's adoption-enqueue arm
+	// failing, Task 8 - adopt_upgrade_mr left WITH the mint it named: the
+	// dispatcher's own admit-time mint failure is a plain error return, not a
+	// fail(reason, ...) call in sweep.go, so it never belonged in this
+	// sweep.go-scanned set), brainstorm x 1 (demand-driven now, only
+	// stamp_failed can fire), documentation/issueScan x 2 each (invalid_cron,
+	// stamp_failed), refine x 3 (its own cron, Task 3), upgrade x 3 (plain cron
+	// plus its own capacity-count failure).
+	const wantPerProject = 19 + 1 + 2*2 + 3 + 3
 
 	before := testutil.CollectAndCount(SweepErrorsTotal)
 	SeedSweepErrorsForProject("seed-test-proj")
@@ -98,9 +101,10 @@ func TestSeedSweepSkippedForProject(t *testing.T) {
 	// (sweep, webhook) x the closed SweepSkip* vocabulary. The webhook is a
 	// PRODUCER of this counter since issue #521's review: MintForItem names the
 	// clause that refused an issue, and a webhook mint is not a sweep pass.
-	// The 9th member is upgrade_headroom_bound (dependency-MR adoption deferred
-	// to a later pass by maxOpenUpgrades).
-	const wantPerProject = 2 * 9
+	// upgrade_headroom_bound is gone (Task 8): the sweep enqueues an adoptable
+	// dependency merge request instead of minting it directly, so there is no
+	// per-pass lane cap left to defer against.
+	const wantPerProject = 2 * 8
 
 	before := testutil.CollectAndCount(SweepSkippedTotal)
 	SeedSweepErrorsForProject("skip-seed-proj")

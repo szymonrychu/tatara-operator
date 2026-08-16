@@ -336,7 +336,6 @@ var sweepSkipReasons = []string{
 	"already_minted",
 	"tombstone_deleted",
 	"mint_not_owed",
-	"upgrade_headroom_bound",
 }
 
 // mintOutcomeKinds x mintOutcomes is MintOutcomeTotal's closed label set, seeded
@@ -396,11 +395,15 @@ var sweepSeedReasons = []string{
 	"get_owning_task", "get_mr_cr", "adopt_pr", "mint_review_task",
 	"reopen_retained_proposal", "get_mr_cr_post_classify", "list_pr_comments",
 	"reconcile_ownership", "resolve_live_owner",
-	// The adoption arm (a dependency-upgrade merge request minting its own
-	// upgrade Task): the mint itself, and the lane count that decides how many
-	// this pass may take. An uncountable lane budget adopts NOTHING, so its
-	// failure is invisible in the mint counters and only shows up here.
-	"adopt_upgrade_mr", "count_upgrade_lanes",
+	// The adoption arm no longer mints and no longer counts lanes - it ENQUEUES,
+	// and the dispatcher mints under the general pool (queue_controller.go,
+	// outside this scan: this list is sweep.go's fail(reason, ...) sites only).
+	// enqueue_adopt_upgrade is the sweep's enqueue failing, which is the one way
+	// a merge request the operator CAN see still ends a pass with no queue
+	// entry. adopt_upgrade_mr left with the mint it named - the dispatcher's own
+	// admit-time failure is a plain error return, not a fail(reason, ...) call,
+	// so it is not part of this seeded set.
+	"enqueue_adopt_upgrade",
 }
 
 // cronReasons/refineReasons are the closed reason sets for projectscan.go's

@@ -14,6 +14,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/own"
+	"github.com/szymonrychu/tatara-operator/internal/queue"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -161,14 +162,6 @@ const (
 	// which asserts a Task exists - the two are opposite facts and a shared
 	// series cannot be alerted on.
 	SweepSkipMintNotOwed = "mint_not_owed"
-
-	// SweepSkipUpgradeHeadroom: an adoptable dependency merge request the
-	// project has no upgrade lane free for this pass. NOT an error and not
-	// metered as one: it is picked up oldest-first on a later pass as lanes
-	// free. maxOpenUpgrades is the whole point - adoption is unbounded by
-	// construction and would otherwise mint a Task per open merge request at
-	// once on the first pass after it is armed.
-	SweepSkipUpgradeHeadroom = "upgrade_headroom_bound"
 
 	// SweepIssueKind is the Task kind a sweep-minted ISSUE Task carries.
 	//
@@ -1382,32 +1375,6 @@ func (r *ProjectReconciler) SweepProject(ctx context.Context, proj *tatarav1alph
 			"action", "sweep_writer_unavailable", "resource_id", proj.Name, "activity", activity, "error", werr.Error())
 	}
 
-	// Adoption headroom for the WHOLE pass, computed once. Per-repo would let a
-	// project with five repos mint five times the cap. openUpgradeLaneCount is
-	// the same counter the upgrade cron checks, so cron mints and adoptions
-	// compete for the same lanes rather than each getting a private allowance -
-	// which is what "maxOpenUpgrades governs adoption" has to mean.
-	//
-	// The nil guard on Cron is load-bearing: adoptBranchPrefixOf reads
-	// Spec.UpgradePolicy, which is independent of Spec.Scm.Cron, so a project
-	// could configure the prefix with no upgrade cron at all and reading
-	// Cron.Upgrade unguarded would panic. In that shape the headroom stays 0 and
-	// nothing adopts, which is the right answer: a project with no
-	// maxOpenUpgrades has declared no upgrade capacity.
-	adoptHeadroom := 0
-	if adoptBranchPrefixOf(proj) != "" && proj.Spec.Scm != nil && proj.Spec.Scm.Cron != nil {
-		maxOpen := proj.Spec.Scm.Cron.Upgrade.MaxOpenUpgrades
-		if maxOpen <= 0 {
-			maxOpen = 1
-		}
-		if live, cerr := r.openUpgradeLaneCount(ctx, proj); cerr != nil {
-			// Fail CLOSED: an uncountable lane budget adopts nothing this pass.
-			fail("count_upgrade_lanes", cerr)
-		} else if live < maxOpen {
-			adoptHeadroom = maxOpen - live
-		}
-	}
-
 	for i := range repos {
 		repo := &repos[i]
 		owner, name, oerr := scm.OwnerRepo(repo.Spec.URL)
@@ -1428,8 +1395,7 @@ func (r *ProjectReconciler) SweepProject(ctx context.Context, proj *tatarav1alph
 			continue
 		}
 		requeue = soonerRequeue(requeue,
-			r.sweepPRs(ctx, proj, repo, reader, writer, token, owner, name, prs, budget, minted, sp, activity,
-				&adoptHeadroom, fail))
+			r.sweepPRs(ctx, proj, repo, reader, writer, token, owner, name, prs, budget, minted, sp, activity, fail))
 	}
 
 	// EVERY pass, including the zero: a sweep that mints nothing is the signal
@@ -1722,7 +1688,7 @@ func (r *ProjectReconciler) sweepIssues(ctx context.Context, proj *tatarav1alpha
 func (r *ProjectReconciler) sweepPRs(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository,
 	reader scm.SCMReader, writer scm.SCMWriter, token, owner, name string,
 	prs []scm.PRRef, budget *sweepBudget, minted map[string]int, sp objbudget.Spiller, activity string,
-	adoptHeadroom *int, fail func(string, error, ...any)) time.Duration {
+	fail func(string, error, ...any)) time.Duration {
 
 	l := log.FromContext(ctx)
 	requeue := time.Duration(0)
@@ -1769,38 +1735,6 @@ func (r *ProjectReconciler) sweepPRs(ctx context.Context, proj *tatarav1alpha1.P
 		})
 	}
 
-	// THE ADOPTION WINDOW, over the CLASSIFIED set. It is the oldest `headroom`
-	// merge requests that actually classify PRAdoptUpgrade, so a merge request
-	// this project already adopted - always the lowest-numbered, and always
-	// PRIgnore because its mirror has a live controller owner - can no longer
-	// spend a slot it could never use. Computed from an ownership-blind
-	// shape filter, the window on {42 adopted, 43 adopted, 44 free} with one free
-	// lane was {42}, and 44 was deferred upgrade_headroom_bound on every pass
-	// forever: effective utilisation capped near maxOpenUpgrades/2.
-	//
-	// Ascending, because the forge lists newest-first (GitLab's default is
-	// created_at desc and ListOpenPRs sets no ordering) and the cap is tight, so
-	// taking them in list order would starve the oldest merge request
-	// indefinitely. Number is the age proxy rather than UpdatedAt: merge-request
-	// IIDs are monotonic per project, while UpdatedAt moves every time a pipeline
-	// touches it. Fairness is oldest-first WITHIN a repo and repo-iteration-order
-	// ACROSS repos; a global oldest-first would need a cross-repo pre-pass this
-	// does not justify.
-	adoptableNums := make([]int, 0, len(passes))
-	for i := range passes {
-		if passes[i].disp == PRAdoptUpgrade {
-			adoptableNums = append(adoptableNums, passes[i].pr.Number)
-		}
-	}
-	slices.Sort(adoptableNums)
-	if len(adoptableNums) > *adoptHeadroom {
-		adoptableNums = adoptableNums[:max(*adoptHeadroom, 0)]
-	}
-	adoptable := make(map[int]bool, len(adoptableNums))
-	for _, n := range adoptableNums {
-		adoptable[n] = true
-	}
-
 	// PHASE 2: ACT. Same order the forge listed in, same body as before.
 	for _, p := range passes {
 		pr, cr, claimedBy, ownerTask := p.pr, p.cr, p.claimedBy, p.ownerTask
@@ -1814,25 +1748,40 @@ func (r *ProjectReconciler) sweepPRs(ctx context.Context, proj *tatarav1alpha1.P
 				"action", "sweep_adopt_pr", "resource_id", ownerTask.Name, "activity", activity,
 				"repo", repo.Name, "number", pr.Number, "head_branch", pr.HeadBranch)
 		case PRAdoptUpgrade:
-			if *adoptHeadroom <= 0 || !adoptable[pr.Number] {
-				skipPR(ctx, proj, repo, pr.Number, activity, SweepSkipUpgradeHeadroom,
-					"head_branch", pr.HeadBranch)
-				break
+			// THE SWEEP ENQUEUES, IT NO LONGER MINTS - and the cap it used to
+			// enforce here is gone with it. adoptHeadroom was recomputed once per
+			// pass and a pass is gated on the issueScan cron, so a merge request
+			// the pass had no lane for was skipped upgrade_headroom_bound and waited
+			// up to four hours for the next slot even when every lane had freed
+			// minutes later. Adopted work is now an ordinary queue citizen bounded
+			// by QueueCapacity and MaxLivePods (design D1), and admission re-runs on
+			// every Task write, so the surplus admits the moment a slot frees.
+			//
+			// SAME DEDUP KEY AS THE WEBHOOK, deliberately: the deterministic
+			// QueuedEvent name makes a duplicate collide on AlreadyExists at the API
+			// server, which EnqueueEvent reports as created=false and which burns no
+			// sequence number. That is what makes this a true backstop for a
+			// delivery lost while the operator was down, rather than a second
+			// producer racing the first.
+			payload := tatarav1alpha1.QueuedEventPayload{
+				Kind:           adoptedUpgradeKind,
+				RepositoryRef:  repo.Name,
+				Provider:       providerOf(proj),
+				PodRepo:        repo.Name,
+				AdoptedUpgrade: AdoptedUpgradeRefFromPR(pr),
 			}
-			// The PRRef, not the MergeRequest CR: for a merge request no Task
-			// has ever bound there IS no CR, and the mint's own bindMRToTask is
-			// what creates it. pr carries everything needed - number, title,
-			// author, head branch, head SHA, body - from THIS pass's ListOpenPRs
-			// call, so there is no second round trip either.
-			tk, outcome, aerr := r.minter().MintAdoptedUpgradeTask(ctx, proj, repo, pr, sp, nil)
-			if aerr != nil {
-				fail("adopt_upgrade_mr", aerr, "repo", repo.Name, "number", pr.Number)
+			dedupKey := queue.AdoptUpgradeDedupKey(repo.Name, pr.Number)
+			_, created, eerr := queue.EnqueueEvent(ctx, r.Client, r.Seq, proj,
+				tatarav1alpha1.QueueClassNormal, true, dedupKey, payload, queue.WithPriority(2))
+			if eerr != nil {
+				fail("enqueue_adopt_upgrade", eerr, "repo", repo.Name, "number", pr.Number)
 				continue
 			}
-			if outcome == MintCreated {
-				*adoptHeadroom--
-				l.Info("sweep: adopted a dependency upgrade merge request into an upgrade task",
-					"action", "sweep_adopt_upgrade_mr", "resource_id", tk.Name, "activity", activity,
+			if created {
+				obs.AdoptionEnqueuedTotal.WithLabelValues(proj.Name, SweepActivity).Inc()
+				l.Info("sweep: queued a dependency upgrade merge request for adoption",
+					"action", "sweep_enqueue_adopt_upgrade",
+					"resource_id", queue.QueuedEventName(proj.Name, dedupKey), "activity", activity,
 					"repo", repo.Name, "number", pr.Number, "head_branch", pr.HeadBranch,
 					"author", pr.Author)
 			}

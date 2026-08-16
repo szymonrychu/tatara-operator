@@ -1,11 +1,14 @@
 package controller
 
 import (
+	"context"
 	"fmt"
+	"strconv"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
+	"github.com/szymonrychu/tatara-operator/internal/own"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -258,7 +261,10 @@ func TestClassifyPR_ClauseOneStillWins(t *testing.T) {
 }
 
 // sweepAdoptProject is the sweep-harness project ARMED for adoption: the
-// prefix, and an upgrade cron carrying the lane cap adoption competes for.
+// prefix, plus an upgrade cron. maxOpen is now VESTIGIAL - design D1 retired
+// per-pass adoption headroom entirely (Task 8), so nothing here reads
+// MaxOpenUpgrades any more - but the cron shape is kept so these tests still
+// exercise a project whose upgrade activity is configured, same as prod.
 func sweepAdoptProject(name string, maxOpen int) *tatarav1alpha1.Project {
 	p := sweepProject(name)
 	p.Spec.UpgradePolicy = &tatarav1alpha1.UpgradePolicySpec{AdoptBranchPrefix: "renovate/"}
@@ -277,47 +283,75 @@ func sweepRenovatePR(number int, branch string) scm.PRRef {
 	}
 }
 
-// Capacity. Adoption is unbounded by construction - the engine opens as many
-// merge requests as there are updates - so maxOpenUpgrades must govern it or
-// the first run after arming mints a Task per open merge request at once. The
-// counter is openUpgradeLaneCount, SHARED with the cron: the two sources
-// compete for the same lanes rather than each getting their own.
-func TestSweepAdoption_MintsAtMostTheRemainingUpgradeHeadroom(t *testing.T) {
-	proj := sweepAdoptProject("adopt-headroom-proj", 2)
-	repo := sweepRepo("adopt-headroom-proj")
-	// One live CRON-minted upgrade Task already holds a lane.
-	cron := &tatarav1alpha1.Task{
-		ObjectMeta: metav1.ObjectMeta{Name: "upgrade-cron-live", Namespace: testNS},
-		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: proj.Name, Kind: "upgrade", Goal: "g"},
+// enginePR is a listing row from the dependency engine, authored by the bot.
+// Moved from the now-deleted sweep_adopt_headroom_test.go.
+func enginePR(repo *tatarav1alpha1.Repository, number int) scm.PRRef {
+	return scm.PRRef{
+		Repo:       "szymonrychu/tatara-operator",
+		HeadRepo:   "szymonrychu/tatara-operator",
+		Number:     number,
+		Author:     "tatara-bot",
+		Title:      "chore(deps): bump " + strconv.Itoa(number),
+		HeadBranch: "renovate/dep-" + strconv.Itoa(number),
+		HeadSHA:    "sha-" + strconv.Itoa(number),
 	}
-	cron.Status.State = tatarav1alpha1.StateUnderImplementation
-	c := newMirrorClient(t, proj, repo, cron)
-	rd := &sweepReader{}
-	for n := 41; n <= 45; n++ {
-		rd.prs = append(rd.prs, sweepRenovatePR(n, fmt.Sprintf("renovate/dep-%d", n)))
-	}
-	before := testutil.ToFloat64(obs.SweepSkippedTotal.WithLabelValues(
-		proj.Name, SweepActivity, SweepSkipUpgradeHeadroom))
+}
 
-	runSweep(t, c, proj, repo, rd)
+// seedAdoptedLane persists an already-adopted, still-live upgrade Task and the
+// MergeRequest mirror it controller-owns: the steady state of a merge request
+// this project adopted on an earlier pass and has not merged yet. Moved from
+// the now-deleted sweep_adopt_headroom_test.go.
+func seedAdoptedLane(t *testing.T, ctx context.Context, c client.Client,
+	proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, number int) {
+	t.Helper()
 
-	adopted := adoptedTasksIn(t, c, proj.Name)
-	if len(adopted) != 1 {
-		t.Fatalf("adopted %d Tasks, want exactly 1 (maxOpenUpgrades 2 minus the live cron lane)", len(adopted))
+	task := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      AdoptedUpgradeTaskName(proj.Name, repo.Name, number),
+			Namespace: proj.Namespace,
+		},
+		Spec: tatarav1alpha1.TaskSpec{
+			ProjectRef:    proj.Name,
+			RepositoryRef: repo.Name,
+			Kind:          "upgrade",
+			Goal:          "already adopted",
+			MergeOrder:    []string{repo.Name},
+			Source: &tatarav1alpha1.TaskSource{
+				Number: number, IsPR: true, Title: "chore(deps): bump " + strconv.Itoa(number),
+			},
+		},
 	}
-	if adopted[0].Spec.Source.Number != 41 {
-		t.Errorf("adopted merge request %d, want the OLDEST (41)", adopted[0].Spec.Source.Number)
+	if err := c.Create(ctx, task); err != nil {
+		t.Fatalf("seed adopted task %d: %v", number, err)
 	}
-	after := testutil.ToFloat64(obs.SweepSkippedTotal.WithLabelValues(
-		proj.Name, SweepActivity, SweepSkipUpgradeHeadroom))
-	if after-before != 4 {
-		t.Errorf("upgrade_headroom_bound skips = %v, want 4 (the merge requests deferred to a later pass)", after-before)
+	task.Status.State = tatarav1alpha1.StateAwaitingReview
+	if err := c.Status().Update(ctx, task); err != nil {
+		t.Fatalf("stamp adopted task %d: %v", number, err)
 	}
 
-	// A SECOND pass with the first adopted Task still live creates none.
-	runSweep(t, c, proj, repo, rd)
-	if n := len(adoptedTasksIn(t, c, proj.Name)); n != 1 {
-		t.Fatalf("adopted %d Tasks after a second pass, want still 1: the lane is full", n)
+	mr := &tatarav1alpha1.MergeRequest{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      tatarav1alpha1.MergeRequestName(repo.Name, number),
+			Namespace: proj.Namespace,
+		},
+		Spec: tatarav1alpha1.MergeRequestSpec{
+			RepositoryRef: repo.Name, ProjectRef: proj.Name, Number: number,
+			URL: "https://github.com/szymonrychu/tatara-operator/pull/" + strconv.Itoa(number),
+		},
+	}
+	own.AddPlainOwner(mr, task)
+	if err := own.HandOverController(mr, nil, task); err != nil {
+		t.Fatalf("hand over controller for %d: %v", number, err)
+	}
+	if err := c.Create(ctx, mr); err != nil {
+		t.Fatalf("seed adopted mirror %d: %v", number, err)
+	}
+	mr.Status.State = "open"
+	mr.Status.Author = "tatara-bot"
+	mr.Status.HeadBranch = "renovate/dep-" + strconv.Itoa(number)
+	mr.Status.HeadSHA = "sha-" + strconv.Itoa(number)
+	if err := c.Status().Update(ctx, mr); err != nil {
+		t.Fatalf("stamp adopted mirror %d: %v", number, err)
 	}
 }
 
@@ -334,62 +368,108 @@ func adoptedTasksIn(t *testing.T, c client.Client, proj string) []tatarav1alpha1
 	return out
 }
 
-// Fairness. The forge lists newest-first and the acting loop keeps that order,
-// so without an explicit ordering on the adoption WINDOW the newest merge
-// request would be adopted first and the oldest could starve indefinitely under
-// a tight cap.
-//
-// It drives the whole sweep rather than a shape-only helper (which is what it
-// used to do, and which is exactly how the window came to be computed without
-// ownership - see TestSweepPRs_AlreadyAdoptedMergeRequestsDoNotConsumeTheAdoptionWindow).
-// A human's non-prefixed branch and an unconfigured project are both here for
-// the same reason: neither may ever consume a lane.
-func TestSweepAdoption_TakesTheOldestMergeRequestsFirst(t *testing.T) {
-	proj := sweepAdoptProject("adopt-oldest-proj", 2)
-	proj.Spec.Scm.PRReactionScope = "labeledOrMentioned"
-	repo := sweepRepo("adopt-oldest-proj")
+// sweepQueuedEvents lists the QueuedEvents ONE sweep pass left behind for a
+// project, so a test can assert on the enqueue rather than on a minted Task -
+// the sweep is a producer now, not a minter (Task 8).
+func sweepQueuedEvents(t *testing.T, c client.Client, proj string) []tatarav1alpha1.QueuedEvent {
+	t.Helper()
+	var qel tatarav1alpha1.QueuedEventList
+	if err := c.List(context.Background(), &qel, client.InNamespace(testNS)); err != nil {
+		t.Fatalf("list queuedevents: %v", err)
+	}
+	out := make([]tatarav1alpha1.QueuedEvent, 0, len(qel.Items))
+	for _, qe := range qel.Items {
+		if qe.Spec.ProjectRef == proj {
+			out = append(out, qe)
+		}
+	}
+	return out
+}
+
+// THE SWEEP IS A BACKSTOP NOW, NOT A PACER. It enqueues under the SAME dedup key
+// the webhook uses, so a merge request the webhook already queued collides on
+// AlreadyExists and burns no sequence number - and one whose delivery was lost
+// while the operator was down is picked up on the next pass.
+func TestSweepPRs_AdoptableMergeRequestIsEnqueuedNotMinted(t *testing.T) {
+	proj := sweepAdoptProject("adopt-enqueue-proj", 1) // maxOpenUpgrades=1: no longer bounds anything
+	repo := sweepRepo("adopt-enqueue-proj")
 	c := newMirrorClient(t, proj, repo)
-	rd := &sweepReader{prs: []scm.PRRef{ // as the forge returns them: newest first
-		sweepRenovatePR(90, "renovate/loki"),
-		sweepRenovatePR(41, "renovate/cilium"),
-		sweepRenovatePR(77, "renovate/grafana"),
-		{Repo: "szymonrychu/tatara-operator", HeadRepo: "szymonrychu/tatara-operator",
-			Number: 55, Author: "alice", HeadBranch: "feat/human-work"},
-	}}
+	rd := &sweepReader{}
+	for _, n := range []int{41, 42, 43} {
+		rd.prs = append(rd.prs, sweepRenovatePR(n, fmt.Sprintf("renovate/dep-%d", n)))
+	}
 
 	runSweep(t, c, proj, repo, rd)
 
-	got := map[int]bool{}
-	for _, tk := range adoptedTasksIn(t, c, proj.Name) {
-		got[tk.Spec.Source.Number] = true
+	events := sweepQueuedEvents(t, c, proj.Name)
+	if len(events) != 3 {
+		t.Fatalf("queued events = %d, want 3 (one per adoptable merge request, unbounded by "+
+			"maxOpenUpgrades=1 per design D1)", len(events))
 	}
-	if !got[41] || !got[77] {
-		t.Fatalf("want the two OLDEST adoptable merge requests 41 and 77 adopted, got %v", got)
+	seen := map[int]bool{}
+	for _, qe := range events {
+		a := qe.Spec.Payload.AdoptedUpgrade
+		if a == nil {
+			t.Fatalf("queued event %s carries no payload.adoptedUpgrade", qe.Name)
+		}
+		seen[a.Number] = true
+		if qe.Spec.Priority == nil || *qe.Spec.Priority != 2 {
+			t.Errorf("queued event %s priority = %v, want 2", qe.Name, qe.Spec.Priority)
+		}
 	}
-	if got[90] {
-		t.Error("90 is newer than both and must not be adopted into a two-lane cap")
-	}
-	if got[55] {
-		t.Error("a non-prefixed, human-authored branch must never be adopted")
+	for _, n := range []int{41, 42, 43} {
+		if !seen[n] {
+			t.Errorf("merge request %d was not queued for adoption", n)
+		}
 	}
 
-	// The same listing against a project with adoption unconfigured adopts
-	// nothing at all - the release-inert shape.
-	off := sweepAdoptProject("adopt-oldest-off-proj", 2)
-	off.Spec.UpgradePolicy.AdoptBranchPrefix = ""
-	off.Spec.Scm.PRReactionScope = "labeledOrMentioned"
-	offRepo := sweepRepo("adopt-oldest-off-proj")
-	offC := newMirrorClient(t, off, offRepo)
-	runSweep(t, offC, off, offRepo, &sweepReader{prs: rd.prs})
-	if n := len(adoptedTasksIn(t, offC, off.Name)); n != 0 {
-		t.Errorf("adoption unconfigured adopted %d merge requests, want 0", n)
+	// The dispatcher is the minter now, not the sweep.
+	if n := len(adoptedTasksIn(t, c, proj.Name)); n != 0 {
+		t.Fatalf("the sweep pass minted %d Tasks directly, want 0: admission mints, the sweep only enqueues", n)
+	}
+}
+
+// A SECOND PASS OVER THE SAME MERGE REQUEST IS A NO-OP. The natural key is
+// deterministic, so the Create collides and EnqueueEvent reports created=false.
+func TestSweepPRs_ASecondPassDoesNotDoubleEnqueue(t *testing.T) {
+	proj := sweepAdoptProject("adopt-second-pass-proj", 1)
+	repo := sweepRepo("adopt-second-pass-proj")
+	c := newMirrorClient(t, proj, repo)
+	rd := &sweepReader{prs: []scm.PRRef{sweepRenovatePR(41, "renovate/cilium")}}
+
+	before := testutil.ToFloat64(obs.AdoptionEnqueuedTotal.WithLabelValues(proj.Name, SweepActivity))
+	runSweep(t, c, proj, repo, rd)
+	runSweep(t, c, proj, repo, rd)
+	after := testutil.ToFloat64(obs.AdoptionEnqueuedTotal.WithLabelValues(proj.Name, SweepActivity))
+
+	if events := sweepQueuedEvents(t, c, proj.Name); len(events) != 1 {
+		t.Fatalf("queued events after two passes = %d, want 1: the dedup key must collide", len(events))
+	}
+	if after-before != 1 {
+		t.Errorf("operator_adoption_enqueued_total{activity=sweep} increased by %v, want 1", after-before)
+	}
+}
+
+// A MERGE REQUEST A LIVE TASK ALREADY OWNS PRODUCES NO SECOND EVENT. ClassifyPR
+// sends it to PRIgnore on the mirror's live controller owner, exactly as before.
+func TestSweepPRs_AnAlreadyAdoptedMergeRequestEnqueuesNothing(t *testing.T) {
+	ctx := context.Background()
+	proj := sweepAdoptProject("adopt-already-proj", 1)
+	repo := sweepRepo("adopt-already-proj")
+	c := newMirrorClient(t, proj, repo)
+	seedAdoptedLane(t, ctx, c, proj, repo, 42)
+
+	runSweep(t, c, proj, repo, &sweepReader{prs: []scm.PRRef{enginePR(repo, 42)}})
+
+	if events := sweepQueuedEvents(t, c, proj.Name); len(events) != 0 {
+		t.Fatalf("queued events for an already-adopted merge request = %d, want 0", len(events))
 	}
 }
 
 // Adoption must not consume the sweepBudget that mints review and issue Tasks.
-// They are different capacity dimensions: maxNewTasksPerSweep protects the
-// forge and the token spend for NEW work, maxOpenUpgrades protects the upgrade
-// lane. Coupling them would let a busy engine run starve issue triage.
+// They are different mechanisms entirely now: maxNewTasksPerSweep protects the
+// forge and the token spend for NEW Task mints, and the adoption enqueue goes
+// through EnqueueEvent, which is not gated on it at all.
 func TestSweepAdoption_DoesNotConsumeTheReviewMintBudget(t *testing.T) {
 	proj := sweepAdoptProject("adopt-budget-proj", 2)
 	proj.Spec.MaxNewTasksPerSweep = 1
@@ -405,28 +485,26 @@ func TestSweepAdoption_DoesNotConsumeTheReviewMintBudget(t *testing.T) {
 
 	runSweep(t, c, proj, repo, rd)
 
+	if events := sweepQueuedEvents(t, c, proj.Name); len(events) != 1 {
+		t.Errorf("queued adoption events = %d, want 1", len(events))
+	}
 	tasks := sweepTasks(t, c, proj.Name)
-	var adopted, review int
+	var review int
 	for i := range tasks {
-		switch tasks[i].Spec.Kind {
-		case "upgrade":
-			adopted++
-		case SweepReviewKind:
+		if tasks[i].Spec.Kind == SweepReviewKind {
 			review++
 		}
-	}
-	if adopted != 1 {
-		t.Errorf("adopted = %d, want 1", adopted)
 	}
 	if review != 1 {
 		t.Errorf("review Tasks = %d, want 1: adoption must not eat maxNewTasksPerSweep", review)
 	}
 }
 
-// A project that configures the prefix but has NO upgrade cron adopts nothing,
-// and must not panic reading Cron.Upgrade through a nil Cron. No declared
-// upgrade capacity means no adoption.
-func TestSweepAdoption_NoUpgradeCronMeansNoHeadroomAndNoPanic(t *testing.T) {
+// A project that configures the prefix but has NO upgrade cron still enqueues
+// the merge request for adoption, and must not panic: adoption no longer reads
+// Cron.Upgrade at all (design D1 - the mint-time lane cap it fed is gone), so a
+// declared upgrade cron is no longer a precondition for adoption.
+func TestSweepAdoption_NoUpgradeCronStillEnqueuesAndDoesNotPanic(t *testing.T) {
 	proj := sweepProject("adopt-nocron-proj")
 	proj.Spec.UpgradePolicy = &tatarav1alpha1.UpgradePolicySpec{AdoptBranchPrefix: "renovate/"}
 	repo := sweepRepo("adopt-nocron-proj")
@@ -435,8 +513,62 @@ func TestSweepAdoption_NoUpgradeCronMeansNoHeadroomAndNoPanic(t *testing.T) {
 
 	runSweep(t, c, proj, repo, rd)
 
-	if n := len(adoptedTasksIn(t, c, proj.Name)); n != 0 {
-		t.Fatalf("adopted %d Tasks with no upgrade cron configured, want 0", n)
+	if events := sweepQueuedEvents(t, c, proj.Name); len(events) != 1 {
+		t.Fatalf("queued adoption events with no upgrade cron configured = %d, want 1", len(events))
+	}
+}
+
+// INERTNESS ON RELEASE. Every behavioural difference adoption introduces is
+// gated on adoptBranchPrefix being non-empty (default) AND the author being one
+// the project owns. With the prefix empty NOTHING may change: no adoption, no
+// queued event, and the merge requests the engine already has open must
+// classify exactly as they did before. Moved from the now-deleted
+// sweep_adopt_headroom_test.go; headroomProject is gone with the window, so
+// this now arms via sweepAdoptProject instead.
+func TestSweepAdoption_IsInertWithNoAdoptBranchPrefix(t *testing.T) {
+	proj := sweepAdoptProject("inert-proj", 0)
+	proj.Spec.UpgradePolicy.AdoptBranchPrefix = "" // the shipped default
+	proj.Spec.Scm.PRReactionScope = "labeledOrMentioned"
+	repo := sweepRepo("inert-proj")
+	c := newMirrorClient(t, proj, repo)
+
+	engine := enginePR(repo, 44)
+	human := enginePR(repo, 45)
+	human.Author = "alice"
+	human.HeadBranch = "feat/human"
+
+	// Classification is byte-identical to the pre-adoption dispositions.
+	if got := ClassifyPR(proj, repo, engine, nil, "", nil); got != PRIgnore {
+		t.Fatalf("bot-authored engine MR = %v, want PRIgnore (clause 2)", got)
+	}
+	if got := ClassifyPR(proj, repo, human, nil, "", nil); got != PRIgnore {
+		t.Fatalf("unlabelled human MR = %v, want PRIgnore (out of reaction scope)", got)
+	}
+
+	runSweep(t, c, proj, repo, &sweepReader{prs: []scm.PRRef{engine, human}})
+
+	if n := len(sweepTasks(t, c, proj.Name)); n != 0 {
+		t.Fatalf("an inert project minted %d Tasks, want 0", n)
+	}
+	if n := len(sweepQueuedEvents(t, c, proj.Name)); n != 0 {
+		t.Fatalf("an inert project queued %d adoption events, want 0", n)
+	}
+	// And the author gate is the SECOND lock: even with the prefix armed, the
+	// engine running under a human's token adopts nothing.
+	armed := sweepAdoptProject("inert-authorgate-proj", 0)
+	armed.Spec.Scm.PRReactionScope = "labeledOrMentioned"
+	armedRepo := sweepRepo("inert-authorgate-proj")
+	armedC := newMirrorClient(t, armed, armedRepo)
+	preToken := enginePR(armedRepo, 46)
+	preToken.Author = "szymonrychu" // pre-cutover: Renovate ran with the human's token
+	runSweep(t, armedC, armed, armedRepo, &sweepReader{prs: []scm.PRRef{preToken}})
+	for _, tk := range sweepTasks(t, armedC, armed.Name) {
+		if tk.Spec.Kind == "upgrade" {
+			t.Fatalf("adopted %s although the author is not the bot or an allowlisted engine", tk.Name)
+		}
+	}
+	if n := len(sweepQueuedEvents(t, armedC, armed.Name)); n != 0 {
+		t.Fatalf("queued %d adoption events although the author is not adoptable", n)
 	}
 }
 
