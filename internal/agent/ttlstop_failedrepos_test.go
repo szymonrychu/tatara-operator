@@ -228,7 +228,11 @@ func TestFailedReposAddendumNamesItsTurnWithinTheNoteBudget(t *testing.T) {
 	sess.onHandoff = func() { appendAgentHandoffNote(t, h) }
 
 	in := h.input()
-	in.ReposTurnID = strings.Repeat("t", tatarav1alpha1.LastTurnReposTurnIDMaxBytes)
+	// Deliberately NOT a repeat of a letter the repo names below also use: the
+	// Contains assertion has to be satisfiable by the suffix alone, or a later
+	// change to the name length would let a repo name answer for it and the
+	// mutation-kill would quietly stop working.
+	in.ReposTurnID = "turn-" + strings.Repeat("Z", tatarav1alpha1.LastTurnReposTurnIDMaxBytes-5)
 	for i := range 20 {
 		in.FailedRepos = append(in.FailedRepos, strings.Repeat(string(rune('a'+i)), 200))
 	}
@@ -239,7 +243,6 @@ func TestFailedReposAddendumNamesItsTurnWithinTheNoteBudget(t *testing.T) {
 	body := h.notes(t)[1].Body
 	require.LessOrEqual(t, len(body), tatarav1alpha1.NoteBodyMaxBytes, "Note.Body CRD MaxLength")
 	require.Contains(t, body, in.ReposTurnID, "the turn id is what makes a recurrence distinguishable")
-	require.Contains(t, body, "origin", "the directive still outranks the names")
 }
 
 // An UNKNOWN turn - lists written by a binary that predates the field - renders

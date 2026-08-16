@@ -140,6 +140,9 @@ type NoteAppender interface {
 	// is captured at StopWithHandoff entry and the append happens after waitIdle,
 	// SubmitHandoffTurn and waitHandoffNote, so it can be many minutes stale. The
 	// sibling helper appendOperatorNoteTo does it the same way, inside the closure.
+	//
+	// "Once" is about the NOTE, not about the write: a suppressed append still
+	// costs the same round trip the unconditional one does.
 	AppendNoteOnce(ctx context.Context, taskName string, n tatarav1alpha1.Note) error
 }
 
@@ -852,16 +855,22 @@ func AppendFailedReposNote(ctx context.Context, notes NoteAppender, task *tatara
 }
 
 // failedReposTurnSuffix names the turn the repo list describes, so two distinct
-// losses of the SAME repos render two distinct bodies. It is also the only thing
-// in the note the next agent can correlate against the turn log.
+// losses of the SAME repos render two distinct bodies.
 //
-// The id is already clamped to LastTurnReposTurnIDMaxBytes on the write path, so
-// this is bounded without a second clamp.
+// A full clause rather than a trailing "(turn X)" parenthetical, for the reason
+// OOMKilledNoteBody puts its timestamp inside one: a bare parenthetical after a
+// closed sentence does not say what it qualifies, and this note is read by an
+// LLM. The turn id itself is operator-facing - the next pod holds a fresh
+// wrapper session and no way to look one up - so the clause has to carry its own
+// meaning rather than lean on the reader recognising the id.
+//
+// The id is already clamped to LastTurnReposTurnIDMaxBytes on the write path,
+// and bounded again by the CRD marker, so this is bounded without a third clamp.
 func failedReposTurnSuffix(turnID string) string {
 	if turnID == "" {
 		return ""
 	}
-	return " (turn " + turnID + ")"
+	return " This describes turn " + turnID + "."
 }
 
 // syntheticNoteLostBody is what the operator writes when it holds nothing to
