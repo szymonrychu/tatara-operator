@@ -64,6 +64,48 @@ spec:
                   rebuilds the Task from it verbatim on admission. Producers keep ownership of
                   label/goal/source construction so the dispatcher stays generic.
                 properties:
+                  adoptedUpgrade:
+                    description: |-
+                      AdoptedUpgrade marks the ADOPTION payload shape: a dependency-upgrade
+                      merge request that already exists on the forge, queued until the pool has
+                      room. Mutually exclusive with the admission-ticket shape
+                      (AgentKind+TaskRef) and with NewTask - see ValidateQueuedEventSpec.
+                    properties:
+                      author:
+                        description: |-
+                          Author is the forge login that opened the merge request - the identity
+                          adoptableAuthor rules on. Never a git commit author.
+                        type: string
+                      body:
+                        description: |-
+                          Body carries the changelog the review agent reads. Capped at the same
+                          budget the goal is: an engine release-notes body is unbounded upstream.
+                        maxLength: 16384
+                        type: string
+                      headBranch:
+                        type: string
+                      headRepo:
+                        type: string
+                      headSHA:
+                        type: string
+                      labels:
+                        items:
+                          type: string
+                        type: array
+                      number:
+                        description: Number is the merge request number/iid. Required.
+                        type: integer
+                      repo:
+                        description: |-
+                          Repo and HeadRepo are AdoptUpgradeMR clause (d)'s fork guard, in the
+                          forge's own slug namespace. An EMPTY HeadRepo fails the guard CLOSED.
+                        type: string
+                      title:
+                        type: string
+                    required:
+                    - author
+                    - number
+                    type: object
                   agentKind:
                     description: |-
                       AgentKind is the pod to spawn for a stage-driven admission (contract

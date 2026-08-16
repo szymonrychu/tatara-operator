@@ -148,6 +148,24 @@ const (
 	LabelActivity = "tatara.io/activity"
 )
 
+// LabelUpgradeOrigin discriminates the two producers of an `upgrade` Task, and
+// it exists so a draining dependency-engine backlog does not silence the upgrade
+// CRON. maxOpenUpgrades bounds the cron ALONE (design D2); adopted merge requests
+// are bounded by the general pool. Without a discriminator openUpgradeLaneCount
+// would read a Renovate batch as "lanes full" and the cron would stop proposing
+// bumps for as long as the batch lasted, invisibly.
+//
+// The prefix is tatara.dev/, NOT the tatara.io/ its neighbours above use. That
+// split predates this label (every annotation in this file is tatara.dev/, both
+// scan labels are tatara.io/); do not "fix" one to match the other, it would
+// orphan every live object carrying the old key.
+const (
+	LabelUpgradeOrigin = "tatara.dev/upgrade-origin"
+	// UpgradeOriginAdopted marks work born from an EXISTING third-party merge
+	// request. The cron's own mints carry no upgrade-origin label at all.
+	UpgradeOriginAdopted = "adopted"
+)
+
 const (
 	// AnnGrafanaAlert carries the rendered Grafana alert context on an incident Task.
 	AnnGrafanaAlert = "tatara.dev/grafana-alert"
