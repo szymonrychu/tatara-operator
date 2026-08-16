@@ -17,7 +17,7 @@ func reapAdopted(t *testing.T, ctx context.Context, proj *tatarav1alpha1.Project
 	repo *tatarav1alpha1.Repository, number int, state, reason string) *tatarav1alpha1.MergeRequest {
 
 	t.Helper()
-	task, _, err := newTestMinter(t).MintAdoptedUpgradeTask(ctx, proj, repo, adoptedPR(number), testSpiller(t))
+	task, _, err := newTestMinter(t).MintAdoptedUpgradeTask(ctx, proj, repo, adoptedPR(number), testSpiller(t), nil)
 	if err != nil {
 		t.Fatalf("mint %d: %v", number, err)
 	}

@@ -118,9 +118,18 @@ func AdoptedUpgradeTaskName(proj, repo string, number int) string {
 // annotation the review pod would fall through to TaskBranch(task) - a
 // tatara/chore-<n>-<slug> branch that does not exist on the forge - and review
 // the wrong tree.
+//  3. Stamps LabelUpgradeOrigin=adopted, so openUpgradeLaneCount can exclude
+//     this Task from the CRON's maxOpenUpgrades budget (design D2). Adopted
+//     work is bounded by the general pool; the cron's knob counts only its own.
+//
+// `stamp` is the minting QueuedEvent's label set (queue.MintStamp) and may be
+// nil. It is TAKEN, not derived, because this mint builds its Task by hand
+// rather than through BuildTaskFromQueuedEvent - and without it the event that
+// admitted this Task is never reaped: reconcileDone finds the Task by
+// LabelQueuedEvent and mintedTask resolves idempotency by LabelMintedBy.
 func (m *Minter) MintAdoptedUpgradeTask(ctx context.Context, proj *tatarav1alpha1.Project,
 	repo *tatarav1alpha1.Repository, pr scm.PRRef,
-	sp objbudget.Spiller) (*tatarav1alpha1.Task, MintOutcome, error) {
+	sp objbudget.Spiller, stamp map[string]string) (*tatarav1alpha1.Task, MintOutcome, error) {
 
 	name := AdoptedUpgradeTaskName(proj.Name, repo.Name, pr.Number)
 
@@ -153,6 +162,7 @@ func (m *Minter) MintAdoptedUpgradeTask(ctx context.Context, proj *tatarav1alpha
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: proj.Namespace,
+			Labels:    adoptedTaskLabels(stamp),
 			Annotations: map[string]string{
 				// Kind-agnostic in branchEnvValues: the pod's TASK_BRANCH becomes
 				// this branch, so the REVIEW pod reviews the right tree and the
@@ -310,4 +320,41 @@ func (m *Minter) seedAdoptedSemverFloor(ctx context.Context, proj *tatarav1alpha
 		return fmt.Errorf("adopt: seed the semver floor on %s: %w", mrName, err)
 	}
 	return nil
+}
+
+// adoptedTaskLabels merges the caller's mint stamp with the adoption origin
+// marker. The origin is stamped LAST and unconditionally: it is this repo's own
+// invariant, not the caller's to override.
+func adoptedTaskLabels(stamp map[string]string) map[string]string {
+	labels := make(map[string]string, len(stamp)+1)
+	for k, v := range stamp {
+		labels[k] = v
+	}
+	labels[tatarav1alpha1.LabelUpgradeOrigin] = tatarav1alpha1.UpgradeOriginAdopted
+	return labels
+}
+
+// AdoptedUpgradeRefFromPR snapshots a listing/delivery PRRef into the CRD shape
+// a QueuedEvent carries. Everything AdoptUpgradeMR and MintAdoptedUpgradeTask
+// read is copied, HeadRepo included - the fork guard fails CLOSED on an empty
+// one, so a lossy copy silently disarms adoption rather than breaking it loudly.
+func AdoptedUpgradeRefFromPR(pr scm.PRRef) *tatarav1alpha1.AdoptedUpgradeRef {
+	return &tatarav1alpha1.AdoptedUpgradeRef{
+		Number: pr.Number, Title: pr.Title, Author: pr.Author,
+		HeadSHA: pr.HeadSHA, HeadBranch: pr.HeadBranch, Body: pr.Body,
+		Labels: pr.Labels, Repo: pr.Repo, HeadRepo: pr.HeadRepo,
+	}
+}
+
+// prRefFromAdopted is AdoptedUpgradeRefFromPR's inverse, used at admit time.
+// UpdatedAt is deliberately left zero: nothing on the adoption path reads it.
+func prRefFromAdopted(a *tatarav1alpha1.AdoptedUpgradeRef) scm.PRRef {
+	if a == nil {
+		return scm.PRRef{}
+	}
+	return scm.PRRef{
+		Number: a.Number, Title: a.Title, Author: a.Author,
+		HeadSHA: a.HeadSHA, HeadBranch: a.HeadBranch, Body: a.Body,
+		Labels: a.Labels, Repo: a.Repo, HeadRepo: a.HeadRepo,
+	}
 }

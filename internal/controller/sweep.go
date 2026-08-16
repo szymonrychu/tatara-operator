@@ -1814,7 +1814,7 @@ func (r *ProjectReconciler) sweepPRs(ctx context.Context, proj *tatarav1alpha1.P
 			// what creates it. pr carries everything needed - number, title,
 			// author, head branch, head SHA, body - from THIS pass's ListOpenPRs
 			// call, so there is no second round trip either.
-			tk, outcome, aerr := r.minter().MintAdoptedUpgradeTask(ctx, proj, repo, pr, sp)
+			tk, outcome, aerr := r.minter().MintAdoptedUpgradeTask(ctx, proj, repo, pr, sp, nil)
 			if aerr != nil {
 				fail("adopt_upgrade_mr", aerr, "repo", repo.Name, "number", pr.Number)
 				continue

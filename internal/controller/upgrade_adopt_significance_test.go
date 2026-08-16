@@ -28,7 +28,7 @@ func TestMintAdoptedUpgradeTask_SeedsTheSemverFloorOnItsMirror(t *testing.T) {
 	proj, repo := adoptProject(t, ctx)
 	m := newTestMinter(t)
 
-	if _, _, err := m.MintAdoptedUpgradeTask(ctx, proj, repo, adoptedPR(61), testSpiller(t)); err != nil {
+	if _, _, err := m.MintAdoptedUpgradeTask(ctx, proj, repo, adoptedPR(61), testSpiller(t), nil); err != nil {
 		t.Fatalf("mint: %v", err)
 	}
 	var mr tatarav1alpha1.MergeRequest
@@ -52,7 +52,7 @@ func TestAdoptedUpgradeApprovedOnFirstReviewReachesMergedWithASignificance(t *te
 	m := newTestMinter(t)
 	pr := adoptedPR(62)
 
-	task, _, err := m.MintAdoptedUpgradeTask(ctx, proj, repo, pr, testSpiller(t))
+	task, _, err := m.MintAdoptedUpgradeTask(ctx, proj, repo, pr, testSpiller(t), nil)
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestMintAdoptedUpgradeTask_ConvergesAnInterruptedMintOnTheNextPass(t *testi
 
 	// The state an interrupted mint leaves behind: the Task is live under its
 	// deterministic natural key, and NOTHING else happened.
-	task, _, err := m.MintAdoptedUpgradeTask(ctx, proj, repo, pr, testSpiller(t))
+	task, _, err := m.MintAdoptedUpgradeTask(ctx, proj, repo, pr, testSpiller(t), nil)
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}
@@ -135,7 +135,7 @@ func TestMintAdoptedUpgradeTask_ConvergesAnInterruptedMintOnTheNextPass(t *testi
 	}
 
 	// The next sweep pass, byte-identical to the first.
-	if _, outcome, err := m.MintAdoptedUpgradeTask(ctx, proj, repo, pr, testSpiller(t)); err != nil {
+	if _, outcome, err := m.MintAdoptedUpgradeTask(ctx, proj, repo, pr, testSpiller(t), nil); err != nil {
 		t.Fatalf("second mint: %v", err)
 	} else if outcome != MintExistingLive {
 		t.Fatalf("second mint outcome = %q, want existing_live", outcome)
