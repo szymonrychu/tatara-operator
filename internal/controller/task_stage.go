@@ -1534,6 +1534,12 @@ func logTTLStop(ctx context.Context, okMsg, lostMsg, action string, res agent.TT
 func clearLastTurn(t *tatarav1alpha1.Task) {
 	t.Status.LastTurnFinalText = ""
 	t.Status.LastTurnPushedRepos = nil
+	// The failed set is the one whose staleness does more than misreport. A
+	// leftover non-empty list makes the NEXT stop compute contentFree=false, so a
+	// pod that produced nothing at all writes a normal-looking note, skips
+	// syntheticNoteLostBody() and never fires RecordEmptySynthetic - the #527
+	// detector disarmed by a slice nobody retired.
+	t.Status.LastTurnFailedRepos = nil
 }
 
 // turn0Marker identifies the pod turn-0 was submitted to. A respawn re-stamps

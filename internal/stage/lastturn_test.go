@@ -28,6 +28,7 @@ func TestEveryTransitionClearsTheLastTurnContinuationState(t *testing.T) {
 	tk.Status.PodStartedAt = ptrTime(now.Add(-time.Hour))
 	tk.Status.LastTurnFinalText = "clarified the scope with the maintainer; ready to implement"
 	tk.Status.LastTurnPushedRepos = []string{"tatara-operator"}
+	tk.Status.LastTurnFailedRepos = []string{"tatara-cli"}
 
 	require.NoError(t, stage.Enter(tk, nil, v1alpha1.StateUnderImplementation, "", now))
 
@@ -35,4 +36,8 @@ func TestEveryTransitionClearsTheLastTurnContinuationState(t *testing.T) {
 		"a new state must not hand its TTL stop the previous state's final text")
 	require.Empty(t, tk.Status.LastTurnPushedRepos,
 		"nor the previous state's pushed repos")
+	require.Empty(t, tk.Status.LastTurnFailedRepos,
+		"nor the previous state's FAILED repos - and this one is the worst to leave behind, "+
+			"because a non-empty failed set is what stops writeSyntheticNote calling a "+
+			"content-free stop content-free")
 }
