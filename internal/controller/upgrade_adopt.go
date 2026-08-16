@@ -115,15 +115,24 @@ func AdoptedUpgradeTaskName(proj, repo string, number int) string {
 // draft stamped ownership here; this one does not. AdoptUpgradeMR requires the
 // merge request to be authored by an identity adoptableAuthor accepts, and
 // ownershipForAuthor asks the same predicate, so the mirror classifies
-// `tatara` on the next ReconcileOwnership pass over it, with a live head from
-// GetPRHead. (NOT "later in this same sweep pass", which this said until
-// #604's round 7: since #612 the mint runs from the queue dispatcher's
-// admission, not from the sweep, so there is no shared pass to be later in.)
-// That backfill also seeds LastBotHeadSHA in the same write, and an absent seed
-// cannot cause a flip anyway (ownership.go seeds and returns rather than
-// flipping when the baseline is empty). Stamping any of it here would put a
-// second write on Status.Ownership, on a field the classification writes from a
-// live head this code does not have.
+// `tatara` on the next ReconcileOwnership pass over it. (NOT "later in this
+// same sweep pass", which this said until #604's round 7: since #612 the mint
+// runs from the queue dispatcher's admission, not from the sweep, so there is
+// no shared pass to be later in. And NOT "with a live head from GetPRHead",
+// retired in round 8 - name no head source here at all, because the
+// classification does not read one: ownershipForAuthor decides on
+// Status.Author, and liveHead reaches only the LastBotHeadSHA seed inside the
+// same branch. The waking pass is the bind's own status WRITE, not its create:
+// ReconcileOwnership returns at once on a status-less mirror.) That seed lands
+// in the same write, and an absent one cannot cause a flip anyway (ownership.go
+// seeds and returns rather than flipping when the baseline is empty). Stamping
+// any of it here would be REDUNDANT rather than early: the classification
+// derives the same value from the same predicate AdoptUpgradeMR's own
+// precondition already applied. NOT "a second write on Status.Ownership",
+// retired with the head claim - the backfill is guarded on Ownership == "", so
+// a stamp here would make it a no-op rather than a second write, and counting
+// writers of that field is what the ownership note at the top of this file
+// refuses.
 //
 // It does NOT stamp the head branch as a work branch on its own: that is
 // AnnTakeoverHeadBranch, read kind-agnostically by branchEnvValues, which is

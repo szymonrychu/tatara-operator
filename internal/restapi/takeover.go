@@ -306,8 +306,16 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 		//
 		// ParkRetention is the SECOND half and only sometimes: the push that
 		// un-marks the mirror also rewrites an implement-declined park to
-		// ownership-lost (parkOwnerTask), which resumes this very Task with no
-		// wait and nothing collected. For a park the push does not rewrite,
+		// ownership-lost (parkOwnerTask), after which this very Task can resume
+		// with no wait and nothing collected. THE PUSH RESUMES NOTHING BY ITSELF,
+		// which is why the string says push AND ask again:
+		// UpgradeDeclineToOwnershipLost rewrites the reason and leaves the Task
+		// parked, and the un-park a REQUEST reaches is MintOrUnparkTakeoverTask's
+		// ownership-lost arm. That arm is not the only un-park of the rewritten
+		// park - DrainStandDownMerge re-drives it off an approved review of the
+		// human's head, as the ownership-lost early return above already says - so
+		// this is the remedy for a maintainer who is asking, NOT the only way the
+		// Task comes back. For a park the push does not rewrite,
 		// collection has to happen too - and unresumableTakeoverPark's doc block
 		// owns the exceptions to "collection is what ends it", so do not restate
 		// them here.
@@ -324,11 +332,13 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 		// exists to remove. Filed as #615; NOT fixed here.
 		writeError(w, http.StatusConflict,
 			"the takeover task for this merge request is parked "+existing.Status.ParkReason+
-				" and can never resume: only parked(ownership-lost) re-takes. Push to the branch: "+
-				"that marks the merge request yours again, which every route back needs, and it "+
-				"resumes a take-over that was declined. For any other park the task must also age "+
-				"out at ParkRetention first - collection on its own does not restore the take-over, "+
-				"because it does not change who the merge request is marked for. The merge request "+
+				" and can never resume: only parked(ownership-lost) re-takes. Push to the branch, "+
+				"then ask again: the push marks the merge request yours again, which every route "+
+				"back needs, and for a take-over that was declined, asking again then resumes "+
+				"it - the push on its own only makes it resumable. For any other park the "+
+				"task must also age out at ParkRetention first - collection on its own does not "+
+				"restore the take-over, because it does not change who the merge request is "+
+				"marked for. The merge request "+
 				"is yours to work on in the meantime")
 		return
 	}
