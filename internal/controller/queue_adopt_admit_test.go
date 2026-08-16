@@ -218,6 +218,94 @@ func TestAdmit_AdoptedUpgradeConvergesAnInterruptedMint(t *testing.T) {
 	}
 }
 
+// THE FRESHNESS BACKSTOP, for when the webhook's own drop (Task 7,
+// handleMRClosed/dropQueuedAdoption) never ran or its Delete failed and the
+// event is still sitting Queued when this pass reaches it. admitAdoptedUpgrade
+// reads the SAME MergeRequest mirror CR it already fetches for clause (e)'s
+// live-owner check, and refuses to mint when that mirror is merged or closed -
+// dropping the event under the identical reason the webhook would have used, so
+// the two producers share one series per reason.
+//
+// This backstop needs the mirror CR to ALREADY EXIST, which is why the table
+// seeds one directly rather than relying on any handler to create it: fitMR
+// (internal/webhook/mirror_refresh.go) only UPDATES an existing MergeRequest
+// mirror, it never CREATES one.
+func TestAdmit_AdoptedUpgradeRefusedByAnAlreadyMergedOrClosedMirror(t *testing.T) {
+	tests := []struct {
+		name   string
+		state  string
+		number int
+	}{
+		{"merged", "merged", 46},
+		{"closed", "closed", 47},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			proj := adoptAdmitProject()
+			repo := adoptRepo()
+			qe := adoptionEvent(proj, repo, tt.number)
+			mr := &tatarav1alpha1.MergeRequest{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: tatarav1alpha1.MergeRequestName(repo.Name, tt.number), Namespace: proj.Namespace,
+				},
+				Spec:   tatarav1alpha1.MergeRequestSpec{RepositoryRef: repo.Name, Number: tt.number, ProjectRef: proj.Name, URL: "u"},
+				Status: tatarav1alpha1.MergeRequestStatus{State: tt.state},
+			}
+			c := newMirrorClient(t, proj, repo, qe, mr)
+			r := &DispatcherReconciler{Client: c, Scheme: c.Scheme()}
+
+			before := testutil.ToFloat64(obs.AdoptionEventDroppedTotal.WithLabelValues(proj.Name, tt.state))
+			if _, _, _, err := r.admit(ctx, proj, []tatarav1alpha1.QueuedEvent{*qe}, nil,
+				budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
+				t.Fatalf("admit: %v", err)
+			}
+
+			var task tatarav1alpha1.Task
+			err := c.Get(ctx, types.NamespacedName{
+				Namespace: proj.Namespace, Name: AdoptedUpgradeTaskName(proj.Name, repo.Name, tt.number)}, &task)
+			if err == nil {
+				t.Fatalf("a %s mirror must mint nothing", tt.state)
+			}
+			var gone tatarav1alpha1.QueuedEvent
+			if err := c.Get(ctx, types.NamespacedName{Namespace: qe.Namespace, Name: qe.Name}, &gone); err == nil {
+				t.Fatal("a mirror-merged/closed refusal must delete the event, not leave it Queued forever")
+			}
+			after := testutil.ToFloat64(obs.AdoptionEventDroppedTotal.WithLabelValues(proj.Name, tt.state))
+			if after-before != 1 {
+				t.Errorf("%s drops counted = %v, want 1", tt.state, after-before)
+			}
+		})
+	}
+}
+
+// AN OPEN MIRROR IS NOT REFUSED BY THE BACKSTOP. It exists (unlike the common
+// first-admission case), but its state has not moved - the ordinary path
+// through liveOwner/AdoptUpgradeMR still decides it.
+func TestAdmit_AdoptedUpgradeWithAnOpenMirrorIsNotRefusedByTheFreshnessBackstop(t *testing.T) {
+	ctx := context.Background()
+	proj := adoptAdmitProject()
+	repo := adoptRepo()
+	qe := adoptionEvent(proj, repo, 48)
+	mr := &tatarav1alpha1.MergeRequest{
+		ObjectMeta: metav1.ObjectMeta{Name: tatarav1alpha1.MergeRequestName(repo.Name, 48), Namespace: proj.Namespace},
+		Spec:       tatarav1alpha1.MergeRequestSpec{RepositoryRef: repo.Name, Number: 48, ProjectRef: proj.Name, URL: "u"},
+		Status:     tatarav1alpha1.MergeRequestStatus{State: "open"},
+	}
+	c := newMirrorClient(t, proj, repo, qe, mr)
+	r := &DispatcherReconciler{Client: c, Scheme: c.Scheme()}
+
+	if _, _, _, err := r.admit(ctx, proj, []tatarav1alpha1.QueuedEvent{*qe}, nil,
+		budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
+		t.Fatalf("admit: %v", err)
+	}
+	var task tatarav1alpha1.Task
+	if err := c.Get(ctx, types.NamespacedName{
+		Namespace: proj.Namespace, Name: AdoptedUpgradeTaskName(proj.Name, repo.Name, 48)}, &task); err != nil {
+		t.Fatalf("an open mirror must still mint through the ordinary path: %v", err)
+	}
+}
+
 // BACKWARD COMPATIBILITY. An event already Queued when this ships carries no
 // adoptedUpgrade and must still take BuildTaskFromQueuedEvent unchanged.
 func TestAdmit_LegacyMintPayloadIsUnaffected(t *testing.T) {

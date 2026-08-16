@@ -804,6 +804,30 @@ func (r *DispatcherReconciler) admitAdoptedUpgrade(ctx context.Context, proj *ta
 	if err != nil {
 		return nil, adoptRetry, err
 	}
+	// THE FRESHNESS BACKSTOP FOR A MERGED/CLOSED MERGE REQUEST, and it is FREE:
+	// cr is already fetched above for clause (e)'s live-owner check below, no new
+	// read added. The PRIMARY defense is the webhook
+	// (handleMRSynchronize/handleMRClosed, internal/webhook/mirror_refresh.go),
+	// which refreshes or drops the queued snapshot the moment a
+	// synchronize/close delivery arrives; this is the second gate for when that
+	// delivery is lost or its own Delete fails, and the event is still sitting
+	// Queued when this pass reaches it.
+	//
+	// IT IS NOT UNIVERSAL, and does not pretend to be. fitMR
+	// (internal/webhook/mirror_refresh.go) only UPDATES an existing
+	// MergeRequest mirror CR, it never CREATES one - so an adoption that has
+	// never been admitted before has cr == nil here regardless of the live
+	// merge request's real state, and this check cannot see it. The webhook
+	// handlers above remain the ONLY defense for that common, first-admission
+	// case; this only catches a merge request whose mirror CR already existed
+	// (e.g. a prior review Task, or an earlier adoption attempt) before it
+	// merged or closed out from under a still-Queued event.
+	if cr != nil && cr.Status.State == "merged" {
+		return drop("merged")
+	}
+	if cr != nil && cr.Status.State == "closed" {
+		return drop("closed")
+	}
 	liveOwner, err := m.resolveLiveMROwner(ctx, proj, cr, QueueActivity)
 	if err != nil {
 		return nil, adoptRetry, err

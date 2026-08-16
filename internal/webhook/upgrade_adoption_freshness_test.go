@@ -8,17 +8,24 @@ package webhook_test
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strconv"
+	"sync/atomic"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 
 	tatarav1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
+	"github.com/szymonrychu/tatara-operator/internal/queue"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 // prSynchronized renders a pull_request.synchronize delivery for number,
@@ -125,6 +132,93 @@ func TestMRSynchronize_LeavesAnAdmittedAdoptionAlone(t *testing.T) {
 	var got tatarav1.QueuedEvent
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: qe.Name}, &got))
 	require.Equal(t, "sha-78", got.Spec.Payload.AdoptedUpgrade.HeadSHA, "an admitted event's snapshot must not be rewritten")
+}
+
+// A CONFLICTING CONCURRENT WRITE MUST RETRY, NOT LOSE THE NEWER HEAD SHA.
+// Production runs 3 webhook replicas with no leader election on this path, so
+// two near-simultaneous synchronize deliveries for the SAME merge request -
+// exactly "Renovate force-pushes each successive bump" - can both reach
+// refreshQueuedAdoption's Update with a stale resourceVersion. A single
+// Get-then-Update drops the loser's write silently; retry.RetryOnConflict must
+// re-Get and re-apply it instead.
+func TestMRSynchronize_ConflictingUpdateRetriesAndWins(t *testing.T) {
+	const secretVal = "whsec-fresh7"
+	var attempts int32
+	c := fake.NewClientBuilder().WithScheme(newScheme(t)).
+		WithObjects(
+			adoptionProject("fr7", "fr7-scm", "tatara-bot", "renovate/", 2, nil),
+			secret("fr7-scm", secretVal),
+			repository("charts", "fr7", baseRepoURL, "main"),
+		).
+		WithStatusSubresource(&tatarav1.Project{}, &tatarav1.Repository{}, &tatarav1.Task{}, &tatarav1.QueuedEvent{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Update: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				if _, isQE := obj.(*tatarav1.QueuedEvent); isQE {
+					if atomic.AddInt32(&attempts, 1) == 1 {
+						// The FIRST Update attempt loses the race: simulate the second
+						// replica's write having already landed and bumped the
+						// resourceVersion this attempt was read against.
+						return apierrors.NewConflict(
+							schema.GroupResource{Group: "tatara.dev", Resource: "queuedevents"},
+							obj.GetName(), errors.New("injected conflict"))
+					}
+				}
+				return cl.Update(ctx, obj, opts...)
+			},
+		}).Build()
+	h, _ := newServer(t, c)
+	postPROpened(t, h, "fr7", secretVal, prOpenedOnBranch("tatara-bot", "renovate/cilium", 82))
+
+	postPRSynchronize(t, h, "fr7", secretVal,
+		prSynchronized("tatara-bot", "renovate/cilium", 82, "sha-conflict", "new title", "new body"))
+
+	qe := adoptionEvent(t, c, "fr7", "charts", 82)
+	require.Equal(t, "sha-conflict", qe.Spec.Payload.AdoptedUpgrade.HeadSHA,
+		"the retry must re-Get and win after the first attempt's conflict, not drop the newer head")
+	require.GreaterOrEqual(t, atomic.LoadInt32(&attempts), int32(2), "one conflict, then a successful retry")
+}
+
+// A CONCURRENT DROP DURING A REFRESH IS BENIGN, NOT AN ERROR. A synchronize
+// delivery immediately followed by a close/merge - on the same replica or a
+// different one - can have dropQueuedAdoption delete the event between
+// refreshQueuedAdoption's Get and its Update. The Update then 404s; that must
+// not surface as a failure or recreate the event.
+func TestMRSynchronize_ConcurrentDropDuringRefreshIsBenign(t *testing.T) {
+	const secretVal = "whsec-fresh8"
+	var updates int32
+	c := fake.NewClientBuilder().WithScheme(newScheme(t)).
+		WithObjects(
+			adoptionProject("fr8", "fr8-scm", "tatara-bot", "renovate/", 2, nil),
+			secret("fr8-scm", secretVal),
+			repository("charts", "fr8", baseRepoURL, "main"),
+		).
+		WithStatusSubresource(&tatarav1.Project{}, &tatarav1.Repository{}, &tatarav1.Task{}, &tatarav1.QueuedEvent{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Update: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				qe, isQE := obj.(*tatarav1.QueuedEvent)
+				if isQE && atomic.AddInt32(&updates, 1) == 1 {
+					// Simulate a concurrent handleMRClosed deleting the event between
+					// refreshQueuedAdoption's Get and this Update.
+					if derr := cl.Delete(ctx, qe.DeepCopy()); derr != nil {
+						return derr
+					}
+				}
+				return cl.Update(ctx, obj, opts...)
+			},
+		}).Build()
+	h, _ := newServer(t, c)
+	postPROpened(t, h, "fr8", secretVal, prOpenedOnBranch("tatara-bot", "renovate/cilium", 83))
+
+	// Must not error, panic, or recreate the event - postPRSynchronize itself
+	// already asserts the response is a 202.
+	postPRSynchronize(t, h, "fr8", secretVal,
+		prSynchronized("tatara-bot", "renovate/cilium", 83, "sha-race", "t", "b"))
+
+	var got tatarav1.QueuedEvent
+	err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: ns, Name: queue.QueuedEventName("fr8", queue.AdoptUpgradeDedupKey("charts", 83)),
+	}, &got)
+	require.Error(t, err, "the concurrent close deleted the event; refreshQueuedAdoption must not recreate it")
 }
 
 // A MERGE DELETES THE QUEUED EVENT. Admitting it would burn an agent pod on a

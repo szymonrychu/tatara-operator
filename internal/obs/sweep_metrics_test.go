@@ -278,12 +278,15 @@ func TestRetainSweepOrphanStranded(t *testing.T) {
 // whose merge request merged or closed while it waited. Scanning only the
 // dispatcher would have called every one of those other reasons a dead series.
 //
-// mirror_refresh.go's producer (dropQueuedAdoption) does not carry its reason
-// as a literal at the WithLabelValues call site - it takes `reason string` and
-// handleMRClosed passes its own local `state`, reusing the very value it just
-// mirrored onto MergeRequest.Status.State. The two literals this scan needs are
-// therefore where `state` is ASSIGNED (`state := "closed"` / `state =
-// "merged"`), not where dropQueuedAdoption is CALLED.
+// mirror_refresh.go's producer is dropQueuedAdoption(ctx, ..., reason string),
+// and its two call sites in handleMRClosed pass "merged"/"closed" as LITERALS
+// at the call, deliberately - not the shared `state` local handleMRClosed also
+// computes for the mirror write, which this scan would have no structural link
+// to (a future unrelated `state := "..."` anywhere else in that file would be
+// misread as a new adoption-drop reason, and a future
+// dropQueuedAdoption(ctx, ..., "declined") passed some OTHER way would go
+// unseen). Scanning the call site itself, the same shape as the dispatcher's
+// drop("...") above, keeps the tie structural instead of a name coincidence.
 func TestAdoptionDropReasonsMatchTheirProducers(t *testing.T) {
 	producers := []struct {
 		file string
@@ -295,7 +298,7 @@ func TestAdoptionDropReasonsMatchTheirProducers(t *testing.T) {
 		{"webhook/server.go", []string{"..", "webhook", "server.go"},
 			regexp.MustCompile(`AdoptionEventDroppedTotal\.WithLabelValues\([^)]*"([a-z_]+)"\)`)},
 		{"webhook/mirror_refresh.go", []string{"..", "webhook", "mirror_refresh.go"},
-			regexp.MustCompile(`\bstate\s*:?=\s*"([a-z_]+)"`)},
+			regexp.MustCompile(`dropQueuedAdoption\([^)]*"([a-z_]+)"\)`)},
 	}
 	seeded := map[string]bool{}
 	for _, r := range adoptionDropReasons {
