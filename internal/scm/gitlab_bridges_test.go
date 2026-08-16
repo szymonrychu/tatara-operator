@@ -3,8 +3,10 @@ package scm
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -282,4 +284,86 @@ func TestGitLabPRChecksBridgesError(t *testing.T) {
 	var he *HTTPError
 	require.ErrorAs(t, err, &he)
 	require.Equal(t, http.StatusInternalServerError, he.Status)
+}
+
+// TestGitLabPRChecksPaginatesJobsAndBridges pins that checks[] is the WHOLE
+// check list. GitLab's default page size is 20: a first page of green jobs
+// hiding a failing one at index 22 is the same "fold an incomplete set" shape
+// that #609 was, one endpoint over.
+func TestGitLabPRChecksPaginatesJobsAndBridges(t *testing.T) {
+	page := func(w http.ResponseWriter, r *http.Request, pages [][]map[string]any) {
+		n := 1
+		if p := r.URL.Query().Get("page"); p != "" {
+			_, _ = fmt.Sscanf(p, "%d", &n)
+		}
+		if n < len(pages) {
+			w.Header().Set("X-Next-Page", strconv.Itoa(n+1))
+		}
+		_ = json.NewEncoder(w).Encode(pages[n-1])
+	}
+	jobPages := [][]map[string]any{
+		{{"id": int64(101), "name": "job-1", "status": "success"}},
+		{{"id": int64(102), "name": "job-2", "status": "failed"}},
+	}
+	bridgePages := [][]map[string]any{
+		{{"id": int64(201), "name": "bridge-1", "status": "success"}},
+		{{"id": int64(202), "name": "bridge-2", "status": "failed"}},
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.EscapedPath() {
+		case "/projects/g%2Fp/merge_requests/9":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"sha":           "deadbeef",
+				"merge_status":  "can_be_merged",
+				"head_pipeline": map[string]any{"id": int64(555), "sha": "deadbeef", "status": "failed"},
+			})
+		case "/projects/g%2Fp/pipelines/555/jobs":
+			page(w, r, jobPages)
+		case "/projects/g%2Fp/pipelines/555/bridges":
+			page(w, r, bridgePages)
+		default:
+			t.Errorf("unexpected path %q", r.URL.EscapedPath())
+		}
+	}))
+	defer srv.Close()
+
+	c := &GitLab{apiBase: srv.URL}
+	got, err := c.PRChecks(context.Background(), "https://gitlab.example/g/p.git", "tok", 9)
+	require.NoError(t, err)
+	require.Len(t, got.Checks, 4, "both pages of both endpoints")
+	names := []string{got.Checks[0].Name, got.Checks[1].Name, got.Checks[2].Name, got.Checks[3].Name}
+	require.Equal(t, []string{"job-1", "job-2", "bridge-1", "bridge-2"}, names)
+}
+
+// TestGitLabPRChecksCommitStatusRows pins the invariant that a status is
+// explained by at least one row: with no head pipeline the fallback derives
+// from commit statuses, so those statuses ARE the checks.
+func TestGitLabPRChecksCommitStatusRows(t *testing.T) {
+	f := &glCIFake{
+		mr: map[string]any{
+			"sha":           "deadbeef",
+			"merge_status":  "can_be_merged",
+			"head_pipeline": nil,
+		},
+		statuses: []map[string]any{
+			{"name": "external/lint", "status": "success", "target_url": "https://ci.example/1"},
+			{"name": "external/build", "status": "failed", "target_url": "https://ci.example/2"},
+		},
+	}
+	srv := f.server(t)
+	defer srv.Close()
+
+	c := &GitLab{apiBase: srv.URL}
+	got, err := c.PRChecks(context.Background(), "https://gitlab.example/g/p.git", "tok", 9)
+	require.NoError(t, err)
+	require.Equal(t, CIMirrorRed, got.Status)
+	require.False(t, got.Mergeable)
+	require.Len(t, got.Checks, 2, "a red status with zero rows is unactionable")
+	require.Equal(t, "external/lint", got.Checks[0].Name)
+	require.Equal(t, "completed", got.Checks[0].Status)
+	require.Equal(t, "success", got.Checks[0].Conclusion)
+	require.Equal(t, "https://ci.example/1", got.Checks[0].URL)
+	require.Equal(t, "external/build", got.Checks[1].Name)
+	require.Equal(t, "failure", got.Checks[1].Conclusion)
+	require.Empty(t, got.Checks[1].JobID, "a commit status has no fetchable job trace")
 }

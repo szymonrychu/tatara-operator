@@ -520,7 +520,13 @@ type glHeadPipeline struct {
 // failed. That was #609.
 //
 // sha is the MR's current head; head may be nil.
-func (c *GitLab) headCIStatus(ctx context.Context, proj, sha, token string, head *glHeadPipeline) (string, error) {
+//
+// The second return is the commit statuses the answer was folded from, and is
+// non-empty ONLY on the head==nil arm. PRChecks turns them into checks[] rows
+// so the status it reports is explained by at least one row; GetPRState, which
+// has nowhere to put them, discards them. Returning them beats re-fetching:
+// there is one derivation and one round-trip.
+func (c *GitLab) headCIStatus(ctx context.Context, proj, sha, token string, head *glHeadPipeline) (string, []glCommitStatus, error) {
 	switch {
 	case head == nil:
 		// No pipeline attached yet; fall back to commit statuses so external CI
@@ -528,20 +534,20 @@ func (c *GitLab) headCIStatus(ctx context.Context, proj, sha, token string, head
 		// c.token: the writer client from ByProvider has an empty c.token, so
 		// GetCommitCIStatus (which reads c.token) would issue an unauthenticated
 		// read and 401 on private projects.
-		gate, err := c.commitCIStatus(ctx, proj, sha, token)
+		statuses, err := c.commitStatuses(ctx, proj, sha, token)
 		if err != nil {
-			return "", err
+			return "", nil, err
 		}
-		// commitCIStatus folds EVERY status on the commit before it answers, so
-		// its success is an aggregate claim and MirrorCIStatus's contract holds.
-		return MirrorCIStatus(gate), nil
+		// foldCommitStatuses folds EVERY status on the commit before it answers,
+		// so its success is an aggregate claim and MirrorCIStatus's contract holds.
+		return MirrorCIStatus(foldCommitStatuses(statuses)), statuses, nil
 	case head.SHA != "" && head.SHA != sha:
 		// Pipeline is present but belongs to a previous commit (lag window after
 		// a push). Treat as pending so nobody acts on a stale success.
-		return CIMirrorPending, nil
+		return CIMirrorPending, nil, nil
 	default:
 		// Pipeline is for the current SHA (or SHA field not reported by the API).
-		return glPipelineCIStatus(head.Status), nil
+		return glPipelineCIStatus(head.Status), nil, nil
 	}
 }
 
@@ -570,7 +576,7 @@ func (c *GitLab) GetPRState(ctx context.Context, repoURL, token string, number i
 		return PRState{}, err
 	}
 
-	mirror, err := c.headCIStatus(ctx, proj, mr.SHA, token, mr.HeadPipeline)
+	mirror, _, err := c.headCIStatus(ctx, proj, mr.SHA, token, mr.HeadPipeline)
 	if err != nil {
 		return PRState{}, err
 	}
@@ -965,21 +971,59 @@ func (c *GitLab) GetCommitCIStatus(ctx context.Context, owner, _ /*repo*/, sha s
 // would 401 on private projects and break the merge gate when an MR has no head
 // pipeline yet.
 func (c *GitLab) commitCIStatus(ctx context.Context, owner, sha, token string) (string, error) {
-	type statusItem struct {
-		Status string `json:"status"`
-	}
-	path := "/projects/" + url.PathEscape(owner) + "/repository/commits/" + url.PathEscape(sha) + "/statuses?per_page=100"
-	statuses, err := glDoPaged[statusItem](ctx, c.base(), path, token)
+	statuses, err := c.commitStatuses(ctx, owner, sha, token)
 	if err != nil {
 		return "", err
 	}
+	return foldCommitStatuses(statuses), nil
+}
+
+// glCommitStatus is one row of /repository/commits/{sha}/statuses. name and
+// target_url are decoded so the same fetch that answers "what is the CI" can
+// also populate checks[]; nothing folds on them.
+type glCommitStatus struct {
+	Name      string `json:"name"`
+	Status    string `json:"status"`
+	TargetURL string `json:"target_url"`
+}
+
+// commitStatuses lists every commit status on sha. All pages are fetched
+// (per_page=100) so a failing status beyond the default 20-item first page is
+// not missed.
+func (c *GitLab) commitStatuses(ctx context.Context, owner, sha, token string) ([]glCommitStatus, error) {
+	path := "/projects/" + url.PathEscape(owner) + "/repository/commits/" + url.PathEscape(sha) + "/statuses?per_page=100"
+	return glDoPaged[glCommitStatus](ctx, c.base(), path, token)
+}
+
+// foldCommitStatuses reduces commit statuses to the gate vocabulary through
+// the shared failure > pending > success > "" reducer. No statuses means no
+// observation, which is "" and not success.
+func foldCommitStatuses(statuses []glCommitStatus) string {
 	if len(statuses) == 0 {
-		return "", nil
+		return ""
 	}
-	// Aggregate through the shared failure > pending > success > "" reducer.
 	mapped := make([]string, len(statuses))
 	for i, s := range statuses {
 		mapped[i] = glCIStatus(s.Status)
 	}
-	return foldCIStatuses(mapped...), nil
+	return foldCIStatuses(mapped...)
+}
+
+// glPipelineJob is one row of /pipelines/{id}/jobs.
+type glPipelineJob struct {
+	ID     int64  `json:"id"`
+	Name   string `json:"name"`
+	Status string `json:"status"`
+	WebURL string `json:"web_url"`
+}
+
+// glPipelineBridge is one row of /pipelines/{id}/bridges: a trigger job, and
+// the unit that carries a child pipeline's result. /jobs does not return these.
+type glPipelineBridge struct {
+	Name               string `json:"name"`
+	Status             string `json:"status"`
+	WebURL             string `json:"web_url"`
+	DownstreamPipeline *struct {
+		WebURL string `json:"web_url"`
+	} `json:"downstream_pipeline"`
 }

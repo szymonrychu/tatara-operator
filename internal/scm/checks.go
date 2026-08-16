@@ -249,37 +249,29 @@ func (c *GitLab) PRChecks(ctx context.Context, repoURL, token string, number int
 		return CIResult{}, fmt.Errorf("gitlab: pr checks: get mr: %w", err)
 	}
 
-	status, err := c.headCIStatus(ctx, proj, mr.SHA, token, mr.HeadPipeline)
+	status, commitStatuses, err := c.headCIStatus(ctx, proj, mr.SHA, token, mr.HeadPipeline)
 	if err != nil {
 		return CIResult{}, fmt.Errorf("gitlab: pr checks: head ci status: %w", err)
 	}
 
 	var checks []CICheck
-	if mr.HeadPipeline != nil {
+	switch {
+	case mr.HeadPipeline != nil:
+		// Every list here is paged at per_page=100 and followed to the end. A
+		// first page of green jobs hiding a failing one at index 22 is the same
+		// "fold an incomplete set" shape the bridge omission was.
 		pipelinePath := "/projects/" + url.PathEscape(proj) + "/pipelines/" + strconv.FormatInt(mr.HeadPipeline.ID, 10)
 
-		var jobs []struct {
-			ID     int64  `json:"id"`
-			Name   string `json:"name"`
-			Status string `json:"status"`
-			WebURL string `json:"web_url"`
-		}
-		if err := glDo(ctx, c.base(), http.MethodGet, pipelinePath+"/jobs", token, nil, &jobs); err != nil {
+		jobs, err := glDoPaged[glPipelineJob](ctx, c.base(), pipelinePath+"/jobs?per_page=100", token)
+		if err != nil {
 			return CIResult{}, fmt.Errorf("gitlab: pr checks: list jobs: %w", err)
 		}
 
 		// Bridges are a SEPARATE endpoint: /jobs omits them entirely. An error
 		// here propagates rather than degrading to the job-only view, which is
 		// the view that reported green on a failed child pipeline.
-		var bridges []struct {
-			Name               string `json:"name"`
-			Status             string `json:"status"`
-			WebURL             string `json:"web_url"`
-			DownstreamPipeline *struct {
-				WebURL string `json:"web_url"`
-			} `json:"downstream_pipeline"`
-		}
-		if err := glDo(ctx, c.base(), http.MethodGet, pipelinePath+"/bridges", token, nil, &bridges); err != nil {
+		bridges, err := glDoPaged[glPipelineBridge](ctx, c.base(), pipelinePath+"/bridges?per_page=100", token)
+		if err != nil {
 			return CIResult{}, fmt.Errorf("gitlab: pr checks: list bridges: %w", err)
 		}
 
@@ -310,7 +302,26 @@ func (c *GitLab) PRChecks(ctx context.Context, repoURL, token string, number int
 				// A bridge id is NOT a job id: /jobs/{id}/trace 404s on it, and
 				// fetchRawLog maps 404 to ("", nil), so a JobID here would buy a
 				// silent wasted round-trip on every red bridge. Bridges have no
-				// trace of their own - the failing job is in the child pipeline.
+				// trace of their own - the failing job is in the child pipeline,
+				// which the URL above points at.
+				JobID: "",
+			})
+		}
+
+	case len(commitStatuses) > 0:
+		// No head pipeline: the status was folded from commit statuses, so those
+		// statuses ARE the checks. Reporting red with an empty checks[] would
+		// leave the caller nothing to act on.
+		checks = make([]CICheck, 0, len(commitStatuses))
+		for _, s := range commitStatuses {
+			st, conclusion := glJobCIStatus(s.Status)
+			checks = append(checks, CICheck{
+				Name:       s.Name,
+				Status:     st,
+				Conclusion: conclusion,
+				URL:        s.TargetURL,
+				// An external reporter's status has no trace this operator can
+				// fetch; target_url is where its log lives.
 				JobID: "",
 			})
 		}
