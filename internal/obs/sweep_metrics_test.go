@@ -264,6 +264,62 @@ func TestRetainSweepOrphanStranded(t *testing.T) {
 	}
 }
 
+// TestAdoptionDropReasonsMatchTheDispatcher is TestSweepSkipReasonsMatchSweepConstants
+// for the adoption half. The dispatcher's drop reasons are inline literals at its
+// drop(...) call sites rather than named constants, so nothing but this scan ties
+// them to the seeded set: an unseeded reason has NO series until its first drop
+// and increase(...[1h]) is blind to it, and a seeded reason no drop site produces
+// is a permanently dead zero series. Fails both ways.
+func TestAdoptionDropReasonsMatchTheDispatcher(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join("..", "controller", "queue_controller.go"))
+	if err != nil {
+		t.Fatalf("read queue_controller.go: %v", err)
+	}
+	seeded := map[string]bool{}
+	for _, r := range adoptionDropReasons {
+		seeded[r] = true
+	}
+	produced := map[string]bool{}
+	for _, m := range regexp.MustCompile(`drop\("([a-z_]+)"\)`).FindAllStringSubmatch(string(src), -1) {
+		produced[m[1]] = true
+	}
+	if len(produced) == 0 {
+		t.Fatal("found no drop(\"...\") call sites in queue_controller.go - the scan is broken, not the seed list")
+	}
+	for reason := range produced {
+		if !seeded[reason] {
+			t.Errorf("the dispatcher drops adoptions with reason %q but adoptionDropReasons does not seed it: "+
+				"increase() cannot see its first increment", reason)
+		}
+	}
+	for reason := range seeded {
+		if !produced[reason] {
+			t.Errorf("adoptionDropReasons seeds %q but no drop(...) site produces it: "+
+				"a permanently dead zero series", reason)
+		}
+	}
+}
+
+// TestQueueActivityMatchesTheControllerConstant is
+// TestWebhookActivityMatchesTheControllerConstant for the dispatcher's own
+// activity label, and exists for the same reason: the literal is duplicated to
+// avoid a reverse import, and a duplicated literal nothing checks is how a
+// seeded series silently stops matching its producer.
+func TestQueueActivityMatchesTheControllerConstant(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join("..", "controller", "sweep.go"))
+	if err != nil {
+		t.Fatalf("read sweep.go: %v", err)
+	}
+	m := regexp.MustCompile(`QueueActivity\s*=\s*"([a-z_]+)"`).FindStringSubmatch(string(src))
+	if m == nil {
+		t.Fatal("found no QueueActivity constant in sweep.go - the scan is broken, not the constant")
+	}
+	if m[1] != QueueActivity {
+		t.Fatalf("controller.QueueActivity = %q but obs.QueueActivity = %q: the seeded series "+
+			"and the producer's label have drifted apart", m[1], QueueActivity)
+	}
+}
+
 // TestWebhookActivityMatchesTheControllerConstant pins obs.WebhookActivity to
 // controller.WebhookActivity. The literal is duplicated here to avoid a reverse
 // import (the sweepSeedReasons precedent), and a duplicated literal that

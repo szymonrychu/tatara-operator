@@ -285,8 +285,11 @@ var AdoptionEventDroppedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 // adoptionDropReasons is AdoptionEventDroppedTotal's closed reason set, seeded
 // for the same reason every counter here is: a CounterVec with no
 // WithLabelValues call has NO series, so increase(...[1h]) is blind to the first
-// increment after every pod roll.
-var adoptionDropReasons = []string{"not_adoptable", "mint_not_owed", "repository_gone"}
+// increment after every pod roll. Kept in sync with the dispatcher's drop(...)
+// call sites by TestAdoptionDropReasonsMatchTheDispatcher, which scans them out
+// of the source - sweepSkipReasons carried the prose version of that instruction
+// and drifted from four call sites anyway (issue #495).
+var adoptionDropReasons = []string{"not_adoptable", "repository_gone"}
 
 // sweepSkipReasons is the closed skip-reason set. Keep in sync with sweep.go's
 // SweepSkip* constants - enforced by TestSweepSkipReasonsMatchSweepConstants,
@@ -322,10 +325,25 @@ var mintOutcomes = []string{"not_owed", "created", "existing_live", "tombstone_d
 // live forge delivery is not a sweep pass and must not read as one.
 var sweepActivities = []string{"sweep", WebhookActivity}
 
+// ownerActivities is the closed {activity} set for the two OWNER-resolution
+// counters, and it is sweepActivities plus the dispatcher. resolveLiveMROwner
+// now also runs at ADMIT time (the queued-adoption re-check), and a stale-owner
+// ref it repairs there is not a sweep pass and must not read as one - the exact
+// mislabelling issue #521 fixed for the webhook half. SweepSkippedTotal is
+// deliberately NOT seeded for it: the dispatcher records its refusals on
+// AdoptionEventDroppedTotal and emits no sweep skip at all, so seeding one would
+// add permanently dead series.
+var ownerActivities = []string{"sweep", WebhookActivity, QueueActivity}
+
 // WebhookActivity mirrors controller.WebhookActivity. Literal here for the same
 // no-reverse-import reason as sweepSeedReasons; the two are pinned together by
 // TestWebhookActivityMatchesTheControllerConstant.
 const WebhookActivity = "webhook"
+
+// QueueActivity mirrors controller.QueueActivity: mint-adjacent work the
+// leader-elected DISPATCHER does at admission. Pinned by
+// TestQueueActivityMatchesTheControllerConstant.
+const QueueActivity = "queue"
 
 // sweepSeedReasons is the closed fail(reason, ...) set for sweep.go's B.4 pass
 // (SweepActivity), plus list_tasks. Literal here (not imported from
@@ -399,7 +417,7 @@ func SeedSweepErrorsForProject(project string) {
 	seedLabels(seed, []string{project}, []string{"upgrade"}, upgradeReasons)
 	skip := func(l ...string) { SweepSkippedTotal.WithLabelValues(l...) }
 	seedLabels(skip, []string{project}, sweepActivities, sweepSkipReasons)
-	for _, activity := range sweepActivities {
+	for _, activity := range ownerActivities {
 		SweepStaleOwnerRepairedTotal.WithLabelValues(project, activity)
 		SweepTerminalOwnerReleasedTotal.WithLabelValues(project, activity)
 	}

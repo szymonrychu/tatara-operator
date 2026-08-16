@@ -93,6 +93,16 @@ const (
 	// error counters.
 	SweepActivity = "sweep"
 
+	// QueueActivity is the {activity} label value for intake work the
+	// leader-elected DISPATCHER does at admission - today, the queued
+	// dependency-upgrade adoption's own owner resolution and mint. It is a third
+	// value alongside SweepActivity and WebhookActivity because a stale-owner ref
+	// the dispatcher repairs is not a sweep pass, and labelling it "sweep" is the
+	// exact mislabelling issue #521 fixed for the webhook half. obs.QueueActivity
+	// mirrors it (TestQueueActivityMatchesTheControllerConstant), and
+	// obs.ownerActivities seeds it.
+	QueueActivity = "queue"
+
 	// THE CLOSED SweepSkip VOCABULARY: every reason the sweep DELIBERATELY does
 	// not do a piece of work. It is the {reason} label on
 	// obs.SweepSkippedTotal and the `reason` field on the sweep_skip_issue /

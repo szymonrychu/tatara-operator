@@ -142,6 +142,7 @@ func TestAdmit_AdoptedUpgradeWithNoRepositoryIsDropped(t *testing.T) {
 	c := newMirrorClient(t, proj, qe) // repo deliberately NOT seeded
 	r := &DispatcherReconciler{Client: c, Scheme: c.Scheme()}
 
+	before := testutil.ToFloat64(obs.AdoptionEventDroppedTotal.WithLabelValues(proj.Name, "repository_gone"))
 	if _, _, _, err := r.admit(ctx, proj, []tatarav1alpha1.QueuedEvent{*qe}, nil,
 		budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
 		t.Fatalf("admit: %v", err)
@@ -149,6 +150,71 @@ func TestAdmit_AdoptedUpgradeWithNoRepositoryIsDropped(t *testing.T) {
 	var gone tatarav1alpha1.QueuedEvent
 	if err := c.Get(ctx, types.NamespacedName{Namespace: qe.Namespace, Name: qe.Name}, &gone); err == nil {
 		t.Fatal("an adoption event whose repository is gone must be dropped")
+	}
+	var task tatarav1alpha1.Task
+	if err := c.Get(ctx, types.NamespacedName{
+		Namespace: proj.Namespace, Name: AdoptedUpgradeTaskName(proj.Name, repo.Name, 43)}, &task); err == nil {
+		t.Fatal("a repository-gone drop must mint nothing")
+	}
+	after := testutil.ToFloat64(obs.AdoptionEventDroppedTotal.WithLabelValues(proj.Name, "repository_gone"))
+	if after-before != 1 {
+		t.Errorf("repository_gone drops counted = %v, want 1", after-before)
+	}
+}
+
+// THE ADOPTED MINT'S ONLY CONVERGENCE PATH ONCE THE DISPATCHER OWNS IT. The mint
+// is four writes and only the Task create carries the mint stamp atomically, so a
+// mint that died at bindMRToTask or seedAdoptedSemverFloor leaves a stamped Task
+// behind - and mintedTask then finds it on every later pass, skipping the mint
+// branch and MintAdoptedUpgradeTask's own MintExistingLive converge arm forever.
+// The mr-binding backstop re-binds the mirror but never re-seeds the floor, so
+// without this the merge request merges with an empty significance, CI cuts no
+// tag, and the Task sits in `deploying`.
+func TestAdmit_AdoptedUpgradeConvergesAnInterruptedMint(t *testing.T) {
+	ctx := context.Background()
+	proj := adoptAdmitProject()
+	repo := adoptRepo()
+	qe := adoptionEvent(proj, repo, 45)
+	// The Task the interrupted mint left behind: stamped, so mintedTask finds it,
+	// but with no mirror bound and no significance floor seeded.
+	half := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      AdoptedUpgradeTaskName(proj.Name, repo.Name, 45),
+			Namespace: proj.Namespace,
+			Labels: map[string]string{
+				queue.LabelQueuedEvent:            qe.Name,
+				queue.LabelMintedBy:               string(qe.UID),
+				tatarav1alpha1.LabelUpgradeOrigin: tatarav1alpha1.UpgradeOriginAdopted,
+			},
+		},
+		Spec: tatarav1alpha1.TaskSpec{ProjectRef: proj.Name, RepositoryRef: repo.Name, Kind: "upgrade"},
+	}
+	c := newMirrorClient(t, proj, repo, qe, half)
+	r := &DispatcherReconciler{Client: c, Scheme: c.Scheme()}
+
+	if _, _, _, err := r.admit(ctx, proj, []tatarav1alpha1.QueuedEvent{*qe}, nil,
+		budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
+		t.Fatalf("admit: %v", err)
+	}
+
+	var mr tatarav1alpha1.MergeRequest
+	mrName := tatarav1alpha1.MergeRequestName(repo.Name, 45)
+	if err := c.Get(ctx, types.NamespacedName{Namespace: proj.Namespace, Name: mrName}, &mr); err != nil {
+		t.Fatalf("the interrupted bind was not converged: %v", err)
+	}
+	if mr.Status.Significance != AdoptedSignificanceFloor {
+		t.Errorf("significance = %q, want the adopted floor %q", mr.Status.Significance, AdoptedSignificanceFloor)
+	}
+	var tl tatarav1alpha1.TaskList
+	if err := c.List(ctx, &tl); err != nil || len(tl.Items) != 1 {
+		t.Fatalf("converging minted a SECOND task: %d tasks (err %v)", len(tl.Items), err)
+	}
+	var fresh tatarav1alpha1.QueuedEvent
+	if err := c.Get(ctx, types.NamespacedName{Namespace: qe.Namespace, Name: qe.Name}, &fresh); err != nil {
+		t.Fatalf("get event: %v", err)
+	}
+	if fresh.Status.State != tatarav1alpha1.QueueStateAdmitted || fresh.Status.TaskRef != half.Name {
+		t.Fatalf("event status = %+v, want Admitted -> %s", fresh.Status, half.Name)
 	}
 }
 

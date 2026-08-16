@@ -568,6 +568,23 @@ func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.P
 				if err != nil {
 					return err
 				}
+				if existing != nil && queue.IsAdoptedUpgradeMint(q) {
+					// THE ONLY CONVERGENCE PATH A QUEUED ADOPTION HAS, and it has to be
+					// here rather than inside the mint branch below. An adopted mint is
+					// FOUR writes and only the Task create carries the mint stamp
+					// atomically; if the bind or the semver-floor seed then fails, the
+					// Task persists and the lookup above finds it on every later pass -
+					// so the mint branch, and with it convergeAdoptedMint's
+					// MintExistingLive arm, is never entered again. The
+					// mr-binding backstop does not cover the gap either: it re-binds the
+					// mirror and never touches the floor, so a mint that died at
+					// seedAdoptedSemverFloor would merge with an empty significance, cut
+					// no tag, and sit in `deploying` until its budget parks it. That is
+					// exactly the wedge AdoptedSignificanceFloor exists to close.
+					if cerr := r.convergeAdoptedAdmission(ctx, proj, q, existing); cerr != nil {
+						return cerr
+					}
+				}
 				if existing == nil {
 					// THE GATE, and it sits HERE rather than at the top of the
 					// mint branch on purpose: an event whose Task already exists
@@ -593,6 +610,14 @@ func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.P
 						}
 						continue // leave Queued; no slot burned
 					}
+					// created is whether THIS pass brought a Task into existence, and
+					// therefore whether the live-mint budget is spent below. The generic
+					// arm always says yes (its AlreadyExists case is reachable only for
+					// an explicitly named mint and was always counted this way); the
+					// adoption arm can find a live twin the sweep or an earlier event
+					// already minted, which liveMintBudget has ALREADY counted - charging
+					// for it again contradicts the `existing == nil` gate's own rationale.
+					created := true
 					if queue.IsAdoptedUpgradeMint(q) {
 						// THE ADOPTION FUNNEL, not the generic build. Only
 						// MintAdoptedUpgradeTask binds the merge-request mirror (which it
@@ -613,6 +638,7 @@ func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.P
 							continue // still Queued; no slot burned
 						}
 						existing = minted
+						created = verdict == adoptCreated
 					} else {
 						task, buildErr := queue.BuildTaskFromQueuedEvent(q, proj, r.Scheme)
 						if buildErr != nil {
@@ -642,7 +668,9 @@ func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.P
 					// adopted Task becomes live exactly like any other, and design
 					// D1 gives adoption no cap of its own precisely because this
 					// general one already bounds it.
-					mintBudget--
+					if created {
+						mintBudget--
+					}
 				}
 				if queueTaskDone(existing) {
 					// The Task this event owns is DEAD (a named mint colliding with a
@@ -693,8 +721,13 @@ func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.P
 type adoptVerdict int
 
 const (
-	// adoptMinted: the adopted upgrade Task exists (created, or a live twin).
-	adoptMinted adoptVerdict = iota
+	// adoptCreated: THIS pass created the adopted upgrade Task, so it spends a
+	// live-mint slot.
+	adoptCreated adoptVerdict = iota
+	// adoptExisting: the Task was already there (the sweep's own mint, or an
+	// earlier event's). It is admitted, but liveMintBudget already counts it, so
+	// it spends nothing.
+	adoptExisting
 	// adoptDropped: the adoption is no longer owed. The event has been DELETED.
 	// It burns no slot and is never requeued.
 	adoptDropped
@@ -708,27 +741,52 @@ const (
 //
 // THE PREDICATES DO NOT RUN ANYWHERE ELSE ON THIS PATH. In the sweep they ran in
 // ClassifyPR one frame above the mint; MintAdoptedUpgradeTask has never checked
-// AdoptUpgradeMR itself. So without this re-ask an admission would adopt a fork
-// merge request the webhook could not classify (scm.WebhookEvent reports a head
-// repo, but an old delivery or a forge that omits it leaves the guard's input
-// empty and the guard fails CLOSED), or one a human has since taken over.
+// AdoptUpgradeMR itself. So with no re-ask, nothing at all would validate a
+// snapshot between enqueue and admission.
 //
-// THE MIRROR AND THE LIVE OWNER ARE READ FRESH, not carried on the event: they
-// are the two inputs that can change while an event waits, and an unadopted
-// merge request has no mirror at all until this mint's own bind creates one.
+// WHAT THE RE-ASK ACTUALLY GUARANTEES, precisely, because two of AdoptUpgradeMR's
+// clauses read the SNAPSHOT and the dispatcher deliberately makes no forge call:
+//
+//   - FRESH, and the whole point of re-asking: the mirror CR and its LIVE owner.
+//     They are the two inputs that genuinely change while an event waits, and
+//     they carry clauses (e) and (h) - a Task that took the merge request over
+//     while it queued, and a mirror stood down to an external push. An unadopted
+//     merge request has no mirror at all until this mint's own bind creates one,
+//     which is why they are read here rather than carried on the event.
+//   - IMMUTABLE, so the snapshot is authoritative: head branch, author, and head
+//     repo. Clause (d) still fails CLOSED on an empty head repo, which is what
+//     keeps a fork out when a forge or an old delivery would not say.
+//
+// TWO GAPS, NAMED SO THEY ARE DISCOVERABLE. Both are snapshot-sourced facts a
+// human can change after the enqueue, and neither is closed here:
+//
+//  1. adoptionRefused is keyed on pr.HeadSHA, which comes from the snapshot. If
+//     the engine force-pushes a new tree onto the branch and a human then refuses
+//     THAT SHA, this check compares against the OLD one and lets the adoption
+//     through. Task 7 refreshes headSHA on a `synchronize` delivery, which is what
+//     closes this half; a re-read here would need a forge call the design keeps
+//     out of the dispatcher.
+//  2. the trigger-label escape hatch, clause (f), reads pr.Labels off the
+//     snapshot. A label applied AFTER the enqueue is invisible at admission, so
+//     the merge request adopts rather than falling through to a review Task. The
+//     recovery is the one clause (g) documents: AnnAdoptionRefused on the mirror,
+//     or merging it yourself.
 func (r *DispatcherReconciler) admitAdoptedUpgrade(ctx context.Context, proj *tatarav1alpha1.Project,
 	q *tatarav1alpha1.QueuedEvent) (*tatarav1alpha1.Task, adoptVerdict, error) {
 
 	lg := log.FromContext(ctx)
+	// COUNTED ONLY ONCE THE EVENT IS ACTUALLY GONE. A transient Delete failure
+	// leaves the event Queued and this whole function re-runs next pass, so
+	// counting before the delete would count one refusal twice.
 	drop := func(reason string) (*tatarav1alpha1.Task, adoptVerdict, error) {
+		if err := r.Delete(ctx, q); err != nil && !apierrors.IsNotFound(err) {
+			return nil, adoptRetry, err
+		}
 		obs.AdoptionEventDroppedTotal.WithLabelValues(proj.Name, reason).Inc()
 		lg.Info("queue: dropped a queued dependency-upgrade adoption",
 			"action", "queue_adopt_drop", "resource_id", q.Name, "project", proj.Name,
 			"repo", q.Spec.RepositoryRef, "number", q.Spec.Payload.AdoptedUpgrade.Number,
 			"reason", reason)
-		if err := r.Delete(ctx, q); err != nil && !apierrors.IsNotFound(err) {
-			return nil, adoptRetry, err
-		}
 		return nil, adoptDropped, nil
 	}
 
@@ -741,13 +799,12 @@ func (r *DispatcherReconciler) admitAdoptedUpgrade(ctx context.Context, proj *ta
 	}
 
 	pr := prRefFromAdopted(q.Spec.Payload.AdoptedUpgrade)
-	m := &Minter{Client: r.Client, APIReader: r.APIReader, Scheme: r.Scheme,
-		Metrics: r.Metrics, SpillerFor: r.SpillerFor, Activity: SweepActivity}
+	m := r.minter()
 	cr, err := m.mergeRequestCR(ctx, proj, &repo, pr.Number)
 	if err != nil {
 		return nil, adoptRetry, err
 	}
-	liveOwner, err := m.resolveLiveMROwner(ctx, proj, cr, SweepActivity)
+	liveOwner, err := m.resolveLiveMROwner(ctx, proj, cr, QueueActivity)
 	if err != nil {
 		return nil, adoptRetry, err
 	}
@@ -763,19 +820,58 @@ func (r *DispatcherReconciler) admitAdoptedUpgrade(ctx context.Context, proj *ta
 	if err != nil {
 		return nil, adoptRetry, err
 	}
-	switch outcome {
-	case MintTombstoneDeleted:
+	if outcome == MintTombstoneDeleted {
 		// A dead twin held the deterministic name and has just been deleted; the
 		// mint is still OWED. Stay Queued and let the prompt requeue re-drive it.
+		// There is no MintNotOwed arm here on purpose: every MintNotOwed return in
+		// MintAdoptedUpgradeTask carries a non-nil error, which the check above
+		// already consumed, so the outcome cannot reach this point with a Task to
+		// admit or a reason to drop.
 		return nil, adoptRetry, nil
-	case MintNotOwed:
-		return drop("mint_not_owed")
 	}
 	lg.Info("queue: adopted a dependency upgrade merge request into an upgrade task",
 		"action", "queue_adopt_upgrade_mr", "resource_id", task.Name, "project", proj.Name,
 		"repo", repo.Name, "number", pr.Number, "head_branch", pr.HeadBranch,
 		"author", pr.Author, "outcome", string(outcome))
-	return task, adoptMinted, nil
+	if outcome == MintCreated {
+		return task, adoptCreated, nil
+	}
+	return task, adoptExisting, nil
+}
+
+// convergeAdoptedAdmission re-runs the two writes an adopted mint makes AFTER its
+// Task exists - the mirror bind and the semver floor - for an event whose Task the
+// #443 idempotency lookup already found. See its call site for why the mint
+// branch's own converge arm can never be reached again once that lookup hits.
+//
+// A GONE REPOSITORY IS NOT A REFUSAL HERE, unlike in admitAdoptedUpgrade. The Task
+// exists and is about to be admitted; there is nothing left to adopt into and
+// nothing to undo, so this logs and returns rather than deleting an event that has
+// already minted.
+func (r *DispatcherReconciler) convergeAdoptedAdmission(ctx context.Context, proj *tatarav1alpha1.Project,
+	q *tatarav1alpha1.QueuedEvent, task *tatarav1alpha1.Task) error {
+
+	var repo tatarav1alpha1.Repository
+	if err := r.Get(ctx, types.NamespacedName{Namespace: q.Namespace, Name: q.Spec.RepositoryRef}, &repo); err != nil {
+		if apierrors.IsNotFound(err) {
+			log.FromContext(ctx).Info("queue: skipped converging an adopted upgrade task, its repository is gone",
+				"action", "queue_adopt_converge_skip", "resource_id", task.Name, "project", proj.Name,
+				"repo", q.Spec.RepositoryRef, "number", q.Spec.Payload.AdoptedUpgrade.Number)
+			return nil
+		}
+		return err
+	}
+	m := r.minter()
+	pr := prRefFromAdopted(q.Spec.Payload.AdoptedUpgrade)
+	return m.convergeAdoptedMint(ctx, proj, &repo, mrSnapshot(proj, &repo, pr), task, m.spillerFor(proj))
+}
+
+// minter builds the intake funnel the dispatcher's adoption path mints through.
+// Activity is QueueActivity: an owner ref this repairs is repaired at ADMISSION,
+// not in a sweep pass, and obs.ownerActivities seeds that value.
+func (r *DispatcherReconciler) minter() *Minter {
+	return &Minter{Client: r.Client, APIReader: r.APIReader, Scheme: r.Scheme,
+		Metrics: r.Metrics, SpillerFor: r.SpillerFor, Activity: QueueActivity}
 }
 
 // ticketVerdict is what admitTicket decided about an admission ticket.
