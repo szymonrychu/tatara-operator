@@ -1716,6 +1716,10 @@ func (r *ProjectReconciler) sweepPRs(ctx context.Context, proj *tatarav1alpha1.P
 
 	l := log.FromContext(ctx)
 	requeue := time.Duration(0)
+	// Set by the adoption arm below when this repo held an adoptable merge
+	// request the project-wide cap would not let it take. It is the pass's
+	// verdict for the WHOLE repo, written once at the end.
+	deferredHeadroom := false
 
 	// PHASE 1: RESOLVE AND CLASSIFY, ACT ON NOTHING. Every read here used to sit
 	// at the top of the single acting loop; it is hoisted so the adoption window
@@ -1805,6 +1809,11 @@ func (r *ProjectReconciler) sweepPRs(ctx context.Context, proj *tatarav1alpha1.P
 				"repo", repo.Name, "number", pr.Number, "head_branch", pr.HeadBranch)
 		case PRAdoptUpgrade:
 			if *adoptHeadroom <= 0 || !adoptable[pr.Number] {
+				// RECORDED, not just logged and counted. This is the ONE place
+				// that knows a specific repository is holding an adoptable merge
+				// request it could not take, and a lane frees somewhere else
+				// entirely - see UpgradeDeferredAnnotation.
+				deferredHeadroom = true
 				skipPR(ctx, proj, repo, pr.Number, activity, SweepSkipUpgradeHeadroom,
 					"head_branch", pr.HeadBranch)
 				break
@@ -1925,6 +1934,20 @@ func (r *ProjectReconciler) sweepPRs(ctx context.Context, proj *tatarav1alpha1.P
 		if _, oerr := r.driver().ReconcileOwnership(ctx, proj, repo, mrCR, liveHead, newComments); oerr != nil {
 			fail("reconcile_ownership", oerr, "repo", repo.Name, "number", pr.Number)
 		}
+	}
+
+	// THE PASS'S VERDICT ON THIS REPO'S ADOPTION BACKLOG, and it is written on
+	// BOTH edges: set when something was deferred for want of a lane, cleared
+	// when nothing was. The clear is what keeps a freed lane from re-requesting a
+	// sweep of a repo with nothing left to adopt - see UpgradeDeferredAnnotation.
+	// A steady state costs no write at all.
+	//
+	// AFTER the acting loop, not inside it: "did this repo defer anything" is one
+	// fact per pass, exactly like the budget's own per-pass counters, and writing
+	// it per deferred merge request would rewrite the same key five times for one
+	// engine burst.
+	if derr := r.recordUpgradeDeferral(ctx, repo, deferredHeadroom, time.Now()); derr != nil {
+		fail("record_upgrade_deferral", derr, "repo", repo.Name)
 	}
 	return requeue
 }

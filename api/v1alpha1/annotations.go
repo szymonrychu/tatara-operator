@@ -31,6 +31,38 @@ const ReingestRequestedAnnotation = "tatara.dev/reingest-requested"
 // one pass serves them all.
 const SweepRequestedAnnotation = "tatara.dev/sweep-requested"
 
+// UpgradeDeferredAnnotation records that the most recent sweep pass over this
+// Repository found an adoptable dependency-upgrade merge request and could NOT
+// take it because the project-wide maxOpenUpgrades was already spent
+// (SweepSkipUpgradeHeadroom). Its value is that pass's RFC3339 instant; its
+// PRESENCE is what anything reads.
+//
+// IT IS THE ADDRESS OF A WAIT. SweepRequestedAnnotation above closes the ARRIVAL
+// half of the adoption latency - a delivery says "look at THIS repo now". The
+// RELEASE half is the mirror image and has no address of its own: an upgrade
+// Task frees a lane that is PROJECT-WIDE, and the merge request that lane
+// unblocks may sit in any enrolled repository, not the one the finished Task was
+// bound to. The two available shortcuts are both wrong. Marking only the
+// finished Task's own repository is cheap and silently misses every cross-repo
+// deferral. Marking every enrolled repository buys a full forge listing of the
+// whole project for every finished Task, which at the observed rate is a
+// standing listing load in exchange for information the operator already has.
+//
+// The pass that DEFERRED is the only actor that knows which repository is
+// waiting and why, so it writes it down here, and the freed lane marks exactly
+// those. On a project with nothing deferred the release is a cached List and
+// zero writes.
+//
+// IT IS CLEARED, unlike SweepRequestedAnnotation, and by exactly one writer: the
+// same sweep arm, on the first pass over this repository that defers nothing.
+// That is what bounds the mechanism. A record that outlived its backlog would
+// let every subsequent freed lane re-request a sweep of a repository with
+// nothing left to adopt, which is the forge-listing loop the whole marker idiom
+// is built to avoid. Clearing needs no compare-and-delete race window: this key
+// has ONE writer, the leader's serialized sweep, whereas the request marker is
+// written by every webhook replica.
+const UpgradeDeferredAnnotation = "tatara.dev/upgrade-deferred"
+
 // Turn-loop annotation keys, shared by the controller (agent-run state) and the
 // webhook (reactivation must clear them so a fresh run starts clean).
 const (
@@ -92,6 +124,31 @@ const (
 	// individually preserved by every writer to promise that. Nothing ever removes
 	// this annotation.
 	AnnRetiredParkMigrated = "tatara.dev/retired-park-migrated"
+	// AnnUpgradeLaneReleased is the ONCE-ONLY LATCH for the lane-release sweep
+	// request. Its VALUE is the RFC3339 instant the release ran; its PRESENCE -
+	// not its value - is the guard. Nothing ever removes it.
+	//
+	// IT IS WHAT MAKES THE TRIGGER AN EDGE. A terminal Task is not reconciled
+	// once: every informer resync, every event on an object it owns, and every
+	// reaper write re-delivers it, and the terminal early return in
+	// reconcileStage is reached each time. Without the latch, each of those
+	// re-stamps SweepRequestedAnnotation with a fresh instant, which makes the
+	// repository due again on the next 30s project reconcile, which lists the
+	// forge again - a 30s listing loop driven by Tasks that finished hours ago
+	// and are only waiting for the reaper. The freed lane is an EVENT and must be
+	// spent exactly once.
+	//
+	// On metadata rather than status, for the same reason AnnRetiredParkMigrated
+	// is: it has to survive everything a status write does to a Task, including
+	// an objbudget spill.
+	//
+	// ONE RELEASE PER TASK IS A DELIBERATE UNDER-COUNT. A Task that parks,
+	// unparks (retaking its lane) and parks again frees a lane twice and asks for
+	// a sweep once. Re-arming on unpark would need a second writer on the unpark
+	// path and would re-open the loop this latch closes, for a shape that is rare
+	// and costs only latency: the ordinary four-hourly slot and the webhook
+	// fast path both still reach that repository.
+	AnnUpgradeLaneReleased = "tatara.dev/upgrade-lane-released"
 )
 
 // AnnAutoReentries / AnnAutoReentryExhausted are the C.3 automatic-pickup

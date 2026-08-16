@@ -334,6 +334,12 @@ var sweepSeedReasons = []string{
 	// this pass may take. An uncountable lane budget adopts NOTHING, so its
 	// failure is invisible in the mint counters and only shows up here.
 	"adopt_upgrade_mr", "count_upgrade_lanes",
+	// The deferral record a freed lane reads to know WHICH repository is
+	// waiting. Its failure is silent by construction - the pass still logs and
+	// counts every upgrade_headroom_bound skip, and the merge request is still
+	// adopted on the ordinary four-hourly slot - so this counter is the only
+	// place a repository that can no longer be woken early becomes visible.
+	"record_upgrade_deferral",
 }
 
 // cronReasons/refineReasons are the closed reason sets for projectscan.go's
