@@ -188,9 +188,12 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 	//
 	// MintOrUnparkTakeoverTask un-parks on ReasonOwnershipLost and NOTHING else.
 	// A takeover parked for any other UnparkNever reason is a Task that will
-	// never run again, and nothing here hands the merge request back either (the
-	// only writer of Ownership=external is ownership.go's flipToExternal, driven
-	// by a HUMAN PUSH). Left at 200 the maintainer is told their take-over
+	// never run again, and nothing here hands the merge request back either: the
+	// only thing that TAKES ownership back from tatara is ownership.go's
+	// flipToExternal, driven by a HUMAN PUSH. (Not "the only writer of
+	// Ownership=external" - ReconcileOwnership's classification backfill writes
+	// that value too, but only onto a mirror that was never classified, which a
+	// taken-over one never is.) Left at 200 the maintainer is told their take-over
 	// succeeded while the MR sits controller-owned by a dead Task, which is
 	// precisely the stranded shape #604 is about - just moved one state right.
 	//
@@ -200,9 +203,10 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 	// that turn is required to invoke declines on an ORDINARY STAND-DOWN too, so
 	// the gate was refusing the most routine event in a takeover's life. That is
 	// fixed where it belongs, in the flip: parkOwnerTask upgrades a takeover's
-	// implement-declined park to ownership-lost (stage.UpgradeDeclineToOwnership
-	// Lost). So the rule a declined takeover actually follows is TERMINAL WHILE
-	// THE BRANCH IS STILL TATARA'S, RESUMABLE ONCE IT IS THE HUMAN'S AGAIN -
+	// implement-declined park to ownership-lost, via the exported
+	// stage.UpgradeDeclineToOwnershipLost. So the rule a declined takeover
+	// actually follows is TERMINAL WHILE THE BRANCH IS STILL TATARA'S,
+	// RESUMABLE ONCE IT IS THE HUMAN'S AGAIN -
 	// deliberate declines included. "A deliberate decline is never followed by a
 	// flip" is FALSE and must not be reinstated here: the takeover job text
 	// requires the agent to comment on the merge request explaining itself before
@@ -212,11 +216,11 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 	//
 	// THE PREDICATE DOES NOT CARVE OUT implement-declined. Within the two classes
 	// it refuses, ownership-lost is the only reason it lets through, and this
-	// gate still 409s an implement-declined park -
-	// TestMRTakeover_RefusesReTakeOnAnUnresumableParked
-	// Task pins that, though only by posting as the parked Task itself, which the
-	// reachable-shape note below says production cannot do. What removes it in
-	// production is UPSTREAM: nothing can call here until the human pushes, and
+	// gate still 409s an implement-declined park. That is pinned by
+	// TestMRTakeover_RefusesReTakeOnAnUnresumableParkedTask, though only by
+	// posting as the parked Task itself, which the reachable-shape note below
+	// says production cannot do. What removes it in production is UPSTREAM:
+	// nothing can call here until the human pushes, and
 	// that push has already rewritten the reason. Rounds 5 and 6 of #604's review
 	// both described the carve-out as this predicate's own; reconciling
 	// unresumableTakeoverPark to that reading means deleting its ownership-lost
