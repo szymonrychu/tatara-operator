@@ -213,6 +213,51 @@ func TestFailedReposAddendumIsNotAnAgentHandoff(t *testing.T) {
 		"the operator talking to the next pod is not the agent talking to a human")
 }
 
+// THE ADDENDUM NAMES ITS TURN, WITHIN THE SAME BUDGET.
+//
+// The turn id is what stops a persistent rejection - the same repos failing again
+// many turns later - from rendering a body byte-identical to the older note and
+// being swallowed by the idempotency scan. Unlike the synthetic note's copy, this
+// body spends the WHOLE note budget on names, so the suffix has to be reserved
+// out of that budget rather than appended after it: the apiserver rejects a
+// Note.Body over MaxLength outright, and the write that is lost is the one naming
+// work that exists nowhere else.
+func TestFailedReposAddendumNamesItsTurnWithinTheNoteBudget(t *testing.T) {
+	sess := &stopSession{states: []string{agent.SessionStateBusy, agent.SessionStateReady}}
+	h := newTTLHarness(t, sess)
+	sess.onHandoff = func() { appendAgentHandoffNote(t, h) }
+
+	in := h.input()
+	in.ReposTurnID = strings.Repeat("t", tatarav1alpha1.LastTurnReposTurnIDMaxBytes)
+	for i := range 20 {
+		in.FailedRepos = append(in.FailedRepos, strings.Repeat(string(rune('a'+i)), 200))
+	}
+
+	_, err := h.stopper.StopWithHandoff(context.Background(), h.task, in)
+	require.NoError(t, err)
+
+	body := h.notes(t)[1].Body
+	require.LessOrEqual(t, len(body), tatarav1alpha1.NoteBodyMaxBytes, "Note.Body CRD MaxLength")
+	require.Contains(t, body, in.ReposTurnID, "the turn id is what makes a recurrence distinguishable")
+	require.Contains(t, body, "origin", "the directive still outranks the names")
+}
+
+// An UNKNOWN turn - lists written by a binary that predates the field - renders
+// no suffix rather than an empty one, so the body stays exactly what it was.
+func TestFailedReposAddendumOmitsAnUnknownTurn(t *testing.T) {
+	sess := &stopSession{states: []string{agent.SessionStateBusy, agent.SessionStateReady}}
+	h := newTTLHarness(t, sess)
+	sess.onHandoff = func() { appendAgentHandoffNote(t, h) }
+
+	in := h.input()
+	in.FailedRepos = []string{"tatara-cli"}
+	_, err := h.stopper.StopWithHandoff(context.Background(), h.task, in)
+	require.NoError(t, err)
+
+	require.True(t, strings.HasSuffix(h.notes(t)[1].Body, "Repos: tatara-cli."),
+		"an unknown turn must not leave a dangling turn clause")
+}
+
 // A name longer than the whole names budget renders as the count alone. Half a
 // repo name is not a repo, so there is nothing else the note can honestly say -
 // but it must still say the number, and it must not leave the gap where the

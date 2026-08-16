@@ -131,6 +131,16 @@ const TTLPollInterval = 5 * time.Second
 // FitNoteAppender, which routes the write through the A.7 byte-budget guard.
 type NoteAppender interface {
 	AppendNote(ctx context.Context, taskName string, n tatarav1alpha1.Note) error
+	// AppendNoteOnce is AppendNote skipped when a note with the same Agent and
+	// Body is already in the journal.
+	//
+	// It exists as its own method rather than as a scan in the caller because the
+	// decision has to be made against the object version the append MUTATES. A
+	// caller holding a Task snapshot cannot do that: on the TTL path the snapshot
+	// is captured at StopWithHandoff entry and the append happens after waitIdle,
+	// SubmitHandoffTurn and waitHandoffNote, so it can be many minutes stale. The
+	// sibling helper appendOperatorNoteTo does it the same way, inside the closure.
+	AppendNoteOnce(ctx context.Context, taskName string, n tatarav1alpha1.Note) error
 }
 
 // FitNoteAppender is the production NoteAppender: every note lands via
@@ -143,9 +153,24 @@ type FitNoteAppender struct {
 }
 
 func (a *FitNoteAppender) AppendNote(ctx context.Context, taskName string, n tatarav1alpha1.Note) error {
+	return a.append(ctx, taskName, n, false)
+}
+
+func (a *FitNoteAppender) AppendNoteOnce(ctx context.Context, taskName string, n tatarav1alpha1.Note) error {
+	return a.append(ctx, taskName, n, true)
+}
+
+func (a *FitNoteAppender) append(ctx context.Context, taskName string, n tatarav1alpha1.Note, once bool) error {
 	return objbudget.FitTask(ctx, a.Client, a.Spiller,
 		types.NamespacedName{Namespace: a.Namespace, Name: taskName},
 		func(t *tatarav1alpha1.Task) {
+			if once {
+				for _, have := range t.Status.Notes {
+					if have.Agent == n.Agent && have.Body == n.Body {
+						return
+					}
+				}
+			}
 			t.Status.Notes = append(t.Status.Notes, n)
 		})
 }
@@ -318,6 +343,10 @@ type TTLStopInput struct {
 	// commits survive nowhere, and this note is the only place the next pod can
 	// be told to go and redo them.
 	FailedRepos []string
+	// ReposTurnID is status.lastTurnReposTurnID: which turn the two lists above
+	// describe. It travels with them so the failed-repos note can name its turn
+	// and a recurrence cannot be mistaken for a replay. Empty means unknown.
+	ReposTurnID string
 	// Cause is the ttl|stall|eviction|idle label on
 	// operator_agent_pod_ttl_expired_total: WHY this stop ran. Empty defaults to
 	// TTLCauseTTL, which is both the historic meaning of the counter and the only
@@ -733,7 +762,7 @@ func (s *TTLStopper) writeSyntheticNote(ctx context.Context, task *tatarav1alpha
 }
 
 func (s *TTLStopper) noteFailedRepos(ctx context.Context, task *tatarav1alpha1.Task, in TTLStopInput) {
-	AppendFailedReposNote(ctx, s.Notes, task, in.FailedRepos, s.now())
+	AppendFailedReposNote(ctx, s.Notes, task, in.FailedRepos, in.ReposTurnID, s.now())
 }
 
 // AppendFailedReposNote appends the operator's own note naming the repos whose
@@ -765,39 +794,74 @@ func (s *TTLStopper) noteFailedRepos(ctx context.Context, task *tatarav1alpha1.T
 // handoffNoteCount, HasAgentHandoffNote{,Since} and the agentAskedSomething call
 // sites are all unmoved by an addendum landing beside the agent's own note.
 //
-// IDEMPOTENT ON THE RENDERED BODY, the way noteOOMKilledPod is on its marker.
+// IDEMPOTENT ON THE RENDERED BODY, which is why the body has to NAME ITS TURN.
 // The payload survives a respawn (clearLastTurn is deliberately not run there),
-// so the same repo list can reach a second stop and say the same thing twice -
-// and this note is a standing statement of fact, not an event. Exact body rather
-// than a marker prefix, so it never suppresses a note about a DIFFERENT repo
-// list, and so it does not collide with the copy of the same sentence
-// writeSyntheticNote embeds in a larger body.
+// so the same repo list can reach a second stop and say the same thing twice.
+// But failedReposSentence is a pure function of the list, and a persistent
+// rejection - branch protection, auth, a diverged branch - is exactly the shape
+// that recurs with an IDENTICAL list many turns later. Deduping on the prose
+// alone would match the older note, skip the write, and let the caller's
+// unconditional clearLastTurn destroy the report it just suppressed: the
+// survivor then sits behind agent notes saying the work landed, while its own
+// text claims "the LAST turn's". So the turn id joins the body, the way
+// OOMKilledNoteBody carries the kill timestamp - the discriminator is IN the
+// fact, and exact-body dedupe distinguishes turns by construction.
+//
+// turnID is status.lastTurnReposTurnID, which exists to say which turn the repo
+// lists describe, and it travels with `failed` from the same snapshot so the two
+// cannot disagree. Empty - an in-place upgrade whose lists were written by a
+// binary that had no such field - degrades to the old body-only behaviour, which
+// is the right way for an UNKNOWN turn to fail: a note suppressed is recoverable
+// on the next distinct failure, a note doubled on every reconcile is not.
+//
+// Exact body rather than a marker prefix, so it never suppresses a note about a
+// DIFFERENT repo list, and so it does not collide with the copy of the same
+// sentence writeSyntheticNote embeds in a larger body.
+//
+// The dedupe runs INSIDE the appender's own read-modify-write (AppendNoteOnce),
+// not over the caller's Task snapshot: `task` here is the object identity, and
+// its status is deliberately not read.
 //
 // Best-effort, and deliberately so on both counts: a note that will not write
 // must never keep a pod alive, and returning an error here would send the
 // TTL caller back through a stop sequence whose agent handoff note now predates
 // its own baseline - the retry would time out waiting for a second one and
 // overwrite a perfectly good agent handoff with the synthetic note.
-func AppendFailedReposNote(ctx context.Context, notes NoteAppender, task *tatarav1alpha1.Task, failed []string, at time.Time) {
-	body := strings.TrimSpace(failedReposSentence(failed, maxNoteBody))
+func AppendFailedReposNote(ctx context.Context, notes NoteAppender, task *tatarav1alpha1.Task,
+	failed []string, turnID string, at time.Time) {
+
+	// Budgeted against the suffix rather than clamped after it: failedReposSentence
+	// spends its whole budget on repo names, so a plain append would push a maximal
+	// list past Note.Body's MaxLength and the apiserver would reject the write.
+	suffix := failedReposTurnSuffix(turnID)
+	body := strings.TrimSpace(failedReposSentence(failed, maxNoteBody-len(suffix)))
 	if body == "" {
 		return
-	}
-	for _, n := range task.Status.Notes {
-		if n.Agent == NoteAgentOperator && n.Body == body {
-			return
-		}
 	}
 	n := tatarav1alpha1.Note{
 		At:    metav1.NewTime(at),
 		Agent: NoteAgentOperator,
 		Kind:  NoteKindHandoff,
-		Body:  body,
+		Body:  body + suffix,
 	}
-	if err := notes.AppendNote(ctx, task.Name, n); err != nil {
+	if err := notes.AppendNoteOnce(ctx, task.Name, n); err != nil {
 		log.FromContext(ctx).Error(err, "could not record the repos whose push failed",
-			"action", "failed_repos_note", "resource_id", task.Name, "failed_repos", failed)
+			"action", "failed_repos_note", "resource_id", task.Name,
+			"failed_repos", failed, "repos_turn_id", turnID)
 	}
+}
+
+// failedReposTurnSuffix names the turn the repo list describes, so two distinct
+// losses of the SAME repos render two distinct bodies. It is also the only thing
+// in the note the next agent can correlate against the turn log.
+//
+// The id is already clamped to LastTurnReposTurnIDMaxBytes on the write path, so
+// this is bounded without a second clamp.
+func failedReposTurnSuffix(turnID string) string {
+	if turnID == "" {
+		return ""
+	}
+	return " (turn " + turnID + ")"
 }
 
 // syntheticNoteLostBody is what the operator writes when it holds nothing to

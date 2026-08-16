@@ -1396,6 +1396,7 @@ func (r *TaskReconciler) stalledTurnStop(ctx context.Context, proj *tatarav1alph
 		LastFinalText: task.Status.LastTurnFinalText,
 		PushedRepos:   task.Status.LastTurnPushedRepos,
 		FailedRepos:   task.Status.LastTurnFailedRepos,
+		ReposTurnID:   task.Status.LastTurnReposTurnID,
 	})
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("stalled turn stop %s: %w", task.Name, err)
@@ -1465,6 +1466,7 @@ func (r *TaskReconciler) ttlStop(ctx context.Context, proj *tatarav1alpha1.Proje
 		LastFinalText: task.Status.LastTurnFinalText,
 		PushedRepos:   task.Status.LastTurnPushedRepos,
 		FailedRepos:   task.Status.LastTurnFailedRepos,
+		ReposTurnID:   task.Status.LastTurnReposTurnID,
 	}
 	res, err := stopper.StopWithHandoff(ctx, task, in)
 	if err != nil {

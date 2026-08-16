@@ -444,10 +444,12 @@ func (r *TaskReconciler) stopAfterAgentHandoff(ctx context.Context, proj *tatara
 	// than the tidy state: if the patch then fails, respawnLostPod picks the Task
 	// up with the payload deliberately un-retired, and the note is already
 	// written. AppendFailedReposNote is idempotent on the body, so that second
-	// pass does not double it.
+	// pass does not double it - and the body names its turn, so a LATER turn
+	// losing the same repos is still recorded rather than swallowed by the older
+	// note that this unconditional clearLastTurn is about to make unrecoverable.
 	agent.AppendFailedReposNote(ctx,
 		&agent.FitNoteAppender{Client: r.Client, Spiller: r.spiller(proj), Namespace: task.Namespace},
-		task, task.Status.LastTurnFailedRepos, now)
+		task, task.Status.LastTurnFailedRepos, task.Status.LastTurnReposTurnID, now)
 	if err := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 		fresh.Status.PodStartedAt = nil
 		fresh.Status.StateWorkStartedAt = nil

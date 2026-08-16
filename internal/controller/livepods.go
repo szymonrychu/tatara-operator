@@ -89,6 +89,7 @@ func (r *TaskReconciler) liveHandoffAndPark(ctx context.Context, proj *tatarav1a
 			LastFinalText: task.Status.LastTurnFinalText,
 			PushedRepos:   task.Status.LastTurnPushedRepos,
 			FailedRepos:   task.Status.LastTurnFailedRepos,
+			ReposTurnID:   task.Status.LastTurnReposTurnID,
 		}
 		res, err := stopper.StopWithHandoff(ctx, task, in)
 		if err != nil {
