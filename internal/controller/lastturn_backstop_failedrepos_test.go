@@ -76,3 +76,53 @@ func TestPollBackstop_KeepsTheFailuresItsOwnTurnReported(t *testing.T) {
 	require.Equal(t, []string{"tatara-cli"}, getTask(t, "t-fr-backstop2").Status.LastTurnFailedRepos,
 		"the backstop knows less than the callback about its own turn; it must not overwrite it with that")
 }
+
+// AN ABSENT lastTurnReposTurnId MEANS UNKNOWN, NEVER "OLDER".
+//
+// A Task already carrying failures when the field shipped has no id, and so does
+// one whose callback was served by a not-yet-upgraded replica: the callback
+// runnable is not leader-elected while the poll backstop is, so the two halves
+// genuinely run different binaries during a rollout. Reading "" as stale would
+// make the backstop delete a failure report belonging to its own turn - the exact
+// loss the gate exists to prevent, arrived at from the other side.
+func TestPollBackstop_TreatsAnAbsentReposTurnIDAsUnknown(t *testing.T) {
+	mkTaskProject(t, "p-fr-backstop3", 3)
+	mkTaskRepository(t, "r-fr-backstop3", "p-fr-backstop3")
+	mkTask(t, "t-fr-backstop3", "p-fr-backstop3", "r-fr-backstop3")
+	annotate(t, "t-fr-backstop3", map[string]string{annCurrentTurn: "turn-b-4"})
+
+	// The state an older binary left behind: lists written, no id.
+	task := getTask(t, "t-fr-backstop3")
+	task.Status.LastTurnFailedRepos = []string{"tatara-cli"}
+	require.NoError(t, k8sClient.Status().Update(context.Background(), task))
+
+	require.NoError(t, newCallbackServer().stampLastTurn(context.Background(),
+		getTask(t, "t-fr-backstop3"), "turn-b-4", "tatara-cli was rejected", nil, nil, false))
+
+	require.Equal(t, []string{"tatara-cli"}, getTask(t, "t-fr-backstop3").Status.LastTurnFailedRepos,
+		"an unknown owner is not evidence that the failures belong to an older turn")
+}
+
+// A BLANK REPO NAME IS REJECTED ON ARRIVAL, NOT ONLY AT THE SENDER.
+//
+// The wrapper stopped producing them, but version skew is a designed-for state
+// here: every pre-fix image keeps sending [""] until the train rolls. One blank
+// element is len()==1 downstream, which suppresses the placeholder note and
+// RecordEmptySynthetic (#527) and renders a handoff note that asserts lost work
+// and names no repo.
+func TestTurnComplete_DropsBlankRepoNames(t *testing.T) {
+	mkTaskProject(t, "p-fr-blank", 3)
+	mkTaskRepository(t, "r-fr-blank", "p-fr-blank")
+	mkTask(t, "t-fr-blank", "p-fr-blank", "r-fr-blank")
+
+	postTurnComplete(t, "t-fr-blank", "turn-b-5", map[string]any{
+		"state": "completed", "finalText": "one landed, one is unnameable",
+		"pushedRepos": []string{"", "tatara-operator"},
+		"failedRepos": []string{""},
+	})
+
+	got := getTask(t, "t-fr-blank")
+	require.Equal(t, []string{"tatara-operator"}, got.Status.LastTurnPushedRepos)
+	require.Empty(t, got.Status.LastTurnFailedRepos,
+		"a list whose only element names nothing carries nothing")
+}

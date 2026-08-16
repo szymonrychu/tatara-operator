@@ -29,8 +29,12 @@ func TestEveryTransitionClearsTheLastTurnContinuationState(t *testing.T) {
 	tk.Status.LastTurnFinalText = "clarified the scope with the maintainer; ready to implement"
 	tk.Status.LastTurnPushedRepos = []string{"tatara-operator"}
 	tk.Status.LastTurnFailedRepos = []string{"tatara-cli"}
+	tk.Status.LastTurnReposTurnID = "turn-42"
 
 	require.NoError(t, stage.Enter(tk, nil, v1alpha1.StateUnderImplementation, "", now))
+
+	require.Empty(t, tk.Status.LastTurnReposTurnID,
+		"the id names the turn those two lists described; it retires with them")
 
 	require.Empty(t, tk.Status.LastTurnFinalText,
 		"a new state must not hand its TTL stop the previous state's final text")

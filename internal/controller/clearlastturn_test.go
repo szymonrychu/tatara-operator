@@ -23,6 +23,7 @@ func TestClearLastTurn_RetiresTheFailedReposToo(t *testing.T) {
 			LastTurnFinalText:   "opened PR #91",
 			LastTurnPushedRepos: []string{"tatara-operator"},
 			LastTurnFailedRepos: []string{"tatara-cli"},
+			LastTurnReposTurnID: "turn-42",
 		},
 	}
 
@@ -30,6 +31,8 @@ func TestClearLastTurn_RetiresTheFailedReposToo(t *testing.T) {
 
 	require.Empty(t, task.Status.LastTurnFinalText)
 	require.Empty(t, task.Status.LastTurnPushedRepos)
+	require.Empty(t, task.Status.LastTurnReposTurnID,
+		"an id left behind names a turn whose lists are gone, and it gates the backstop's clear")
 	require.Empty(t, task.Status.LastTurnFailedRepos,
 		"the stop that just ran already rendered this into the notes journal; "+
 			"leaving it makes the next stop attribute this pod's loss to that one")

@@ -491,14 +491,21 @@ func (s *CallbackServer) stampLastTurn(ctx context.Context, task *tatarav1alpha1
 				changed = true
 			}
 			fresh.Status.LastTurnReposTurnID = turnID
-		} else if fresh.Status.LastTurnReposTurnID != turnID && len(fresh.Status.LastTurnFailedRepos) > 0 {
-			// The final text just became a NEWER turn's, and this path knows
-			// nothing about that turn's repos. Keeping the older turn's failures
+		} else if id := fresh.Status.LastTurnReposTurnID; id != "" && id != turnID && len(fresh.Status.LastTurnFailedRepos) > 0 {
+			// The final text just became a DIFFERENT turn's, and this path knows
+			// nothing about that turn's repos. Keeping the other turn's failures
 			// beside it is not a stale optimism like a stale pushedRepos is: it
-			// tells the next agent to redo work the following turn may well have
+			// tells the next agent to redo work the newer turn may well have
 			// landed, and it makes a content-free stop compute contentFree=false,
 			// which re-disarms the #527 empty-synthetic detector. The pushed list
 			// stays, for the reason it has always stayed.
+			//
+			// An ABSENT id means UNKNOWN, never "older", and unknown must leave the
+			// lists alone: a Task that was already carrying failures when this field
+			// shipped, or one whose callback was served by a not-yet-upgraded
+			// replica (the callback runnable is not leader-elected, the poll
+			// backstop is), would otherwise have its own turn's report deleted by
+			// the very backstop that is supposed to know less than the callback.
 			fresh.Status.LastTurnFailedRepos = nil
 			changed = true
 		}
@@ -515,14 +522,28 @@ func (s *CallbackServer) stampLastTurn(ctx context.Context, task *tatarav1alpha1
 // failure these fields exist to prevent.
 const maxLastTurnPushedRepos = 20
 
+// It also DROPS BLANK NAMES, on the receiving side rather than trusting the
+// sender. The wrapper stopped producing them, but version skew is a designed-for
+// state here and every pre-fix image in the cluster keeps sending them until the
+// train rolls. A [""] is len()==1 downstream: it makes a content-free stop
+// compute contentFree=false, suppressing the placeholder note and
+// RecordEmptySynthetic (#527), and on the failed list it produces a handoff note
+// that asserts lost work and names no repo.
 func clampPushedRepos(repos []string) []string {
-	if len(repos) == 0 {
+	out := make([]string, 0, min(len(repos), maxLastTurnPushedRepos))
+	for _, r := range repos {
+		if r == "" {
+			continue
+		}
+		if len(out) == maxLastTurnPushedRepos {
+			break
+		}
+		out = append(out, r)
+	}
+	if len(out) == 0 {
 		return nil
 	}
-	if len(repos) > maxLastTurnPushedRepos {
-		repos = repos[:maxLastTurnPushedRepos]
-	}
-	return slices.Clone(repos)
+	return out
 }
 
 // recordResult bumps the Task's turn-complete annotation to requeue its

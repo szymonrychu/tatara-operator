@@ -808,6 +808,11 @@ func syntheticNoteLostBody() string {
 // cap. Truncating the rendered sentence would cut inside the join and take the
 // directive with it, leaving a note that names some lost repos and silently omits
 // the others. Names are dropped whole and counted instead.
+//
+// budget bounds the NAMES. It is a precondition, not a clamp: both call sites
+// pass at least maxNoteBody/4, several times the fixed prose, and a budget under
+// that renders the prose anyway rather than mutilating the directive it exists to
+// protect.
 func failedReposSentence(failed []string, budget int) string {
 	if len(failed) == 0 {
 		return ""
@@ -822,12 +827,20 @@ func failedReposSentence(failed []string, budget int) string {
 
 // joinWithinBudget renders as many names as fit and reports how many it dropped.
 // A name is rendered whole or not at all: half a repo name is not a repo, and a
-// list that ends mid-name reads as a complete list.
+// list that ends mid-name reads as a complete list. A single name too long for
+// the whole budget therefore renders as the count alone, which is all the note
+// can honestly say about it.
 func joinWithinBudget(names []string, budget int) string {
-	elided := func(from int) string { return fmt.Sprintf(" (+%d more)", len(names)-from) }
-	// Reserved against the WHOLE count so the reservation can never be too small
-	// for the suffix it is reserving for.
-	reserve := len(elided(0))
+	elided := func(from int) string {
+		sep := " "
+		if from == 0 {
+			sep = ""
+		}
+		return fmt.Sprintf("%s(+%d more)", sep, len(names)-from)
+	}
+	// Reserved against the WHOLE count, and against the separated form, so the
+	// reservation can never be too small for the suffix it is reserving for.
+	reserve := len(fmt.Sprintf(" (+%d more)", len(names)))
 	var b strings.Builder
 	for i, n := range names {
 		sep := ""

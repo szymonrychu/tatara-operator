@@ -191,6 +191,50 @@ func TestTTLStop_ALongFailedReposListNeverEatsTheDirective(t *testing.T) {
 		"a note ending mid-list is a note that lies about how many repos were lost")
 }
 
+// THE ADDENDUM MUST NEVER READ AS THE AGENT ASKING A QUESTION.
+//
+// It is a handoff-kind note the OPERATOR wrote, and every "did the agent say
+// something" predicate keys on Agent != operator. If that ever regressed, a Task
+// whose only note is this warning would park awaiting-human on a question nobody
+// asked, waiting forever for a reply nobody owes.
+func TestFailedReposAddendumIsNotAnAgentHandoff(t *testing.T) {
+	sess := &stopSession{states: []string{agent.SessionStateBusy, agent.SessionStateReady}}
+	h := newTTLHarness(t, sess)
+	sess.onHandoff = func() { appendAgentHandoffNote(t, h) }
+
+	in := h.input()
+	in.FailedRepos = []string{"tatara-cli"}
+	_, err := h.stopper.StopWithHandoff(context.Background(), h.task, in)
+	require.NoError(t, err)
+
+	addendum := h.notes(t)[1]
+	only := &tatarav1alpha1.Task{Status: tatarav1alpha1.TaskStatus{Notes: []tatarav1alpha1.Note{addendum}}}
+	require.False(t, agent.HasAgentHandoffNote(only),
+		"the operator talking to the next pod is not the agent talking to a human")
+}
+
+// A name longer than the whole names budget renders as the count alone. Half a
+// repo name is not a repo, so there is nothing else the note can honestly say -
+// but it must still say the number, and it must not leave the gap where the
+// names would have been.
+func TestTTLStop_ASingleOversizedRepoNameStillReportsTheCount(t *testing.T) {
+	sess := &stopSession{
+		states:     []string{agent.SessionStateReady},
+		handoffErr: &agent.HTTPError{Status: http.StatusGone},
+	}
+	h := newTTLHarness(t, sess)
+	in := h.input()
+	in.FailedRepos = []string{strings.Repeat("z", tatarav1alpha1.NoteBodyMaxBytes)}
+
+	_, err := h.stopper.StopWithHandoff(context.Background(), h.task, in)
+	require.NoError(t, err)
+
+	body := h.notes(t)[0].Body
+	require.LessOrEqual(t, len(body), tatarav1alpha1.NoteBodyMaxBytes)
+	require.Contains(t, body, "Repos: (+1 more).",
+		"the count is all that fits, and it must read as a sentence rather than a gap")
+}
+
 // appendAgentHandoffNote is the agent answering the G.7 step-3 handoff turn.
 func appendAgentHandoffNote(t *testing.T, h *ttlHarness) {
 	t.Helper()
