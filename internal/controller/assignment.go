@@ -470,15 +470,15 @@ func agentJob(agentKind string, task *tatarav1alpha1.Task, proj *tatarav1alpha1.
 			"change_significance=major|minor|patch)` once the merge request is clean by the three " +
 			"tests above. It then goes to review exactly like any other change.\n\n" +
 			"If you will not finish it, `submit_outcome(kind=implement, action=declined, " +
-			"decline_reason=...)`. **A DELIBERATE DECLINE IS TERMINAL FOR A TAKEOVER.** It parks the " +
-			"Task permanently: nothing un-parks it, and a second \"take over\" comment from the " +
-			"maintainer is REFUSED rather than resuming you. The merge request goes back to its author " +
-			"only when they push to it again, or when the Task is eventually collected. (The " +
-			"stand-down decline in section 2 is the exception, and the operator tells the two apart " +
-			"by whether the branch actually went back to the human - not by what you write.) So " +
-			"BEFORE you decline, `mr_write(action=\"comment\", ...)` on the merge request saying what " +
-			"you found and why you are handing it back - a decline the maintainer only discovers by " +
-			"noticing nothing happened is the failure this rule exists to prevent." +
+			"decline_reason=...)`. **A DECLINE IS TERMINAL FOR AS LONG AS THE BRANCH IS STILL " +
+			"TATARA'S.** It parks the Task: nothing un-parks it, and a second \"take over\" comment " +
+			"from the maintainer is REFUSED rather than resuming you. What lifts it is the merge " +
+			"request going back to its author - they push to it, or the Task is eventually collected. " +
+			"So the stand-down decline in section 2 costs nothing, and the operator does not need to " +
+			"tell the two apart: it reads the branch, not your decline reason. BEFORE you decline, " +
+			"`mr_write(action=\"comment\", ...)` on the merge request saying what you found and why " +
+			"you are handing it back - a decline the maintainer only discovers by noticing nothing " +
+			"happened is the failure this rule exists to prevent." +
 			promptguidance.ToolingConsumeGuidance
 
 	case stage.AgentReview:

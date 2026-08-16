@@ -15,6 +15,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/own"
+	"github.com/szymonrychu/tatara-operator/internal/scm"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
@@ -328,6 +329,13 @@ func takeoverTestSlug(t *testing.T) string {
 	// test name lands it mid-separator and yields a leading "-", which is not a
 	// legal RFC 1123 name and fails the Secret create with an error that names
 	// the fixture rather than the test.
+	//
+	// THE UNIQUENESS IS OVER THE LAST 40 CHARACTERS, not over the whole name. Two
+	// tests whose names differ only in a PREFIX
+	// (TestRepairMRBinding_StampsRefWhenX / TestRepairIssueBinding_StampsRefWhenX)
+	// collide, and the failure reads "secrets ... already exists" against the
+	// second one to run - which names the fixture rather than the collision. Vary
+	// the tail, not the head.
 	return strings.Trim(s, "-")
 }
 
@@ -540,5 +548,88 @@ func TestMintOrUnparkTakeoverTask_FreezesTheBranchAtTheTitleItSaw(t *testing.T) 
 	if got := agent.TaskBranch(same); got != want {
 		t.Fatalf("TaskBranch moved to %q after a mirror title change: a live Task's ourMR verdict "+
 			"is not stable, and ourMR gates closing a merge request and deleting its head branch", got)
+	}
+}
+
+// THE ISSUE HALF OF THE SAME CONFLATION (#604 review round 2, INFO).
+//
+// repairIssueBinding is repairMRBinding's counterpart and had the identical
+// "any controller owner means hands off" skip, which conflates "someone else's"
+// with "ours, and only the ref stamp is missing". The Issue mint is the same
+// three writes - createTaskRaceSafe, SyncIssue+ownIssueForTask, stampMintStatus
+// - so an interruption between the last two leaves an Issue CR owned by THIS
+// Task and an EMPTY status.issueRefs.
+//
+// That shape matters more here than it did for merge requests, because it is on
+// the LIVE issue path and it lands the Task in #604's own failure: issueRefs is
+// what verifyApprovalScope counts, so a Task carrying none is refused
+// no-live-issue at `refined` forever - by the gate, for a reason that is not
+// true.
+func TestRepairIssueBinding_StampsTheIssueRefWhenAlreadyOurs(t *testing.T) {
+	ctx := context.Background()
+	proj, repo := seedProjectRepo(t, ctx)
+	m := newTestMinter(t)
+	ext := scm.Issue{Number: 41, Title: "issue 41", URL: "https://github.com/o/r/issues/41", Author: "octocat"}
+
+	task, _, err := m.MintIssueTask(ctx, proj, repo, ext, tatarav1alpha1.StateNew, "", testSpiller(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	clearTaskIssueRefs(t, ctx, task)
+
+	if err := m.repairIssueBinding(ctx, proj, repo, ext, task, testSpiller(t)); err != nil {
+		t.Fatalf("repair: %v", err)
+	}
+	got := getTask(t, task.Name)
+	want := tatarav1alpha1.IssueName(repo.Name, 41)
+	if !slices.Contains(got.Status.IssueRefs, want) {
+		t.Fatalf("issueRefs = %v, want %q stamped: the Issue CR is controller-owned by THIS task, "+
+			"so 'already bound' is only half true - the ref stamp is what was interrupted, and "+
+			"without it the approval gate refuses no-live-issue forever", got.Status.IssueRefs, want)
+	}
+}
+
+// THE NEVER-STEAL RULE IS UNCHANGED ON THE ISSUE SIDE TOO: an Issue CR
+// controller-owned by a DIFFERENT Task is left alone and this Task's issueRefs
+// stay empty. Stamping one would hand this Task an Issue another Task drives -
+// and, at the gate, a citation scope it was never granted.
+func TestRepairIssueBinding_LeavesAForeignOwnedIssueUntouched(t *testing.T) {
+	ctx := context.Background()
+	proj, repo := seedProjectRepo(t, ctx)
+	m := newTestMinter(t)
+	ext := scm.Issue{Number: 42, Title: "issue 42", URL: "https://github.com/o/r/issues/42", Author: "octocat"}
+
+	owner, _, err := m.MintIssueTask(ctx, proj, repo, ext, tatarav1alpha1.StateNew, "", testSpiller(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stranger := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: owner.Name + "-stranger", Namespace: proj.Namespace},
+		Spec: tatarav1alpha1.TaskSpec{
+			ProjectRef: proj.Name, RepositoryRef: repo.Name, Kind: "brainstorm", Goal: "not mine",
+		},
+	}
+	if err := k8sClient.Create(ctx, stranger); err != nil {
+		t.Fatalf("create stranger task: %v", err)
+	}
+	if err := m.repairIssueBinding(ctx, proj, repo, ext, stranger, testSpiller(t)); err != nil {
+		t.Fatalf("repair: %v", err)
+	}
+	if got := getTask(t, stranger.Name); len(got.Status.IssueRefs) != 0 {
+		t.Fatalf("a foreign-owned Issue must never be stamped onto another task, got %v", got.Status.IssueRefs)
+	}
+}
+
+// clearTaskIssueRefs is clearTaskMRRefs' Issue counterpart: it reproduces the
+// interrupted mint by dropping the LAST of the three writes.
+func clearTaskIssueRefs(t *testing.T, ctx context.Context, task *tatarav1alpha1.Task) {
+	t.Helper()
+	var fresh tatarav1alpha1.Task
+	if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(task), &fresh); err != nil {
+		t.Fatalf("get task %s: %v", task.Name, err)
+	}
+	fresh.Status.IssueRefs = nil
+	if err := k8sClient.Status().Update(ctx, &fresh); err != nil {
+		t.Fatalf("clear issueRefs on %s: %v", task.Name, err)
 	}
 }

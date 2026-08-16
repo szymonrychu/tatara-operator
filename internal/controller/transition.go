@@ -411,28 +411,50 @@ func ParkTask(ctx context.Context, c client.Client, sp objbudget.Spiller, m *obs
 // It is deliberately NOT ParkTask with a different reason - ParkTask returns
 // early on an already-parked Task, which is the very early return that produced
 // the bug. Nor does it need ParkTask's other two jobs: the Task has been parked
-// since the decline, so its pod is long gone and its turn annotations are
-// already cleared. The only thing to do is the status write.
+// since the decline, so the pod teardown and the turn-annotation clear are
+// somebody else's already. Note that the DECLINE park does not run through
+// ParkTask either - restapi/outcome.go tears the wrapper down best-effort and
+// swallows the error, and never touches the turn annotations - so what actually
+// covers those here is the same pair that covers an interrupted ParkTask:
+// repairParkedWithLivePod for the pod, PollOnce for the annotations. The only
+// thing THIS function does is the status write.
 //
 // The park counter is NOT re-fired. This is one park's reason being corrected,
 // not a second park, and double-counting it would overstate
 // operator_task_parked_total against a real park elsewhere. The upgrade has its
-// own counter, which is the honest series to ask about it.
+// own counter, which is the honest series to ask about it - and it fires only on
+// the write that actually changed something, so a converge-by-retry caller
+// cannot inflate it.
+//
+// The guard runs against the CALLER's task before any write, not only inside the
+// FitTask closure. FitTask re-runs the closure against a fresh server copy, so a
+// refusal decided in there has already been preceded by a Status().Update - the
+// caller would be handed an error after a write it cannot see, and could not
+// tell whether to retry. This function is exported; a future call site must not
+// have to know that.
 func UpgradeDeclinedTakeoverPark(ctx context.Context, c client.Client, sp objbudget.Spiller,
 	task *tatarav1alpha1.Task, now time.Time) error {
 
+	if _, err := stage.UpgradeDeclineToOwnershipLost(task.DeepCopy(), now); err != nil {
+		return fmt.Errorf("stage: upgrade declined takeover park on %s: %w", task.Name, err)
+	}
+
+	var changed bool
 	var upErr error
 	key := client.ObjectKeyFromObject(task)
 	if err := objbudget.FitTask(ctx, c, sp, key, func(t *tatarav1alpha1.Task) {
-		upErr = stage.UpgradeDeclineToOwnershipLost(t, now)
+		changed, upErr = stage.UpgradeDeclineToOwnershipLost(t, now)
 	}); err != nil {
 		return fmt.Errorf("stage: upgrade declined takeover park on %s: %w", key.Name, err)
 	}
 	if upErr != nil {
 		return fmt.Errorf("stage: upgrade declined takeover park on %s: %w", key.Name, upErr)
 	}
-	if err := stage.UpgradeDeclineToOwnershipLost(task, now); err != nil {
+	if _, err := stage.UpgradeDeclineToOwnershipLost(task, now); err != nil {
 		return fmt.Errorf("stage: upgrade declined takeover park in memory: %w", err)
+	}
+	if !changed {
+		return nil // already converged; a retry of a write that landed
 	}
 
 	log.FromContext(ctx).Info("declined takeover park upgraded to ownership-lost",

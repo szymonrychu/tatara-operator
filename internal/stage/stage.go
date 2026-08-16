@@ -58,11 +58,17 @@ const (
 // merged. There is no path, no condition, no exception. It does not exist.
 const kindReview = "review"
 
-// kindTakeover is the Task.Spec.Kind minted for a maintainer-gated take-over of
-// somebody else's merge request. It is spelled here as well as in
-// internal/controller because park.go's UpgradeDeclineToOwnershipLost is keyed
-// on it and internal/stage may not import the controllers.
-const kindTakeover = "takeover"
+// KindTakeover is the Task.Spec.Kind minted for a maintainer-gated take-over of
+// somebody else's merge request. It lives here, and internal/controller's
+// takeoverKind is an alias of it, because park.go's
+// UpgradeDeclineToOwnershipLost is keyed on the kind and internal/stage may not
+// import the controllers - so the dependency can only point this way. One
+// spelling, not two that nothing compares.
+const KindTakeover = "takeover"
+
+// kindTakeover is KindTakeover under this file's lower-case convention, next to
+// kindReview.
+const kindTakeover = KindTakeover
 
 // refinedDoneKinds are the three NON-CODE kinds whose whole job finishes at the
 // gate state: brainstorm ends on propose/skip, refine on folds/closes/links

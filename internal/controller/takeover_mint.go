@@ -21,7 +21,12 @@ import (
 // MR (MR ownership design). It is its own kind - not review, not clarify - so
 // its deterministic natural-key name never collides with the review Task or a
 // clarify/issue Task minted for the same forge number.
-const takeoverKind = "takeover"
+//
+// It is an ALIAS of stage.KindTakeover rather than a second literal: the state
+// machine keys on this kind too (park.go's UpgradeDeclineToOwnershipLost), and
+// internal/stage cannot import this package, so the one spelling has to live
+// there and be re-exported here.
+const takeoverKind = stage.KindTakeover
 
 // takeoverTaskName is the deterministic natural-key name for the ONE
 // full-lifecycle takeover Task an MR ever gets, across every flip round: a
@@ -109,12 +114,22 @@ func TakeoverTaskName(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Reposit
 // So the flip corrects it: parkOwnerTask upgrades a takeover's
 // implement-declined park to ownership-lost (stage.UpgradeDeclineToOwnershipLost),
 // and the un-park branch below then resumes it exactly as it would any other
-// stand-down. The distinction is made by the WORLD, not by parsing what the
-// agent wrote: a deliberate decline is never followed by a flip, so it keeps its
-// terminal; a divergence decline is followed by one by definition, because the
-// push the agent saw IS the push the flip is reacting to. The other order needs
-// nothing - restapi/outcome.go refuses an outcome on an already-parked Task, so
-// an operator-first stand-down never produces the decline in the first place.
+// stand-down. The other order needs nothing - restapi/outcome.go refuses an
+// outcome on an already-parked Task, so an operator-first stand-down never
+// produces the decline in the first place.
+//
+// THAT WIDENS THE PARAGRAPH ABOVE, and the widening is deliberate rather than a
+// side effect. The upgrade cannot tell a divergence decline from a deliberate
+// one and does not try: there is no trustworthy signal (decline_reason is free
+// text), and the human response the job text ASKS FOR after a deliberate decline
+// - read the agent's comment, push a fix - flips ownership exactly like a
+// divergence does. So the rule is the merge request's, not the agent's: a
+// declined takeover is terminal WHILE THE BRANCH IS STILL TATARA'S, and resumable
+// once it is the human's again. A deliberate decline followed by a human push is
+// therefore re-takeable, and DrainStandDownMerge can merge - on an approved
+// review of the HUMAN's head - a merge request an earlier turn declined. Refusing
+// forever on a merge request its author has since moved on is #604's own failure
+// shape with a different label.
 //
 // expectFrom (optional, see MintReviewTask/bindMRToTask) is forwarded to the
 // fresh-mint path's bindMRToTask call unchanged - fix #408: the takeover REST

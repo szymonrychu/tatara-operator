@@ -219,7 +219,9 @@ func TestUpgradeDeclineToOwnershipLost(t *testing.T) {
 		require.NoError(t, stage.Park(tk, stage.ReasonImplementDeclined, now))
 		carry, entered := tk.Status.StageElapsedCarrySeconds, tk.Status.StateEnteredAt.Time
 
-		require.NoError(t, stage.UpgradeDeclineToOwnershipLost(tk, later))
+		changed, err := stage.UpgradeDeclineToOwnershipLost(tk, later)
+		require.NoError(t, err)
+		require.True(t, changed)
 		require.Equal(t, stage.ReasonOwnershipLost, tk.Status.ParkReason)
 		require.Equal(t, v1alpha1.StateUnderImplementation, tk.Status.State,
 			"the upgrade must not move State")
@@ -238,21 +240,40 @@ func TestUpgradeDeclineToOwnershipLost(t *testing.T) {
 	t.Run("refuses another kind", func(t *testing.T) {
 		tk := taskOfKind(v1alpha1.StateUnderImplementation, "implement")
 		require.NoError(t, stage.Park(tk, stage.ReasonImplementDeclined, now))
-		require.Error(t, stage.UpgradeDeclineToOwnershipLost(tk, later),
-			"on a non-takeover kind implement-declined is a refusal the agent stands behind")
+		_, err := stage.UpgradeDeclineToOwnershipLost(tk, later)
+		require.Error(t, err,
+			"on a non-takeover kind the branch is tatara's own, so a human push is not a hand-back")
 		require.Equal(t, stage.ReasonImplementDeclined, tk.Status.ParkReason)
 	})
 
 	t.Run("refuses another park reason", func(t *testing.T) {
 		tk := taskOfKind(v1alpha1.StateUnderImplementation, "takeover")
 		require.NoError(t, stage.Park(tk, stage.ReasonStageDeadline, now))
-		require.Error(t, stage.UpgradeDeclineToOwnershipLost(tk, later),
+		_, err := stage.UpgradeDeclineToOwnershipLost(tk, later)
+		require.Error(t, err,
 			"every other unresumable park on a takeover is a genuine terminal")
 		require.Equal(t, stage.ReasonStageDeadline, tk.Status.ParkReason)
 	})
 
 	t.Run("refuses an unparked task", func(t *testing.T) {
-		require.Error(t, stage.UpgradeDeclineToOwnershipLost(
-			taskOfKind(v1alpha1.StateUnderImplementation, "takeover"), later))
+		_, err := stage.UpgradeDeclineToOwnershipLost(
+			taskOfKind(v1alpha1.StateUnderImplementation, "takeover"), later)
+		require.Error(t, err)
+	})
+
+	// CONVERGED, NOT MISUSED. Every caller is a converge-by-retry path -
+	// resumeFlipToExternal re-drives an interrupted flip off a CACHED read that
+	// can still say implement-declined after the write landed - so erroring here
+	// would block the retry and double-count the upgrade.
+	t.Run("is a no-op success when already ownership-lost", func(t *testing.T) {
+		tk := taskOfKind(v1alpha1.StateUnderImplementation, "takeover")
+		require.NoError(t, stage.Park(tk, stage.ReasonOwnershipLost, now))
+		stamped := tk.Status.ParkedAt.Time
+
+		changed, err := stage.UpgradeDeclineToOwnershipLost(tk, later)
+		require.NoError(t, err)
+		require.False(t, changed, "a converged Task must not re-count as an upgrade")
+		require.Equal(t, stamped, tk.Status.ParkedAt.Time,
+			"a no-op must not restart the retention window either")
 	})
 }

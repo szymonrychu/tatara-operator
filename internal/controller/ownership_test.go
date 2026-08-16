@@ -597,7 +597,7 @@ func TestReconcileOwnership_ClassifyWithoutLiveHeadDoesNotArmAFalseFlip(t *testi
 	}
 }
 
-// THE DIVERGENCE DECLINE (#604 review round 2).
+// A HUMAN PUSH SUPERSEDES A DECLINED TAKEOVER (#604 review round 2).
 //
 // Routing takeover into `under-implementation` made `declined` a legal action
 // for a takeover pod, and the skill that pod is now REQUIRED to invoke
@@ -606,6 +606,14 @@ func TestReconcileOwnership_ClassifyWithoutLiveHeadDoesNotArmAFalseFlip(t *testi
 // submit_outcome(action="declined"). Both signals are LOCAL git calls, so the
 // pod reaches that verdict long before the operator's own flip does (webhook ->
 // mirror headSHA -> ReconcileOwnership).
+//
+// A DELIBERATE decline is upgraded by the same push, and that is stated rather
+// than argued away: the job text REQUIRES the agent to comment before it
+// declines, so a human reading that comment and pushing a fix is the expected
+// response, not an edge case - and there is no trustworthy signal separating the
+// two declines anyway. The rule the machine actually implements is the merge
+// request's, not the agent's: a takeover is refused resumption while the branch
+// is still tatara's, and stops being refused once it is the human's again.
 //
 // The agent-first order therefore parks the Task implement-declined, and
 // parkOwnerTask used to return early on it - leaving a park that
@@ -637,11 +645,10 @@ func TestReconcileOwnership_UpgradesADeclinedTakeoverParkToOwnershipLost(t *test
 	}
 }
 
-// The upgrade is takeover-only, and DELIBERATELY so: implement-declined on a
-// takeover is the one place the platform itself instructs a decline for a cause
-// that is not a refusal. On any other kind it means what it says - the agent
-// looked at the work and declined it - and a human pushing to a tatara branch
-// afterwards must not reopen that verdict.
+// The upgrade is takeover-only, and DELIBERATELY so. Only a takeover Task is
+// contingent on tatara owning SOMEBODY ELSE'S merge request, so only there does
+// a human push mean "I am taking this back". On any other kind the branch is
+// tatara's own, the push is not a hand-back, and the decline keeps standing.
 func TestReconcileOwnership_LeavesANormalDeclinedOwnerParkedDeclined(t *testing.T) {
 	ctx := context.Background()
 	d, proj, repo := newOwnershipDriver(t, ctx)
@@ -693,4 +700,64 @@ func parkOwnerTaskForTest(t *testing.T, ctx context.Context, task *tatarav1alpha
 	if err := k8sClient.Status().Update(ctx, task); err != nil {
 		t.Fatalf("persist park %s: %v", reason, err)
 	}
+}
+
+// THE UPGRADE IS A CONVERGE-BY-RETRY WRITE, so running it twice must be a
+// no-op success rather than an error. resumeFlipToExternal exists to re-drive an
+// interrupted flip's park+hand-back half, and its Get reads the informer CACHE -
+// which can still say implement-declined after the upgrade's write has landed.
+// Erroring on the second pass would abort that resume BEFORE handBackToReviewTask,
+// blocking the convergence the caller is there to perform, and would double-count
+// the upgrade.
+func TestUpgradeDeclinedTakeoverPark_IsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	d, proj, repo := newOwnershipDriver(t, ctx)
+	mr := seedTataraOwnedMRWithTakeoverTask(t, ctx, proj, repo, 44, "feat/human-44", "bot-head")
+	task := ownerTaskOf(t, ctx, mr)
+	parkOwnerTaskForTest(t, ctx, task, stage.ReasonImplementDeclined)
+	before := testutil.ToFloat64(obs.OwnershipDeclineUpgradedTotal)
+
+	if err := d.upgradeDeclinedTakeoverPark(ctx, proj, task); err != nil {
+		t.Fatalf("first upgrade: %v", err)
+	}
+	// The second call is handed a STALE caller copy on purpose - the shape the
+	// cached Get produces - and must still succeed.
+	stale := ownerTaskOf(t, ctx, mr)
+	stale.Status.ParkReason = stage.ReasonImplementDeclined
+	if err := d.upgradeDeclinedTakeoverPark(ctx, proj, stale); err != nil {
+		t.Fatalf("second upgrade on a converged Task must be a no-op success, got %v", err)
+	}
+	if after := testutil.ToFloat64(obs.OwnershipDeclineUpgradedTotal); after-before != 1 {
+		t.Fatalf("the upgrade counter must fire once per real upgrade, got %v", after-before)
+	}
+	if got := ownerTaskOf(t, ctx, mr); got.Status.ParkReason != stage.ReasonOwnershipLost {
+		t.Fatalf("park reason = %q after two passes", got.Status.ParkReason)
+	}
+}
+
+// A kind the upgrade does not apply to is refused BEFORE any write, so an
+// exported caller is never handed an error after a status update it cannot see.
+func TestUpgradeDeclinedTakeoverPark_RefusesBeforeWriting(t *testing.T) {
+	ctx := context.Background()
+	d, proj, repo := newOwnershipDriver(t, ctx)
+	mr := seedTataraOwnedMRWithNormalTask(t, ctx, proj, repo, 45, "tatara/feat-45", "bot-head")
+	name := tatarav1alpha1.IntakeTaskName(proj.Name, SweepIssueKind, repo.Name, 45)
+	var task tatarav1alpha1.Task
+	if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: proj.Namespace, Name: name}, &task); err != nil {
+		t.Fatalf("get owner task: %v", err)
+	}
+	parkOwnerTaskForTest(t, ctx, &task, stage.ReasonImplementDeclined)
+	rv := task.ResourceVersion
+
+	if err := d.upgradeDeclinedTakeoverPark(ctx, proj, &task); err == nil {
+		t.Fatal("a non-takeover kind must be refused")
+	}
+	var got tatarav1alpha1.Task
+	if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: proj.Namespace, Name: name}, &got); err != nil {
+		t.Fatalf("re-get: %v", err)
+	}
+	if got.ResourceVersion != rv {
+		t.Fatalf("a refusal must not write: resourceVersion moved %s -> %s", rv, got.ResourceVersion)
+	}
+	_ = mr
 }

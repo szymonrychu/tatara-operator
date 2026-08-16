@@ -222,24 +222,42 @@ func repark(t *v1alpha1.Task, reason string, now time.Time) {
 // cannot re-drive an approved external head, and a merge request a human simply
 // took back is stuck until ParkRetention.
 //
-// The upgrade is what makes a DIVERGENCE decline distinct from a DELIBERATE one
-// without asking the agent to say which it was, and without parsing free text:
-// the distinction is made by the world. A deliberate decline is never followed
-// by an ownership flip, so it keeps implement-declined and stays terminal. A
-// divergence decline is followed by one BY DEFINITION - the push the agent saw
-// is the push the flip is reacting to.
+// THE RULE IS "A HUMAN PUSH SUPERSEDES A DECLINED TAKEOVER", NOT "A DIVERGENCE
+// DECLINE IS TOLD APART FROM A DELIBERATE ONE". The first draft of this claimed
+// the second, and it is FALSE: the job text requires the agent to comment on the
+// merge request explaining itself before it declines, so the expected human
+// response to a DELIBERATE decline is to read that comment and push a fix - and
+// that push flips ownership exactly like a divergence does. There is no signal
+// that separates the two. The agent's decline_reason is free text and cannot be
+// trusted with the question, and a trustworthy one would be a new outcome field,
+// i.e. an API change and its own design call.
 //
-// NARROW ON BOTH AXES, because both narrowings are load-bearing:
+// So the discriminator is not intent, it is the merge request: a takeover Task
+// is refused resumption for as long as the branch is still tatara's, and stops
+// being refused the moment it is the human's again. That is the right rule
+// anyway, and it is the one the rest of the machine already follows - it is what
+// UnparkTakeover's targets, DrainStandDownMerge and the whole stand-down path
+// are keyed on. The alternative, refusing a takeover forever on a merge request
+// its author has since moved on, is #604's own failure shape with a different
+// label on it.
 //
-//   - kind=takeover only. On any other kind implement-declined means what it
-//     says, and a human pushing to a tatara branch afterwards must not reopen a
-//     refusal the agent stands behind.
+// So a DELIBERATE decline is terminal until the human pushes, and resumable
+// after. That is a behaviour change on the decline, stated plainly rather than
+// smuggled in under an invariant that does not hold, and it includes
+// DrainStandDownMerge being able to merge - on an approved review of the HUMAN's
+// head - a merge request an earlier turn declined.
+//
+// NARROW ON BOTH AXES ANYWAY, because both narrowings still are load-bearing:
+//
+//   - kind=takeover only. Only a takeover's Task is CONTINGENT on tatara owning
+//     somebody else's merge request; on any other kind the branch is tatara's
+//     own, so a human pushing to it is not "taking it back" and must not reopen
+//     a refusal the agent stands behind.
 //   - implement-declined only. Every other UnparkNever park on a takeover is a
 //     genuine terminal (an exhaustion cap, an operator error, a contract
-//     mismatch), and a human push must not launder it into a resumable one.
-//     That is also what keeps restapi.mrTakeover's 409 gate alive: it now fires
-//     for those reasons, having stopped catching the case that was never a
-//     refusal in the first place.
+//     mismatch) reached without any judgement about the merge request at all,
+//     and a human push must not launder one into a resumable Task. That is also
+//     what keeps restapi.mrTakeover's 409 gate alive rather than dead.
 //
 // It is NOT repark: repark clears and re-Parks, and Park folds the elapsed
 // residency into StageElapsedCarrySeconds. Re-folding here would charge the
@@ -248,18 +266,28 @@ func repark(t *v1alpha1.Task, reason string, now time.Time) {
 // stamp move; ParkedFromState, StateEnteredAt and the carry are untouched. The
 // stamp DOES move, so the maintainer gets a full ParkRetention window from the
 // moment the branch actually came back, exactly as a fresh park would have.
-func UpgradeDeclineToOwnershipLost(t *v1alpha1.Task, now time.Time) error {
+//
+// changed is false, with no error, when the Task is ALREADY parked
+// ownership-lost. That is a converged state, not a misuse: every caller is a
+// converge-by-retry path (resumeFlipToExternal exists to re-drive an interrupted
+// flip, and its Get reads a CACHE that can still say implement-declined after
+// the write landed), so erroring there would block the very retry the caller is
+// making and would double-count the upgrade.
+func UpgradeDeclineToOwnershipLost(t *v1alpha1.Task, now time.Time) (bool, error) {
 	if t.Spec.Kind != kindTakeover {
-		return fmt.Errorf("decline upgrade is takeover-only, got kind %q", t.Spec.Kind)
+		return false, fmt.Errorf("decline upgrade is takeover-only, got kind %q", t.Spec.Kind)
+	}
+	if t.Status.ParkReason == ReasonOwnershipLost {
+		return false, nil // already converged
 	}
 	if t.Status.ParkReason != ReasonImplementDeclined {
-		return fmt.Errorf("decline upgrade requires parkReason=%s, got %q",
+		return false, fmt.Errorf("decline upgrade requires parkReason=%s, got %q",
 			ReasonImplementDeclined, t.Status.ParkReason)
 	}
 	stamp := metav1.NewTime(now)
 	t.Status.ParkReason = ReasonOwnershipLost
 	t.Status.ParkedAt = &stamp
-	return nil
+	return true, nil
 }
 
 // takeoverTargets is UnparkTakeover's OWN allow-list, and it is deliberately
