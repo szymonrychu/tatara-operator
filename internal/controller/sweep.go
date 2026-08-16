@@ -2092,8 +2092,8 @@ func taskStillPushes(t *tatarav1alpha1.Task) bool {
 // "nobody" for the one case where deleting destroys live work.
 //
 // parked counts as LIVE even though TaskDone calls it terminal: a
-// parked(ownership-lost) takeover Task is re-entered into approved by a
-// maintainer's "take over" comment and RESUMES PUSHING to that same branch.
+// parked(ownership-lost) takeover Task is re-entered into under-implementation
+// by a maintainer's "take over" comment and RESUMES PUSHING to that same branch.
 // Only delivered/failed/rejected are past pushing.
 func (r *ProjectReconciler) liveTaskPushingTo(ctx context.Context, proj *tatarav1alpha1.Project, branch, exclude string) (string, error) {
 	if branch == "" {

@@ -218,13 +218,100 @@ func (h *takeoverHarness) seedParkedTakeoverTask(t *testing.T, number int) {
 		t.Fatalf("create parked takeover task: %v", err)
 	}
 	entered := metav1.NewTime(takeoverFrozenNow)
-	task.Status.State = tatarav1alpha1.StateRefined
+	task.Status.State = tatarav1alpha1.StateUnderImplementation
 	task.Status.StateEnteredAt = &entered
+	// mrRefs is POPULATED, because a Task cannot reach parked(ownership-lost)
+	// without having completed a mint first: bindMRToTask and the mrRefs stamp
+	// both ran, then it worked, then a human pushed and stood it down. Seeding
+	// it empty would describe an INTERRUPTED mint instead, which #604 made the
+	// un-park path repair - and that repair writes to the MR, which is exactly
+	// what the two error-metric tests below need this branch not to do.
+	task.Status.MRRefs = []string{tatarav1alpha1.MergeRequestName(h.repo.Name, number)}
 	if err := stage.Park(task, stage.ReasonOwnershipLost, takeoverFrozenNow); err != nil {
 		t.Fatalf("park takeover task: %v", err)
 	}
 	if err := h.c.Status().Update(ctx, task); err != nil {
 		t.Fatalf("park takeover task: %v", err)
+	}
+}
+
+// seedUnresumableTakeoverTask seeds a takeover Task parked for an UnparkNever
+// reason that is NOT ownership-lost, still controller-owning its (tatara-owned)
+// merge request. MintOrUnparkTakeoverTask un-parks on ownership-lost and nothing
+// else, so this Task will never run again - and before #604 the endpoint
+// answered a re-take on it with 200.
+//
+// It takes the reason as a parameter rather than assuming implement-declined,
+// because that one is no longer a member of the set once a human has pushed:
+// the flip upgrades it to ownership-lost (see
+// stage.UpgradeDeclineToOwnershipLost). Callers that want the DIVERGENCE shape
+// seed implement-declined here and then apply that upgrade.
+func (h *takeoverHarness) seedUnresumableTakeoverTask(t *testing.T, number int, reason string) *tatarav1alpha1.Task {
+	t.Helper()
+	ctx := context.Background()
+	name := takeoverTaskName(h.proj, h.repo, number)
+	task := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: takeoverNS},
+		Spec: tatarav1alpha1.TaskSpec{
+			ProjectRef: h.proj.Name, RepositoryRef: h.repo.Name, Kind: "takeover",
+			Goal: "take over", MergeOrder: []string{h.repo.Name},
+		},
+	}
+	if err := h.c.Create(ctx, task); err != nil {
+		t.Fatalf("create declined takeover task: %v", err)
+	}
+	entered := metav1.NewTime(takeoverFrozenNow)
+	task.Status.State = tatarav1alpha1.StateUnderImplementation
+	task.Status.StateEnteredAt = &entered
+	task.Status.MRRefs = []string{tatarav1alpha1.MergeRequestName(h.repo.Name, number)}
+	if err := stage.Park(task, reason, takeoverFrozenNow); err != nil {
+		t.Fatalf("park takeover task %s: %v", reason, err)
+	}
+	if err := h.c.Status().Update(ctx, task); err != nil {
+		t.Fatalf("park takeover task: %v", err)
+	}
+
+	// The declined takeover still controller-owns the MR, and the MR is still
+	// tatara-owned: a decline flips NOTHING back (ownership.go's flipToExternal
+	// fires on a human PUSH, not on an outcome).
+	mr := h.getMR(t, number)
+	if err := controller.MutateOwnerRefs(ctx, h.c, mr, func(fresh *tatarav1alpha1.MergeRequest) error {
+		own.AddPlainOwner(fresh, task)
+		return own.HandOverController(fresh, h.task(t, "review-task"), task)
+	}); err != nil {
+		t.Fatalf("hand MR to the declined takeover task: %v", err)
+	}
+	mr = h.getMR(t, number)
+	mr.Status.Ownership = tatarav1alpha1.OwnershipTatara
+	mr.Status.OwnershipReason = "takeover-requested-by:alice"
+	if err := h.c.Status().Update(ctx, mr); err != nil {
+		t.Fatalf("stamp tatara ownership: %v", err)
+	}
+	return task
+}
+
+// handBackToReviewTask replays what a HUMAN PUSH does to a parked takeover:
+// flipToExternal stamps ownership `external` and handBackToReviewTask moves the
+// MR's controller ref off the parked Task and onto the review Task. Crucially it
+// does NOT touch the park reason - parkOwnerTask returns early on an
+// already-parked Task - which is what leaves an implement-declined takeover
+// sitting behind an MR the review agent now drives.
+func (h *takeoverHarness) handBackToReviewTask(t *testing.T, number int, from *tatarav1alpha1.Task) {
+	t.Helper()
+	ctx := context.Background()
+	mr := h.getMR(t, number)
+	review := h.task(t, "review-task")
+	if err := controller.MutateOwnerRefs(ctx, h.c, mr, func(fresh *tatarav1alpha1.MergeRequest) error {
+		own.AddPlainOwner(fresh, review)
+		return own.HandOverController(fresh, from, review)
+	}); err != nil {
+		t.Fatalf("hand back to the review task: %v", err)
+	}
+	mr = h.getMR(t, number)
+	mr.Status.Ownership = tatarav1alpha1.OwnershipExternal
+	mr.Status.OwnershipReason = "external-push"
+	if err := h.c.Status().Update(ctx, mr); err != nil {
+		t.Fatalf("stamp external ownership: %v", err)
 	}
 }
 
@@ -417,6 +504,172 @@ func TestMRTakeover_AlreadyTataraIsIdempotent(t *testing.T) {
 	ctrl, ok := ownerControllerName(got)
 	if !ok || ctrl != "review-task" {
 		t.Fatalf("idempotent no-op must not move controller ownership, got %q", ctrl)
+	}
+}
+
+// A RE-TAKE ON A TASK THAT CAN NEVER RESUME IS A 409, NOT A 200 (#604).
+//
+// Routing takeover into under-implementation made its DECLINE terminal
+// reachable: `declined` parks(implement-declined), which is UnparkNever, and
+// mintOrUnparkTakeoverTask un-parks on ownership-lost ONLY. Nothing flips the
+// merge request back either - flipToExternal fires on a human PUSH. So the
+// maintainer's second "take over" comment used to be answered with 200 by the
+// already-tatara idempotent branch while nothing whatsoever happened, forever.
+// The endpoint now says so.
+// THE SHAPE THIS ACTUALLY FIRES ON. An unresumable takeover controller-owns its
+// merge request and runs no pod, so nothing can reach this endpoint until the
+// HUMAN PUSHES. That push runs flipToExternal -> parkOwnerTask and then hands
+// the controller ref to a review Task. The review agent is therefore the caller,
+// with ownership back at `external`, and the parked takeover Task is still
+// sitting there unresumable.
+//
+// The reason here is stage-deadline, NOT implement-declined, and that is the
+// whole point of the round-2 fix: parkOwnerTask now UPGRADES a takeover's
+// implement-declined park to ownership-lost on the flip, so the shape this test
+// used to seed cannot survive a human push any more. What is left for the gate
+// is the set of genuine terminals - exhaustion caps, operator errors, contract
+// mismatches - which a push must not launder into a resumable Task.
+//
+// Seeded as tatara-owned-and-posting-as-the-takeover (the other case below) the
+// gate is still exercised, but through the already-tatara branch - so a refactor
+// that folded the check into that branch would keep the other test green while
+// leaving THIS path broken. Both are pinned deliberately.
+func TestMRTakeover_RefusesReTakeAfterTheHumanTookTheBranchBack(t *testing.T) {
+	h := newTakeoverHarness(t)
+	tk := h.seedUnresumableTakeoverTask(t, 9, stage.ReasonStageDeadline)
+	h.handBackToReviewTask(t, 9, tk)
+	before := testutil.ToFloat64(obs.RestTakeoverRefusedTotal.WithLabelValues(stage.ReasonStageDeadline))
+
+	rr := h.post(t, `{"repo":"repo-a","number":9,"commentExternalId":"10","task":"review-task"}`)
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("a re-take routed through the review Task after a hand-back must be 409, got %d: %s",
+			rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), stage.ReasonStageDeadline) {
+		t.Fatalf("the 409 must name the park reason, got %s", rr.Body.String())
+	}
+	// The endpoint's only PERMANENT refusal must be countable. It is otherwise
+	// invisible to every takeover query, which is how a maintainer-facing dead
+	// end goes unnoticed for a month.
+	if after := testutil.ToFloat64(obs.RestTakeoverRefusedTotal.WithLabelValues(stage.ReasonStageDeadline)); after-before != 1 {
+		t.Fatalf("the permanent refusal must increment operator_rest_takeover_refused_total{reason=%q}",
+			stage.ReasonStageDeadline)
+	}
+	// The MR must NOT have been flipped back to tatara on a refusal.
+	if got := h.getMR(t, 9); got.Status.Ownership == tatarav1alpha1.OwnershipTatara {
+		t.Fatalf("a refused re-take must not flip ownership to tatara")
+	}
+	if got := h.task(t, tk.Name); got.Status.ParkReason != stage.ReasonStageDeadline {
+		t.Fatalf("a refused re-take must not mutate the parked Task, reason = %q", got.Status.ParkReason)
+	}
+}
+
+// THE ORDINARY STAND-DOWN, DECLINED AGENT-FIRST, STILL RESUMES (#604 review).
+//
+// This is the end of the chain the round-2 review found: the takeover skill
+// tells the pod to decline on a divergence, the pod's git signal beats the
+// operator's webhook-driven flip, and the resulting implement-declined park was
+// UnparkNever. controller.UpgradeDeclinedTakeoverPark is the flip's write for
+// exactly that case (internal/controller pins that parkOwnerTask performs it);
+// this pins the OTHER joint - that what it produces is a Task this endpoint
+// resumes rather than refuses.
+func TestMRTakeover_ResumesAfterADivergenceDecline(t *testing.T) {
+	h := newTakeoverHarness(t)
+	tk := h.seedUnresumableTakeoverTask(t, 9, stage.ReasonImplementDeclined)
+	if err := controller.UpgradeDeclinedTakeoverPark(context.Background(), h.c, nil, tk, takeoverFrozenNow); err != nil {
+		t.Fatalf("upgrade the declined park: %v", err)
+	}
+	h.handBackToReviewTask(t, 9, tk)
+
+	rr := h.post(t, `{"repo":"repo-a","number":9,"commentExternalId":"10","task":"review-task"}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("a re-take after a DIVERGENCE decline must resume, got %d: %s", rr.Code, rr.Body.String())
+	}
+	got := h.task(t, tk.Name)
+	if tatarav1alpha1.Parked(got) {
+		t.Fatalf("the re-take must clear the park, still %q", got.Status.ParkReason)
+	}
+	if got.Status.State != tatarav1alpha1.StateUnderImplementation {
+		t.Fatalf("a resumed takeover pushes again from under-implementation, got %q", got.Status.State)
+	}
+}
+
+func TestMRTakeover_RefusesReTakeOnAnUnresumableParkedTask(t *testing.T) {
+	// One per UnparkClass that cannot resume: UnparkNever, and the O3 migration
+	// class UnparkRetired - which an `== UnparkNever` test would have missed.
+	for _, reason := range []string{
+		stage.ReasonImplementDeclined,
+		stage.ReasonStageDeadline,
+		stage.ReasonTurnBudgetExhausted,
+	} {
+		t.Run(reason, func(t *testing.T) {
+			h := newTakeoverHarness(t)
+			tk := h.seedUnresumableTakeoverTask(t, 9, reason)
+
+			// The caller is the takeover Task itself: it is the MR's controller
+			// owner by now, which is what the ownership gate requires.
+			rr := h.post(t, `{"repo":"repo-a","number":9,"commentExternalId":"10","task":"`+tk.Name+`"}`)
+			if rr.Code != http.StatusConflict {
+				t.Fatalf("re-take on a parked(%s) takeover must be 409, got %d: %s",
+					reason, rr.Code, rr.Body.String())
+			}
+			if !strings.Contains(rr.Body.String(), reason) {
+				t.Fatalf("the 409 must name the park reason that blocks the resume, got %s", rr.Body.String())
+			}
+			got := h.task(t, tk.Name)
+			if got.Status.ParkReason != reason {
+				t.Fatalf("a refused re-take must not mutate the parked Task, reason = %q", got.Status.ParkReason)
+			}
+		})
+	}
+}
+
+// A park a HUMAN can clear is not refused: those genuinely do resume.
+//
+// Seeded THROUGH THE HAND-BACK, not as the already-tatara idempotent no-op.
+// Posting as the parked takeover Task itself with ownership still at tatara
+// short-circuits at the idempotent branch and never reaches the mint, so it
+// would pin only "the gate does not fire" and nothing about the claim the gate's
+// carve-out actually makes - that an UnparkHuman park is a Task the mint is
+// still willing to bind. This is the same caller shape the refusal test uses
+// (the review Task, ownership back at external), which is what makes the two a
+// matched pair.
+func TestMRTakeover_DoesNotRefuseAHumanClearablePark(t *testing.T) {
+	h := newTakeoverHarness(t)
+	tk := h.seedUnresumableTakeoverTask(t, 9, stage.ReasonAwaitingHuman)
+	h.handBackToReviewTask(t, 9, tk)
+
+	rr := h.post(t, `{"repo":"repo-a","number":9,"commentExternalId":"10","task":"review-task"}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("parked(awaiting-human) clears on a human comment and must NOT be refused, got %d: %s",
+			rr.Code, rr.Body.String())
+	}
+	// The park is NOT cleared by this call - a LATER comment does that, once the
+	// mint has routed control back to the takeover Task. What must be true is
+	// that the take-over itself went through.
+	if got := h.getMR(t, 9); got.Status.Ownership != tatarav1alpha1.OwnershipTatara {
+		t.Fatalf("a non-refused re-take must flip ownership to tatara, got %q", got.Status.Ownership)
+	}
+	if ctrl, ok := ownerControllerName(h.getMR(t, 9)); !ok || ctrl != tk.Name {
+		t.Fatalf("the mint must hand control back to the takeover task, got %q", ctrl)
+	}
+}
+
+// The ownership-lost park is the one that DOES resume, and it must keep
+// answering 200 - it is the whole re-take path.
+func TestMRTakeover_OwnershipLostParkStillResumes(t *testing.T) {
+	h := newTakeoverHarness(t)
+	h.seedParkedTakeoverTask(t, 9)
+	rr := h.post(t, `{"repo":"repo-a","number":9,"commentExternalId":"10","task":"review-task"}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("a re-take on parked(ownership-lost) must resume, got %d: %s", rr.Code, rr.Body.String())
+	}
+	got := h.task(t, takeoverTaskName(h.proj, h.repo, 9))
+	if tatarav1alpha1.Parked(got) {
+		t.Fatalf("the re-take must clear the park, still %q", got.Status.ParkReason)
+	}
+	if got.Status.State != tatarav1alpha1.StateUnderImplementation {
+		t.Fatalf("the re-take must land at under-implementation, got %q", got.Status.State)
 	}
 }
 

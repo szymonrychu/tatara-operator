@@ -1,9 +1,11 @@
 package restapi
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -12,6 +14,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/own"
+	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
 // mrTakeoverReq is the wire contract for POST /projects/{p}/scm/mr-takeover -
@@ -31,6 +34,64 @@ type mrTakeoverReq struct {
 // naming scheme.
 func takeoverTaskName(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, number int) string {
 	return controller.TakeoverTaskName(proj, repo, number)
+}
+
+// liveTakeoverTask reads the ONE deterministic takeover Task for (proj, repo,
+// number), if it exists. found=false means no takeover has ever been minted for
+// this merge request, which is the ordinary first-take case.
+func (s *Server) liveTakeoverTask(ctx context.Context, proj *tatarav1alpha1.Project,
+	repo *tatarav1alpha1.Repository, number int) (*tatarav1alpha1.Task, bool, error) {
+
+	var task tatarav1alpha1.Task
+	key := types.NamespacedName{Namespace: s.ns, Name: takeoverTaskName(proj, repo, number)}
+	err := s.c.Get(ctx, key, &task)
+	if apierrors.IsNotFound(err) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return &task, true, nil
+}
+
+// unresumableTakeoverPark reports whether t is parked in a way NOTHING will
+// clear: not this endpoint, not a human comment, not a timer.
+//
+// implement-declined is the member that matters and the reason this exists: see
+// the decline-terminal note on controller.MintOrUnparkTakeoverTask.
+//
+// THE ownership-lost EARLY RETURN IS LOAD-BEARING, NOT DEFENSIVE. That reason is
+// ITSELF UnparkNever (stage/park.go) - it is special only because
+// MintOrUnparkTakeoverTask has an explicit arm for it. Delete this line as
+// redundant and every re-take, the whole point of the endpoint, starts 409ing.
+//
+// The class test is stated as "not the two that DO resume" rather than
+// "== UnparkNever", because there are FOUR classes, and an == UnparkNever test
+// would silently answer an UnparkRetired park 200 and do nothing - the exact
+// behaviour this gate exists to eliminate.
+//
+// UnparkRetired IS THE ONE PLACE THE REFUSAL IS NOT EXACT, and this used to
+// claim otherwise ("a takeover carrying one is just as stuck"). It is not
+// quite: driveRetiredUnparks skips on the migration ANNOTATION, not on the
+// kind, so an unstamped Task inside its 48h window does get released, and for
+// those three reasons the 409 - and the ParkRetention remedy it names - is
+// pessimistic. Left as is deliberately: that sweep is a one-shot migration
+// nearly done, no takeover Task has ever existed (MEMORY.md's dead-path
+// queries), and the failure direction is a maintainer told to wait rather than
+// a merge request silently stranded.
+//
+// An UNKNOWN reason (ok==false) is deliberately NOT refused: refusing a
+// maintainer's takeover on a reason we cannot classify is the worse error of
+// the two.
+func unresumableTakeoverPark(t *tatarav1alpha1.Task) bool {
+	if t == nil || !tatarav1alpha1.Parked(t) {
+		return false
+	}
+	if t.Status.ParkReason == stage.ReasonOwnershipLost {
+		return false // THE re-take path
+	}
+	class, ok := stage.UnparkClassFor(t.Status.ParkReason)
+	return ok && class != stage.UnparkHuman && class != stage.UnparkTimer
 }
 
 // mrTakeover is the consumer end of the OP6 (webhook fast path) / OP12 (sweep
@@ -122,6 +183,166 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// #604. REFUSE a re-take the mint cannot act on, BEFORE the idempotent
+	// branch below can answer it 200.
+	//
+	// MintOrUnparkTakeoverTask un-parks on ReasonOwnershipLost and NOTHING else.
+	// A takeover parked for any other UnparkNever reason is a Task that will
+	// never run again, and nothing here hands the merge request back either: the
+	// only thing that TAKES ownership back from tatara is ownership.go's
+	// flipToExternal, driven by a HUMAN PUSH. (Not "the only writer of
+	// Ownership=external" - ReconcileOwnership's classification backfill writes
+	// that value too, but only onto a mirror that was never classified, which a
+	// taken-over one never is.) Left at 200 the maintainer is told their take-over
+	// succeeded while the MR sits controller-owned by a dead Task, which is
+	// precisely the stranded shape #604 is about - just moved one state right.
+	//
+	// WHAT IS AND IS NOT IN THIS SET, because the answer moved during #604's own
+	// review. implement-declined was this gate's headline example, since routing
+	// takeover into under-implementation made a decline reachable - but the skill
+	// that turn is required to invoke declines on an ORDINARY STAND-DOWN too, so
+	// the gate was refusing the most routine event in a takeover's life. That is
+	// fixed where it belongs, in the flip: parkOwnerTask upgrades a takeover's
+	// implement-declined park to ownership-lost, via the exported
+	// stage.UpgradeDeclineToOwnershipLost. So the rule a declined takeover
+	// actually follows is TERMINAL WHILE THE BRANCH IS STILL TATARA'S, RESUMABLE
+	// ONCE IT IS THE HUMAN'S AGAIN - deliberate declines included. "A deliberate
+	// decline is never followed by a flip" is FALSE and must not be reinstated
+	// here: the takeover job text requires the agent to comment on the merge
+	// request explaining itself before declining, so a maintainer reading that
+	// comment and pushing a fix is the EXPECTED response, and that push flips
+	// ownership exactly as a divergence does.
+	//
+	// THE PREDICATE DOES NOT CARVE OUT implement-declined. Within the two classes
+	// it refuses, ownership-lost is the only reason it lets through, and this
+	// gate still 409s an implement-declined park. That is pinned by
+	// TestMRTakeover_RefusesReTakeOnAnUnresumableParkedTask, though only by
+	// posting as the parked Task itself, which the reachable-shape note below
+	// reads as a narrow race rather than the ordinary path. What removes the
+	// ordinary one is UPSTREAM:
+	// nothing can call here until the human pushes, and that push has already
+	// rewritten the reason. Rounds 5 and 6 of #604's review both described the
+	// carve-out as this predicate's own; reconciling
+	// unresumableTakeoverPark to that reading means deleting its ownership-lost
+	// early return, and every legitimate re-take then 409s.
+	//
+	// AND THE TEST IS FACTUAL, NOT NORMATIVE - "nothing here will clear this
+	// park", not "this park is a verdict a human push must not launder". That
+	// gloss stood here as "every member is reached without any judgement about
+	// the merge request at all"; it is FALSE and must not come back. ci-red is
+	// counterexample enough: enterCIRed writes it off the merge request's own
+	// pipeline verdict.
+	//
+	// DO NOT REPLACE IT WITH A CENSUS of which reasons are merge-request-derived.
+	// Two review passes over this comment produced two different lists and both
+	// were wrong - merge-blocked reads only its own re-entry counter, and
+	// review-post-refused is a forge 4xx to tatara's own POST, i.e. the very
+	// "operator error" category the gloss named. Retiring a universal claim takes
+	// ONE counterexample; a list of them is a second thing to keep true, and this
+	// block has now cost more rounds to that than to any behaviour.
+	//
+	// The gate does not need the reasons to mean anything, because the fact
+	// holds for the UnparkNever class: MintOrUnparkTakeoverTask and
+	// DrainStandDownMerge fire on ownership-lost only, stage.Unpark declines the
+	// class, and UnparkForMRTerminal - which does ignore the park reason - only
+	// ever clears INTO a terminal, never into a resumable Task. It is NOT exact
+	// for UnparkRetired; unresumableTakeoverPark owns that caveat.
+	//
+	// WHAT MAKES THE ParkRetention REMEDY BELOW TRUE IS THE ZERO-ISSUE PROPERTY,
+	// not the park reason - and it is the part that does not generalise.
+	// driveStrandedParks and resumeNoReentryParks are what otherwise rescue an
+	// UnparkNever park, and neither resumes nor re-mints a Task owning no Issue
+	// mirror, which a takeover always is. For a kind that DOES own one the same
+	// sentence would be wrong: driveStrandedParks collects on a 30-minute grace.
+	//
+	// UnparkHuman reasons (awaiting-human and friends) are deliberately NOT
+	// refused: those parks DO clear on a human comment. Note the timing though -
+	// comment routing goes to the MR's CONTROLLER OWNER, which in the shape
+	// below is still the review Task, so it is a LATER comment that un-parks the
+	// takeover, not the one that triggered this call. 200 is right; the reason is
+	// "this park is clearable", not "this call clears it".
+	//
+	// THE REACHABLE SHAPE, spelled out because the ownership gate above hides it:
+	// an unresumable takeover still controller-owns its merge request and runs no
+	// pod, so nothing can call this endpoint at all until the human PUSHES. That
+	// push runs flipToExternal -> parkOwnerTask, which rewrites an
+	// implement-declined park to ownership-lost and leaves every OTHER park
+	// reason untouched (the carve-out is parkOwnerTask's, NOT this predicate's -
+	// see above) - and then hands the controller ref to a review Task. THAT
+	// review agent is the caller here, with ownership back at
+	// `external` - which is why this gate sits ahead of the already-tatara branch
+	// AND ahead of the flip, rather than inside either.
+	//
+	// THAT IS THE ORDINARY SHAPE, NOT THE ONLY ONE, and "runs no pod" is not a
+	// guarantee. transition.go writes the park status and tears the wrapper down
+	// as two steps, and livepods.go meters and REPAIRS the residue
+	// (ParkedWithLivePodRepaired), so a just-parked takeover's in-flight turn can
+	// still call here - as the controller owner, with ownership still `tatara`.
+	// This endpoint has no parked-caller guard, where outcome.go and
+	// handlers_v2.go both refuse one. That is why the remedy below names BOTH
+	// halves instead of assuming the push has already happened. Adding the guard
+	// is deliberately NOT done in #604: it changes who may call a
+	// maintainer-facing endpoint, and it wants the caller-identity question
+	// (`task` is a request field, not the authenticated subject) answered with
+	// it.
+	if existing, found, err := s.liveTakeoverTask(ctx, proj, repo, req.Number); err != nil {
+		s.log.ErrorContext(ctx, "restapi: read existing takeover task failed",
+			append(reqLogFields(r), "mr", mr.Name, "error", err)...)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	} else if found && unresumableTakeoverPark(existing) {
+		// The endpoint's ONLY permanent refusal, and therefore the one that most
+		// needs a series: a merge request nobody can take over until ParkRetention
+		// collects the Task. Every sibling outcome here counts (the ownership 409,
+		// the three write 500s); a WarnContext alone is invisible to the takeover
+		// queries anyone runs before trusting a claim about this path.
+		obs.RestTakeoverRefusedTotal.WithLabelValues(existing.Status.ParkReason).Inc()
+		s.log.WarnContext(ctx, "restapi: takeover requested on a parked task that can never resume",
+			append(reqLogFields(r), "action", "mr_takeover_unresumable", "resource_id", mr.Name,
+				"user", cmt.Author, "task", existing.Name, "park_reason", existing.Status.ParkReason)...)
+		// THE PUSH IS THE HALF THAT IS TRUE FOR EVERY REASON, so it leads.
+		// Whatever becomes of this Task, no route back exists while the mirror
+		// is still marked `tatara`, and flipToExternal is what un-marks it.
+		//
+		// ParkRetention is the SECOND half and only sometimes: the push that
+		// un-marks the mirror also rewrites an implement-declined park to
+		// ownership-lost (parkOwnerTask), after which this very Task can resume
+		// with no wait and nothing collected. THE PUSH RESUMES NOTHING BY ITSELF,
+		// which is why the string says push AND ask again:
+		// UpgradeDeclineToOwnershipLost rewrites the reason and leaves the Task
+		// parked, and the un-park a REQUEST reaches is MintOrUnparkTakeoverTask's
+		// ownership-lost arm. That arm is not the only un-park of the rewritten
+		// park - DrainStandDownMerge re-drives it off an approved review of the
+		// human's head, as the ownership-lost early return above already says - so
+		// this is the remedy for a maintainer who is asking, NOT the only way the
+		// Task comes back. For a park the push does not rewrite,
+		// collection has to happen too - and unresumableTakeoverPark's doc block
+		// owns the exceptions to "collection is what ends it", so do not restate
+		// them here.
+		//
+		// WHAT THIS STRING NO LONGER PROMISES, per #604's round 7: that
+		// collection ALONE restores the take-over. reapParked has no
+		// keep-it-while-the-merge-request-is-open rule (see flipToExternal's doc
+		// block), releaseOwnership DROPS the mirror's owner ref rather than
+		// cascading it, and nothing on that path rewrites Status.Ownership. So a
+		// mirror collected while still marked `tatara` is stranded: as soon as
+		// anything re-mints a controller owner onto it, the next request takes
+		// the already-tatara branch below and is answered 200 having minted
+		// nothing, which is the "yes, then nothing happens" shape this gate
+		// exists to remove. Filed as #615; NOT fixed here.
+		writeError(w, http.StatusConflict,
+			"the takeover task for this merge request is parked "+existing.Status.ParkReason+
+				" and can never resume: only parked(ownership-lost) re-takes. Push to the branch, "+
+				"then ask again: the push marks the merge request yours again, which every route "+
+				"back needs, and for a take-over that was declined, asking again then resumes "+
+				"it - the push on its own only makes it resumable. For any other park the "+
+				"task must also age out at ParkRetention first - collection on its own does not "+
+				"restore the take-over, because it does not change who the merge request is "+
+				"marked for. The merge request "+
+				"is yours to work on in the meantime")
+		return
+	}
+
 	// Idempotent no-op: ownership is already tatara, so there is nothing to
 	// take over (a repeat "take over" comment after a prior takeover already
 	// succeeded, or a stray one on an MR tatara has authored from the start).
@@ -170,8 +391,8 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 	// Move (or re-assert) the MR mirror's controller ownership onto the
 	// takeover Task. A fresh mint above already did this atomically (via
 	// bindMRToTask, handed expectFrom); a re-take (an existing
-	// parked(ownership-lost) Task just re-entered approved) has not -
-	// MintOrUnparkTakeoverTask never touches owner refs on that branch. Re-Get
+	// parked(ownership-lost) Task just re-entered under-implementation) has
+	// not - MintOrUnparkTakeoverTask never touches owner refs on that branch. Re-Get
 	// and skip when already converged, so the fresh-mint path costs exactly
 	// the one Update the mint itself made - no redundant second Update on top
 	// of an atomic handover that already landed.
@@ -236,7 +457,10 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 	// same value so the mirror does not itself go stale relative to the SHA
 	// this flip is keyed on. A later real human push still moves the live
 	// head off this baseline and stands the MR down correctly; the takeover
-	// agent's own push refreshes this same field again at outcome accept.
+	// agent's own push refreshes this same field again at outcome accept - but
+	// only on the SUBMITTED path, so a turn that pushes and then declines leaves
+	// this seed in place and depends on the synchronize webhook to advance it.
+	// See controller/ownership.go's parkOwnerTask for what that costs.
 	if err := objbudget.FitMergeRequest(ctx, s.c, sp, key, func(m *tatarav1alpha1.MergeRequest) {
 		m.Status.Ownership = tatarav1alpha1.OwnershipTatara
 		m.Status.OwnershipReason = "takeover-requested-by:" + cmt.Author

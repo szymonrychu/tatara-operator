@@ -94,9 +94,11 @@ func TestMintAdoptedUpgradeTask_IsIdempotentPerMergeRequest(t *testing.T) {
 //   - under-implementation would pay an upgrade turn on every adopted merge
 //     request, including the trivial pin bumps that are most of them. Review
 //     first, implement only if review asks;
-//   - refined can never be left by a Task owning zero Issue CRs;
-//   - awaiting-review is not mintable at all - InitialState's CRD enum is
-//     new;refined;under-implementation.
+//   - refined can never be left by a Task owning zero Issue CRs, and since #604
+//     it is not admissible either: the (create) -> refined edge is gone and the
+//     enum was narrowed in lockstep;
+//   - awaiting-review is not mintable. The live set is TaskSpec.InitialState's
+//     kubebuilder Enum marker, deliberately not copied here.
 //
 // `new` runs no pod (AgentKindFor(new, *) == ""), so the entry is free, and
 // reconcileTriaging walks it to awaiting-review via the widened edge.

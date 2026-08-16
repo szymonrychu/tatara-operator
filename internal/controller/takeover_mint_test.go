@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
@@ -14,10 +15,18 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/own"
+	"github.com/szymonrychu/tatara-operator/internal/scm"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
-func TestMintOrUnparkTakeoverTask_MintsBoundIntoApproved(t *testing.T) {
+// A FRESH TAKEOVER IS MINTED STRAIGHT INTO THE WORK (#604), not into the gate.
+// It owns zero Issue CRs by construction - Source.IsPR is always true, so
+// mintIssueCRs bails - and `refined`'s only forward edge is the approval gate,
+// which refuses no-live-issue for a Task owning zero Issues. Minted there it
+// burned a pod and parked awaiting-human, forever. under-implementation is also
+// exactly where the re-take un-park below already landed, so the two takeover
+// entry paths now agree instead of one of them being unreachable.
+func TestMintOrUnparkTakeoverTask_MintsBoundIntoUnderImplementation(t *testing.T) {
 	ctx := context.Background()
 	proj, repo := seedProjectRepo(t, ctx)
 	mr := seedOpenExternalMR(t, ctx, proj, repo, 7, "renovate/foo", "octocat") // author != bot
@@ -30,8 +39,9 @@ func TestMintOrUnparkTakeoverTask_MintsBoundIntoApproved(t *testing.T) {
 	if task.Spec.Kind != "takeover" {
 		t.Fatalf("kind = %q", task.Spec.Kind)
 	}
-	if task.Spec.InitialState != tatarav1alpha1.StateRefined {
-		t.Fatalf("initial stage = %q, want approved", task.Spec.InitialState)
+	if task.Spec.InitialState != tatarav1alpha1.StateUnderImplementation {
+		t.Fatalf("initial state = %q, want under-implementation: a takeover owns zero Issues, so a "+
+			"mint into refined can never pass the gate", task.Spec.InitialState)
 	}
 	if task.Annotations[tatarav1alpha1.AnnTakeoverHeadBranch] != "renovate/foo" {
 		t.Fatalf("push branch annotation = %q", task.Annotations[tatarav1alpha1.AnnTakeoverHeadBranch])
@@ -88,7 +98,7 @@ func TestMintOrUnparkTakeoverTask_ExistingNotOwnershipLostPark_ReturnedUnchanged
 		stg    string
 		reason string
 	}{
-		{"live approved task is returned unchanged", tatarav1alpha1.StateRefined, ""},
+		{"live task mid-review is returned unchanged", tatarav1alpha1.StateAwaitingReview, ""},
 		{"parked for a non-ownership-lost reason is returned unchanged", tatarav1alpha1.StateUnderImplementation, stage.ReasonAwaitingHuman},
 	}
 	for i, tc := range cases {
@@ -139,7 +149,169 @@ func TestMintOrUnparkTakeoverTask_ExistingNotOwnershipLostPark_ReturnedUnchanged
 	}
 }
 
+// AN INTERRUPTED MINT MUST BACKFILL mrRefs ON THE ENDPOINT RETRY (#604).
+//
+// createTaskRaceSafe, bindMRToTask and stampMintStatus are three writes, not
+// one: a mint that errors between the first and the last leaves a Task with MR
+// ownership already flipped and status.mrRefs EMPTY. At `refined` that was
+// merely another way to be stuck. At `under-implementation` it is worse, because
+// mrRefs is load-bearing in two places:
+//
+//   - submit_outcome(action=submitted) is gated on >= 1 owned MR being open, so
+//     the agent's turn 400s no-open-mr and it can never leave.
+//   - mr_write(action=open)'s idempotency loop reads status.mrRefs, so an agent
+//     working around that opens a DUPLICATE merge request against the human's PR.
+//
+// reconcileMRBindingBackstop does not cover it: repairMRBinding returned nil for
+// any MR CR that already had a controller owner, and a takeover's always does.
+// So the endpoint retry - the maintainer simply commenting again - is the repair
+// path, and it has to fall through its own idempotent early return to run.
+func TestMintOrUnparkTakeoverTask_BackfillsMRRefsAfterAnInterruptedMint(t *testing.T) {
+	ctx := context.Background()
+	proj, repo := seedProjectRepo(t, ctx)
+	mr := seedOpenExternalMR(t, ctx, proj, repo, 31, "renovate/interrupted", "octocat")
+	m := newTestMinter(t)
+
+	first, err := m.MintOrUnparkTakeoverTask(ctx, proj, repo, mr, "alice", "take over", testSpiller(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRef := tatarav1alpha1.MergeRequestName(repo.Name, 31)
+
+	// Reproduce the interrupted mint: the Task and the MR binding exist, the
+	// mrRefs stamp never landed.
+	clearTaskMRRefs(t, ctx, first)
+
+	second, err := m.MintOrUnparkTakeoverTask(ctx, proj, repo, mr, "alice", "take over again", testSpiller(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Name != first.Name {
+		t.Fatalf("the retry must reuse the same Task: %q vs %q", first.Name, second.Name)
+	}
+	got := getTask(t, second.Name)
+	if !slices.Contains(got.Status.MRRefs, wantRef) {
+		t.Fatalf("mrRefs = %v, want the backfilled %q: without it submit_outcome(submitted) 400s "+
+			"no-open-mr and mr_write(open) opens a duplicate PR", got.Status.MRRefs, wantRef)
+	}
+	// Still exactly one ref: the backfill must not duplicate on a third call.
+	third, err := m.MintOrUnparkTakeoverTask(ctx, proj, repo, mr, "alice", "and again", testSpiller(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = getTask(t, third.Name)
+	if len(got.Status.MRRefs) != 1 {
+		t.Fatalf("mrRefs = %v, want exactly one entry after a repeat call", got.Status.MRRefs)
+	}
+}
+
+// repairMRBinding's own half of the same hole: an MR CR whose controller owner
+// IS this Task, with the Task's mrRefs empty, must get the ref stamped rather
+// than being skipped as "already bound". The never-steal rule is unchanged for
+// a CR owned by anyone ELSE - that is the next assertion.
+func TestRepairMRBinding_StampsRefWhenTheBindingIsAlreadyOurs(t *testing.T) {
+	ctx := context.Background()
+	proj, repo := seedProjectRepo(t, ctx)
+	mr := seedOpenExternalMR(t, ctx, proj, repo, 32, "renovate/ours", "octocat")
+	m := newTestMinter(t)
+
+	task, err := m.MintOrUnparkTakeoverTask(ctx, proj, repo, mr, "alice", "take over", testSpiller(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	clearTaskMRRefs(t, ctx, task)
+
+	if err := m.repairMRBinding(ctx, proj, repo, mrExtFromMR(mr), task, testSpiller(t)); err != nil {
+		t.Fatalf("repair: %v", err)
+	}
+	got := getTask(t, task.Name)
+	want := tatarav1alpha1.MergeRequestName(repo.Name, 32)
+	if !slices.Contains(got.Status.MRRefs, want) {
+		t.Fatalf("mrRefs = %v, want %q stamped: the CR is controller-owned by THIS task, so "+
+			"'already bound' is only half true - the ref stamp is what was interrupted", got.Status.MRRefs, want)
+	}
+}
+
+// THE NEVER-STEAL RULE IS UNCHANGED. A CR controller-owned by a DIFFERENT Task
+// is left completely alone, and this Task's mrRefs stay empty: stamping a ref to
+// an MR we do not own would give this Task a merge request another Task drives.
+func TestRepairMRBinding_LeavesAForeignOwnedMRAlone(t *testing.T) {
+	ctx := context.Background()
+	proj, repo := seedProjectRepo(t, ctx)
+	mr := seedOpenExternalMR(t, ctx, proj, repo, 33, "renovate/theirs", "octocat")
+	m := newTestMinter(t)
+
+	owner, err := m.MintOrUnparkTakeoverTask(ctx, proj, repo, mr, "alice", "take over", testSpiller(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A second, unrelated Task tries to repair the SAME merge request.
+	stranger := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: owner.Name + "-stranger", Namespace: proj.Namespace},
+		Spec: tatarav1alpha1.TaskSpec{
+			ProjectRef: proj.Name, RepositoryRef: repo.Name, Kind: "review", Goal: "not mine",
+		},
+	}
+	if err := k8sClient.Create(ctx, stranger); err != nil {
+		t.Fatalf("create stranger task: %v", err)
+	}
+	if err := m.repairMRBinding(ctx, proj, repo, mrExtFromMR(mr), stranger, testSpiller(t)); err != nil {
+		t.Fatalf("repair must be a silent no-op, got: %v", err)
+	}
+	if got := getTask(t, stranger.Name); len(got.Status.MRRefs) != 0 {
+		t.Fatalf("a foreign-owned MR must never be stamped onto another Task, mrRefs = %v", got.Status.MRRefs)
+	}
+	if ctrl, ok := ownerControllerName(getMR(t, ctx, proj, repo, 33)); !ok || ctrl != owner.Name {
+		t.Fatalf("controller ownership moved to %q; never steal", ctrl)
+	}
+}
+
+// THE REPAIR MUST NOT WRITE ON AN ALREADY-CONVERGED OBJECT. repairMRBinding's
+// owned-by-us branch runs per open merge request per sweep pass (MintReviewTask's
+// existing-twin arm, convergeAdoptedMint), so an unconditional Status().Update
+// there spends an apiserver round trip on every converged Task, every pass, to
+// write bytes identical to the ones already stored.
+//
+// resourceVersion is the observable: it changes on a write and not otherwise.
+func TestRepairMRBinding_ConvergedTaskIsNotRewritten(t *testing.T) {
+	ctx := context.Background()
+	proj, repo := seedProjectRepo(t, ctx)
+	mr := seedOpenExternalMR(t, ctx, proj, repo, 34, "renovate/converged", "octocat")
+	m := newTestMinter(t)
+
+	task, err := m.MintOrUnparkTakeoverTask(ctx, proj, repo, mr, "alice", "take over", testSpiller(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := getTask(t, task.Name).ResourceVersion
+
+	for i := 0; i < 3; i++ {
+		if err := m.repairMRBinding(ctx, proj, repo, mrExtFromMR(mr), task, testSpiller(t)); err != nil {
+			t.Fatalf("repair pass %d: %v", i, err)
+		}
+	}
+	if after := getTask(t, task.Name).ResourceVersion; after != before {
+		t.Fatalf("resourceVersion moved %s -> %s: the repair rewrote a Task whose mrRefs were "+
+			"already correct, on a path that runs every sweep pass", before, after)
+	}
+}
+
 // --- envtest fixtures local to the takeover minter tests ---
+
+// clearTaskMRRefs wipes status.mrRefs, reproducing a mint that errored between
+// createTaskRaceSafe/bindMRToTask and stampMintStatus.
+func clearTaskMRRefs(t *testing.T, ctx context.Context, task *tatarav1alpha1.Task) {
+	t.Helper()
+	var fresh tatarav1alpha1.Task
+	if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(task), &fresh); err != nil {
+		t.Fatalf("get task %s: %v", task.Name, err)
+	}
+	fresh.Status.MRRefs = nil
+	if err := k8sClient.Status().Update(ctx, &fresh); err != nil {
+		t.Fatalf("clear mrRefs on %s: %v", task.Name, err)
+	}
+}
 
 // takeoverTestSlug derives a short, valid k8s name segment from the running
 // test's name, so parallel tests sharing the ONE envtest control plane (see
@@ -157,6 +329,13 @@ func takeoverTestSlug(t *testing.T) string {
 	// test name lands it mid-separator and yields a leading "-", which is not a
 	// legal RFC 1123 name and fails the Secret create with an error that names
 	// the fixture rather than the test.
+	//
+	// THE UNIQUENESS IS OVER THE LAST 40 CHARACTERS, not over the whole name. Two
+	// tests whose names differ only in a PREFIX
+	// (TestRepairMRBinding_StampsRefWhenX / TestRepairIssueBinding_StampsRefWhenX)
+	// collide, and the failure reads "secrets ... already exists" against the
+	// second one to run - which names the fixture rather than the collision. Vary
+	// the tail, not the head.
 	return strings.Trim(s, "-")
 }
 
@@ -252,7 +431,7 @@ func ownerControllerName(obj client.Object) (string, bool) {
 
 // parkTaskOwnershipLost stamps task directly into parked(ownership-lost),
 // simulating an external-push stand-down (OP3) without driving the full
-// approved->implementing->parked(ownership-lost) transition sequence: that
+// under-implementation->parked(ownership-lost) transition sequence: that
 // sequence is OP3's own coverage, and re-deriving it here would just be
 // exercising the same edges a second time under a different test's name.
 func parkTaskOwnershipLost(t *testing.T, ctx context.Context, task *tatarav1alpha1.Task) {
@@ -369,5 +548,88 @@ func TestMintOrUnparkTakeoverTask_FreezesTheBranchAtTheTitleItSaw(t *testing.T) 
 	if got := agent.TaskBranch(same); got != want {
 		t.Fatalf("TaskBranch moved to %q after a mirror title change: a live Task's ourMR verdict "+
 			"is not stable, and ourMR gates closing a merge request and deleting its head branch", got)
+	}
+}
+
+// THE ISSUE HALF OF THE SAME CONFLATION (#604 review round 2, INFO).
+//
+// repairIssueBinding is repairMRBinding's counterpart and had the identical
+// "any controller owner means hands off" skip, which conflates "someone else's"
+// with "ours, and only the ref stamp is missing". The Issue mint is the same
+// three writes - createTaskRaceSafe, SyncIssue+ownIssueForTask, stampMintStatus
+// - so an interruption between the last two leaves an Issue CR owned by THIS
+// Task and an EMPTY status.issueRefs.
+//
+// That shape matters more here than it did for merge requests, because it is on
+// the LIVE issue path and it lands the Task in #604's own failure: issueRefs is
+// what verifyApprovalScope counts, so a Task carrying none is refused
+// no-live-issue at `refined` forever - by the gate, for a reason that is not
+// true.
+func TestRepairIssueBinding_StampsTheIssueRefWhenAlreadyOurs(t *testing.T) {
+	ctx := context.Background()
+	proj, repo := seedProjectRepo(t, ctx)
+	m := newTestMinter(t)
+	ext := scm.Issue{Number: 41, Title: "issue 41", URL: "https://github.com/o/r/issues/41", Author: "octocat"}
+
+	task, _, err := m.MintIssueTask(ctx, proj, repo, ext, tatarav1alpha1.StateNew, "", testSpiller(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	clearTaskIssueRefs(t, ctx, task)
+
+	if err := m.repairIssueBinding(ctx, proj, repo, ext, task, testSpiller(t)); err != nil {
+		t.Fatalf("repair: %v", err)
+	}
+	got := getTask(t, task.Name)
+	want := tatarav1alpha1.IssueName(repo.Name, 41)
+	if !slices.Contains(got.Status.IssueRefs, want) {
+		t.Fatalf("issueRefs = %v, want %q stamped: the Issue CR is controller-owned by THIS task, "+
+			"so 'already bound' is only half true - the ref stamp is what was interrupted, and "+
+			"without it the approval gate refuses no-live-issue forever", got.Status.IssueRefs, want)
+	}
+}
+
+// THE NEVER-STEAL RULE IS UNCHANGED ON THE ISSUE SIDE TOO: an Issue CR
+// controller-owned by a DIFFERENT Task is left alone and this Task's issueRefs
+// stay empty. Stamping one would hand this Task an Issue another Task drives -
+// and, at the gate, a citation scope it was never granted.
+func TestRepairIssueBinding_LeavesAForeignOwnedIssueUntouched(t *testing.T) {
+	ctx := context.Background()
+	proj, repo := seedProjectRepo(t, ctx)
+	m := newTestMinter(t)
+	ext := scm.Issue{Number: 42, Title: "issue 42", URL: "https://github.com/o/r/issues/42", Author: "octocat"}
+
+	owner, _, err := m.MintIssueTask(ctx, proj, repo, ext, tatarav1alpha1.StateNew, "", testSpiller(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stranger := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: owner.Name + "-stranger", Namespace: proj.Namespace},
+		Spec: tatarav1alpha1.TaskSpec{
+			ProjectRef: proj.Name, RepositoryRef: repo.Name, Kind: "brainstorm", Goal: "not mine",
+		},
+	}
+	if err := k8sClient.Create(ctx, stranger); err != nil {
+		t.Fatalf("create stranger task: %v", err)
+	}
+	if err := m.repairIssueBinding(ctx, proj, repo, ext, stranger, testSpiller(t)); err != nil {
+		t.Fatalf("repair: %v", err)
+	}
+	if got := getTask(t, stranger.Name); len(got.Status.IssueRefs) != 0 {
+		t.Fatalf("a foreign-owned Issue must never be stamped onto another task, got %v", got.Status.IssueRefs)
+	}
+}
+
+// clearTaskIssueRefs is clearTaskMRRefs' Issue counterpart: it reproduces the
+// interrupted mint by dropping the LAST of the three writes.
+func clearTaskIssueRefs(t *testing.T, ctx context.Context, task *tatarav1alpha1.Task) {
+	t.Helper()
+	var fresh tatarav1alpha1.Task
+	if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(task), &fresh); err != nil {
+		t.Fatalf("get task %s: %v", task.Name, err)
+	}
+	fresh.Status.IssueRefs = nil
+	if err := k8sClient.Status().Update(ctx, &fresh); err != nil {
+		t.Fatalf("clear issueRefs on %s: %v", task.Name, err)
 	}
 }

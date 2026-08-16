@@ -71,8 +71,15 @@ const AdoptedSignificanceFloor = "patch"
 // authors as the bot (AdoptUpgradeMR requires it, or an allowlisted engine login
 // that ownershipForAuthor accepts through the SAME predicate), so
 // ownershipForAuthor classifies it `tatara` on its own and there is nothing to
-// flip. Ownership has exactly ONE writer, ReconcileOwnership, and it stays that
-// way.
+// flip.
+//
+// What that buys is that ADOPTION stamps no ownership. It is NOT that the field
+// has a single writer - restapi's takeover endpoint writes
+// Status.Ownership=tatara on the gated hand-over, and ReconcileOwnership's own
+// doc block concedes it ("that is the gated takeover REST endpoint's job"). The
+// stronger claim stood here until #604's round 7; do not restore it, and do not
+// replace it with a list of who else writes the field, because nothing this
+// file decides depends on the answer.
 
 // AdoptedUpgradeTaskName is the deterministic name of the upgrade Task adopted
 // onto (repo, number). Being a pure function of the merge request's identity is
@@ -108,13 +115,24 @@ func AdoptedUpgradeTaskName(proj, repo string, number int) string {
 // draft stamped ownership here; this one does not. AdoptUpgradeMR requires the
 // merge request to be authored by an identity adoptableAuthor accepts, and
 // ownershipForAuthor asks the same predicate, so the mirror classifies
-// `tatara` on the first ReconcileOwnership pass - which happens LATER IN THIS
-// SAME SWEEP PASS, with a live head from GetPRHead. That backfill also seeds
-// LastBotHeadSHA in the same write, and an absent seed cannot cause a flip
-// anyway (ownership.go seeds and returns rather than flipping when the
-// baseline is empty). Stamping any of it here would make this a SECOND writer
-// of Status.Ownership, which ReconcileOwnership's own doc block asks callers
-// not to be.
+// `tatara` on the next ReconcileOwnership pass over it. (NOT "later in this
+// same sweep pass", which this said until #604's round 7: since #612 the mint
+// runs from the queue dispatcher's admission, not from the sweep, so there is
+// no shared pass to be later in. And NOT "with a live head from GetPRHead",
+// retired in round 8 - name no head source here at all, because the
+// classification does not read one: ownershipForAuthor decides on
+// Status.Author, and liveHead reaches only the LastBotHeadSHA seed inside the
+// same branch. The waking pass is the bind's own status WRITE, not its create:
+// ReconcileOwnership returns at once on a status-less mirror.) That seed lands
+// in the same write, and an absent one cannot cause a flip anyway (ownership.go
+// seeds and returns rather than flipping when the baseline is empty). Stamping
+// any of it here would be REDUNDANT rather than early: the classification
+// derives the same value from the same predicate AdoptUpgradeMR's own
+// precondition already applied. NOT "a second write on Status.Ownership",
+// retired with the head claim - the backfill is guarded on Ownership == "", so
+// a stamp here would make it a no-op rather than a second write, and counting
+// writers of that field is what the ownership note at the top of this file
+// refuses.
 //
 // It does NOT stamp the head branch as a work branch on its own: that is
 // AnnTakeoverHeadBranch, read kind-agnostically by branchEnvValues, which is
@@ -188,12 +206,18 @@ func (m *Minter) MintAdoptedUpgradeTask(ctx context.Context, proj *tatarav1alpha
 			// turn decides, and a request_changes is what hands it to the upgrade
 			// agent.
 			//
-			// Not `refined` either: refined's only exit into under-implementation
-			// is submit_outcome(action=approved), which routes through
+			// Not `refined` either, and since #604 it is not even admissible:
+			// refined's only exit into under-implementation is
+			// submit_outcome(action=approved), which routes through
 			// verifyApprovalScope and is refused with no-live-issue for a Task
-			// owning zero Issue CRs - which a merge-request-born Task always
-			// does. And awaiting-review is not mintable at all: InitialState's
-			// CRD enum is new;refined;under-implementation.
+			// owning zero Issue CRs - which a merge-request-born Task always is.
+			// #604 deleted the (create) -> refined edge and narrowed the enum in
+			// lockstep, so this paragraph now explains why the value is GONE
+			// rather than why it is not chosen. awaiting-review was never
+			// mintable. Read the live set off TaskSpec.InitialState's kubebuilder
+			// Enum marker rather than a copy of it here: copies of it drifted
+			// twice during #604's own review, which is what
+			// TestNoProseRestatesTheRetiredInitialStateEnum now fails on.
 			//
 			// `new` costs nothing: AgentKindFor(new, *) is "", so no pod runs
 			// there, and reconcileTriaging walks the Task to awaiting-review on
@@ -267,9 +291,9 @@ func (m *Minter) MintAdoptedUpgradeTask(ctx context.Context, proj *tatarav1alpha
 	// AND THAT IS THE WHOLE MINT. No ownership write of any kind: the merge
 	// request is authored by an identity adoptableAuthor accepts, by
 	// AdoptUpgradeMR's own precondition, so ReconcileOwnership classifies it
-	// `tatara` and seeds LastBotHeadSHA later in this same sweep pass. Adding an
-	// ownership stamp here would make this a second writer of a field with one
-	// owner.
+	// `tatara` and seeds LastBotHeadSHA on its next pass over the mirror. Adding
+	// an ownership stamp here would put a second write on that field - see the
+	// ownership note at the top of this file.
 	return task, MintCreated, nil
 }
 

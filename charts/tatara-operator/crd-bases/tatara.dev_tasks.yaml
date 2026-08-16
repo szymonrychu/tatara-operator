@@ -127,9 +127,18 @@ spec:
                   rename because the create edge can now land in TWO orthogonal places at
                   once: a sweep-minted backlog owner is `new` AND parked(backlog-sweep), and
                   `parked` is no longer a state it could have been expressed as.
+
+                  `refined` was REMOVED from the enum by #604, in lockstep with deleting the
+                  `(create) -> refined` edge from stage.Transitions. The two must move
+                  together: an admitted `initialState: refined` whose edge no longer exists
+                  makes stage.Enter return *IllegalTransitionError on EVERY reconcile pass
+                  forever, incrementing operator_illegal_state_transition_total - whose alert
+                  declares any non-zero value a table bug rather than a spec bug. Narrowing
+                  the enum turns that permanent silent loop into an admission rejection at
+                  the moment the bad spec is written. Safe to narrow: `refined` had exactly
+                  one writer (the takeover mint) and no Task carrying it exists.
                 enum:
                 - new
-                - refined
                 - under-implementation
                 type: string
               kind:

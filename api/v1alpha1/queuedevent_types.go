@@ -53,7 +53,15 @@ type QueuedEventPayload struct {
 	// submit_outcome(action=approved) and the upgrade outcome schema has no such
 	// action. Without this the Task would sit at refined re-submitting against a
 	// transition that does not exist.
-	// +kubebuilder:validation:Enum=new;refined;under-implementation
+	//
+	// THIS ENUM MUST TRACK TaskSpec.InitialState's, because enqueue.go copies
+	// this field onto it VERBATIM. #604 removed `refined` from both. A payload
+	// that still admitted it would build a Task the Task CRD now REJECTS, so the
+	// queue controller would fail to mint on every reconcile pass forever -
+	// trading the stranded Task #604 fixed for a stranded QueuedEvent, one
+	// enforcement site later. The only writer is projectscan's upgrade tick
+	// (under-implementation).
+	// +kubebuilder:validation:Enum=new;under-implementation
 	// +optional
 	InitialState string `json:"initialState,omitempty"`
 	// AlertRule is carried from the incident webhook onto the built Task's

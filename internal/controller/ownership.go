@@ -230,11 +230,20 @@ func (d *StageDriver) resumeFlipToExternal(ctx context.Context, proj *tatarav1al
 // controller ownership back to the review Task so review rounds and
 // hand-back comments continue to route. The stand-down announcement is
 // posted by the drain (OP11), keyed on the ownershipChangedAt marker this
-// stamps. The parked owner Task is RETAINED (not reaped while its MR is
-// open) as the durable merge-driver: an approved review on this stood-down
-// MR re-drives it parked(ownership-lost) -> merging via DrainStandDownMerge
-// (OP11), because merge-on-approve CONTINUES after a stand-down (spec
-// Section 1: external + external-push keeps review + merge).
+// stamps. The parked owner Task is LEFT IN PLACE as the durable merge-driver:
+// an approved review on this stood-down MR re-drives it
+// parked(ownership-lost) -> merging via DrainStandDownMerge (OP11), because
+// merge-on-approve CONTINUES after a stand-down (spec Section 1: external +
+// external-push keeps review + merge).
+//
+// "LEFT IN PLACE" IS NOT "RETAINED", which is what this said until #604's
+// round 7. No rule in the reaper keeps a parked Task alive because its merge
+// request is still open. reapParked's unpark PROBE does read the owned merge
+// requests, and that is what holds an awaiting-human park - but the park this
+// function writes is ownership-lost, which stage.Unpark declines by class, so
+// the probe cannot fire and what is left is the retention clock. Past it the
+// merge-driver is collected with the merge request still open. restapi's
+// takeover 409 remedy leans on exactly that, so the two must not drift apart.
 func (d *StageDriver) flipToExternal(ctx context.Context, proj *tatarav1alpha1.Project,
 	repo *tatarav1alpha1.Repository, mr *tatarav1alpha1.MergeRequest, liveHead string) (bool, error) {
 
@@ -352,11 +361,75 @@ func (d *StageDriver) parkAndHandBack(ctx context.Context, proj *tatarav1alpha1.
 // non-done state can hold the flag; hasOwnershipLostParkEdge and its
 // ownership_flip_park_skipped log line are deleted with the question they
 // answered.
+//
+// ONE PARK IS UPGRADED RATHER THAN LEFT ALONE (#604 review). A takeover Task
+// parked implement-declined is the ordinary stand-down arriving agent-first: the
+// pod's divergence signal is a local git call and beats the operator's flip,
+// which waits on webhook -> mirror headSHA -> here. Left at implement-declined
+// it is UnparkNever, so the re-take is refused, DrainStandDownMerge cannot
+// re-drive an approved external head, and a branch a human merely took back
+// sits until ParkRetention. See stage.UpgradeDeclineToOwnershipLost for why the
+// upgrade is narrow on both kind and reason, and why it is not a repark.
+//
+// THE DISCRIMINATOR IS THE RECORDED BOT HEAD, NOT THE PUSHER, and the rule this
+// upgrade implements ("terminal while the branch is still tatara's") is only as
+// good as that baseline. ReconcileOwnership never sees a pusher identity: the
+// flip fires on liveHead != Status.LastBotHeadSHA, and exactly two writers
+// ADVANCE that baseline after a push - the synchronize webhook when
+// isUpgradeEngineActor matches the pusher (webhook.stampMRHead) and /outcome's
+// record_bot_head, which is on the SUBMITTED path only. (Three more SEED it,
+// all outside this function: restapi.mrTakeover at the takeover itself, and
+// ReconcileOwnership's classification backfill and empty-baseline seed. Only ONE
+// of the three looks at the baseline before writing - the empty-baseline seed,
+// which writes when LastBotHeadSHA == "". The classification backfill keys on
+// Status.Ownership == "" instead and OVERWRITES a non-empty baseline with
+// liveHead whenever it classifies tatara, so a mirror whose head was stamped
+// before it was ever classified has that value replaced. mrTakeover's is
+// unconditional inside its FitMergeRequest closure and re-stamps on EVERY
+// successful re-take. A seed is not a refresh in any of the three cases -
+// mrTakeover's is the very value that goes stale below.) So a takeover that
+// pushed, lost its synchronize delivery or pushed under a login
+// isUpgradeEngineActor does not match, and then DELIBERATELY
+// declined, is flipped against tatara's OWN sha - and its deliberate decline is
+// upgraded here with no human having touched the branch, after which
+// DrainStandDownMerge may merge, on an approved review, commits the agent
+// refused to stand behind.
+//
+// The stale baseline is PRE-EXISTING and already accepted (handleMRSynchronize
+// argues it out); what #604 adds is that a spurious flip now rewrites a terminal
+// instead of hitting the Parked early return above.
+//
+// IT IS NOT FIXED BY REFRESHING LastBotHeadSHA ON THE DECLINE ARM, which is the
+// first remedy anyone proposes and is worse than the hole. The decline arm holds
+// no information this flip does not already have - anything it could record is a
+// function of (liveHead, LastBotHeadSHA) - so the stamp is a no-op exactly when
+// it is safe and decisive exactly when it is ambiguous. On a DIVERGENCE decline
+// the live head is the HUMAN's, so stamping it pins the baseline to the human's
+// sha, this flip never fires, and the ordinary stand-down is a permanent terminal
+// again: the #604-review bug, restored. Every field-renamed variant of it
+// (declinedAtHeadSHA and friends) is isomorphic. And as usually worded it is
+// kind-agnostic - outcome.go's decline arm serves implement and upgrade too - so
+// it would suppress the stand-down flip on tatara's OWN merge requests as well.
+//
+// What WOULD close it is positive attribution of the drifted head: a
+// LastExternalHeadSHA stamped on stampMRHead's non-attributable branch, with only
+// this upgrade - never the flip - gated on it. DECLINED, not missed. A new CRD
+// field is a major API change by rule 7; it still cannot tell a MISattributed
+// push apart, by construction; and it makes #604's fix contingent on the
+// human-push delivery actually arriving, with no sweep repair possible, since the
+// sweep's live head read carries no attribution. That trades a narrow laundering
+// window for a narrow stranding window on a path that has never carried a single
+// Task. Status.HeadSHA is NOT the free version of it: mirror.go writes that
+// unattributed on the sync cadence, so it means "the mirror synced", not "a
+// non-bot pushed".
 func (d *StageDriver) parkOwnerTask(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task) error {
 	if task.Spec.Kind == SweepReviewKind || tatarav1alpha1.TaskDone(task) {
 		return nil
 	}
 	if tatarav1alpha1.Parked(task) {
+		if task.Spec.Kind == takeoverKind && task.Status.ParkReason == stage.ReasonImplementDeclined {
+			return d.upgradeDeclinedTakeoverPark(ctx, proj, task)
+		}
 		return nil
 	}
 	if err := d.parkTask(ctx, proj, task, stage.ReasonOwnershipLost); err != nil {

@@ -1,6 +1,7 @@
 package stage
 
 import (
+	"sort"
 	"time"
 
 	"github.com/szymonrychu/tatara-operator/api/v1alpha1"
@@ -57,6 +58,23 @@ var originAgentKinds = map[string]string{
 	"refine":        AgentRefine,
 	"documentation": AgentDocumentation,
 	"upgrade":       AgentUpgrade,
+}
+
+// OriginKinds returns every ORIGIN kind the platform can mint, sorted. It
+// exists so a test can be TOTAL over the set rather than restating it: a kind
+// added to originAgentKinds with no row in the caller's table fails that test,
+// which is the forcing function for stating where the new kind is minted and
+// whether it can leave the state it is minted into (see
+// TestNoOriginKindCanReachAGateItCannotLeave in internal/controller - it lives
+// there, and is named for REACHING rather than being minted into, because the
+// mint state alone left the predicate dead: triage is the other route in).
+func OriginKinds() []string {
+	kinds := make([]string, 0, len(originAgentKinds))
+	for k := range originAgentKinds {
+		kinds = append(kinds, k)
+	}
+	sort.Strings(kinds)
+	return kinds
 }
 
 // AgentKindFor is the F.2 table, now keyed on (state, spec.kind) because the

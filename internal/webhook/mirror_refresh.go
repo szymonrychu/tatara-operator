@@ -255,6 +255,17 @@ func (s *Server) handleMRSynchronize(ctx context.Context, w http.ResponseWriter,
 	// there can only cause a spurious flip whose window is bounded by the next
 	// accept - it self-corrects, it never compounds.
 	//
+	// THAT BACKSTOP IS SUBMITTED-ONLY, and the paragraph above used to imply it
+	// covered every accept. record_bot_head runs after the `submitted` arm's
+	// commit; a turn that ends `declined` returns well before it and re-stamps
+	// nothing. On a kind=takeover Task that is now more than a stalled merge
+	// request: ReconcileOwnership's parkOwnerTask UPGRADES a takeover's
+	// implement-declined park to ownership-lost on the flip (#604), so a spurious
+	// flip against tatara's own sha rewrites a TERMINAL rather than hitting the
+	// already-parked early return. Same accepted staleness, a third place where
+	// nothing corrects it. Argued in full, with the remedies that do not work and
+	// the one that would, at controller/ownership.go's parkOwnerTask.
+	//
 	// THAT BACKSTOP DOES NOT EXIST ON AN ADOPTED MERGE REQUEST, and the comment
 	// used to imply it did. record_bot_head runs only on the implement/upgrade
 	// `submitted` path, and the COMMON adopted path - approved at first review -
