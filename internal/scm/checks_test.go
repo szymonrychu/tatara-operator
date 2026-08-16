@@ -230,15 +230,19 @@ func TestGitLabPRChecksJobStatusMapping(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.EscapedPath() {
 				case "/projects/g%2Fp/merge_requests/9":
+					// The pipeline's own status is what CIResult.Status now reports;
+					// this table is about the job -> CICheck mapping, so pin it green.
 					_ = json.NewEncoder(w).Encode(map[string]any{
 						"sha":           "deadbeef",
 						"merge_status":  "can_be_merged",
-						"head_pipeline": map[string]any{"id": int64(555)},
+						"head_pipeline": map[string]any{"id": int64(555), "sha": "deadbeef", "status": "success"},
 					})
 				case "/projects/g%2Fp/pipelines/555/jobs":
 					_ = json.NewEncoder(w).Encode([]map[string]any{
 						{"id": int64(111), "name": "build", "status": tc.glStatus, "web_url": "https://gitlab.example/j/111"},
 					})
+				case "/projects/g%2Fp/pipelines/555/bridges":
+					_ = json.NewEncoder(w).Encode([]map[string]any{})
 				default:
 					t.Fatalf("unexpected path %q", r.URL.EscapedPath())
 				}
@@ -261,12 +265,20 @@ func TestGitLabPRChecksJobStatusMapping(t *testing.T) {
 
 func TestGitLabPRChecksNoHeadPipeline(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, "/projects/g%2Fp/merge_requests/9", r.URL.EscapedPath())
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"sha":           "deadbeef",
-			"merge_status":  "cannot_be_merged",
-			"head_pipeline": nil,
-		})
+		switch r.URL.EscapedPath() {
+		case "/projects/g%2Fp/merge_requests/9":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"sha":           "deadbeef",
+				"merge_status":  "cannot_be_merged",
+				"head_pipeline": nil,
+			})
+		case "/projects/g%2Fp/repository/commits/deadbeef/statuses":
+			// No pipeline now falls back to commit statuses, so commit-status-only
+			// external CI is visible through scm_read.
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+		default:
+			t.Fatalf("unexpected path %q", r.URL.EscapedPath())
+		}
 	}))
 	defer srv.Close()
 
