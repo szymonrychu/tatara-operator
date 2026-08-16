@@ -218,7 +218,8 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 	// gate still 409s an implement-declined park. That is pinned by
 	// TestMRTakeover_RefusesReTakeOnAnUnresumableParkedTask, though only by
 	// posting as the parked Task itself, which the reachable-shape note below
-	// says production cannot do. What removes it in production is UPSTREAM:
+	// reads as a narrow race rather than the ordinary path. What removes the
+	// ordinary one is UPSTREAM:
 	// nothing can call here until the human pushes, and that push has already
 	// rewritten the reason. Rounds 5 and 6 of #604's review both described the
 	// carve-out as this predicate's own; reconciling
@@ -271,6 +272,19 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 	// review agent is the caller here, with ownership back at
 	// `external` - which is why this gate sits ahead of the already-tatara branch
 	// AND ahead of the flip, rather than inside either.
+	//
+	// THAT IS THE ORDINARY SHAPE, NOT THE ONLY ONE, and "runs no pod" is not a
+	// guarantee. transition.go writes the park status and tears the wrapper down
+	// as two steps, and livepods.go meters and REPAIRS the residue
+	// (ParkedWithLivePodRepaired), so a just-parked takeover's in-flight turn can
+	// still call here - as the controller owner, with ownership still `tatara`.
+	// This endpoint has no parked-caller guard, where outcome.go and
+	// handlers_v2.go both refuse one. That is why the remedy below names BOTH
+	// halves instead of assuming the push has already happened. Adding the guard
+	// is deliberately NOT done in #604: it changes who may call a
+	// maintainer-facing endpoint, and it wants the caller-identity question
+	// (`task` is a request field, not the authenticated subject) answered with
+	// it.
 	if existing, found, err := s.liveTakeoverTask(ctx, proj, repo, req.Number); err != nil {
 		s.log.ErrorContext(ctx, "restapi: read existing takeover task failed",
 			append(reqLogFields(r), "mr", mr.Name, "error", err)...)
@@ -286,15 +300,36 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 		s.log.WarnContext(ctx, "restapi: takeover requested on a parked task that can never resume",
 			append(reqLogFields(r), "action", "mr_takeover_unresumable", "resource_id", mr.Name,
 				"user", cmt.Author, "task", existing.Name, "park_reason", existing.Status.ParkReason)...)
-		// The remedy deliberately does NOT say "push to take it back": by the
-		// time this can fire, the human has already pushed (that push is what
-		// produced this shape), and pushing again returns the same 409. Ageing
-		// out at ParkRetention is the only thing that actually clears it.
+		// THE PUSH IS THE HALF THAT IS TRUE FOR EVERY REASON, so it leads.
+		// Whatever becomes of this Task, no route back exists while the mirror
+		// is still marked `tatara`, and flipToExternal is what un-marks it.
+		//
+		// ParkRetention is the SECOND half and only sometimes: the push that
+		// un-marks the mirror also rewrites an implement-declined park to
+		// ownership-lost (parkOwnerTask), which resumes this very Task with no
+		// wait and nothing collected. For a park the push does not rewrite,
+		// collection has to happen too - and unresumableTakeoverPark's doc block
+		// owns the exceptions to "collection is what ends it", so do not restate
+		// them here.
+		//
+		// WHAT THIS STRING NO LONGER PROMISES, per #604's round 7: that
+		// collection ALONE restores the take-over. reapParked has no
+		// keep-it-while-the-merge-request-is-open rule (see flipToExternal's doc
+		// block), releaseOwnership DROPS the mirror's owner ref rather than
+		// cascading it, and nothing on that path rewrites Status.Ownership. So a
+		// mirror collected while still marked `tatara` is stranded: as soon as
+		// anything re-mints a controller owner onto it, the next request takes
+		// the already-tatara branch below and is answered 200 having minted
+		// nothing, which is the "yes, then nothing happens" shape this gate
+		// exists to remove. Filed as #615; NOT fixed here.
 		writeError(w, http.StatusConflict,
 			"the takeover task for this merge request is parked "+existing.Status.ParkReason+
-				" and can never resume: only parked(ownership-lost) re-takes. Nothing clears this "+
-				"park - the task ages out at ParkRetention and is collected, after which a fresh "+
-				"take-over can be minted. The merge request is yours in the meantime")
+				" and can never resume: only parked(ownership-lost) re-takes. Push to the branch: "+
+				"that marks the merge request yours again, which every route back needs, and it "+
+				"resumes a take-over that was declined. For any other park the task must also age "+
+				"out at ParkRetention first - collection on its own does not restore the take-over, "+
+				"because it does not change who the merge request is marked for. The merge request "+
+				"is yours to work on in the meantime")
 		return
 	}
 

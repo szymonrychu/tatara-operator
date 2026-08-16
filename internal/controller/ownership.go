@@ -230,11 +230,20 @@ func (d *StageDriver) resumeFlipToExternal(ctx context.Context, proj *tatarav1al
 // controller ownership back to the review Task so review rounds and
 // hand-back comments continue to route. The stand-down announcement is
 // posted by the drain (OP11), keyed on the ownershipChangedAt marker this
-// stamps. The parked owner Task is RETAINED (not reaped while its MR is
-// open) as the durable merge-driver: an approved review on this stood-down
-// MR re-drives it parked(ownership-lost) -> merging via DrainStandDownMerge
-// (OP11), because merge-on-approve CONTINUES after a stand-down (spec
-// Section 1: external + external-push keeps review + merge).
+// stamps. The parked owner Task is LEFT IN PLACE as the durable merge-driver:
+// an approved review on this stood-down MR re-drives it
+// parked(ownership-lost) -> merging via DrainStandDownMerge (OP11), because
+// merge-on-approve CONTINUES after a stand-down (spec Section 1: external +
+// external-push keeps review + merge).
+//
+// "LEFT IN PLACE" IS NOT "RETAINED", which is what this said until #604's
+// round 7. No rule in the reaper keeps a parked Task alive because its merge
+// request is still open. reapParked's unpark PROBE does read the owned merge
+// requests, and that is what holds an awaiting-human park - but the park this
+// function writes is ownership-lost, which stage.Unpark declines by class, so
+// the probe cannot fire and what is left is the retention clock. Past it the
+// merge-driver is collected with the merge request still open. restapi's
+// takeover 409 remedy leans on exactly that, so the two must not drift apart.
 func (d *StageDriver) flipToExternal(ctx context.Context, proj *tatarav1alpha1.Project,
 	repo *tatarav1alpha1.Repository, mr *tatarav1alpha1.MergeRequest, liveHead string) (bool, error) {
 
