@@ -10,25 +10,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
-
-// awaitWake drains wakes until a request for key arrives or d elapses. Requests
-// for OTHER projects are ignored rather than failed on: this package's tests
-// share one control plane and earlier tests leave Tasks behind.
-func awaitWake(wakes <-chan reconcile.Request, key types.NamespacedName, d time.Duration) bool {
-	deadline := time.After(d)
-	for {
-		select {
-		case req := <-wakes:
-			if req.NamespacedName == key {
-				return true
-			}
-		case <-deadline:
-			return false
-		}
-	}
-}
 
 // TestBrainstormChainWakesProjectReconcile runs a REAL manager against the
 // envtest control plane with the REAL brainstormChainEdge (the same function
@@ -47,7 +29,8 @@ func awaitWake(wakes <-chan reconcile.Request, key types.NamespacedName, d time.
 // brainstormResyncInterval (15m); this edge makes the wake immediate instead.
 func TestBrainstormChainWakesProjectReconcile(t *testing.T) {
 	mgr := newTestManager(t)
-	wakes := make(chan reconcile.Request, 32)
+	key := types.NamespacedName{Namespace: testNS, Name: "chain-proj"}
+	rec, wakes := recordWakesFor(key)
 
 	// .Named() is REQUIRED: controller-runtime's controller-name registry is
 	// process-wide, and project_controller_setup_test.go already registers a
@@ -57,13 +40,7 @@ func TestBrainstormChainWakesProjectReconcile(t *testing.T) {
 	// turns this test RED instead of leaving it passing against a stale copy.
 	err := projectControllerBuilder(mgr).
 		Named("brainstorm-chain-envtest").
-		Complete(reconcile.Func(func(_ context.Context, req reconcile.Request) (reconcile.Result, error) {
-			select {
-			case wakes <- req:
-			default:
-			}
-			return reconcile.Result{}, nil
-		}))
+		Complete(rec)
 	if err != nil {
 		t.Fatalf("register the test controller: %v", err)
 	}
@@ -80,7 +57,7 @@ func TestBrainstormChainWakesProjectReconcile(t *testing.T) {
 	}
 
 	proj := &tatarav1alpha1.Project{
-		ObjectMeta: metav1.ObjectMeta{Name: "chain-proj", Namespace: testNS},
+		ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace},
 		Spec: tatarav1alpha1.ProjectSpec{
 			ScmSecretRef: "chain-scm",
 			Scm:          &tatarav1alpha1.ScmSpec{Provider: "github", Owner: "o", BotLogin: "tatara-bot"},
@@ -89,7 +66,6 @@ func TestBrainstormChainWakesProjectReconcile(t *testing.T) {
 	if err := k8sClient.Create(ctx, proj); err != nil {
 		t.Fatalf("create project: %v", err)
 	}
-	key := types.NamespacedName{Namespace: testNS, Name: proj.Name}
 	if !awaitWake(wakes, key, timeout) {
 		t.Fatal("the Project create never reached the reconciler; the manager is not actually running")
 	}

@@ -644,6 +644,8 @@ func stampEnter(t *v1alpha1.Task, to, reason string, now time.Time) {
 	// empty one: the next agent cannot tell that it is stale.
 	t.Status.LastTurnFinalText = ""
 	t.Status.LastTurnPushedRepos = nil
+	t.Status.LastTurnFailedRepos = nil
+	t.Status.LastTurnReposTurnID = ""
 	t.Status.Stats.PodRecreations = 0
 	t.Status.StageElapsedCarrySeconds = 0
 	if Live(to) {
