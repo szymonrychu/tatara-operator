@@ -707,12 +707,22 @@ func (s *TTLStopper) writeSyntheticNote(ctx context.Context, task *tatarav1alpha
 	// is the branch that needs it most: an OOM kill and a failed push lose the
 	// same commits for the same reason. Appended rather than woven in so the note
 	// reads exactly as before when nothing failed, which is almost every stop.
-	body += failedReposSentence(in.FailedRepos)
+	//
+	// It is RESERVED out of the budget rather than appended after truncation:
+	// lastTurnFinalText is capped at exactly NoteBodyMaxBytes and Note.Body is
+	// capped at the same number, so a maximal final text alone fills the note and
+	// a plain append would drop this sentence in full. The final text can afford
+	// to lose its tail; this cannot, because it names work that no longer exists
+	// anywhere.
+	// Capped in turn, so the reservation can never starve the note it is reserved
+	// out of: the two truncations bound each other rather than trusting the repo
+	// list to be short.
+	warning := truncateNoteBodyTo(failedReposSentence(in.FailedRepos), maxNoteBody/4)
 	n := tatarav1alpha1.Note{
 		At:    metav1.NewTime(s.now()),
 		Agent: NoteAgentOperator,
 		Kind:  NoteKindHandoff,
-		Body:  truncateNoteBody(body),
+		Body:  truncateNoteBodyTo(body, maxNoteBody-len(warning)) + warning,
 	}
 	if err := s.Notes.AppendNote(ctx, task.Name, n); err != nil {
 		return "", fmt.Errorf("agent: write synthetic handoff note: %w", err)
@@ -812,12 +822,18 @@ const ReasonOOMKilled = "OOMKilled"
 // an EMPTY notes journal, the exact failure this whole path exists to prevent.
 const maxNoteBody = tatarav1alpha1.NoteBodyMaxBytes
 
-func truncateNoteBody(s string) string {
-	if len(s) <= maxNoteBody {
+// truncateNoteBodyTo cuts s to budget bytes, on a rune boundary, marking the
+// cut. The budget is explicit because the caller reserves room out of
+// maxNoteBody for a suffix it refuses to let the truncation eat.
+func truncateNoteBodyTo(s string, budget int) string {
+	if len(s) <= budget {
 		return s
 	}
 	const ellipsis = "...(truncated)"
-	return tatarav1alpha1.TruncateUTF8(s, maxNoteBody-len(ellipsis)) + ellipsis
+	if budget <= len(ellipsis) {
+		return tatarav1alpha1.TruncateUTF8(s, max(budget, 0))
+	}
+	return tatarav1alpha1.TruncateUTF8(s, budget-len(ellipsis)) + ellipsis
 }
 
 func earliest(a, b time.Time) time.Time {

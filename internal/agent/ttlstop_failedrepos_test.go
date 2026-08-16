@@ -3,9 +3,11 @@ package agent_test
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
 )
 
@@ -60,4 +62,30 @@ func TestTTLStop_FailedReposAloneIsNotAContentFreeNote(t *testing.T) {
 	require.NotContains(t, body, agent.SyntheticNoteLostMarker,
 		"the placeholder marker trains the next agent to distrust the note; this one has something to say")
 	require.Contains(t, body, "tatara-cli")
+}
+
+// THE MOST URGENT SENTENCE MUST NOT BE THE FIRST ONE TRUNCATED.
+//
+// status.lastTurnFinalText is capped at exactly NoteBodyMaxBytes and Note.Body
+// is capped at the same number, so a maximal final text alone fills the entire
+// note budget. A failed-push warning appended after it would be cut off in full
+// - and it is the one line in the note describing work that no longer exists
+// anywhere.
+func TestTTLStop_FailedReposWarningSurvivesAMaximalFinalText(t *testing.T) {
+	sess := &stopSession{
+		states:     []string{agent.SessionStateReady},
+		handoffErr: &agent.HTTPError{Status: http.StatusGone},
+	}
+	h := newTTLHarness(t, sess)
+	in := h.input()
+	in.LastFinalText = strings.Repeat("x", tatarav1alpha1.NoteBodyMaxBytes)
+	in.FailedRepos = []string{"tatara-cli"}
+
+	_, err := h.stopper.StopWithHandoff(context.Background(), h.task, in)
+	require.NoError(t, err)
+
+	body := h.notes(t)[0].Body
+	require.LessOrEqual(t, len(body), tatarav1alpha1.NoteBodyMaxBytes, "Note.Body CRD MaxLength")
+	require.Contains(t, body, "tatara-cli",
+		"a long final text must lose ITS tail, not the warning about work that no longer exists")
 }
