@@ -212,3 +212,54 @@ func TestReposDueForScanDisabledOrBadCron(t *testing.T) {
 		t.Fatal("bad cron: ok = true, want false")
 	}
 }
+
+// TestReposDueForScan_IgnoresAStaleSweepRequestedAnnotation guards the deletion
+// of the pulled-forward sweep slot (queued adoption removed its only writer,
+// requestRepoSweep, in an earlier change). An adoptable delivery is a durable
+// QueuedEvent now, so nothing stamps "tatara.dev/sweep-requested" and a
+// repository's issueScan slot is governed by its cron alone. A Repository CR
+// still carrying a stale annotation from the previous release must NOT be
+// treated as due: that would turn the 30s project reconcile into a 30s forge-
+// listing loop for as long as the annotation survived.
+func TestReposDueForScan_IgnoresAStaleSweepRequestedAnnotation(t *testing.T) {
+	base := time.Date(2026, 6, 27, 10, 0, 0, 0, time.UTC)
+	now := base.Add(time.Minute)
+	proj, repos := jitterProject(base, "r0", "r1", "r2", "r3", "r4", "r5")
+	proj.Spec.Scm.Cron.IssueScan.Schedule = "0 */4 * * *"
+	proj.Status.LastIssueScan = &metav1.Time{Time: base}
+	r := &ProjectReconciler{}
+
+	before, _, ok := r.reposDueForScan(proj, "issueScan", repos, now)
+	if !ok {
+		t.Fatal("reposDueForScan not ok")
+	}
+	beforeSet := map[string]bool{}
+	for i := range before {
+		beforeSet[before[i].Name] = true
+	}
+	idx := -1
+	for i := range repos {
+		if !beforeSet[repos[i].Name] {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		t.Fatal("fixture is degenerate: every repo is already due, so the annotation can prove nothing")
+	}
+
+	repos[idx].Annotations = map[string]string{"tatara.dev/sweep-requested": now.Format(time.RFC3339)}
+	after, _, ok := r.reposDueForScan(proj, "issueScan", repos, now)
+	if !ok {
+		t.Fatal("reposDueForScan not ok")
+	}
+	for i := range after {
+		if after[i].Name == repos[idx].Name {
+			t.Fatalf("%s carries a stale sweep-requested annotation and must not be due: due=%v",
+				repos[idx].Name, after)
+		}
+	}
+	if len(after) != len(before) {
+		t.Fatalf("the stale annotation must change nothing: before=%d after=%d", len(before), len(after))
+	}
+}

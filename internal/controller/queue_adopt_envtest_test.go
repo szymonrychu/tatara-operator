@@ -365,7 +365,7 @@ func TestDispatcher_ThirdQueuedAdoptionAdmitsOnTheFirstTaskGoingTerminal(t *test
 	stampTaskState(t, ctx, task41, tatarav1alpha1.StateDone)
 
 	// ROUND 2: the SECOND adoption is admitted off that terminal write. No sweep
-	// ran, no cron fired, no SweepRequestedAnnotation was involved at any point.
+	// ran, no cron fired, no pulled-forward annotation was involved at any point.
 	admitted = awaitAdmitted(t, ctx, ns, second.Name, timeout)
 	taskName42 := AdoptedUpgradeTaskName(proj.Name, repo.Name, 42)
 	if admitted.Status.TaskRef != taskName42 {

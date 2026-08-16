@@ -591,9 +591,9 @@ func (s *Server) minter() *controller.Minter {
 // enqueueAdoption turns an adoptable dependency-upgrade delivery into a DURABLE
 // queue entry, which is the whole of this change.
 //
-// THE OLD FAST PATH WAS ONE SHOT AND SELF-CONSUMING. It stamped
-// SweepRequestedAnnotation to pull the repository's issueScan slot forward, and
-// the pass that ran computed one adoptHeadroom for the whole pass, adopted up to
+// THE OLD FAST PATH WAS ONE SHOT AND SELF-CONSUMING. It stamped an annotation
+// to pull the repository's issueScan slot forward, and the pass that ran
+// computed one adoptHeadroom for the whole pass, adopted up to
 // that many merge requests oldest-first, and cleared the marker of every one it
 // skipped. Nothing re-drove the remainder: the third merge request of a
 // three-MR Renovate run was still unadopted four hours later with both siblings
@@ -853,26 +853,12 @@ func (s *Server) handleIssueOpened(ctx context.Context, w http.ResponseWriter, p
 // deliveries across replicas and each one independently passes the same check.
 // No in-process lock spans processes, and a counter that must be decremented
 // when a lane frees is the kind of distributed state this repo derives from
-// reality instead. Minting here would be correct only by accident. (The budget
-// that binds an adoption is now the queue's own admission ceiling.
-// maxOpenUpgrades governs the upgrade CRON only - design D1/D2 - so it is not a
-// project-wide adoption cap this handler could spend even if it were serialized.)
-//
-// THE LEADER-ELECTED DISPATCHER ALREADY HAS ALL OF IT: it is the single
-// serialized writer of admission, it re-asks the adoption question against a
-// fresh mirror and live owner before it mints, and it holds the lane budget. So
-// the fast path is not a second minter - it ENQUEUES: AdoptionCandidate
-// recognises the shape, the handler writes a QueuedEvent carrying the merge
-// request snapshot, and admission mints it the moment a lane frees. Four hours
-// becomes seconds with exactly one minting path, one cap, and no distributed
-// lock.
-//
-// ENQUEUEING RATHER THAN STAMPING IS THE POINT. The predecessor stamped
-// SweepRequestedAnnotation to pull the repository's sweep slot forward, and the
-// pass it pulled forward cleared that one-shot marker for every merge request
-// its per-pass headroom made it skip - so a three-MR Renovate run left its third
-// merge request unadopted for four hours. A queue entry is durable and per merge
-// request; nothing has to re-drive it. See enqueueAdoption.
+// reality instead of holding in a handler. So the arm ENQUEUES rather than
+// mints: AdoptionCandidate recognises the shape, the handler writes a durable
+// QueuedEvent carrying the merge request snapshot, and the leader-elected
+// DispatcherReconciler - the single serialized writer of admission - re-asks
+// the adoption question against a fresh mirror and live owner before it mints.
+// See enqueueAdoption for the rest of that mechanism.
 //
 // A CANDIDATE IS A SHAPE, NOT A VERDICT. AdoptionCandidate answers only "prefix
 // configured, branch under it, author is an identity this project owns" - forks,

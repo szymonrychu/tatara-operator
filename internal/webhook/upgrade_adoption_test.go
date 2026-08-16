@@ -13,8 +13,8 @@ package webhook_test
 // false) and a burst of engine merge requests load-balances across all of them,
 // so any check-then-mint in this handler is a distributed race no in-process
 // lock can close. What changed is WHAT the handler leaves behind: it used to
-// stamp a one-shot SweepRequestedAnnotation that pulled the repo's sweep slot
-// forward, and the pass it pulled forward computed one headroom for the whole
+// stamp a one-shot annotation that pulled the repo's sweep slot forward, and
+// the pass it pulled forward computed one headroom for the whole
 // pass, adopted up to that many merge requests, and CLEARED the marker of every
 // one it skipped - so the third merge request of a three-MR Renovate run sat
 // unadopted for four hours with both siblings already merged. Now it ENQUEUES a
