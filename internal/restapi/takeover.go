@@ -66,13 +66,23 @@ func (s *Server) liveTakeoverTask(ctx context.Context, proj *tatarav1alpha1.Proj
 // redundant and every re-take, the whole point of the endpoint, starts 409ing.
 //
 // The class test is stated as "not the two that DO resume" rather than
-// "== UnparkNever", because there are FOUR classes: UnparkRetired (the O3
-// migration reasons) resumes only via a one-shot sweep that skips anything
-// already stamped, so a takeover carrying one is just as stuck - and an
-// == UnparkNever test would silently answer it 200 and do nothing, which is the
-// exact behaviour this gate exists to eliminate. An UNKNOWN reason (ok==false)
-// is deliberately NOT refused: refusing a maintainer's takeover on a reason we
-// cannot classify is the worse error of the two.
+// "== UnparkNever", because there are FOUR classes, and an == UnparkNever test
+// would silently answer an UnparkRetired park 200 and do nothing - the exact
+// behaviour this gate exists to eliminate.
+//
+// UnparkRetired IS THE ONE PLACE THE REFUSAL IS NOT EXACT, and this used to
+// claim otherwise ("a takeover carrying one is just as stuck"). It is not
+// quite: driveRetiredUnparks skips on the migration ANNOTATION, not on the
+// kind, so an unstamped Task inside its 48h window does get released, and for
+// those three reasons the 409 - and the ParkRetention remedy it names - is
+// pessimistic. Left as is deliberately: that sweep is a one-shot migration
+// nearly done, no takeover Task has ever existed (MEMORY.md's dead-path
+// queries), and the failure direction is a maintainer told to wait rather than
+// a merge request silently stranded.
+//
+// An UNKNOWN reason (ok==false) is deliberately NOT refused: refusing a
+// maintainer's takeover on a reason we cannot classify is the worse error of
+// the two.
 func unresumableTakeoverPark(t *tatarav1alpha1.Task) bool {
 	if t == nil || !tatarav1alpha1.Parked(t) {
 		return false
@@ -198,11 +208,48 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 	// requires the agent to comment on the merge request explaining itself before
 	// declining, so a maintainer reading that comment and pushing a fix is the
 	// EXPECTED response, and that push flips ownership exactly as a divergence
-	// does. What this gate is left holding is every OTHER UnparkNever and
-	// UnparkRetired reason - a set, not an enumeration, but each member is reached
-	// without any judgement about the merge request at all (exhaustion caps,
-	// operator errors, contract mismatches, and the CI/merge/deploy terminals). A
-	// human push must not launder any of them into a resumable Task.
+	// does.
+	//
+	// THE PREDICATE DOES NOT CARVE OUT implement-declined. Within the two classes
+	// it refuses, ownership-lost is the only reason it lets through, and this
+	// gate still 409s an implement-declined park -
+	// TestMRTakeover_RefusesReTakeOnAnUnresumableParked
+	// Task pins that, though only by posting as the parked Task itself, which the
+	// reachable-shape note below says production cannot do. What removes it in
+	// production is UPSTREAM: nothing can call here until the human pushes, and
+	// that push has already rewritten the reason. Rounds 5 and 6 of #604's review
+	// both described the carve-out as this predicate's own; reconciling
+	// unresumableTakeoverPark to that reading means deleting its ownership-lost
+	// early return, and every legitimate re-take then 409s.
+	//
+	// AND THE TEST IS FACTUAL, NOT NORMATIVE - "nothing here will clear this
+	// park", not "this park is a verdict a human push must not launder". That
+	// gloss stood here as "every member is reached without any judgement about
+	// the merge request at all"; it is FALSE and must not come back. ci-red is
+	// counterexample enough: enterCIRed writes it off the merge request's own
+	// pipeline verdict.
+	//
+	// DO NOT REPLACE IT WITH A CENSUS of which reasons are merge-request-derived.
+	// Two review passes over this comment produced two different lists and both
+	// were wrong - merge-blocked reads only its own re-entry counter, and
+	// review-post-refused is a forge 4xx to tatara's own POST, i.e. the very
+	// "operator error" category the gloss named. Retiring a universal claim takes
+	// ONE counterexample; a list of them is a second thing to keep true, and this
+	// block has now cost more rounds to that than to any behaviour.
+	//
+	// The gate does not need the reasons to mean anything, because the fact
+	// holds for the UnparkNever class: MintOrUnparkTakeoverTask and
+	// DrainStandDownMerge fire on ownership-lost only, stage.Unpark declines the
+	// class, and UnparkForMRTerminal - which does ignore the park reason - only
+	// ever clears INTO a terminal, never into a resumable Task. It is NOT exact
+	// for UnparkRetired; unresumableTakeoverPark owns that caveat.
+	//
+	// WHAT MAKES THE ParkRetention REMEDY BELOW TRUE IS THE ZERO-ISSUE PROPERTY,
+	// not the park reason - and it is the part that does not generalise.
+	// driveStrandedParks and resumeNoReentryParks are what otherwise rescue an
+	// UnparkNever park, and neither resumes nor re-mints a Task owning no Issue
+	// mirror, which a takeover always is. For a kind that DOES own one the same
+	// sentence would be wrong: driveStrandedParks collects on a 30-minute grace.
 	//
 	// UnparkHuman reasons (awaiting-human and friends) are deliberately NOT
 	// refused: those parks DO clear on a human comment. Note the timing though -
@@ -214,13 +261,13 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 	// THE REACHABLE SHAPE, spelled out because the ownership gate above hides it:
 	// an unresumable takeover still controller-owns its merge request and runs no
 	// pod, so nothing can call this endpoint at all until the human PUSHES. That
-	// push runs flipToExternal -> parkOwnerTask - which leaves every reason THIS
-	// GATE STILL REFUSES alone, implement-declined having just been carved out of
-	// that set by the upgrade above - and then hands the controller ref to a
-	// review Task. THAT
-	// review agent is the caller here, with ownership back at `external` - which
-	// is why this gate sits ahead of the already-tatara branch AND ahead of the
-	// flip, rather than inside either.
+	// push runs flipToExternal -> parkOwnerTask, which rewrites an
+	// implement-declined park to ownership-lost and leaves every OTHER park
+	// reason untouched (the carve-out is parkOwnerTask's, NOT this predicate's -
+	// see above) - and then hands the controller ref to a review Task. THAT
+	// review agent is the caller here, with ownership back at
+	// `external` - which is why this gate sits ahead of the already-tatara branch
+	// AND ahead of the flip, rather than inside either.
 	if existing, found, err := s.liveTakeoverTask(ctx, proj, repo, req.Number); err != nil {
 		s.log.ErrorContext(ctx, "restapi: read existing takeover task failed",
 			append(reqLogFields(r), "mr", mr.Name, "error", err)...)

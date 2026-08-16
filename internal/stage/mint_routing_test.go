@@ -16,7 +16,10 @@ import (
 // no-live-issue for a Task owning zero Issue CRs. The edge is gone; nothing may
 // put it back without also answering the routing invariant, which lives in
 // internal/controller/mint_routing_test.go because the OTHER route into
-// `refined` - triage - is decided there and this package may not import it.
+// `refined` - triage - is decided by triageTarget, and triageTarget is
+// UNEXPORTED there. NOT an import restriction: this file is package stage_test
+// and could legally import controller. Keep this in step with the same
+// statement on LegalFor's GUARD 6, which points the reader here.
 func TestCreateEdgeCannotMintIntoTheGate(t *testing.T) {
 	for _, e := range stage.Transitions[stage.Create] {
 		require.NotEqualf(t, v1alpha1.StateRefined, e.To,

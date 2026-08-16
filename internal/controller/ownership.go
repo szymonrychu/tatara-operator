@@ -370,11 +370,15 @@ func (d *StageDriver) parkAndHandBack(ctx context.Context, proj *tatarav1alpha1.
 // isUpgradeEngineActor matches the pusher (webhook.stampMRHead) and /outcome's
 // record_bot_head, which is on the SUBMITTED path only. (Three more SEED it,
 // all outside this function: restapi.mrTakeover at the takeover itself, and
-// ReconcileOwnership's classification backfill and empty-baseline seed. Those
-// two are guarded on emptiness and so genuinely fire once; mrTakeover's is an
-// unconditional write inside its FitMergeRequest closure, so it re-stamps on
-// every successful re-take. A seed is not a refresh either way - mrTakeover's
-// is the very value that goes stale below.) So a takeover that
+// ReconcileOwnership's classification backfill and empty-baseline seed. Only ONE
+// of the three looks at the baseline before writing - the empty-baseline seed,
+// which writes when LastBotHeadSHA == "". The classification backfill keys on
+// Status.Ownership == "" instead and OVERWRITES a non-empty baseline with
+// liveHead whenever it classifies tatara, so a mirror whose head was stamped
+// before it was ever classified has that value replaced. mrTakeover's is
+// unconditional inside its FitMergeRequest closure and re-stamps on EVERY
+// successful re-take. A seed is not a refresh in any of the three cases -
+// mrTakeover's is the very value that goes stale below.) So a takeover that
 // pushed, lost its synchronize delivery or pushed under a login
 // isUpgradeEngineActor does not match, and then DELIBERATELY
 // declined, is flipped against tatara's OWN sha - and its deliberate decline is

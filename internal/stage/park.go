@@ -259,11 +259,38 @@ func repark(t *v1alpha1.Task, reason string, now time.Time) {
 //     somebody else's merge request; on any other kind the branch is tatara's
 //     own, so a human pushing to it is not "taking it back" and must not reopen
 //     a refusal the agent stands behind.
-//   - implement-declined only. Every other UnparkNever park on a takeover is a
-//     genuine terminal (an exhaustion cap, an operator error, a contract
-//     mismatch) reached without any judgement about the merge request at all,
-//     and a human push must not launder one into a resumable Task. That is also
-//     what keeps restapi.mrTakeover's 409 gate alive rather than dead.
+//
+//   - implement-declined only, because THE UPGRADE RECONCILES TWO NAMES FOR ONE
+//     EVENT. On a takeover, implement-declined is the AGENT's local-git name for
+//     the very push the flip is here to record: the skill declines on an
+//     ls-remote mismatch or a non-fast-forward rejection, both local calls, so
+//     the agent's verdict routinely lands before the operator's webhook ->
+//     mirror -> here chain. Two observers, one event, two names; renaming is all
+//     this does. No other park reason has that property: each is written about
+//     something other than the push this flip is reacting to.
+//
+//     DO NOT justify it with "a human push must not launder a verdict", which
+//     stood here as "every other UnparkNever park is a genuine terminal (an
+//     exhaustion cap, an operator error, a contract mismatch) reached without
+//     any judgement about the merge request at all". That is FALSE, and ci-red
+//     alone retires it: enterCIRed writes it off the merge request's own
+//     pipeline verdict. Do not answer that with a corrected LIST of which
+//     reasons are merge-request-derived - #604's review tried twice and got two
+//     different wrong lists; one counterexample is what a universal claim costs,
+//     and a list is a second thing to keep true.
+//
+//     ci-blocked AND head-moving ARE OPEN QUESTIONS, not settled by the
+//     principle above. A human push can turn red CI green or land the head the
+//     corridor was waiting for, and afterwards the merge request is still
+//     mergeable on an approved review - a real case for upgrading them too. What
+//     defends excluding them is only that the operator classified no OWNERSHIP
+//     change when it wrote either park, so upgrading would assert a hand-back it
+//     never measured. A conservative default, not a derived result; the price is
+//     ParkRetention. An earlier draft claimed head-moving was structurally
+//     distinguishable because the flip always preempts it - FALSE, and not to be
+//     reinstated: DrainStandDownMerge runs a LIVE takeover Task against an
+//     external-owned merge request, and the flip branch gates on
+//     Ownership == tatara, so it cannot fire there at all.
 //
 // It is NOT repark, and the reason is narrow: this is ONE park's reason being
 // corrected, not a second park. repark clears and re-Parks, so Park's park-event
@@ -276,14 +303,21 @@ func repark(t *v1alpha1.Task, reason string, now time.Time) {
 // THE JUSTIFICATION THAT USED TO BE HERE WAS FALSE; do not reinstate it. It
 // said a repark would charge the resumed Task for the days it sat parked and so
 // blow ResidencyExceeded on its first pass back. It cannot: every way out of
-// parked(ownership-lost) writes a state entry in the same pass, and stampEnter
-// zeroes StageElapsedCarrySeconds and nils StateWorkStartedAt, on which
-// ResidencyExceeded returns false outright. The two that resume the work -
-// MintOrUnparkTakeoverTask and DrainStandDownMerge - go through UnparkTakeover;
-// UnparkForMRTerminal is a THIRD exit and does NOT (it guards on the target
-// state and the state reason, never on the park reason), but it clears the park
-// into a terminal via Enter, so stampEnter runs there too. Unpark/reArm, the one
-// path that DOES preserve the carry, refuses ownership-lost by class.
+// parked(ownership-lost) THAT LEAVES THE TASK ALIVE writes a state entry in the
+// same pass, and stampEnter zeroes StageElapsedCarrySeconds and nils
+// StateWorkStartedAt, on which ResidencyExceeded returns false outright. The two
+// that resume the work - MintOrUnparkTakeoverTask and DrainStandDownMerge - go
+// through UnparkTakeover; UnparkForMRTerminal is a THIRD exit and does NOT (it
+// guards on the target state and the state reason, never on the park reason),
+// but it clears the park into a terminal via Enter, so stampEnter runs there
+// too. The qualifier is load-bearing, and NOT because the exits can be counted:
+// there are also ways out that write no state entry at all, because they DELETE
+// the Task rather than resume it (the reaper on ParkRetention, driveStrandedParks
+// and resumeNoReentryParks on a Task that owns Issues). A carry those leave
+// behind is moot, not carried. reArm is the mutation that PRESERVES the carry;
+// what matters here is only that no reArm caller admits ownership-lost - Unpark
+// and UnparkRetiredPark refuse it by class, reenterParkedOnReview by an explicit
+// switch over the reasons it accepts.
 //
 // NO DECISION reads the carry while the Task is parked (task_stage.go checks
 // residency only on an UN-parked Task), but a READER does, so do not restate
@@ -296,10 +330,18 @@ func repark(t *v1alpha1.Task, reason string, now time.Time) {
 // moves the identical quantity from the first term to the second and reads the
 // same before and after (that continuity is what operator_task_state_age_seconds
 // is carry-adjusted FOR). The only thing a second fold would move is the raw
-// Status.StageElapsedCarrySeconds field, which nothing exposes and nothing
-// decides on. So the gauge is neither a reason to repark nor a reason not to;
-// the reason is the one given above, that a Task which parked once must not be
-// booked two park events.
+// Status.StageElapsedCarrySeconds field - and "nothing exposes or decides on
+// that" is the third overstatement this paragraph has carried, so do not write
+// it either. It is a CRD status field (task_types.go), and ArmedClock DECIDES on
+// it: `reentered && carry > 0` at merged/deployed is the timeout-re-entry
+// discriminator, and ArmedClock's own comment calls that read exact - the
+// merge-timeout round trip, where Unpark's reArm deliberately PRESERVES the
+// carry, is that decision working as designed. The scope that survives is only
+// WHILE THE TASK IS PARKED: ArmedClock takes the park branch whenever ParkReason
+// is set and so never reaches the discriminator. That is enough here, because
+// this function neither un-parks nor transitions. So the gauge is neither a
+// reason to repark nor a reason not to; the reason is the one given above, that
+// a Task which parked once must not be booked two park events.
 //
 // changed is false, with no error, when the Task is ALREADY parked
 // ownership-lost. That is a converged state, not a misuse: every caller is a

@@ -188,12 +188,18 @@ func (m *Minter) MintAdoptedUpgradeTask(ctx context.Context, proj *tatarav1alpha
 			// turn decides, and a request_changes is what hands it to the upgrade
 			// agent.
 			//
-			// Not `refined` either: refined's only exit into under-implementation
-			// is submit_outcome(action=approved), which routes through
+			// Not `refined` either, and since #604 it is not even admissible:
+			// refined's only exit into under-implementation is
+			// submit_outcome(action=approved), which routes through
 			// verifyApprovalScope and is refused with no-live-issue for a Task
-			// owning zero Issue CRs - which a merge-request-born Task always
-			// does. And awaiting-review is not mintable at all: InitialState's
-			// CRD enum is new;refined;under-implementation.
+			// owning zero Issue CRs - which a merge-request-born Task always is.
+			// #604 deleted the (create) -> refined edge and narrowed the enum in
+			// lockstep, so this paragraph now explains why the value is GONE
+			// rather than why it is not chosen. awaiting-review was never
+			// mintable. Read the live set off TaskSpec.InitialState's kubebuilder
+			// Enum marker rather than a copy of it here: copies of it drifted
+			// twice during #604's own review, which is what
+			// TestNoProseRestatesTheRetiredInitialStateEnum now fails on.
 			//
 			// `new` costs nothing: AgentKindFor(new, *) is "", so no pod runs
 			// there, and reconcileTriaging walks the Task to awaiting-review on
