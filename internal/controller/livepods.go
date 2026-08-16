@@ -88,6 +88,8 @@ func (r *TaskReconciler) liveHandoffAndPark(ctx context.Context, proj *tatarav1a
 			// note carries what the agent actually did instead of "(none)".
 			LastFinalText: task.Status.LastTurnFinalText,
 			PushedRepos:   task.Status.LastTurnPushedRepos,
+			FailedRepos:   task.Status.LastTurnFailedRepos,
+			ReposTurnID:   task.Status.LastTurnReposTurnID,
 		}
 		res, err := stopper.StopWithHandoff(ctx, task, in)
 		if err != nil {
@@ -97,8 +99,10 @@ func (r *TaskReconciler) liveHandoffAndPark(ctx context.Context, proj *tatarav1a
 			"conversation handed off",
 			"conversation ended with NO continuation state captured; this pod's work is unrecorded",
 			"conversing_handoff", res, "resource_id", task.Name, "cause", cause)
-		// The stop has spent the last-turn payload on a handoff note, so retire it
-		// before this Task parks or re-arms (#527). Both continuations below
+		// The stop has spent the last-turn payload on a handoff note - including
+		// when the AGENT wrote that note, where the stop appends the operator's own
+		// note for a failed push rather than letting the field be cleared unread -
+		// so retire it before this Task parks or re-arms (#527). Both continuations below
 		// read-modify-write a FRESH Task, so this patch is not clobbered by them.
 		if err := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 			clearLastTurn(fresh)

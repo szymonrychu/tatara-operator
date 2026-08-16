@@ -66,6 +66,15 @@ const (
 	// characters, so a body the forge accepted can still be too long here.
 	IssueBodyMaxBytes        = 65536
 	MergeRequestBodyMaxBytes = 65536
+
+	// LastTurnReposTurnIDMaxBytes caps TaskStatus.LastTurnReposTurnID. The turn
+	// id is EXTERNALLY SIZED like the rest of this list even though it looks
+	// internal: it originates in the wrapper's SubmitTurn response, nothing
+	// operator-side bounds it, and annotation values are not length-limited - so
+	// an id can exceed this while still matching annCurrentTurn. Unclamped, that
+	// costs the whole status update, i.e. the final text and both repo lists,
+	// rather than just the id it does not fit in.
+	LastTurnReposTurnIDMaxBytes = 256
 )
 
 // IssueTitleMaxChars caps the title of every issue this platform files on a

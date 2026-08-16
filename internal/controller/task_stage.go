@@ -1402,6 +1402,8 @@ func (r *TaskReconciler) stalledTurnStop(ctx context.Context, proj *tatarav1alph
 		// idle, so this caller almost always lands on the synthetic note.
 		LastFinalText: task.Status.LastTurnFinalText,
 		PushedRepos:   task.Status.LastTurnPushedRepos,
+		FailedRepos:   task.Status.LastTurnFailedRepos,
+		ReposTurnID:   task.Status.LastTurnReposTurnID,
 	})
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("stalled turn stop %s: %w", task.Name, err)
@@ -1470,6 +1472,8 @@ func (r *TaskReconciler) ttlStop(ctx context.Context, proj *tatarav1alpha1.Proje
 		// the non-empty-notes guarantee vacuous (#527).
 		LastFinalText: task.Status.LastTurnFinalText,
 		PushedRepos:   task.Status.LastTurnPushedRepos,
+		FailedRepos:   task.Status.LastTurnFailedRepos,
+		ReposTurnID:   task.Status.LastTurnReposTurnID,
 	}
 	res, err := stopper.StopWithHandoff(ctx, task, in)
 	if err != nil {
@@ -1539,6 +1543,13 @@ func logTTLStop(ctx context.Context, okMsg, lostMsg, action string, res agent.TT
 func clearLastTurn(t *tatarav1alpha1.Task) {
 	t.Status.LastTurnFinalText = ""
 	t.Status.LastTurnPushedRepos = nil
+	// The failed set is the one whose staleness does more than misreport. A
+	// leftover non-empty list makes the NEXT stop compute contentFree=false, so a
+	// pod that produced nothing at all writes a normal-looking note, skips
+	// syntheticNoteLostBody() and never fires RecordEmptySynthetic - the #527
+	// detector disarmed by a slice nobody retired.
+	t.Status.LastTurnFailedRepos = nil
+	t.Status.LastTurnReposTurnID = ""
 }
 
 // turn0Marker identifies the pod turn-0 was submitted to. A respawn re-stamps
