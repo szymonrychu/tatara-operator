@@ -52,6 +52,17 @@ var _ CIReader = (*GitLab)(nil)
 //   - any check whose conclusion is a failing one -> red
 //   - else any check not yet completed -> running (an in_progress one present) or pending
 //   - else -> green
+//
+// GITHUB ONLY. It is sound there because /commits/{sha}/check-runs is the whole
+// check set. It is NOT sound on GitLab, for two independent reasons, and
+// (*GitLab).PRChecks deliberately does not call it:
+//
+//   - /pipelines/{id}/jobs omits bridge jobs, so the fold runs on a set that
+//     cannot see a child pipeline's result at all;
+//   - a CICheck carries no allow_failure, and glJobCIStatus maps skipped onto
+//     completed/skipped, which this fold counts toward green.
+//
+// GitLab's own pipeline status already encodes all of it. See headCIStatus.
 func deriveCIStatus(checks []CICheck) string {
 	if len(checks) == 0 {
 		return "none"
@@ -213,51 +224,123 @@ func (c *GitHub) JobLogTail(ctx context.Context, repoURL, token, jobID string, m
 }
 
 // PRChecks reads the live head SHA, mergeability and pipeline jobs of a
-// GitLab MR. No head pipeline yet means zero checks.
+// GitLab MR.
+//
+// Status is NOT folded from checks: it comes from headCIStatus, the single
+// GitLab CI derivation shared with the merge gate's GetPRState. checks[] is
+// drill-down detail only - see deriveCIStatus's note on why folding a GitLab
+// job list is wrong.
+//
+// checks[] carries the pipeline's own jobs AND its bridges (trigger: jobs).
+// A bridge is the unit that carries a child pipeline's result, so on a repo
+// whose real gating is downstream the bridge row is the only row that moves.
 func (c *GitLab) PRChecks(ctx context.Context, repoURL, token string, number int) (CIResult, error) {
 	proj, err := glProjectPath(repoURL)
 	if err != nil {
 		return CIResult{}, err
 	}
 	var mr struct {
-		SHA          string `json:"sha"`
-		MergeStatus  string `json:"merge_status"`
-		HeadPipeline *struct {
-			ID int64 `json:"id"`
-		} `json:"head_pipeline"`
+		SHA          string          `json:"sha"`
+		MergeStatus  string          `json:"merge_status"`
+		HeadPipeline *glHeadPipeline `json:"head_pipeline"`
 	}
 	mrPath := "/projects/" + url.PathEscape(proj) + "/merge_requests/" + strconv.Itoa(number)
 	if err := glDo(ctx, c.base(), http.MethodGet, mrPath, token, nil, &mr); err != nil {
 		return CIResult{}, fmt.Errorf("gitlab: pr checks: get mr: %w", err)
 	}
+
+	ci, err := c.headCIStatus(ctx, proj, mr.SHA, token, mr.HeadPipeline)
+	if err != nil {
+		return CIResult{}, fmt.Errorf("gitlab: pr checks: head ci status: %w", err)
+	}
+
 	var checks []CICheck
-	if mr.HeadPipeline != nil {
-		var jobs []struct {
-			ID     int64  `json:"id"`
-			Name   string `json:"name"`
-			Status string `json:"status"`
-			WebURL string `json:"web_url"`
-		}
-		jobsPath := "/projects/" + url.PathEscape(proj) + "/pipelines/" + strconv.FormatInt(mr.HeadPipeline.ID, 10) + "/jobs"
-		if err := glDo(ctx, c.base(), http.MethodGet, jobsPath, token, nil, &jobs); err != nil {
+	switch {
+	case ci.StaleHead:
+		// The head pipeline is for a PREVIOUS commit, so its jobs are not this
+		// head's checks: paging them buys rows that explain another SHA, and
+		// completed/success rows under a pending status read as "CI passed".
+		// Status is pending, which needs no row to explain it.
+
+	case mr.HeadPipeline != nil:
+		// Every list here is paged at per_page=100 and followed to the end. A
+		// first page of green jobs hiding a failing one at index 22 is the same
+		// "fold an incomplete set" shape the bridge omission was.
+		pipelinePath := "/projects/" + url.PathEscape(proj) + "/pipelines/" + strconv.FormatInt(mr.HeadPipeline.ID, 10)
+
+		jobs, err := glDoPaged[glPipelineJob](ctx, c.base(), pipelinePath+"/jobs?per_page=100", token)
+		if err != nil {
 			return CIResult{}, fmt.Errorf("gitlab: pr checks: list jobs: %w", err)
 		}
-		checks = make([]CICheck, 0, len(jobs))
+
+		// Bridges are a SEPARATE endpoint: /jobs omits them entirely. An error
+		// here propagates rather than degrading to the job-only view, which is
+		// the view that reported green on a failed child pipeline.
+		bridges, err := glDoPaged[glPipelineBridge](ctx, c.base(), pipelinePath+"/bridges?per_page=100", token)
+		if err != nil {
+			return CIResult{}, fmt.Errorf("gitlab: pr checks: list bridges: %w", err)
+		}
+
+		checks = make([]CICheck, 0, len(jobs)+len(bridges))
 		for _, j := range jobs {
-			status, conclusion := glJobCIStatus(j.Status)
+			s, conclusion := glJobCIStatus(j.Status)
 			checks = append(checks, CICheck{
 				Name:       j.Name,
-				Status:     status,
+				Status:     s,
 				Conclusion: conclusion,
 				URL:        j.WebURL,
 				JobID:      strconv.FormatInt(j.ID, 10),
 			})
 		}
+		for _, b := range bridges {
+			s, conclusion := glJobCIStatus(b.Status)
+			webURL := b.WebURL
+			if b.DownstreamPipeline != nil && b.DownstreamPipeline.WebURL != "" {
+				// The child pipeline is what an agent needs to open; the bridge's
+				// own page only says "it triggered something".
+				webURL = b.DownstreamPipeline.WebURL
+			}
+			checks = append(checks, CICheck{
+				Name:       b.Name,
+				Status:     s,
+				Conclusion: conclusion,
+				URL:        webURL,
+				// A bridge id is NOT a job id: /jobs/{id}/trace 404s on it, and
+				// fetchRawLog maps 404 to ("", nil), so a JobID here would buy a
+				// silent wasted round-trip on every red bridge. Bridges have no
+				// trace of their own - the failing job is in the child pipeline,
+				// which the URL above points at.
+				JobID: "",
+			})
+		}
+
+	case len(ci.CommitStatuses) > 0:
+		// No head pipeline: the status was folded from commit statuses, so those
+		// statuses ARE the checks. Reporting red with an empty checks[] would
+		// leave the caller nothing to act on.
+		checks = make([]CICheck, 0, len(ci.CommitStatuses))
+		for _, s := range ci.CommitStatuses {
+			st, conclusion := glJobCIStatus(s.Status)
+			checks = append(checks, CICheck{
+				Name:       s.Name,
+				Status:     st,
+				Conclusion: conclusion,
+				URL:        s.TargetURL,
+				// An external reporter's status has no trace this operator can
+				// fetch; target_url is where its log lives.
+				JobID: "",
+			})
+		}
 	}
+
 	return CIResult{
-		HeadSHA:   mr.SHA,
-		Status:    deriveCIStatus(checks),
-		Mergeable: mr.MergeStatus == "can_be_merged",
+		HeadSHA: mr.SHA,
+		Status:  ci.Status,
+		// merge_status answers "are there conflicts", not "is CI green": GitLab
+		// reports can_be_merged on a red pipeline. The only consumer is an agent
+		// deciding whether to submit, and "no conflicts but CI failed" is not
+		// mergeable in any sense that consumer cares about.
+		Mergeable: mr.MergeStatus == "can_be_merged" && ci.Status != CIMirrorRed,
 		Checks:    checks,
 	}, nil
 }
