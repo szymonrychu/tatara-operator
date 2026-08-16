@@ -205,14 +205,13 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 	// fixed where it belongs, in the flip: parkOwnerTask upgrades a takeover's
 	// implement-declined park to ownership-lost, via the exported
 	// stage.UpgradeDeclineToOwnershipLost. So the rule a declined takeover
-	// actually follows is TERMINAL WHILE THE BRANCH IS STILL TATARA'S,
-	// RESUMABLE ONCE IT IS THE HUMAN'S AGAIN -
-	// deliberate declines included. "A deliberate decline is never followed by a
-	// flip" is FALSE and must not be reinstated here: the takeover job text
-	// requires the agent to comment on the merge request explaining itself before
-	// declining, so a maintainer reading that comment and pushing a fix is the
-	// EXPECTED response, and that push flips ownership exactly as a divergence
-	// does.
+	// actually follows is TERMINAL WHILE THE BRANCH IS STILL TATARA'S, RESUMABLE
+	// ONCE IT IS THE HUMAN'S AGAIN - deliberate declines included. "A deliberate
+	// decline is never followed by a flip" is FALSE and must not be reinstated
+	// here: the takeover job text requires the agent to comment on the merge
+	// request explaining itself before declining, so a maintainer reading that
+	// comment and pushing a fix is the EXPECTED response, and that push flips
+	// ownership exactly as a divergence does.
 	//
 	// THE PREDICATE DOES NOT CARVE OUT implement-declined. Within the two classes
 	// it refuses, ownership-lost is the only reason it lets through, and this
@@ -220,9 +219,9 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 	// TestMRTakeover_RefusesReTakeOnAnUnresumableParkedTask, though only by
 	// posting as the parked Task itself, which the reachable-shape note below
 	// says production cannot do. What removes it in production is UPSTREAM:
-	// nothing can call here until the human pushes, and
-	// that push has already rewritten the reason. Rounds 5 and 6 of #604's review
-	// both described the carve-out as this predicate's own; reconciling
+	// nothing can call here until the human pushes, and that push has already
+	// rewritten the reason. Rounds 5 and 6 of #604's review both described the
+	// carve-out as this predicate's own; reconciling
 	// unresumableTakeoverPark to that reading means deleting its ownership-lost
 	// early return, and every legitimate re-take then 409s.
 	//
