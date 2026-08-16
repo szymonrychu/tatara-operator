@@ -417,6 +417,11 @@ func (r *TaskReconciler) agentAskedToBeStopped(task *tatarav1alpha1.Task) bool {
 // already written it, unprompted, so every step of that sequence would spend a
 // real turn's worth of tokens and wall time re-asking a question that has been
 // answered.
+//
+// ONE step of it is still owed, and it is the one the agent structurally cannot
+// perform: the failed-repos note. See AppendFailedReposNote. This is also the
+// path it is needed on MOST - it fires whenever an agent ends its work
+// properly, where the TTL path fires only when a clock came round first.
 func (r *TaskReconciler) stopAfterAgentHandoff(ctx context.Context, proj *tatarav1alpha1.Project,
 	task *tatarav1alpha1.Task, agentKind string, now time.Time) (ctrl.Result, error) {
 
