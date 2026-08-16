@@ -423,7 +423,9 @@ func taskTokenLabels(task *tatarav1alpha1.Task) (project, repo, kind, issue, mod
 // /v1/messages/{turnId}, whose TurnResult has neither field, so it must leave
 // whatever the callback recorded alone rather than clearing it. One flag covers
 // both lists because they arrive from, and are absent from, exactly the same
-// places.
+// places - but "leave alone" is scoped to the turn the lists actually describe,
+// which is what LastTurnReposTurnID records: an unknown-repos stamp for a NEWER
+// turn drops the failures and keeps the pushes.
 //
 // It is guarded exactly like recordResult: a callback for a turn the Task has
 // already moved past must not overwrite a newer turn's state, and a terminal
@@ -485,6 +487,20 @@ func (s *CallbackServer) stampLastTurn(ctx context.Context, task *tatarav1alpha1
 				changed = true
 			}
 			fresh.Status.LastTurnFailedRepos = failed
+			if fresh.Status.LastTurnReposTurnID != turnID {
+				changed = true
+			}
+			fresh.Status.LastTurnReposTurnID = turnID
+		} else if fresh.Status.LastTurnReposTurnID != turnID && len(fresh.Status.LastTurnFailedRepos) > 0 {
+			// The final text just became a NEWER turn's, and this path knows
+			// nothing about that turn's repos. Keeping the older turn's failures
+			// beside it is not a stale optimism like a stale pushedRepos is: it
+			// tells the next agent to redo work the following turn may well have
+			// landed, and it makes a content-free stop compute contentFree=false,
+			// which re-disarms the #527 empty-synthetic detector. The pushed list
+			// stays, for the reason it has always stayed.
+			fresh.Status.LastTurnFailedRepos = nil
+			changed = true
 		}
 		if !changed {
 			return nil

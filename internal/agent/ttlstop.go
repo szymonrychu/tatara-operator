@@ -461,6 +461,7 @@ func (s *TTLStopper) StopWithHandoff(ctx context.Context, task *tatarav1alpha1.T
 		if serr == nil {
 			deadline := earliest(s.now().Add(in.waitBound()), hardCap)
 			if s.waitHandoffNote(ctx, task.Name, before, deadline) {
+				s.noteFailedRepos(ctx, task, in)
 				return s.finish(ctx, task, in, TTLHandoffAgent)
 			}
 		}
@@ -714,10 +715,11 @@ func (s *TTLStopper) writeSyntheticNote(ctx context.Context, task *tatarav1alpha
 	// a plain append would drop this sentence in full. The final text can afford
 	// to lose its tail; this cannot, because it names work that no longer exists
 	// anywhere.
-	// Capped in turn, so the reservation can never starve the note it is reserved
-	// out of: the two truncations bound each other rather than trusting the repo
-	// list to be short.
-	warning := truncateNoteBodyTo(failedReposSentence(in.FailedRepos), maxNoteBody/4)
+	// Budgeted in turn, so the reservation can never starve the note it is
+	// reserved out of: the two bound each other rather than trusting the repo list
+	// to be short. The budget is spent on the repo NAMES; the sentence's fixed
+	// prose is a few hundred bytes and comfortably inside a quarter of the note.
+	warning := failedReposSentence(in.FailedRepos, maxNoteBody/4)
 	n := tatarav1alpha1.Note{
 		At:    metav1.NewTime(s.now()),
 		Agent: NoteAgentOperator,
@@ -728,6 +730,39 @@ func (s *TTLStopper) writeSyntheticNote(ctx context.Context, task *tatarav1alpha
 		return "", fmt.Errorf("agent: write synthetic handoff note: %w", err)
 	}
 	return handoff, nil
+}
+
+// noteFailedRepos appends the operator's own note naming the repos whose push
+// failed, on the ONE path where the agent wrote the handoff itself.
+//
+// Without it the field is spent only on the synthetic-note path - i.e. only when
+// the pod was ALSO wedged, which is the case that was already loud - and is then
+// cleared unread by clearLastTurn/stampEnter on every healthy stop. The agent
+// cannot cover for that: HandoffTurnText is a fixed string, and the wrapper
+// reports the push failure to pod stdout, which is neither in the agent's context
+// nor Loki-scraped. So the agent writes a note that cannot mention it, and the
+// one fact describing LOST WORK dies with the pod.
+//
+// Best-effort, and deliberately so on both counts: a note that will not write
+// must never keep a pod alive, and returning an error here would send the caller
+// back through a stop sequence whose agent handoff note now predates its own
+// baseline - the retry would time out waiting for a second one and overwrite a
+// perfectly good agent handoff with the synthetic note.
+func (s *TTLStopper) noteFailedRepos(ctx context.Context, task *tatarav1alpha1.Task, in TTLStopInput) {
+	body := strings.TrimSpace(failedReposSentence(in.FailedRepos, maxNoteBody))
+	if body == "" {
+		return
+	}
+	n := tatarav1alpha1.Note{
+		At:    metav1.NewTime(s.now()),
+		Agent: NoteAgentOperator,
+		Kind:  NoteKindHandoff,
+		Body:  body,
+	}
+	if err := s.Notes.AppendNote(ctx, task.Name, n); err != nil {
+		log.FromContext(ctx).Error(err, "could not record the repos whose push failed",
+			"action", "failed_repos_note", "resource_id", task.Name, "failed_repos", in.FailedRepos)
+	}
 }
 
 // syntheticNoteLostBody is what the operator writes when it holds nothing to
@@ -761,13 +796,55 @@ func syntheticNoteLostBody() string {
 // loop (tatara-claude-code-wrapper#167), so this is the only signal that a
 // pushed-repos list is short because work was lost rather than because there was
 // nothing to push.
-func failedReposSentence(failed []string) string {
+// It does NOT declare the work lost outright. The mid-turn safety pusher pushes
+// every repo each interval regardless of tree state, so a rejection at 12:00 that
+// succeeds at 12:05 leaves this field naming repos whose commits ARE on origin,
+// and an unconditional "redo it" sends the next agent to redo work that already
+// exists. This is the same uncertainty the OOM note handles the same way: name
+// it, and tell the agent to verify.
+//
+// The repo names come LAST and inside a budget of their own, because they are the
+// only part that can be long: clampPushedRepos admits 20 names with no per-name
+// cap. Truncating the rendered sentence would cut inside the join and take the
+// directive with it, leaving a note that names some lost repos and silently omits
+// the others. Names are dropped whole and counted instead.
+func failedReposSentence(failed []string, budget int) string {
 	if len(failed) == 0 {
 		return ""
 	}
-	return fmt.Sprintf(" WARNING: the last turn failed to push %s - those commits were only ever on the "+
-		"previous pod's workspace, which is gone. Treat that work as LOST and redo it.",
-		strings.Join(failed, ", "))
+	const format = " WARNING: the last turn's commit/push FAILED for %d repo(s). Those commits were only ever " +
+		"on the previous pod's workspace, which is gone - unless the mid-turn safety pusher landed them after " +
+		"the turn-end failure. CHECK origin for the task branch in each, and redo only what is missing. " +
+		"Repos: %s."
+	room := budget - len(fmt.Sprintf(format, len(failed), ""))
+	return fmt.Sprintf(format, len(failed), joinWithinBudget(failed, room))
+}
+
+// joinWithinBudget renders as many names as fit and reports how many it dropped.
+// A name is rendered whole or not at all: half a repo name is not a repo, and a
+// list that ends mid-name reads as a complete list.
+func joinWithinBudget(names []string, budget int) string {
+	elided := func(from int) string { return fmt.Sprintf(" (+%d more)", len(names)-from) }
+	// Reserved against the WHOLE count so the reservation can never be too small
+	// for the suffix it is reserving for.
+	reserve := len(elided(0))
+	var b strings.Builder
+	for i, n := range names {
+		sep := ""
+		if i > 0 {
+			sep = ", "
+		}
+		need := b.Len() + len(sep) + len(n)
+		if i < len(names)-1 {
+			need += reserve
+		}
+		if need > budget {
+			return b.String() + elided(i)
+		}
+		b.WriteString(sep)
+		b.WriteString(n)
+	}
+	return b.String()
 }
 
 // OOMKilledNoteMarker is the phrase an OOM-kill handoff note leads with, for the

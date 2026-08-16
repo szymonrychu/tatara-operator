@@ -825,10 +825,26 @@ type TaskStatus struct {
 	//
 	// Written under the same known/unknown gate as LastTurnPushedRepos: the poll
 	// backstop's TurnResult carries no such field, so it leaves whatever the
-	// callback recorded alone.
+	// callback recorded alone - but only for its OWN turn, see
+	// LastTurnReposTurnID.
 	// +optional
 	// +kubebuilder:validation:MaxItems=20
 	LastTurnFailedRepos []string `json:"lastTurnFailedRepos,omitempty"`
+	// LastTurnReposTurnID names the turn the two repo lists above describe. It
+	// exists because the poll backstop stamps a NEWER turn's final text while
+	// knowing nothing about that turn's repos, which would otherwise leave the
+	// previous turn's lists attached to it.
+	//
+	// The two lists are then treated differently, and deliberately so: a stale
+	// pushedRepos is optimistic and inert (the commits it names really are on
+	// origin, they are simply older than the text beside them), while a stale
+	// failedRepos is an active instruction to redo work that has since landed -
+	// and it would additionally make a content-free stop compute contentFree=false,
+	// re-disarming the #527 empty-synthetic detector. So the failures are dropped
+	// when they belong to an older turn and the pushes are kept.
+	// +optional
+	// +kubebuilder:validation:MaxLength=256
+	LastTurnReposTurnID string `json:"lastTurnReposTurnId,omitempty"`
 }
 
 // +kubebuilder:object:root=true

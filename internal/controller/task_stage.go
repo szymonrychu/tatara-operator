@@ -1540,6 +1540,7 @@ func clearLastTurn(t *tatarav1alpha1.Task) {
 	// syntheticNoteLostBody() and never fires RecordEmptySynthetic - the #527
 	// detector disarmed by a slice nobody retired.
 	t.Status.LastTurnFailedRepos = nil
+	t.Status.LastTurnReposTurnID = ""
 }
 
 // turn0Marker identifies the pod turn-0 was submitted to. A respawn re-stamps
