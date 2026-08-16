@@ -11,7 +11,6 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 // TestAdmittedTicketWakesTaskReconcile runs a REAL manager against the envtest
@@ -32,7 +31,8 @@ import (
 // informer, no predicate, no map func and no workqueue.
 func TestAdmittedTicketWakesTaskReconcile(t *testing.T) {
 	mgr := newTestManager(t)
-	wakes := make(chan reconcile.Request, 32)
+	key := types.NamespacedName{Namespace: testNS, Name: "ticket-wake-task"}
+	rec, wakes := recordWakesFor(key)
 	metrics := obs.NewOperatorMetrics(prometheus.NewRegistry())
 
 	// .Named() is REQUIRED: controller-runtime's controller-name registry is
@@ -44,13 +44,7 @@ func TestAdmittedTicketWakesTaskReconcile(t *testing.T) {
 	r := &TaskReconciler{Client: mgr.GetClient(), Metrics: metrics}
 	err := r.controllerBuilder(mgr).
 		Named("task-ticket-wake-envtest").
-		Complete(reconcile.Func(func(_ context.Context, req reconcile.Request) (reconcile.Result, error) {
-			select {
-			case wakes <- req:
-			default:
-			}
-			return reconcile.Result{}, nil
-		}))
+		Complete(rec)
 	if err != nil {
 		t.Fatalf("register the test controller: %v", err)
 	}
@@ -71,13 +65,12 @@ func TestAdmittedTicketWakesTaskReconcile(t *testing.T) {
 	// NOT include "implement" - that is an AGENT kind, which is a different enum
 	// (queuedevent_types.go:57) and lives on the ticket's payload, not here.
 	task := &tatarav1alpha1.Task{
-		ObjectMeta: metav1.ObjectMeta{Name: "ticket-wake-task", Namespace: testNS},
+		ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace},
 		Spec: tatarav1alpha1.TaskSpec{
 			ProjectRef: "ticket-wake-proj", Kind: "review", Goal: "spawn the review pod",
 		},
 	}
 	mustCreate(t, ctx, task)
-	key := types.NamespacedName{Namespace: testNS, Name: task.Name}
 	if !awaitWake(wakes, key, timeout) {
 		t.Fatal("the Task create never reached the reconciler; the manager is not actually running")
 	}
