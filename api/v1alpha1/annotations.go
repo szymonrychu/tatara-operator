@@ -5,32 +5,6 @@ package v1alpha1
 // reads this to decide whether to launch an ingest Job.
 const ReingestRequestedAnnotation = "tatara.dev/reingest-requested"
 
-// SweepRequestedAnnotation is the RFC3339 instant at which a webhook asked for
-// this Repository's issueScan sweep slot to be PULLED FORWARD. reposDueForScan
-// treats a repo whose request is newer than the project's last scan as due now,
-// regardless of its deterministic phase-shifted slot.
-//
-// IT EXISTS BECAUSE SOME WORK CANNOT BE MINTED FROM AN HTTP GOROUTINE. A
-// dependency-upgrade merge request is adopted under the project-wide
-// maxOpenUpgrades cap, and the webhook server runs on EVERY replica
-// (HandlerRunnable.NeedLeaderElection() is false) behind a load-balancing
-// Service - so a check-then-mint in the handler is a distributed race that no
-// in-process lock can close, and three replicas can each independently pass the
-// same cap check. The leader's sweep is serialized per project
-// (MaxConcurrentReconciles: 1) and already enforces the cap correctly, so the
-// webhook's job is reduced to telling it to run NOW. Same idiom as
-// ReingestRequestedAnnotation above: a marker write from the HTTP goroutine,
-// consumed by a leader-only reconcile (the #353 / F6-1 boundary).
-//
-// IT IS COMPARED, NEVER CLEARED. Deleting it after a pass would need a
-// compare-and-delete against a webhook that may stamp between the list and the
-// clear; comparing the instant against the SAME dueBase every other repo slot is
-// anchored on costs no write at all, and stampScan advancing LastIssueScan
-// retires every request older than the pass that served it. That also makes a
-// burst self-debouncing: five deliveries write five instants onto ONE key, and
-// one pass serves them all.
-const SweepRequestedAnnotation = "tatara.dev/sweep-requested"
-
 // Turn-loop annotation keys, shared by the controller (agent-run state) and the
 // webhook (reactivation must clear them so a fresh run starts clean).
 const (
@@ -146,6 +120,24 @@ const (
 	LabelSourceKind = "tatara.io/source-kind"
 	// LabelActivity is the scan activity name.
 	LabelActivity = "tatara.io/activity"
+)
+
+// LabelUpgradeOrigin discriminates the two producers of an `upgrade` Task, and
+// it exists so a draining dependency-engine backlog does not silence the upgrade
+// CRON. maxOpenUpgrades bounds the cron ALONE (design D2); adopted merge requests
+// are bounded by the general pool. Without a discriminator openUpgradeLaneCount
+// would read a Renovate batch as "lanes full" and the cron would stop proposing
+// bumps for as long as the batch lasted, invisibly.
+//
+// The prefix is tatara.dev/, NOT the tatara.io/ its neighbours above use. That
+// split predates this label (every annotation in this file is tatara.dev/, both
+// scan labels are tatara.io/); do not "fix" one to match the other, it would
+// orphan every live object carrying the old key.
+const (
+	LabelUpgradeOrigin = "tatara.dev/upgrade-origin"
+	// UpgradeOriginAdopted marks work born from an EXISTING third-party merge
+	// request. The cron's own mints carry no upgrade-origin label at all.
+	UpgradeOriginAdopted = "adopted"
 )
 
 const (

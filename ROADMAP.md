@@ -2,6 +2,15 @@
 
 Planned work not yet started. One line per item; link to plans for detail.
 
+- [x] **QUEUED UPGRADE ADOPTION replaces the pulled-forward sweep marker below, landed 2026-08-16
+  (`docs/superpowers/sdd/2026-08-16-queued-upgrade-adoption-plan.md`, workbench tatara-new). PATCH.**
+  An adoptable dependency merge request's webhook delivery now becomes a durable `QueuedEvent` that
+  the leader-elected `DispatcherReconciler` admits the instant a general-pool slot frees, instead of
+  waiting on the `issueScan` cron. `SweepRequestedAnnotation`, its reader in `reposDueForScan`, and
+  the retired `upgrade_headroom_bound` Grafana series are DELETED (no producer left for any of the
+  three) - see MEMORY.md 2026-08-16 for why each objection to a queue-based design no longer binds.
+  `maxOpenUpgrades` now governs the upgrade CRON alone; adoption is bounded by the general pool.
+
 - [x] **RENOVATE MERGE-REQUEST ADOPTION. Phase 3 of
   `docs/superpowers/specs/2026-08-14-upgrade-agent-renovate-fanout-plan.md` (the plan lives in the
   `tatara-new` workbench), landed 2026-08-15. MINOR: two new opt-in fields and a new intake

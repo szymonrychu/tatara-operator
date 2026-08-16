@@ -10,16 +10,26 @@ import (
 )
 
 // newTestManager builds a real manager against the envtest control plane
-// (never Started - SetupWithManager only needs to register, not run) with
-// its network-facing servers disabled so it never binds a port in a test
+// (usually never Started - SetupWithManager only needs to register, not run)
+// with its network-facing servers disabled so it never binds a port in a test
 // run.
-func newTestManager(t *testing.T) ctrl.Manager {
+//
+// Each opt may adjust the Options before the manager is built. That is for the
+// tests that actually START their manager (queue_adopt_envtest_test.go): a
+// running controller needs its cache scoped to its own namespace so it cannot
+// admit another test's fixtures, and needs the process-wide controller-name
+// check skipped because a second manager registering the same For type collides.
+func newTestManager(t *testing.T, opts ...func(*ctrl.Options)) ctrl.Manager {
 	t.Helper()
-	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
+	o := ctrl.Options{
 		Scheme:                 scheme.Scheme,
 		Metrics:                metricsserver.Options{BindAddress: "0"},
 		HealthProbeBindAddress: "0",
-	})
+	}
+	for _, opt := range opts {
+		opt(&o)
+	}
+	mgr, err := ctrl.NewManager(cfg, o)
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}

@@ -54,14 +54,14 @@ func TestMintAdoptedUpgradeTask_IsIdempotentPerMergeRequest(t *testing.T) {
 	proj, repo := adoptProject(t, ctx)
 	m := newTestMinter(t)
 
-	first, outcome, err := m.MintAdoptedUpgradeTask(ctx, proj, repo, adoptedPR(41), testSpiller(t))
+	first, outcome, err := m.MintAdoptedUpgradeTask(ctx, proj, repo, adoptedPR(41), testSpiller(t), nil)
 	if err != nil {
 		t.Fatalf("first mint: %v", err)
 	}
 	if outcome != MintCreated {
 		t.Fatalf("first mint outcome = %q, want created", outcome)
 	}
-	second, outcome, err := m.MintAdoptedUpgradeTask(ctx, proj, repo, adoptedPR(41), testSpiller(t))
+	second, outcome, err := m.MintAdoptedUpgradeTask(ctx, proj, repo, adoptedPR(41), testSpiller(t), nil)
 	if err != nil {
 		t.Fatalf("second mint: %v", err)
 	}
@@ -103,7 +103,7 @@ func TestMintAdoptedUpgradeTask_IsIdempotentPerMergeRequest(t *testing.T) {
 func TestMintAdoptedUpgradeTask_MintsAtNewSoReviewGoesFirst(t *testing.T) {
 	ctx := context.Background()
 	proj, repo := adoptProject(t, ctx)
-	task, _, err := newTestMinter(t).MintAdoptedUpgradeTask(ctx, proj, repo, adoptedPR(42), testSpiller(t))
+	task, _, err := newTestMinter(t).MintAdoptedUpgradeTask(ctx, proj, repo, adoptedPR(42), testSpiller(t), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +142,7 @@ func TestMintAdoptedUpgradeTask_CreatesTheMirrorItBindsTo(t *testing.T) {
 		t.Fatalf("precondition: mergeRequestCR = (%v, %v), want (nil, nil)", cr, err)
 	}
 	pr := adoptedPR(43)
-	task, _, err := m.MintAdoptedUpgradeTask(ctx, proj, repo, pr, testSpiller(t))
+	task, _, err := m.MintAdoptedUpgradeTask(ctx, proj, repo, pr, testSpiller(t), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +169,7 @@ func TestMintAdoptedUpgradeTask_CreatesTheMirrorItBindsTo(t *testing.T) {
 func TestMintAdoptedUpgradeTask_BindsAndStampsTheBranch(t *testing.T) {
 	ctx := context.Background()
 	proj, repo := adoptProject(t, ctx)
-	task, _, err := newTestMinter(t).MintAdoptedUpgradeTask(ctx, proj, repo, adoptedPR(44), testSpiller(t))
+	task, _, err := newTestMinter(t).MintAdoptedUpgradeTask(ctx, proj, repo, adoptedPR(44), testSpiller(t), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +213,7 @@ func TestMintAdoptedUpgradeTask_StampsNoOwnershipAtAll(t *testing.T) {
 	proj, repo := adoptProject(t, ctx)
 	before := testutil.ToFloat64(obs.OwnershipFlipCounter("to-external", "external-push"))
 
-	if _, _, err := newTestMinter(t).MintAdoptedUpgradeTask(ctx, proj, repo, adoptedPR(45), testSpiller(t)); err != nil {
+	if _, _, err := newTestMinter(t).MintAdoptedUpgradeTask(ctx, proj, repo, adoptedPR(45), testSpiller(t), nil); err != nil {
 		t.Fatal(err)
 	}
 	mr := getMR(t, ctx, proj, repo, 45)
@@ -243,7 +243,7 @@ func TestMintAdoptedUpgradeTask_ReconcileOwnershipMakesItMergeable(t *testing.T)
 	d := &StageDriver{Client: k8sClient, APIReader: k8sClient,
 		SpillerFor: func(*tatarav1alpha1.Project) objbudget.Spiller { return &mirrorSpiller{} }}
 
-	if _, _, err := newTestMinter(t).MintAdoptedUpgradeTask(ctx, proj, repo, adoptedPR(46), testSpiller(t)); err != nil {
+	if _, _, err := newTestMinter(t).MintAdoptedUpgradeTask(ctx, proj, repo, adoptedPR(46), testSpiller(t), nil); err != nil {
 		t.Fatal(err)
 	}
 	mr := getMR(t, ctx, proj, repo, 46)
@@ -289,7 +289,7 @@ func TestMintAdoptedUpgradeTask_AHumanPushStillStandsItDown(t *testing.T) {
 	d := &StageDriver{Client: k8sClient, APIReader: k8sClient,
 		SpillerFor: func(*tatarav1alpha1.Project) objbudget.Spiller { return &mirrorSpiller{} }}
 
-	task, _, err := newTestMinter(t).MintAdoptedUpgradeTask(ctx, proj, repo, adoptedPR(47), testSpiller(t))
+	task, _, err := newTestMinter(t).MintAdoptedUpgradeTask(ctx, proj, repo, adoptedPR(47), testSpiller(t), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -335,7 +335,7 @@ func TestMintAdoptedUpgradeTask_AHumanPushStillStandsItDown(t *testing.T) {
 func TestMintAdoptedUpgradeTask_PodWorksOnTheRenovateBranchFromTheFirstTurn(t *testing.T) {
 	ctx := context.Background()
 	proj, repo := adoptProject(t, ctx)
-	task, _, err := newTestMinter(t).MintAdoptedUpgradeTask(ctx, proj, repo, adoptedPR(48), testSpiller(t))
+	task, _, err := newTestMinter(t).MintAdoptedUpgradeTask(ctx, proj, repo, adoptedPR(48), testSpiller(t), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -398,7 +398,7 @@ func TestMintAdoptedUpgradeTask_WithoutTheBindTheCorridorParks(t *testing.T) {
 func TestReleaseTerminal_MarksARefusedAdoptedMergeRequest(t *testing.T) {
 	ctx := context.Background()
 	proj, repo := adoptProject(t, ctx)
-	task, _, err := newTestMinter(t).MintAdoptedUpgradeTask(ctx, proj, repo, adoptedPR(51), testSpiller(t))
+	task, _, err := newTestMinter(t).MintAdoptedUpgradeTask(ctx, proj, repo, adoptedPR(51), testSpiller(t), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

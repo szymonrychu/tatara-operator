@@ -47,6 +47,12 @@ type glPayload struct {
 		LastCommit struct {
 			ID string `json:"id"`
 		} `json:"last_commit"`
+		// Source is the MR's source project, present only on Merge Request Hook
+		// deliveries. PathWithNamespace differs from Project.PathWithNamespace
+		// exactly when the MR is opened from a fork.
+		Source struct {
+			PathWithNamespace string `json:"path_with_namespace"`
+		} `json:"source"`
 	} `json:"object_attributes"`
 	Issue struct {
 		IID int `json:"iid"`
@@ -173,6 +179,7 @@ func glWorkItemEvent(kind string, isPR bool, p glPayload) WebhookEvent {
 		IsPR:         isPR,
 		HeadSHA:      p.ObjectAttributes.LastCommit.ID,
 		HeadBranch:   p.ObjectAttributes.SourceBranch,
+		HeadRepo:     p.ObjectAttributes.Source.PathWithNamespace,
 		ChangedLabel: changed,
 		Merged:       action == "merged",
 	}

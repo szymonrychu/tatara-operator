@@ -34,8 +34,8 @@ func mirrorScheme(t *testing.T) *runtime.Scheme {
 }
 
 // newMirrorClient builds a fake client with the status subresource enabled for
-// Issue/MergeRequest/Task (without it Status().Update unconditionally 404s) and
-// the five contract A.3 field indexes registered.
+// Issue/MergeRequest/Task/QueuedEvent (without it Status().Update
+// unconditionally 404s) and the five contract A.3 field indexes registered.
 func newMirrorClient(t *testing.T, objs ...client.Object) client.Client {
 	t.Helper()
 	return newMirrorClientIntercepted(t, interceptor.Funcs{}, objs...)
@@ -52,7 +52,11 @@ func newMirrorClientIntercepted(t *testing.T, funcs interceptor.Funcs, objs ...c
 		WithScheme(mirrorScheme(t)).
 		WithObjects(objs...).
 		WithInterceptorFuncs(funcs).
-		WithStatusSubresource(&tatarav1alpha1.Issue{}, &tatarav1alpha1.MergeRequest{}, &tatarav1alpha1.Task{}).
+		// QueuedEvent is here because its CRD really does have a status
+		// subresource: the dispatcher stamps Admitted through Status().Update, and
+		// a fake client that does not know that 404s on it rather than writing.
+		WithStatusSubresource(&tatarav1alpha1.Issue{}, &tatarav1alpha1.MergeRequest{},
+			&tatarav1alpha1.Task{}, &tatarav1alpha1.QueuedEvent{}).
 		WithIndex(&tatarav1alpha1.Issue{}, IssueKeyIndex, IssueKeyIndexer).
 		WithIndex(&tatarav1alpha1.MergeRequest{}, MRKeyIndex, MRKeyIndexer).
 		WithIndex(&tatarav1alpha1.Task{}, TaskProjectRefIndex, TaskProjectRefIndexer).
