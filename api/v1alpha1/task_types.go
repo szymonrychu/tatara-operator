@@ -842,6 +842,12 @@ type TaskStatus struct {
 	// and it would additionally make a content-free stop compute contentFree=false,
 	// re-disarming the #527 empty-synthetic detector. So the failures are dropped
 	// when they belong to an older turn and the pushes are kept.
+	//
+	// The id is the WRAPPER's, and nothing operator-side bounds it, so the write
+	// path clamps it to MaxLength rather than letting an over-long one have the
+	// apiserver reject the whole status update - which would lose the final text
+	// and both lists, not just the id. The ownership comparison clamps the same
+	// way, so a clamped id still matches the turn that wrote it.
 	// +optional
 	// +kubebuilder:validation:MaxLength=256
 	LastTurnReposTurnID string `json:"lastTurnReposTurnId,omitempty"`

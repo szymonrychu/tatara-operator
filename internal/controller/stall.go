@@ -11,6 +11,7 @@ import (
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
+	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 )
 
@@ -432,6 +433,18 @@ func (r *TaskReconciler) stopAfterAgentHandoff(ctx context.Context, proj *tatara
 	if err := clearTurnAnnotations(ctx, r.Client, task); err != nil {
 		return ctrl.Result{}, fmt.Errorf("agent-requested stop clear %s: %w", task.Name, err)
 	}
+	// BEFORE the clear below, and not covered by the agent's note: the agent had
+	// no way to know a push failed at turn end (the wrapper reports it to pod
+	// stdout only), so this is the one fact its handoff cannot carry. Best-effort
+	// - see AppendFailedReposNote - and placed here rather than after the patch so
+	// a patch failure retries into a duplicate note rather than losing the report.
+	var sp objbudget.Spiller
+	if r.SpillerFor != nil {
+		sp = r.SpillerFor(proj)
+	}
+	agent.AppendFailedReposNote(ctx,
+		&agent.FitNoteAppender{Client: r.Client, Spiller: sp, Namespace: task.Namespace},
+		task.Name, task.Status.LastTurnFailedRepos, now)
 	if err := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 		fresh.Status.PodStartedAt = nil
 		fresh.Status.StateWorkStartedAt = nil
@@ -446,6 +459,5 @@ func (r *TaskReconciler) stopAfterAgentHandoff(ctx context.Context, proj *tatara
 	l.Info("agent asked to be stopped (handoff note, no turn in flight); pod stopped",
 		"action", "agent_requested_stop", "resource_id", task.Name,
 		"state", task.Status.State, "agent_kind", agentKind)
-	_ = now
 	return ctrl.Result{RequeueAfter: agentBootRequeue}, nil
 }

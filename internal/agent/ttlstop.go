@@ -732,36 +732,50 @@ func (s *TTLStopper) writeSyntheticNote(ctx context.Context, task *tatarav1alpha
 	return handoff, nil
 }
 
-// noteFailedRepos appends the operator's own note naming the repos whose push
-// failed, on the ONE path where the agent wrote the handoff itself.
+func (s *TTLStopper) noteFailedRepos(ctx context.Context, task *tatarav1alpha1.Task, in TTLStopInput) {
+	AppendFailedReposNote(ctx, s.Notes, task.Name, in.FailedRepos, s.now())
+}
+
+// AppendFailedReposNote appends the operator's own note naming the repos whose
+// push failed, on every path that SPENDS the last-turn payload without running
+// the G.7 synthetic note.
 //
-// Without it the field is spent only on the synthetic-note path - i.e. only when
-// the pod was ALSO wedged, which is the case that was already loud - and is then
-// cleared unread by clearLastTurn/stampEnter on every healthy stop. The agent
-// cannot cover for that: HandoffTurnText is a fixed string, and the wrapper
-// reports the push failure to pod stdout, which is neither in the agent's context
-// nor Loki-scraped. So the agent writes a note that cannot mention it, and the
-// one fact describing LOST WORK dies with the pod.
+// There are two such paths and they are the healthy ones. StopWithHandoff
+// returns TTLHandoffAgent as soon as the agent answers the handoff turn, and
+// stopAfterAgentHandoff skips the sequence entirely because the agent wrote the
+// note unprompted - which is how every well-behaved agent ends its work. Both
+// then run clearLastTurn. Without this the field would be spent only on the
+// synthetic-note path, i.e. only when the pod was ALSO wedged, which is the case
+// that was already loud.
+//
+// The agent's own note cannot cover for it: HandoffTurnText is a fixed string,
+// and the wrapper reports the push failure to pod stdout, which is neither in
+// the agent's context nor Loki-scraped. So the agent writes a note that cannot
+// mention it, and the one fact describing LOST WORK dies with the pod.
+//
+// Agent is NoteAgentOperator, so isAgentHandoffNote does not match it and
+// handoffNoteCount, HasAgentHandoffNote{,Since} and the agentAskedSomething call
+// sites are all unmoved by an addendum landing beside the agent's own note.
 //
 // Best-effort, and deliberately so on both counts: a note that will not write
-// must never keep a pod alive, and returning an error here would send the caller
-// back through a stop sequence whose agent handoff note now predates its own
-// baseline - the retry would time out waiting for a second one and overwrite a
-// perfectly good agent handoff with the synthetic note.
-func (s *TTLStopper) noteFailedRepos(ctx context.Context, task *tatarav1alpha1.Task, in TTLStopInput) {
-	body := strings.TrimSpace(failedReposSentence(in.FailedRepos, maxNoteBody))
+// must never keep a pod alive, and returning an error here would send the
+// TTL caller back through a stop sequence whose agent handoff note now predates
+// its own baseline - the retry would time out waiting for a second one and
+// overwrite a perfectly good agent handoff with the synthetic note.
+func AppendFailedReposNote(ctx context.Context, notes NoteAppender, taskName string, failed []string, at time.Time) {
+	body := strings.TrimSpace(failedReposSentence(failed, maxNoteBody))
 	if body == "" {
 		return
 	}
 	n := tatarav1alpha1.Note{
-		At:    metav1.NewTime(s.now()),
+		At:    metav1.NewTime(at),
 		Agent: NoteAgentOperator,
 		Kind:  NoteKindHandoff,
 		Body:  body,
 	}
-	if err := s.Notes.AppendNote(ctx, task.Name, n); err != nil {
+	if err := notes.AppendNote(ctx, taskName, n); err != nil {
 		log.FromContext(ctx).Error(err, "could not record the repos whose push failed",
-			"action", "failed_repos_note", "resource_id", task.Name, "failed_repos", in.FailedRepos)
+			"action", "failed_repos_note", "resource_id", taskName, "failed_repos", failed)
 	}
 }
 

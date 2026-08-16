@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -125,4 +126,66 @@ func TestTurnComplete_DropsBlankRepoNames(t *testing.T) {
 	require.Equal(t, []string{"tatara-operator"}, got.Status.LastTurnPushedRepos)
 	require.Empty(t, got.Status.LastTurnFailedRepos,
 		"a list whose only element names nothing carries nothing")
+}
+
+// THE GUARD AND THE CLAMP HAVE TO AGREE ON WHAT COUNTS AS CONTENT.
+//
+// The empty-payload guard (#527) used to run on the RAW lists while
+// clampPushedRepos dropped blanks twenty lines later, so a payload whose only
+// content was a blank name passed the guard, clamped to nothing, and then wrote
+// that nothing over the previous turn's continuation state. Reachable on exactly
+// the skew the blank-dropping is written for: a pre-fix wrapper image reporting
+// a failed turn emits {finalText:"", pushedRepos:nil, failedRepos:[""]}.
+func TestTurnComplete_ABlankOnlyPayloadDoesNotBlankThePreviousTurn(t *testing.T) {
+	mkTaskProject(t, "p-fr-blankguard", 3)
+	mkTaskRepository(t, "r-fr-blankguard", "p-fr-blankguard")
+	mkTask(t, "t-fr-blankguard", "p-fr-blankguard", "r-fr-blankguard")
+
+	postTurnComplete(t, "t-fr-blankguard", "turn-b-6", map[string]any{
+		"state": "completed", "finalText": "opened PR #91",
+		"pushedRepos": []string{"tatara-operator"},
+	})
+
+	postTurnComplete(t, "t-fr-blankguard", "turn-b-7", map[string]any{
+		"state": "failed", "failedRepos": []string{""},
+	})
+
+	got := getTask(t, "t-fr-blankguard")
+	require.Equal(t, "opened PR #91", got.Status.LastTurnFinalText,
+		"a payload that clamps to nothing is content-free and must not overwrite a turn that said something")
+	require.Equal(t, []string{"tatara-operator"}, got.Status.LastTurnPushedRepos)
+	require.Equal(t, "turn-b-6", got.Status.LastTurnReposTurnID,
+		"the repos still describe turn-b-6; a skipped payload must not claim ownership of them")
+}
+
+// AN OVER-LONG TURN ID COSTS THE FIELD IT DOES NOT FIT IN, NOT THE WHOLE WRITE.
+//
+// The turn id is the wrapper's, unvalidated operator-side, and annotation values
+// are not length-limited - so an id can exceed lastTurnReposTurnId's MaxLength
+// while still matching annCurrentTurn. An uncapped write is rejected by the
+// apiserver in full, taking the final text and both repo lists with it. Clamping
+// once, at both the write and the comparison, keeps the ownership check honest.
+func TestTurnComplete_AnOverLongTurnIDDoesNotFailTheWholeStatusWrite(t *testing.T) {
+	mkTaskProject(t, "p-fr-longid", 3)
+	mkTaskRepository(t, "r-fr-longid", "p-fr-longid")
+	mkTask(t, "t-fr-longid", "p-fr-longid", "r-fr-longid")
+
+	long := strings.Repeat("t", 400)
+	postTurnComplete(t, "t-fr-longid", long, map[string]any{
+		"state": "completed", "finalText": "opened PR #91",
+		"pushedRepos": []string{"tatara-operator"},
+		"failedRepos": []string{"tatara-cli"},
+	})
+
+	got := getTask(t, "t-fr-longid")
+	require.Equal(t, "opened PR #91", got.Status.LastTurnFinalText,
+		"an id that does not fit must not take the continuation state down with it")
+	require.Equal(t, []string{"tatara-cli"}, got.Status.LastTurnFailedRepos)
+	require.Len(t, got.Status.LastTurnReposTurnID, maxLastTurnReposTurnID)
+
+	// The backstop polling that SAME turn must still recognise it as its own.
+	require.NoError(t, newCallbackServer().stampLastTurn(context.Background(),
+		getTask(t, "t-fr-longid"), long, "opened PR #91", nil, nil, false))
+	require.Equal(t, []string{"tatara-cli"}, getTask(t, "t-fr-longid").Status.LastTurnFailedRepos,
+		"a clamped id must compare equal to the clamped form of the id that wrote it")
 }

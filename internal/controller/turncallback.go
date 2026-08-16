@@ -459,9 +459,27 @@ func (s *CallbackServer) stampLastTurn(ctx context.Context, task *tatarav1alpha1
 	// said nothing but LOST a repo is not content-free - it is the single most
 	// consequential thing a turn can report, since that repo's commits exist only
 	// on a workspace about to disappear.
-	if finalText == "" && len(pushedRepos) == 0 && len(failedRepos) == 0 {
+	//
+	// IT GUARDS ON THE CLAMPED LISTS, NOT THE RAW ONES, and the order is the whole
+	// point: clampPushedRepos drops blank names, so a payload whose only content
+	// was a [""] used to pass this guard and then write the nothing it clamped to
+	// over the previous turn's state - the #527 loss, re-opened by the cleaning
+	// that happened after the decision. Reachable on precisely the skew the
+	// blank-dropping exists for: a pre-fix wrapper image reporting a failed turn
+	// sends {finalText:"", pushedRepos:nil, failedRepos:[""]}. Returning early also
+	// correctly leaves LastTurnReposTurnID naming the older turn, i.e. unknown for
+	// this one.
+	repos, failed := clampPushedRepos(pushedRepos), clampPushedRepos(failedRepos)
+	if finalText == "" && len(repos) == 0 && len(failed) == 0 {
 		return nil
 	}
+	// The wrapper's turn id is unvalidated here and the status field carrying it
+	// is bounded, so it is clamped to the same bound the CRD declares - and clamped
+	// ONCE, so the id written and the id compared against are the same string. An
+	// over-long id must cost the field it does not fit in, never the whole status
+	// write: the apiserver rejecting that update would drop this turn's final text
+	// and both repo lists.
+	reposTurnID := tatarav1alpha1.TruncateUTF8(turnID, maxLastTurnReposTurnID)
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.Task{}
 		if err := s.Client.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
@@ -477,21 +495,19 @@ func (s *CallbackServer) stampLastTurn(ctx context.Context, task *tatarav1alpha1
 		changed := fresh.Status.LastTurnFinalText != want
 		fresh.Status.LastTurnFinalText = want
 		if pushedReposKnown {
-			repos := clampPushedRepos(pushedRepos)
 			if !slices.Equal(fresh.Status.LastTurnPushedRepos, repos) {
 				changed = true
 			}
 			fresh.Status.LastTurnPushedRepos = repos
-			failed := clampPushedRepos(failedRepos)
 			if !slices.Equal(fresh.Status.LastTurnFailedRepos, failed) {
 				changed = true
 			}
 			fresh.Status.LastTurnFailedRepos = failed
-			if fresh.Status.LastTurnReposTurnID != turnID {
+			if fresh.Status.LastTurnReposTurnID != reposTurnID {
 				changed = true
 			}
-			fresh.Status.LastTurnReposTurnID = turnID
-		} else if id := fresh.Status.LastTurnReposTurnID; id != "" && id != turnID && len(fresh.Status.LastTurnFailedRepos) > 0 {
+			fresh.Status.LastTurnReposTurnID = reposTurnID
+		} else if id := fresh.Status.LastTurnReposTurnID; id != "" && id != reposTurnID && len(fresh.Status.LastTurnFailedRepos) > 0 {
 			// The final text just became a DIFFERENT turn's, and this path knows
 			// nothing about that turn's repos. Keeping the other turn's failures
 			// beside it is not a stale optimism like a stale pushedRepos is: it
@@ -521,6 +537,14 @@ func (s *CallbackServer) stampLastTurn(ctx context.Context, task *tatarav1alpha1
 // the API server rejects would fail the whole status write, which is the
 // failure these fields exist to prevent.
 const maxLastTurnPushedRepos = 20
+
+// maxLastTurnReposTurnID mirrors the CRD MaxLength on
+// status.lastTurnReposTurnId, for the same reason: the turn id originates in the
+// wrapper's SubmitTurn response and nothing operator-side bounds it, while
+// annotation values are not length-limited - so an id can exceed the field's cap
+// and still match annCurrentTurn. Uncapped, that rejects the whole status update
+// and loses the final text and both repo lists rather than just the id.
+const maxLastTurnReposTurnID = 256
 
 // It also DROPS BLANK NAMES, on the receiving side rather than trusting the
 // sender. The wrapper stopped producing them, but version skew is a designed-for
