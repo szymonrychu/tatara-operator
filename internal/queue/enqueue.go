@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"strconv"
 	"strings"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
@@ -279,6 +280,48 @@ func QueuedEventName(projectRef, dedupKey string) string {
 	return "qe-" + hex.EncodeToString(sum[:])[:16]
 }
 
+// AdoptUpgradeDedupKey is the natural key of ONE queued dependency-upgrade
+// adoption. Both producers derive it from the same two facts they each already
+// hold - the Repository CR's NAME and the merge request number - so a webhook
+// enqueue and a sweep enqueue of the same merge request collide on
+// AlreadyExists at the API server and burn no sequence number.
+//
+// The Repository CR name, deliberately, not the forge slug: the webhook resolves
+// a Repository via matchRepo and the sweep iterates Repository CRs, so the CR
+// name is the one identifier both sides have without a second lookup.
+func AdoptUpgradeDedupKey(repo string, number int) string {
+	return "adopt-upgrade|" + repo + "|" + strconv.Itoa(number)
+}
+
+// IsAdoptedUpgradeMint reports whether qe mints an ADOPTED dependency-upgrade
+// Task rather than a generic one. The payload field IS the discriminator - there
+// is no mirrored label to drift from it.
+func IsAdoptedUpgradeMint(qe *tatarav1alpha1.QueuedEvent) bool {
+	return qe != nil && qe.Spec.Payload.AdoptedUpgrade != nil
+}
+
+// MintStamp is the label set EVERY mint puts on the Task it creates, extracted
+// so the two minting paths cannot drift. BuildTaskFromQueuedEvent uses it for
+// the generic mint; Minter.MintAdoptedUpgradeTask takes it as a parameter,
+// because it builds its Task by hand.
+//
+// All three are load-bearing and the adoption path needs each for a different
+// reason: LabelQueuedEvent is what mapTaskToQE follows to re-trigger admission
+// and what reconcileDone matches to GC the spent event, LabelMintedBy is the
+// #443 idempotency link the dispatcher's mintedTask reads, and LabelDedupKey is
+// what makes dedupExists refuse a SECOND enqueue for a merge request whose event
+// has already been admitted and collected.
+func MintStamp(qe *tatarav1alpha1.QueuedEvent) map[string]string {
+	stamp := map[string]string{LabelQueuedEvent: qe.Name}
+	if qe.UID != "" {
+		stamp[LabelMintedBy] = string(qe.UID)
+	}
+	if qe.Spec.DedupKey != "" {
+		stamp[LabelDedupKey] = dedupLabel(qe.Spec.DedupKey)
+	}
+	return stamp
+}
+
 // EnqueueOption tunes EnqueueEvent. The zero set is the normal producer path.
 type EnqueueOption func(*enqueueOpts)
 
@@ -471,14 +514,8 @@ func BuildTaskFromQueuedEvent(qe *tatarav1alpha1.QueuedEvent, proj *tatarav1alph
 		spec.Kind = bp.Kind
 		spec.AlertRules = bp.AlertRules
 	}
-	labels[LabelQueuedEvent] = qe.Name
-	if qe.UID != "" {
-		// Empty only for a QueuedEvent that never went through an API server
-		// (unit tests); mintedTask treats an unset UID as "adopts nothing".
-		labels[LabelMintedBy] = string(qe.UID)
-	}
-	if qe.Spec.DedupKey != "" {
-		labels[LabelDedupKey] = dedupLabel(qe.Spec.DedupKey)
+	for k, v := range MintStamp(qe) {
+		labels[k] = v
 	}
 	om.Labels = labels
 	task := &tatarav1alpha1.Task{ObjectMeta: om, Spec: spec}
