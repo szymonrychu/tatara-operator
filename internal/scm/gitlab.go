@@ -50,9 +50,15 @@ type glPayload struct {
 		// Source is the MR's source project, present only on Merge Request Hook
 		// deliveries. PathWithNamespace differs from Project.PathWithNamespace
 		// exactly when the MR is opened from a fork.
-		Source struct {
-			PathWithNamespace string `json:"path_with_namespace"`
-		} `json:"source"`
+		//
+		// glPayload is ONE struct shared by every GitLab event kind, and this key
+		// is not one of them: on a Merge Request Hook object_attributes.source is
+		// this object, but on a Pipeline Hook it is a STRING naming what triggered
+		// the pipeline (e.g. "merge_request_event"). A plain struct field failed
+		// json.Unmarshal for every pipeline delivery, and GitLab halts a webhook
+		// after enough consecutive verification failures - see MEMORY.md.
+		// glSourceProject tolerates both shapes without a second parse pass.
+		Source glSourceProject `json:"source"`
 	} `json:"object_attributes"`
 	Issue struct {
 		IID int `json:"iid"`
@@ -68,6 +74,27 @@ type glPayload struct {
 		} `json:"labels"`
 	} `json:"changes"`
 	Labels []glLabel `json:"labels"`
+}
+
+// glSourceProject decodes object_attributes.source. On a Merge Request Hook
+// it is an object (the MR's source project); on a Pipeline Hook it is a
+// string (what triggered the pipeline). Only the object form carries a
+// PathWithNamespace worth reading, so the string form (or anything else
+// that is not an object) is silently ignored rather than treated as an
+// error - the field simply does not apply to that event kind.
+type glSourceProject struct {
+	PathWithNamespace string `json:"-"`
+}
+
+func (s *glSourceProject) UnmarshalJSON(b []byte) error {
+	var obj struct {
+		PathWithNamespace string `json:"path_with_namespace"`
+	}
+	if err := json.Unmarshal(b, &obj); err != nil {
+		return nil
+	}
+	s.PathWithNamespace = obj.PathWithNamespace
+	return nil
 }
 
 // DetectAndVerify verifies the X-Gitlab-Token and parses the payload.
