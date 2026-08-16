@@ -206,3 +206,53 @@ func TestUnparkForMRTerminalIsNarrow(t *testing.T) {
 		t.Fatalf("an unparked task must be a no-op success, got %v", err)
 	}
 }
+
+// UpgradeDeclineToOwnershipLost is the ONE park reason the ownership flip is
+// allowed to rewrite (#604 review). Both of its guards are load-bearing, so both
+// are pinned: widening either one turns a genuine terminal into a Task a human
+// push can resurrect.
+func TestUpgradeDeclineToOwnershipLost(t *testing.T) {
+	later := now.Add(72 * time.Hour)
+
+	t.Run("upgrades a declined takeover", func(t *testing.T) {
+		tk := taskOfKind(v1alpha1.StateUnderImplementation, "takeover")
+		require.NoError(t, stage.Park(tk, stage.ReasonImplementDeclined, now))
+		carry, entered := tk.Status.StageElapsedCarrySeconds, tk.Status.StateEnteredAt.Time
+
+		require.NoError(t, stage.UpgradeDeclineToOwnershipLost(tk, later))
+		require.Equal(t, stage.ReasonOwnershipLost, tk.Status.ParkReason)
+		require.Equal(t, v1alpha1.StateUnderImplementation, tk.Status.State,
+			"the upgrade must not move State")
+		require.Equal(t, later, tk.Status.ParkedAt.Time,
+			"the retention window restarts from the flip, so the maintainer gets a full ParkRetention "+
+				"from when the branch actually came back")
+		// The reason repark is wrong here: Park folds residency into the carry,
+		// so re-Parking would charge the resumed Task for the days it sat parked
+		// and blow ResidencyExceeded on its first pass back.
+		require.Equal(t, carry, tk.Status.StageElapsedCarrySeconds,
+			"the upgrade must not fold the parked interval into the residency carry")
+		require.Equal(t, entered, tk.Status.StateEnteredAt.Time,
+			"the upgrade must not re-arm the state clock")
+	})
+
+	t.Run("refuses another kind", func(t *testing.T) {
+		tk := taskOfKind(v1alpha1.StateUnderImplementation, "implement")
+		require.NoError(t, stage.Park(tk, stage.ReasonImplementDeclined, now))
+		require.Error(t, stage.UpgradeDeclineToOwnershipLost(tk, later),
+			"on a non-takeover kind implement-declined is a refusal the agent stands behind")
+		require.Equal(t, stage.ReasonImplementDeclined, tk.Status.ParkReason)
+	})
+
+	t.Run("refuses another park reason", func(t *testing.T) {
+		tk := taskOfKind(v1alpha1.StateUnderImplementation, "takeover")
+		require.NoError(t, stage.Park(tk, stage.ReasonStageDeadline, now))
+		require.Error(t, stage.UpgradeDeclineToOwnershipLost(tk, later),
+			"every other unresumable park on a takeover is a genuine terminal")
+		require.Equal(t, stage.ReasonStageDeadline, tk.Status.ParkReason)
+	})
+
+	t.Run("refuses an unparked task", func(t *testing.T) {
+		require.Error(t, stage.UpgradeDeclineToOwnershipLost(
+			taskOfKind(v1alpha1.StateUnderImplementation, "takeover"), later))
+	})
+}
