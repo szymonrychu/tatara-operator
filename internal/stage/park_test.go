@@ -228,9 +228,12 @@ func TestUpgradeDeclineToOwnershipLost(t *testing.T) {
 		require.Equal(t, later, tk.Status.ParkedAt.Time,
 			"the retention window restarts from the flip, so the maintainer gets a full ParkRetention "+
 				"from when the branch actually came back")
-		// The reason repark is wrong here: Park folds residency into the carry,
-		// so re-Parking would charge the resumed Task for the days it sat parked
-		// and blow ResidencyExceeded on its first pass back.
+		// The reason repark is wrong here: this is ONE park's reason being
+		// corrected, so Park's park-event bookkeeping - the residency fold and
+		// the StateEnteredAt re-arm - must not run a second time. NOT because a
+		// re-fold would blow ResidencyExceeded: it could not, since every exit
+		// from parked(ownership-lost) runs UnparkTakeover -> stampEnter, which
+		// zeroes the carry anyway. See UpgradeDeclineToOwnershipLost.
 		require.Equal(t, carry, tk.Status.StageElapsedCarrySeconds,
 			"the upgrade must not fold the parked interval into the residency carry")
 		require.Equal(t, entered, tk.Status.StateEnteredAt.Time,

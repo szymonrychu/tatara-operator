@@ -450,11 +450,15 @@ func UpgradeDeclinedTakeoverPark(ctx context.Context, c client.Client, sp objbud
 	if upErr != nil {
 		return fmt.Errorf("stage: upgrade declined takeover park on %s: %w", key.Name, upErr)
 	}
-	if _, err := stage.UpgradeDeclineToOwnershipLost(task, now); err != nil {
-		return fmt.Errorf("stage: upgrade declined takeover park in memory: %w", err)
-	}
 	if !changed {
 		return nil // already converged; a retry of a write that landed
+	}
+	// AFTER the converged return, not before: a pass that wrote nothing must
+	// mutate nothing. Stamping here on the converged path would put ParkedAt=now
+	// on the caller's copy while the server still holds the FIRST call's stamp -
+	// a timestamp that exists on no object anywhere.
+	if _, err := stage.UpgradeDeclineToOwnershipLost(task, now); err != nil {
+		return fmt.Errorf("stage: upgrade declined takeover park in memory: %w", err)
 	}
 
 	log.FromContext(ctx).Info("declined takeover park upgraded to ownership-lost",

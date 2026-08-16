@@ -361,6 +361,47 @@ func (d *StageDriver) parkAndHandBack(ctx context.Context, proj *tatarav1alpha1.
 // re-drive an approved external head, and a branch a human merely took back
 // sits until ParkRetention. See stage.UpgradeDeclineToOwnershipLost for why the
 // upgrade is narrow on both kind and reason, and why it is not a repark.
+//
+// THE DISCRIMINATOR IS THE RECORDED BOT HEAD, NOT THE PUSHER, and the rule this
+// upgrade implements ("terminal while the branch is still tatara's") is only as
+// good as that baseline. ReconcileOwnership never sees a pusher identity: the
+// flip fires on liveHead != Status.LastBotHeadSHA, and exactly two writers keep
+// that baseline fresh - the synchronize webhook when the actor matches
+// (webhook.stampMRHead) and /outcome's record_bot_head, which is on the
+// SUBMITTED path only. So a takeover that pushed, lost its synchronize delivery
+// or pushed under a login that is not spec.scm.botLogin, and then DELIBERATELY
+// declined, is flipped against tatara's OWN sha - and its deliberate decline is
+// upgraded here with no human having touched the branch, after which
+// DrainStandDownMerge may merge, on an approved review, commits the agent
+// refused to stand behind.
+//
+// The stale baseline is PRE-EXISTING and already accepted (handleMRSynchronize
+// argues it out); what #604 adds is that a spurious flip now rewrites a terminal
+// instead of hitting the Parked early return above.
+//
+// IT IS NOT FIXED BY REFRESHING LastBotHeadSHA ON THE DECLINE ARM, which is the
+// first remedy anyone proposes and is worse than the hole. The decline arm holds
+// no information this flip does not already have - anything it could record is a
+// function of (liveHead, LastBotHeadSHA) - so the stamp is a no-op exactly when
+// it is safe and decisive exactly when it is ambiguous. On a DIVERGENCE decline
+// the live head is the HUMAN's, so stamping it pins the baseline to the human's
+// sha, this flip never fires, and the ordinary stand-down is a permanent terminal
+// again: the #604-review bug, restored. Every field-renamed variant of it
+// (declinedAtHeadSHA and friends) is isomorphic. And as usually worded it is
+// kind-agnostic - outcome.go's decline arm serves implement and upgrade too - so
+// it would suppress the stand-down flip on tatara's OWN merge requests as well.
+//
+// What WOULD close it is positive attribution of the drifted head: a
+// LastExternalHeadSHA stamped on stampMRHead's non-attributable branch, with only
+// this upgrade - never the flip - gated on it. DECLINED, not missed. A new CRD
+// field is a major API change by rule 7; it still cannot tell a MISattributed
+// push apart, by construction; and it makes #604's fix contingent on the
+// human-push delivery actually arriving, with no sweep repair possible, since the
+// sweep's live head read carries no attribution. That trades a narrow laundering
+// window for a narrow stranding window on a path that has never carried a single
+// Task. Status.HeadSHA is NOT the free version of it: mirror.go writes that
+// unattributed on the sync cadence, so it means "the mirror synced", not "a
+// non-bot pushed".
 func (d *StageDriver) parkOwnerTask(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task) error {
 	if task.Spec.Kind == SweepReviewKind || tatarav1alpha1.TaskDone(task) {
 		return nil

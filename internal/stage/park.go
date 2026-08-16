@@ -247,6 +247,12 @@ func repark(t *v1alpha1.Task, reason string, now time.Time) {
 // DrainStandDownMerge being able to merge - on an approved review of the HUMAN's
 // head - a merge request an earlier turn declined.
 //
+// "The branch is the human's again" is an OBSERVATION the caller makes, and it
+// is imperfect: the operator's only signal is liveHead != LastBotHeadSHA, so a
+// stale baseline reads tatara's own push as a hand-back. That is this package's
+// caller's problem, not this function's - it is argued, with the remedies that do
+// not work, at controller/ownership.go's parkOwnerTask.
+//
 // NARROW ON BOTH AXES ANYWAY, because both narrowings still are load-bearing:
 //
 //   - kind=takeover only. Only a takeover's Task is CONTINGENT on tatara owning
@@ -259,13 +265,23 @@ func repark(t *v1alpha1.Task, reason string, now time.Time) {
 //     and a human push must not launder one into a resumable Task. That is also
 //     what keeps restapi.mrTakeover's 409 gate alive rather than dead.
 //
-// It is NOT repark: repark clears and re-Parks, and Park folds the elapsed
-// residency into StageElapsedCarrySeconds. Re-folding here would charge the
-// resumed Task for however long it sat parked - days, typically - so it would
-// blow ResidencyExceeded on its first pass back. Only the reason and the park
-// stamp move; ParkedFromState, StateEnteredAt and the carry are untouched. The
-// stamp DOES move, so the maintainer gets a full ParkRetention window from the
-// moment the branch actually came back, exactly as a fresh park would have.
+// It is NOT repark, and the reason is narrow: this is ONE park's reason being
+// corrected, not a second park. repark clears and re-Parks, so Park's park-event
+// bookkeeping - fold this state's elapsed residency into StageElapsedCarrySeconds,
+// re-arm StateEnteredAt, restamp ParkedFromState - would run a second time for a
+// Task that only ever parked once. Only the reason and the park stamp move here.
+// The stamp DOES move, so the maintainer gets a full ParkRetention window from
+// the moment the branch actually came back, exactly as a fresh park would have.
+//
+// THE JUSTIFICATION THAT USED TO BE HERE WAS FALSE; do not reinstate it. It
+// said a repark would charge the resumed Task for the days it sat parked and so
+// blow ResidencyExceeded on its first pass back. It cannot: both exits from
+// parked(ownership-lost) - MintOrUnparkTakeoverTask and DrainStandDownMerge - go
+// through UnparkTakeover -> stampEnter, which zeroes StageElapsedCarrySeconds
+// and nils StateWorkStartedAt, and ResidencyExceeded returns false outright on a
+// nil StateWorkStartedAt. Unpark/reArm, the one path that DOES preserve the
+// carry, refuses ownership-lost by class. Nothing reads the carry while the Task
+// is parked either (task_stage.go checks residency only on an UN-parked Task).
 //
 // changed is false, with no error, when the Task is ALREADY parked
 // ownership-lost. That is a converged state, not a misuse: every caller is a

@@ -724,8 +724,22 @@ func TestUpgradeDeclinedTakeoverPark_IsIdempotent(t *testing.T) {
 	// cached Get produces - and must still succeed.
 	stale := ownerTaskOf(t, ctx, mr)
 	stale.Status.ParkReason = stage.ReasonImplementDeclined
+	staleParkedAt := stale.Status.ParkedAt.DeepCopy()
 	if err := d.upgradeDeclinedTakeoverPark(ctx, proj, stale); err != nil {
 		t.Fatalf("second upgrade on a converged Task must be a no-op success, got %v", err)
+	}
+	// A pass that WROTE NOTHING must MUTATE NOTHING. The in-memory stamp exists
+	// to keep the caller's copy consistent with the write this call made; on the
+	// converged path there is no such write, and stamping ParkedAt=now here would
+	// hand the caller a timestamp that exists on no object anywhere - the server's
+	// stamp is the FIRST call's now, not this one's.
+	if stale.Status.ParkReason != stage.ReasonImplementDeclined {
+		t.Fatalf("a converged no-op must not mutate the caller's copy: park reason = %q",
+			stale.Status.ParkReason)
+	}
+	if !stale.Status.ParkedAt.Equal(staleParkedAt) {
+		t.Fatalf("a converged no-op must not restamp the caller's ParkedAt: %v -> %v",
+			staleParkedAt, stale.Status.ParkedAt)
 	}
 	if after := testutil.ToFloat64(obs.OwnershipDeclineUpgradedTotal); after-before != 1 {
 		t.Fatalf("the upgrade counter must fire once per real upgrade, got %v", after-before)

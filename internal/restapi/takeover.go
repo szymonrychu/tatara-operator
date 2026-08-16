@@ -352,7 +352,10 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 	// same value so the mirror does not itself go stale relative to the SHA
 	// this flip is keyed on. A later real human push still moves the live
 	// head off this baseline and stands the MR down correctly; the takeover
-	// agent's own push refreshes this same field again at outcome accept.
+	// agent's own push refreshes this same field again at outcome accept - but
+	// only on the SUBMITTED path, so a turn that pushes and then declines leaves
+	// this seed in place and depends on the synchronize webhook to advance it.
+	// See controller/ownership.go's parkOwnerTask for what that costs.
 	if err := objbudget.FitMergeRequest(ctx, s.c, sp, key, func(m *tatarav1alpha1.MergeRequest) {
 		m.Status.Ownership = tatarav1alpha1.OwnershipTatara
 		m.Status.OwnershipReason = "takeover-requested-by:" + cmt.Author
