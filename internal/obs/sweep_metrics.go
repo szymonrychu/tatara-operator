@@ -283,10 +283,12 @@ var AdoptionEnqueuedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 }, []string{"project", "activity"})
 
 // adoptionActivities is AdoptionEnqueuedTotal's closed {activity} set: the two
-// producers of a queued adoption. Both are seeded even though only the webhook
-// produces today, because the pair is the whole point of the label - a `sweep`
-// series that only appears once the backstop fires cannot be compared against
-// `webhook` on the first lost delivery after a pod roll.
+// producers of a queued adoption - the webhook (issue #495's original path)
+// and the sweep, which enqueues under the same dedup key as a pure backstop
+// since Task 8. Both are seeded, not just the one a given pass happens to hit,
+// because the pair is the whole point of the label - a `sweep` series that
+// only appears once the backstop fires cannot be compared against `webhook`
+// on the first lost delivery after a pod roll.
 var adoptionActivities = []string{"sweep", WebhookActivity}
 
 // AdoptionEventDroppedTotal counts QUEUED dependency-upgrade adoptions that never
@@ -424,6 +426,19 @@ var refineReasons = []string{"invalid_cron", "stamp_failed", "refine_inflight_ch
 // tick that silently minted nothing.
 var upgradeReasons = []string{"invalid_cron", "stamp_failed", "upgrade_count_failed"}
 
+// queueSeedReasons is the closed SweepErrorsTotal{activity="queue"} reason set
+// for the dispatcher's own admission work (queue_controller.go), as opposed to
+// sweepSeedReasons (sweep.go's B.4 pass). admit_adopted_upgrade is
+// admitAdoptedUpgrade's one reason for every genuine machinery failure on the
+// re-check-then-mint path - a Get, resolveLiveMROwner, MintAdoptedUpgradeTask,
+// or drop's own Delete - which AdoptionEventDroppedTotal does not cover
+// (that counter's contract is "a non-zero rate is the mechanism WORKING", the
+// opposite of a transient API error). Kept in sync with
+// controller.adoptAdmitErrorReason by TestQueueAdmitErrorReasonIsSeeded, which
+// scans queue_controller.go the same way TestSweepSeedReasonsCoverEveryFailSite
+// scans sweep.go.
+var queueSeedReasons = []string{"admit_adopted_upgrade"}
+
 // SeedSweepErrorsForProject pre-seeds the closed (activity x reason) label set of
 // SweepErrorsTotal for ONE project, so a healthy sweep with zero errors still
 // exposes a zero baseline and increase(operator_sweep_errors_total[1h]) is
@@ -450,6 +465,7 @@ func SeedSweepErrorsForProject(project string) {
 	seedLabels(seed, []string{project}, []string{"documentation", "issueScan"}, cronReasons)
 	seedLabels(seed, []string{project}, []string{"refine"}, refineReasons)
 	seedLabels(seed, []string{project}, []string{"upgrade"}, upgradeReasons)
+	seedLabels(seed, []string{project}, []string{QueueActivity}, queueSeedReasons)
 	skip := func(l ...string) { SweepSkippedTotal.WithLabelValues(l...) }
 	seedLabels(skip, []string{project}, sweepActivities, sweepSkipReasons)
 	for _, activity := range ownerActivities {

@@ -59,14 +59,16 @@ func TestSeedSweepErrorsForProject(t *testing.T) {
 	// sweep x 19 (nightlySweep dropped: dead, no live producer; +4 for the
 	// fail() sites the list had drifted from, issue #495; +resolve_live_owner,
 	// issue #521; +enqueue_adopt_upgrade, the sweep's adoption-enqueue arm
-	// failing, Task 8 - adopt_upgrade_mr left WITH the mint it named: the
-	// dispatcher's own admit-time mint failure is a plain error return, not a
-	// fail(reason, ...) call in sweep.go, so it never belonged in this
-	// sweep.go-scanned set), brainstorm x 1 (demand-driven now, only
+	// failing, Task 8 - adopt_upgrade_mr left WITH the mint it named: it is a
+	// plain error return in queue_controller.go, not a fail(reason, ...) call
+	// in sweep.go, so it never belonged in this sweep.go-scanned set), queue x 1
+	// (admit_adopted_upgrade: the dispatcher's own admit-time re-check-then-mint
+	// failure, counted under its own activity rather than sweep.go's - Task 8
+	// review, hard rule 4), brainstorm x 1 (demand-driven now, only
 	// stamp_failed can fire), documentation/issueScan x 2 each (invalid_cron,
 	// stamp_failed), refine x 3 (its own cron, Task 3), upgrade x 3 (plain cron
 	// plus its own capacity-count failure).
-	const wantPerProject = 19 + 1 + 2*2 + 3 + 3
+	const wantPerProject = 19 + 1 + 1 + 2*2 + 3 + 3
 
 	before := testutil.CollectAndCount(SweepErrorsTotal)
 	SeedSweepErrorsForProject("seed-test-proj")
@@ -156,6 +158,44 @@ func TestSweepSeedReasonsCoverEveryFailSite(t *testing.T) {
 		if !used[reason] {
 			t.Errorf("sweepSeedReasons seeds %q but no fail(%q, ...) call site remains in sweep.go: "+
 				"a permanently dead zero series", reason, reason)
+		}
+	}
+}
+
+// TestQueueAdmitErrorReasonIsSeeded is TestSweepSeedReasonsCoverEveryFailSite's
+// twin for the DISPATCHER's own admission work (queue_controller.go), which
+// sweepSeedReasons/that test never scans. admitAdoptedUpgrade's genuine
+// machinery failures (a Get, resolveLiveMROwner, MintAdoptedUpgradeTask, or
+// drop's own Delete) went completely unmetered until Task 8's review found it:
+// AdoptionEventDroppedTotal counts REFUSALS ("a non-zero rate is the mechanism
+// WORKING"), not errors, and the retired adopt_upgrade_mr reason - sweep.go's
+// own direct-mint failure, deleted along with the direct mint itself - was the
+// last thing that looked like coverage for this path. Fails both ways: the
+// constant renamed/removed with queueSeedReasons left stale, or
+// queueSeedReasons carrying a reason the constant no longer names.
+func TestQueueAdmitErrorReasonIsSeeded(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join("..", "controller", "queue_controller.go"))
+	if err != nil {
+		t.Fatalf("read queue_controller.go: %v", err)
+	}
+	m := regexp.MustCompile(`adoptAdmitErrorReason\s*=\s*"([a-z_]+)"`).FindStringSubmatch(string(src))
+	if m == nil {
+		t.Fatal("found no `adoptAdmitErrorReason = \"...\"` declaration in queue_controller.go - " +
+			"the scan is broken, not the seed list")
+	}
+	declared := m[1]
+	seeded := map[string]bool{}
+	for _, r := range queueSeedReasons {
+		seeded[r] = true
+	}
+	if !seeded[declared] {
+		t.Errorf("queue_controller.go declares adoptAdmitErrorReason = %q but queueSeedReasons "+
+			"does not seed it: increase() cannot see its first increment", declared)
+	}
+	for _, r := range queueSeedReasons {
+		if r != declared {
+			t.Errorf("queueSeedReasons seeds %q but adoptAdmitErrorReason names %q: "+
+				"a permanently dead zero series", r, declared)
 		}
 	}
 }

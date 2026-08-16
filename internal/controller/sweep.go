@@ -1292,10 +1292,13 @@ func mintedBucket(parkReason string) string {
 // A DEFERRAL PER ITEM IS ONE FACT, NOT N. allow returns false for EVERY
 // remaining orphan once active >= maxOpen, so an unconditional counter turned
 // "the cap is full" into a series whose rate is the size of the backlog, on
-// every pass, forever - the alert-burying shape upgrade_headroom_bound was
-// excluded from TataraSweepSkipPersistent for. The LOG line is still emitted per
-// item: a counter cannot say WHICH pull request went unanswered, which is the
-// entire reason skipPR and skipIssue log at all.
+// every pass, forever - the alert-burying shape mint_budget_bound is EXCLUDED
+// from TataraSweepSkipPersistent for (upgrade_headroom_bound was the other
+// member of that exclusion until Task 8 retired the per-pass adoption headroom
+// entirely - the sweep enqueues an adoptable merge request now, so there is no
+// lane cap left to defer against). The LOG line is still emitted per item: a
+// counter cannot say WHICH pull request went unanswered, which is the entire
+// reason skipPR and skipIssue log at all.
 //
 // It shares b.hit with capHit; the reason strings and the cap names are disjoint
 // vocabularies (mint_budget_bound vs maxNewTasksPerSweep / maxOpenTasks).
@@ -1693,19 +1696,15 @@ func (r *ProjectReconciler) sweepPRs(ctx context.Context, proj *tatarav1alpha1.P
 	l := log.FromContext(ctx)
 	requeue := time.Duration(0)
 
-	// PHASE 1: RESOLVE AND CLASSIFY, ACT ON NOTHING. Every read here used to sit
-	// at the top of the single acting loop; it is hoisted so the adoption window
-	// below can be computed over the merge requests this pass CAN adopt rather
-	// than over the ones that merely LOOK adoptable. No read is added or
-	// repeated - the acting loop consumes exactly what this one resolved.
-	type prPass struct {
-		pr        scm.PRRef
-		cr        *tatarav1alpha1.MergeRequest
-		claimedBy string
-		ownerTask *tatarav1alpha1.Task
-		disp      PRDisposition
-	}
-	passes := make([]prPass, 0, len(prs))
+	// ONE LOOP: RESOLVE, CLASSIFY, ACT, per PR, in the order the forge listed
+	// them. This used to be two phases - resolve-and-classify every PR first,
+	// then act - because the adoption WINDOW (deleted, Task 8: the sweep now
+	// ENQUEUES an adoptable merge request instead of minting it against a
+	// per-pass lane cap) had to see every PR's disposition before it could pick
+	// the oldest `headroom` of them. Nothing else here ever needed the classified
+	// set ahead of acting on it, so once the window was gone the split was
+	// unexplained structure with no reader left to serve. Collapsed back to the
+	// single loop it was before the window existed.
 	for _, pr := range prs {
 		// The mirror is read BEFORE the branch lookup, not after: its controller
 		// owner is what disambiguates a head branch that several Tasks share
@@ -1729,16 +1728,9 @@ func (r *ProjectReconciler) sweepPRs(ctx context.Context, proj *tatarav1alpha1.P
 			fail("get_owning_task", terr, "repo", repo.Name, "number", pr.Number)
 			continue
 		}
-		passes = append(passes, prPass{
-			pr: pr, cr: cr, claimedBy: claimedBy, ownerTask: ownerTask,
-			disp: ClassifyPR(proj, repo, pr, ownerTask, claimedBy, cr),
-		})
-	}
+		disp := ClassifyPR(proj, repo, pr, ownerTask, claimedBy, cr)
 
-	// PHASE 2: ACT. Same order the forge listed in, same body as before.
-	for _, p := range passes {
-		pr, cr, claimedBy, ownerTask := p.pr, p.cr, p.claimedBy, p.ownerTask
-		switch p.disp {
+		switch disp {
 		case PRAdopt:
 			if aerr := r.adoptPRIntoTask(ctx, proj, repo, pr, ownerTask, sp); aerr != nil {
 				fail("adopt_pr", aerr, "repo", repo.Name, "number", pr.Number)

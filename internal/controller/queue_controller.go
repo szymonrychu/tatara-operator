@@ -736,6 +736,14 @@ const (
 	adoptRetry
 )
 
+// adoptAdmitErrorReason is admitAdoptedUpgrade's SweepErrorsTotal{activity=
+// QueueActivity} reason: a genuine machinery failure on the admit-time
+// re-check-then-mint path (a Get, resolveLiveMROwner, MintAdoptedUpgradeTask,
+// or drop's own Delete), as opposed to a refusal AdoptionEventDroppedTotal
+// already counts. Scanned by TestQueueAdmitErrorReasonIsSeeded
+// (internal/obs) against obs.queueSeedReasons - keep the two in sync.
+const adoptAdmitErrorReason = "admit_adopted_upgrade"
+
 // admitAdoptedUpgrade mints the upgrade Task for a QUEUED dependency-upgrade
 // adoption, and it re-asks the adoption question first.
 //
@@ -775,12 +783,31 @@ func (r *DispatcherReconciler) admitAdoptedUpgrade(ctx context.Context, proj *ta
 	q *tatarav1alpha1.QueuedEvent) (*tatarav1alpha1.Task, adoptVerdict, error) {
 
 	lg := log.FromContext(ctx)
+	// fail COUNTS a genuine machinery error on this path (a Get, the live-owner
+	// resolve, the mint itself, or drop's own Delete) - the one class of failure
+	// AdoptionEventDroppedTotal does NOT cover, since that counter's own
+	// contract is "a non-zero rate is the mechanism WORKING" and a transient API
+	// error is the opposite of that. Before this, admitAdoptedUpgrade's errors
+	// only surfaced through the generic controller-runtime reconcile-error
+	// counter (no reason breakdown) - the same blind spot #495 found in
+	// sweep.go's own fail(reason, ...) sites, here for the dispatcher's admit
+	// path instead. ONE reason for every site: unlike sweep.go's per-read
+	// breakdown, every site here is one step of the SAME re-check-then-mint
+	// sequence, already disambiguated by the ERROR log line and its resource_id.
+	fail := func(err error) (*tatarav1alpha1.Task, adoptVerdict, error) {
+		obs.SweepErrorsTotal.WithLabelValues(proj.Name, QueueActivity, adoptAdmitErrorReason).Inc()
+		lg.Error(err, "queue: admit_adopted_upgrade", "action", "queue_error",
+			"resource_id", q.Name, "project", proj.Name, "reason", adoptAdmitErrorReason)
+		return nil, adoptRetry, err
+	}
 	// COUNTED ONLY ONCE THE EVENT IS ACTUALLY GONE. A transient Delete failure
 	// leaves the event Queued and this whole function re-runs next pass, so
-	// counting before the delete would count one refusal twice.
+	// counting before the delete would count one refusal twice - it goes
+	// through fail, not obs.AdoptionEventDroppedTotal, since the event was NOT
+	// dropped.
 	drop := func(reason string) (*tatarav1alpha1.Task, adoptVerdict, error) {
 		if err := r.Delete(ctx, q); err != nil && !apierrors.IsNotFound(err) {
-			return nil, adoptRetry, err
+			return fail(err)
 		}
 		obs.AdoptionEventDroppedTotal.WithLabelValues(proj.Name, reason).Inc()
 		lg.Info("queue: dropped a queued dependency-upgrade adoption",
@@ -795,14 +822,14 @@ func (r *DispatcherReconciler) admitAdoptedUpgrade(ctx context.Context, proj *ta
 		if apierrors.IsNotFound(err) {
 			return drop("repository_gone")
 		}
-		return nil, adoptRetry, err
+		return fail(err)
 	}
 
 	pr := PRRefFromAdopted(q.Spec.Payload.AdoptedUpgrade)
 	m := r.minter()
 	cr, err := m.mergeRequestCR(ctx, proj, &repo, pr.Number)
 	if err != nil {
-		return nil, adoptRetry, err
+		return fail(err)
 	}
 	// THE FRESHNESS BACKSTOP FOR A MERGED/CLOSED MERGE REQUEST, and it is FREE:
 	// cr is already fetched above for clause (e)'s live-owner check below, no new
@@ -830,7 +857,7 @@ func (r *DispatcherReconciler) admitAdoptedUpgrade(ctx context.Context, proj *ta
 	}
 	liveOwner, err := m.resolveLiveMROwner(ctx, proj, cr, QueueActivity)
 	if err != nil {
-		return nil, adoptRetry, err
+		return fail(err)
 	}
 	// owner is nil, not looked up: taskForBranch matches on agent.TaskBranch and
 	// can never see an engine's renovate/* branch, so the lookup the sweep does
@@ -842,7 +869,7 @@ func (r *DispatcherReconciler) admitAdoptedUpgrade(ctx context.Context, proj *ta
 
 	task, outcome, err := m.MintAdoptedUpgradeTask(ctx, proj, &repo, pr, m.spillerFor(proj), queue.MintStamp(q))
 	if err != nil {
-		return nil, adoptRetry, err
+		return fail(err)
 	}
 	if outcome == MintTombstoneDeleted {
 		// A dead twin held the deterministic name and has just been deleted; the

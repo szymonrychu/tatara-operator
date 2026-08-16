@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -12,6 +13,8 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/queue"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 // adoptAdmitProject is projectWithAdoptPrefix with an agent concurrency the
@@ -159,6 +162,52 @@ func TestAdmit_AdoptedUpgradeWithNoRepositoryIsDropped(t *testing.T) {
 	after := testutil.ToFloat64(obs.AdoptionEventDroppedTotal.WithLabelValues(proj.Name, "repository_gone"))
 	if after-before != 1 {
 		t.Errorf("repository_gone drops counted = %v, want 1", after-before)
+	}
+}
+
+// A GENUINE MACHINERY ERROR ON THE ADMIT PATH IS COUNTED, NOT SILENT. Before
+// Task 8's review this was unmetered: AdoptionEventDroppedTotal only counts a
+// REFUSAL (repository_gone, not_adoptable, ...), never a transient API error,
+// and the retired direct-mint path's own failure counter (sweep.go's
+// adopt_upgrade_mr) went with the direct mint it named. A Repository Get that
+// fails for any reason OTHER than NotFound must leave the event Queued (not
+// dropped - there is nothing to refuse, the read itself failed) and increment
+// operator_sweep_errors_total{project,activity="queue",reason="admit_adopted_upgrade"}.
+func TestAdmit_AdoptedUpgradeGenuineErrorIsCountedNotDropped(t *testing.T) {
+	ctx := context.Background()
+	proj := adoptAdmitProject()
+	repo := adoptRepo()
+	qe := adoptionEvent(proj, repo, 44)
+	injected := errors.New("injected: repository get always fails")
+	c := newMirrorClientIntercepted(t, interceptor.Funcs{
+		Get: func(ctx context.Context, wc client.WithWatch, key types.NamespacedName, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*tatarav1alpha1.Repository); ok {
+				return injected
+			}
+			return wc.Get(ctx, key, obj, opts...)
+		},
+	}, proj, repo, qe)
+	r := &DispatcherReconciler{Client: c, Scheme: c.Scheme()}
+
+	before := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues(proj.Name, QueueActivity, adoptAdmitErrorReason))
+	_, verdict, err := r.admitAdoptedUpgrade(ctx, proj, qe)
+	if err == nil {
+		t.Fatal("admitAdoptedUpgrade swallowed the injected Repository Get failure")
+	}
+	if verdict != adoptRetry {
+		t.Errorf("verdict = %v, want adoptRetry: a genuine error is not a refusal", verdict)
+	}
+	after := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues(proj.Name, QueueActivity, adoptAdmitErrorReason))
+	if after-before != 1 {
+		t.Errorf("admit_adopted_upgrade errors counted = %v, want 1", after-before)
+	}
+
+	var stillQueued tatarav1alpha1.QueuedEvent
+	if err := c.Get(ctx, types.NamespacedName{Namespace: qe.Namespace, Name: qe.Name}, &stillQueued); err != nil {
+		t.Fatalf("get event: %v", err)
+	}
+	if stillQueued.Status.State != tatarav1alpha1.QueueStateQueued {
+		t.Errorf("event state = %q, want still Queued: a genuine error must not drop the event", stillQueued.Status.State)
 	}
 }
 

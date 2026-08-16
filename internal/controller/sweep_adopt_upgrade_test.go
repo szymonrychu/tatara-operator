@@ -261,15 +261,15 @@ func TestClassifyPR_ClauseOneStillWins(t *testing.T) {
 }
 
 // sweepAdoptProject is the sweep-harness project ARMED for adoption: the
-// prefix, plus an upgrade cron. maxOpen is now VESTIGIAL - design D1 retired
-// per-pass adoption headroom entirely (Task 8), so nothing here reads
-// MaxOpenUpgrades any more - but the cron shape is kept so these tests still
-// exercise a project whose upgrade activity is configured, same as prod.
-func sweepAdoptProject(name string, maxOpen int) *tatarav1alpha1.Project {
+// prefix, plus an upgrade cron. Design D1 retired per-pass adoption headroom
+// entirely (Task 8), so nothing on this path reads MaxOpenUpgrades any more -
+// it is a fixed 1 here, not a parameter, purely so the cron shape matches a
+// project whose upgrade activity is configured, same as prod.
+func sweepAdoptProject(name string) *tatarav1alpha1.Project {
 	p := sweepProject(name)
 	p.Spec.UpgradePolicy = &tatarav1alpha1.UpgradePolicySpec{AdoptBranchPrefix: "renovate/"}
 	p.Spec.Scm.Cron = &tatarav1alpha1.ScmCron{
-		Upgrade: tatarav1alpha1.UpgradeActivity{Schedule: "0 */4 * * *", MaxOpenUpgrades: maxOpen},
+		Upgrade: tatarav1alpha1.UpgradeActivity{Schedule: "0 */4 * * *", MaxOpenUpgrades: 1},
 	}
 	return p
 }
@@ -283,12 +283,20 @@ func sweepRenovatePR(number int, branch string) scm.PRRef {
 	}
 }
 
-// enginePR is a listing row from the dependency engine, authored by the bot.
-// Moved from the now-deleted sweep_adopt_headroom_test.go.
-func enginePR(repo *tatarav1alpha1.Repository, number int) scm.PRRef {
+// enginePR is a listing row from the dependency engine, authored by the bot,
+// on repo's own slug - not a hardcoded one, so a test seeding a differently
+// named repo gets a PRRef that actually matches it. Moved from the
+// now-deleted sweep_adopt_headroom_test.go.
+func enginePR(t *testing.T, repo *tatarav1alpha1.Repository, number int) scm.PRRef {
+	t.Helper()
+	owner, name, err := scm.OwnerRepo(repo.Spec.URL)
+	if err != nil {
+		t.Fatalf("owner/repo from %q: %v", repo.Spec.URL, err)
+	}
+	slug := owner + "/" + name
 	return scm.PRRef{
-		Repo:       "szymonrychu/tatara-operator",
-		HeadRepo:   "szymonrychu/tatara-operator",
+		Repo:       slug,
+		HeadRepo:   slug,
 		Number:     number,
 		Author:     "tatara-bot",
 		Title:      "chore(deps): bump " + strconv.Itoa(number),
@@ -391,7 +399,7 @@ func sweepQueuedEvents(t *testing.T, c client.Client, proj string) []tatarav1alp
 // AlreadyExists and burns no sequence number - and one whose delivery was lost
 // while the operator was down is picked up on the next pass.
 func TestSweepPRs_AdoptableMergeRequestIsEnqueuedNotMinted(t *testing.T) {
-	proj := sweepAdoptProject("adopt-enqueue-proj", 1) // maxOpenUpgrades=1: no longer bounds anything
+	proj := sweepAdoptProject("adopt-enqueue-proj")
 	repo := sweepRepo("adopt-enqueue-proj")
 	c := newMirrorClient(t, proj, repo)
 	rd := &sweepReader{}
@@ -432,7 +440,7 @@ func TestSweepPRs_AdoptableMergeRequestIsEnqueuedNotMinted(t *testing.T) {
 // A SECOND PASS OVER THE SAME MERGE REQUEST IS A NO-OP. The natural key is
 // deterministic, so the Create collides and EnqueueEvent reports created=false.
 func TestSweepPRs_ASecondPassDoesNotDoubleEnqueue(t *testing.T) {
-	proj := sweepAdoptProject("adopt-second-pass-proj", 1)
+	proj := sweepAdoptProject("adopt-second-pass-proj")
 	repo := sweepRepo("adopt-second-pass-proj")
 	c := newMirrorClient(t, proj, repo)
 	rd := &sweepReader{prs: []scm.PRRef{sweepRenovatePR(41, "renovate/cilium")}}
@@ -454,12 +462,12 @@ func TestSweepPRs_ASecondPassDoesNotDoubleEnqueue(t *testing.T) {
 // sends it to PRIgnore on the mirror's live controller owner, exactly as before.
 func TestSweepPRs_AnAlreadyAdoptedMergeRequestEnqueuesNothing(t *testing.T) {
 	ctx := context.Background()
-	proj := sweepAdoptProject("adopt-already-proj", 1)
+	proj := sweepAdoptProject("adopt-already-proj")
 	repo := sweepRepo("adopt-already-proj")
 	c := newMirrorClient(t, proj, repo)
 	seedAdoptedLane(t, ctx, c, proj, repo, 42)
 
-	runSweep(t, c, proj, repo, &sweepReader{prs: []scm.PRRef{enginePR(repo, 42)}})
+	runSweep(t, c, proj, repo, &sweepReader{prs: []scm.PRRef{enginePR(t, repo, 42)}})
 
 	if events := sweepQueuedEvents(t, c, proj.Name); len(events) != 0 {
 		t.Fatalf("queued events for an already-adopted merge request = %d, want 0", len(events))
@@ -471,7 +479,7 @@ func TestSweepPRs_AnAlreadyAdoptedMergeRequestEnqueuesNothing(t *testing.T) {
 // forge and the token spend for NEW Task mints, and the adoption enqueue goes
 // through EnqueueEvent, which is not gated on it at all.
 func TestSweepAdoption_DoesNotConsumeTheReviewMintBudget(t *testing.T) {
-	proj := sweepAdoptProject("adopt-budget-proj", 2)
+	proj := sweepAdoptProject("adopt-budget-proj")
 	proj.Spec.MaxNewTasksPerSweep = 1
 	proj.Spec.TriggerLabel = "tatara"
 	proj.Spec.Scm.PRReactionScope = "labeledOrMentioned"
@@ -526,14 +534,14 @@ func TestSweepAdoption_NoUpgradeCronStillEnqueuesAndDoesNotPanic(t *testing.T) {
 // sweep_adopt_headroom_test.go; headroomProject is gone with the window, so
 // this now arms via sweepAdoptProject instead.
 func TestSweepAdoption_IsInertWithNoAdoptBranchPrefix(t *testing.T) {
-	proj := sweepAdoptProject("inert-proj", 0)
+	proj := sweepAdoptProject("inert-proj")
 	proj.Spec.UpgradePolicy.AdoptBranchPrefix = "" // the shipped default
 	proj.Spec.Scm.PRReactionScope = "labeledOrMentioned"
 	repo := sweepRepo("inert-proj")
 	c := newMirrorClient(t, proj, repo)
 
-	engine := enginePR(repo, 44)
-	human := enginePR(repo, 45)
+	engine := enginePR(t, repo, 44)
+	human := enginePR(t, repo, 45)
 	human.Author = "alice"
 	human.HeadBranch = "feat/human"
 
@@ -555,11 +563,11 @@ func TestSweepAdoption_IsInertWithNoAdoptBranchPrefix(t *testing.T) {
 	}
 	// And the author gate is the SECOND lock: even with the prefix armed, the
 	// engine running under a human's token adopts nothing.
-	armed := sweepAdoptProject("inert-authorgate-proj", 0)
+	armed := sweepAdoptProject("inert-authorgate-proj")
 	armed.Spec.Scm.PRReactionScope = "labeledOrMentioned"
 	armedRepo := sweepRepo("inert-authorgate-proj")
 	armedC := newMirrorClient(t, armed, armedRepo)
-	preToken := enginePR(armedRepo, 46)
+	preToken := enginePR(t, armedRepo, 46)
 	preToken.Author = "szymonrychu" // pre-cutover: Renovate ran with the human's token
 	runSweep(t, armedC, armed, armedRepo, &sweepReader{prs: []scm.PRRef{preToken}})
 	for _, tk := range sweepTasks(t, armedC, armed.Name) {
