@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 )
 
 // postTurnComplete drives the real callback path for one turn.
@@ -181,7 +183,7 @@ func TestTurnComplete_AnOverLongTurnIDDoesNotFailTheWholeStatusWrite(t *testing.
 	require.Equal(t, "opened PR #91", got.Status.LastTurnFinalText,
 		"an id that does not fit must not take the continuation state down with it")
 	require.Equal(t, []string{"tatara-cli"}, got.Status.LastTurnFailedRepos)
-	require.Len(t, got.Status.LastTurnReposTurnID, maxLastTurnReposTurnID)
+	require.Len(t, got.Status.LastTurnReposTurnID, tatarav1alpha1.LastTurnReposTurnIDMaxBytes)
 
 	// The backstop polling that SAME turn must still recognise it as its own.
 	require.NoError(t, newCallbackServer().stampLastTurn(context.Background(),

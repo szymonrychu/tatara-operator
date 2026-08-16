@@ -48,11 +48,13 @@ func TestStopAfterAgentHandoff_RecordsTheReposWhosePushFailed(t *testing.T) {
 
 	var operatorNotes int
 	var named bool
+	var opAt time.Time
 	for _, n := range got.Status.Notes {
 		if n.Agent != agent.NoteAgentOperator {
 			continue
 		}
 		operatorNotes++
+		opAt = n.At.Time
 		if strings.Contains(n.Body, "tatara-cli") {
 			named = true
 		}
@@ -60,10 +62,13 @@ func TestStopAfterAgentHandoff_RecordsTheReposWhosePushFailed(t *testing.T) {
 	require.True(t, named, "the next pod is never told repo tatara-cli's commits did not reach origin")
 	require.Equal(t, 1, operatorNotes)
 
-	require.True(t, agent.HasAgentHandoffNote(got),
-		"the operator's addendum must not be mistaken for the agent's own handoff")
-	require.Equal(t, 1, countAgentHandoffNotes(got),
-		"appending beside the agent's note must not change how many handoffs the Task appears to carry")
+	// The REAL predicate, not a re-implementation of it: the operator's addendum
+	// is kind=handoff, so if it were mistaken for an agent handoff every caller of
+	// this - handoffNoteCount, the agentAskedSomething sites, agentAskedToBeStopped
+	// itself - would see one handoff too many.
+	require.True(t, agent.HasAgentHandoffNote(got))
+	require.False(t, agent.HasAgentHandoffNoteSince(got, opAt.Add(time.Millisecond)),
+		"nothing written at or after the operator's addendum may read as an agent handoff")
 }
 
 // A stop with nothing lost writes nothing extra: the overwhelming majority of
@@ -91,12 +96,41 @@ func TestStopAfterAgentHandoff_WritesNoNoteWhenNothingFailed(t *testing.T) {
 	require.Len(t, getTask(t, "t-ah-fr2").Status.Notes, 1)
 }
 
-func countAgentHandoffNotes(t *tatarav1alpha1.Task) int {
-	n := 0
-	for _, note := range t.Status.Notes {
-		if note.Kind == agent.NoteKindHandoff && note.Agent != agent.NoteAgentOperator {
-			n++
+// The payload survives a respawn on purpose (clearLastTurn is deliberately not
+// run there), so the same repo list can reach a second stop. The note is a
+// standing statement of fact, not an event: saying it twice adds nothing and
+// costs journal budget the agent's own notes need.
+func TestStopAfterAgentHandoff_DoesNotRepeatANoteAlreadyInTheJournal(t *testing.T) {
+	ctx := context.Background()
+	mkTaskProject(t, "p-ah-fr3", 3)
+	mkTaskRepository(t, "r-ah-fr3", "p-ah-fr3")
+	mkTask(t, "t-ah-fr3", "p-ah-fr3", "r-ah-fr3")
+
+	arm := func() {
+		task := getTask(t, "t-ah-fr3")
+		task.Status.PodStartedAt = &metav1.Time{Time: time.Now().Add(-time.Hour)}
+		task.Status.LastTurnFailedRepos = []string{"tatara-cli"}
+		task.Status.Notes = append(task.Status.Notes, tatarav1alpha1.Note{
+			At: metav1.NewTime(time.Now()), Agent: "implement",
+			Kind: agent.NoteKindHandoff, Body: "PR is open, CI green",
+		})
+		require.NoError(t, k8sClient.Status().Update(ctx, task))
+	}
+
+	r := newTaskReconciler(newFakeSession())
+	for range 2 {
+		arm()
+		_, err := r.stopAfterAgentHandoff(ctx, getProject(t, "p-ah-fr3"),
+			getTask(t, "t-ah-fr3"), "implement", time.Now())
+		require.NoError(t, err)
+	}
+
+	got := getTask(t, "t-ah-fr3")
+	operatorNotes := 0
+	for _, n := range got.Status.Notes {
+		if n.Agent == agent.NoteAgentOperator {
+			operatorNotes++
 		}
 	}
-	return n
+	require.Equal(t, 1, operatorNotes)
 }

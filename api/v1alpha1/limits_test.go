@@ -25,6 +25,7 @@ func TestCRDMaxLengthMatchesConstants(t *testing.T) {
 		{"tatara.dev_tasks.yaml", []string{"spec", "goal"}, GoalMaxBytes},
 		{"tatara.dev_tasks.yaml", []string{"status", "notes", "body"}, NoteBodyMaxBytes},
 		{"tatara.dev_tasks.yaml", []string{"status", "pendingEvents", "body"}, TaskEventBodyMaxBytes},
+		{"tatara.dev_tasks.yaml", []string{"status", "lastTurnReposTurnId"}, LastTurnReposTurnIDMaxBytes},
 		{"tatara.dev_queuedevents.yaml", []string{"spec", "payload", "goal"}, GoalMaxBytes},
 		{"tatara.dev_issues.yaml", []string{"status", "body"}, IssueBodyMaxBytes},
 		{"tatara.dev_issues.yaml", []string{"status", "comments", "body"}, CommentBodyMaxBytes},

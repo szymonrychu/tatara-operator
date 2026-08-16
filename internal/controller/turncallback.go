@@ -479,7 +479,7 @@ func (s *CallbackServer) stampLastTurn(ctx context.Context, task *tatarav1alpha1
 	// over-long id must cost the field it does not fit in, never the whole status
 	// write: the apiserver rejecting that update would drop this turn's final text
 	// and both repo lists.
-	reposTurnID := tatarav1alpha1.TruncateUTF8(turnID, maxLastTurnReposTurnID)
+	reposTurnID := tatarav1alpha1.TruncateUTF8(turnID, tatarav1alpha1.LastTurnReposTurnIDMaxBytes)
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.Task{}
 		if err := s.Client.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
@@ -537,14 +537,6 @@ func (s *CallbackServer) stampLastTurn(ctx context.Context, task *tatarav1alpha1
 // the API server rejects would fail the whole status write, which is the
 // failure these fields exist to prevent.
 const maxLastTurnPushedRepos = 20
-
-// maxLastTurnReposTurnID mirrors the CRD MaxLength on
-// status.lastTurnReposTurnId, for the same reason: the turn id originates in the
-// wrapper's SubmitTurn response and nothing operator-side bounds it, while
-// annotation values are not length-limited - so an id can exceed the field's cap
-// and still match annCurrentTurn. Uncapped, that rejects the whole status update
-// and loses the final text and both repo lists rather than just the id.
-const maxLastTurnReposTurnID = 256
 
 // It also DROPS BLANK NAMES, on the receiving side rather than trusting the
 // sender. The wrapper stopped producing them, but version skew is a designed-for

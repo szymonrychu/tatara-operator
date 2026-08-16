@@ -11,7 +11,6 @@ import (
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
-	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 )
 
@@ -440,16 +439,15 @@ func (r *TaskReconciler) stopAfterAgentHandoff(ctx context.Context, proj *tatara
 	}
 	// BEFORE the clear below, and not covered by the agent's note: the agent had
 	// no way to know a push failed at turn end (the wrapper reports it to pod
-	// stdout only), so this is the one fact its handoff cannot carry. Best-effort
-	// - see AppendFailedReposNote - and placed here rather than after the patch so
-	// a patch failure retries into a duplicate note rather than losing the report.
-	var sp objbudget.Spiller
-	if r.SpillerFor != nil {
-		sp = r.SpillerFor(proj)
-	}
+	// stdout only), so this is the one fact its handoff cannot carry.
+	// Best-effort, and ordered ahead of the patch because the report is worth more
+	// than the tidy state: if the patch then fails, respawnLostPod picks the Task
+	// up with the payload deliberately un-retired, and the note is already
+	// written. AppendFailedReposNote is idempotent on the body, so that second
+	// pass does not double it.
 	agent.AppendFailedReposNote(ctx,
-		&agent.FitNoteAppender{Client: r.Client, Spiller: sp, Namespace: task.Namespace},
-		task.Name, task.Status.LastTurnFailedRepos, now)
+		&agent.FitNoteAppender{Client: r.Client, Spiller: r.spiller(proj), Namespace: task.Namespace},
+		task, task.Status.LastTurnFailedRepos, now)
 	if err := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 		fresh.Status.PodStartedAt = nil
 		fresh.Status.StateWorkStartedAt = nil
