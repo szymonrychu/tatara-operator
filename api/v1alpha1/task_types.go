@@ -807,6 +807,28 @@ type TaskStatus struct {
 	// +optional
 	// +kubebuilder:validation:MaxItems=20
 	LastTurnPushedRepos []string `json:"lastTurnPushedRepos,omitempty"`
+	// LastTurnFailedRepos is the set of repos whose commit/push FAILED on the
+	// finishing turn, and it is the other half of the same sentence
+	// LastTurnPushedRepos starts.
+	//
+	// The wrapper's turn-end loop used to abort on the first repo that errored,
+	// so a failure was total and loud. It now attempts every repo and joins the
+	// errors (tatara-claude-code-wrapper#167), which turns one loud failure into a
+	// partial success - and a SHORT pushedRepos list is indistinguishable from a
+	// turn that simply had nothing to push in those repos. Without this field the
+	// operator stamps a truthful-looking partial as the turn's whole result.
+	//
+	// It matters more than pushedRepos, not less: /workspace is the container
+	// writable layer with no volume, so a repo that failed to push holds commits
+	// that exist nowhere but on a disk about to disappear. It is rendered into the
+	// G.7 synthetic handoff note for exactly that reason.
+	//
+	// Written under the same known/unknown gate as LastTurnPushedRepos: the poll
+	// backstop's TurnResult carries no such field, so it leaves whatever the
+	// callback recorded alone.
+	// +optional
+	// +kubebuilder:validation:MaxItems=20
+	LastTurnFailedRepos []string `json:"lastTurnFailedRepos,omitempty"`
 }
 
 // +kubebuilder:object:root=true

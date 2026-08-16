@@ -282,11 +282,11 @@ func TTLExpired(project *tatarav1alpha1.Project, task *tatarav1alpha1.Task, now 
 	return now.After(t0)
 }
 
-// TTLStopInput is the per-stop context the operator supplies. LastFinalText and
-// PushedRepos come off the most recent turn-complete payload; they are what the
-// synthetic handoff note is BUILT from, which is why pushedRepos is retained on
-// the wire (G.2): without it the operator cannot tell "no diff" from "forgot to
-// push" on a multi-repo Task.
+// TTLStopInput is the per-stop context the operator supplies. LastFinalText,
+// PushedRepos and FailedRepos come off the most recent turn-complete payload;
+// they are what the synthetic handoff note is BUILT from, which is why
+// pushedRepos is retained on the wire (G.2): without it the operator cannot tell
+// "no diff" from "forgot to push" on a multi-repo Task.
 type TTLStopInput struct {
 	BaseURL     string
 	CallbackURL string
@@ -312,6 +312,12 @@ type TTLStopInput struct {
 	MaxWait       time.Duration
 	LastFinalText string
 	PushedRepos   []string
+	// FailedRepos are the repos the last turn tried to push and could not
+	// (tatara-claude-code-wrapper#167). It is the one field here that reports lost
+	// WORK rather than lost context: the pod's workspace is ephemeral, so those
+	// commits survive nowhere, and this note is the only place the next pod can
+	// be told to go and redo them.
+	FailedRepos []string
 	// Cause is the ttl|stall|eviction|idle label on
 	// operator_agent_pod_ttl_expired_total: WHY this stop ran. Empty defaults to
 	// TTLCauseTTL, which is both the historic meaning of the counter and the only
@@ -652,7 +658,13 @@ func (s *TTLStopper) writeSyntheticNote(ctx context.Context, task *tatarav1alpha
 	}
 	final := strings.TrimSpace(in.LastFinalText)
 	handoff := TTLHandoffSynthetic
-	contentFree := final == "" && len(in.PushedRepos) == 0
+	// A failed push is content, and of the three inputs it is the one carrying
+	// the most urgency: the other two describe work that survived, this one names
+	// work that did not. A turn whose only report is "repo X never reached origin"
+	// must get a real note - degrading it to the placeholder would discard the one
+	// fact the next pod cannot recover any other way
+	// (tatara-claude-code-wrapper#167).
+	contentFree := final == "" && len(in.PushedRepos) == 0 && len(in.FailedRepos) == 0
 	if final == "" {
 		final = "(none)"
 	}
@@ -691,6 +703,11 @@ func (s *TTLStopper) writeSyntheticNote(ctx context.Context, task *tatarav1alpha
 		body = OOMKilledNoteBody(at) +
 			fmt.Sprintf(" Last turn's final text: %s. Repos pushed: %s.", final, pushed)
 	}
+	// LAST, so it survives every branch above - including the OOM rewrite, which
+	// is the branch that needs it most: an OOM kill and a failed push lose the
+	// same commits for the same reason. Appended rather than woven in so the note
+	// reads exactly as before when nothing failed, which is almost every stop.
+	body += failedReposSentence(in.FailedRepos)
 	n := tatarav1alpha1.Note{
 		At:    metav1.NewTime(s.now()),
 		Agent: NoteAgentOperator,
@@ -722,6 +739,25 @@ func syntheticNoteLostBody() string {
 		"and the operator holds no final text and no pushed repos for the last turn. This note is a " +
 		"PLACEHOLDER, not a handoff - the work done on the previous pod is not recorded anywhere. " +
 		"Re-derive the state from the issue thread and the repos; do not read this note as continuity."
+}
+
+// failedReposSentence renders the repos whose commit/push failed on the last
+// turn, or "" when none did.
+//
+// It is a separate sentence, appended to whichever body was chosen, because it
+// is a separate instruction: everything else in the note describes state the
+// next agent can READ, and this describes work it has to REDO. The wrapper
+// attempts every repo and reports the ones that failed rather than aborting the
+// loop (tatara-claude-code-wrapper#167), so this is the only signal that a
+// pushed-repos list is short because work was lost rather than because there was
+// nothing to push.
+func failedReposSentence(failed []string) string {
+	if len(failed) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" WARNING: the last turn failed to push %s - those commits were only ever on the "+
+		"previous pod's workspace, which is gone. Treat that work as LOST and redo it.",
+		strings.Join(failed, ", "))
 }
 
 // OOMKilledNoteMarker is the phrase an OOM-kill handoff note leads with, for the

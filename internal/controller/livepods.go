@@ -88,6 +88,7 @@ func (r *TaskReconciler) liveHandoffAndPark(ctx context.Context, proj *tatarav1a
 			// note carries what the agent actually did instead of "(none)".
 			LastFinalText: task.Status.LastTurnFinalText,
 			PushedRepos:   task.Status.LastTurnPushedRepos,
+			FailedRepos:   task.Status.LastTurnFailedRepos,
 		}
 		res, err := stopper.StopWithHandoff(ctx, task, in)
 		if err != nil {

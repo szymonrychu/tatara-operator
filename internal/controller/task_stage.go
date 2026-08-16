@@ -1395,6 +1395,7 @@ func (r *TaskReconciler) stalledTurnStop(ctx context.Context, proj *tatarav1alph
 		// idle, so this caller almost always lands on the synthetic note.
 		LastFinalText: task.Status.LastTurnFinalText,
 		PushedRepos:   task.Status.LastTurnPushedRepos,
+		FailedRepos:   task.Status.LastTurnFailedRepos,
 	})
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("stalled turn stop %s: %w", task.Name, err)
@@ -1463,6 +1464,7 @@ func (r *TaskReconciler) ttlStop(ctx context.Context, proj *tatarav1alpha1.Proje
 		// the non-empty-notes guarantee vacuous (#527).
 		LastFinalText: task.Status.LastTurnFinalText,
 		PushedRepos:   task.Status.LastTurnPushedRepos,
+		FailedRepos:   task.Status.LastTurnFailedRepos,
 	}
 	res, err := stopper.StopWithHandoff(ctx, task, in)
 	if err != nil {

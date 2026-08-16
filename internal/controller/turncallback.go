@@ -108,6 +108,12 @@ type turnCompletePayload struct {
 	// diff" from "forgot to push" on a multi-repo Task, and the G.7 TTL synthetic
 	// handoff note is BUILT from it.
 	PushedRepos []string `json:"pushedRepos,omitempty"`
+	// FailedRepos are the repos whose commit/push FAILED this turn
+	// (tatara-claude-code-wrapper#167). The wrapper no longer aborts its
+	// turn-end loop on the first failing repo, so a short PushedRepos list can
+	// now mean "lost work" rather than "no diff"; this field is what tells the
+	// two apart.
+	FailedRepos []string `json:"failedRepos,omitempty"`
 	// InternalIssues mirrors tatara-claude-code-wrapper's
 	// internal/turn.InternalIssueReport JSON shape exactly (no shared Go
 	// module between the two repos - this is a wire contract, not an import).
@@ -224,7 +230,7 @@ func (s *CallbackServer) handleTurnComplete(w http.ResponseWriter, r *http.Reque
 	// window every other guarded status write on this turn uses. The Task's
 	// continuation state has to be durable before anything can act on the turn
 	// being finished - including a TTL stop racing this callback (#527).
-	if err := s.stampLastTurn(r.Context(), task, p.TurnID, p.FinalText, p.PushedRepos, true); err != nil {
+	if err := s.stampLastTurn(r.Context(), task, p.TurnID, p.FinalText, p.PushedRepos, p.FailedRepos, true); err != nil {
 		l.Error(err, "persist last-turn continuation state (non-fatal)", "turn_id", p.TurnID)
 	}
 
@@ -408,14 +414,16 @@ func taskTokenLabels(task *tatarav1alpha1.Task) (project, repo, kind, issue, mod
 }
 
 // stampLastTurn persists the finishing turn's continuation state - its final
-// text and the repos it pushed - onto the Task status, so the G.7 synthetic
-// handoff note has something to say (#527).
+// text, the repos it pushed and the repos it FAILED to push - onto the Task
+// status, so the G.7 synthetic handoff note has something to say (#527).
 //
 // pushedReposKnown separates "the agent pushed nothing" from "this code path
-// cannot know". The turn-complete callback carries pushedRepos and is
-// authoritative for both; the poll backstop reads GET /v1/messages/{turnId},
-// whose TurnResult has no pushedRepos field at all, so it must leave whatever
-// the callback recorded alone rather than clearing it.
+// cannot know". The turn-complete callback carries pushedRepos and failedRepos
+// and is authoritative for both; the poll backstop reads GET
+// /v1/messages/{turnId}, whose TurnResult has neither field, so it must leave
+// whatever the callback recorded alone rather than clearing it. One flag covers
+// both lists because they arrive from, and are absent from, exactly the same
+// places.
 //
 // It is guarded exactly like recordResult: a callback for a turn the Task has
 // already moved past must not overwrite a newer turn's state, and a terminal
@@ -427,7 +435,7 @@ func taskTokenLabels(task *tatarav1alpha1.Task) (project, repo, kind, issue, mod
 // It records the newest NON-EMPTY payload: "this turn produced something", not
 // "this turn finished". A wholly empty payload is skipped, see below.
 func (s *CallbackServer) stampLastTurn(ctx context.Context, task *tatarav1alpha1.Task,
-	turnID, finalText string, pushedRepos []string, pushedReposKnown bool) error {
+	turnID, finalText string, pushedRepos, failedRepos []string, pushedReposKnown bool) error {
 
 	// A turn that produced NEITHER final text NOR a push carries no continuation
 	// state, and writing that emptiness destroys the newest turn that did carry
@@ -444,7 +452,12 @@ func (s *CallbackServer) stampLastTurn(ctx context.Context, task *tatarav1alpha1
 	// It does not weaken the "pushed nothing THIS turn" signal that
 	// pushedReposKnown exists for: a turn that said something and pushed nothing
 	// still clears the repos below, because its payload is not empty.
-	if finalText == "" && len(pushedRepos) == 0 {
+	//
+	// failedRepos counts as content on its own. A turn that pushed nothing and
+	// said nothing but LOST a repo is not content-free - it is the single most
+	// consequential thing a turn can report, since that repo's commits exist only
+	// on a workspace about to disappear.
+	if finalText == "" && len(pushedRepos) == 0 && len(failedRepos) == 0 {
 		return nil
 	}
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -467,6 +480,11 @@ func (s *CallbackServer) stampLastTurn(ctx context.Context, task *tatarav1alpha1
 				changed = true
 			}
 			fresh.Status.LastTurnPushedRepos = repos
+			failed := clampPushedRepos(failedRepos)
+			if !slices.Equal(fresh.Status.LastTurnFailedRepos, failed) {
+				changed = true
+			}
+			fresh.Status.LastTurnFailedRepos = failed
 		}
 		if !changed {
 			return nil
@@ -476,9 +494,9 @@ func (s *CallbackServer) stampLastTurn(ctx context.Context, task *tatarav1alpha1
 }
 
 // maxLastTurnPushedRepos mirrors the CRD MaxItems on
-// status.lastTurnPushedRepos. An over-long list the API server rejects would
-// fail the whole status write, which is the failure this field exists to
-// prevent.
+// status.lastTurnPushedRepos and status.lastTurnFailedRepos. An over-long list
+// the API server rejects would fail the whole status write, which is the
+// failure these fields exist to prevent.
 const maxLastTurnPushedRepos = 20
 
 func clampPushedRepos(repos []string) []string {
@@ -728,7 +746,7 @@ func (s *CallbackServer) refreshTurnFromWrapper(ctx context.Context, task *tatar
 		// GET /v1/messages/{turnId} carries no pushedRepos, so this path knows
 		// the final text and NOT the repos: it must not clear what the callback
 		// recorded (#527).
-		_ = s.stampLastTurn(ctx, task, turn, tr.FinalText, nil, false)
+		_ = s.stampLastTurn(ctx, task, turn, tr.FinalText, nil, nil, false)
 		_ = s.recordResult(ctx, tr, task, turn)
 		return true
 	}
