@@ -593,6 +593,15 @@ func (d *StageDriver) parkTask(ctx context.Context, proj *tatarav1alpha1.Project
 	return ParkTask(ctx, d.Client, d.spiller(proj), d.Metrics, task, reason, d.now(), nil)
 }
 
+// upgradeDeclinedTakeoverPark is StageDriver's binding of the decline upgrade.
+func (d *StageDriver) upgradeDeclinedTakeoverPark(ctx context.Context, proj *tatarav1alpha1.Project,
+	task *tatarav1alpha1.Task) error {
+	if err := UpgradeDeclinedTakeoverPark(ctx, d.Client, d.spiller(proj), task, d.now()); err != nil {
+		return fmt.Errorf("flip: %w", err)
+	}
+	return nil
+}
+
 // unparkTakeover is StageDriver's binding of the ONE state-moving un-park.
 func (d *StageDriver) unparkTakeover(ctx context.Context, proj *tatarav1alpha1.Project,
 	task *tatarav1alpha1.Task, to string) error {

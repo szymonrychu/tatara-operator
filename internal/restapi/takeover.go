@@ -177,14 +177,24 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 	// branch below can answer it 200.
 	//
 	// MintOrUnparkTakeoverTask un-parks on ReasonOwnershipLost and NOTHING else.
-	// A takeover parked for any other UnparkNever reason - implement-declined
-	// above all, which routing takeover into under-implementation made reachable
-	// - is a Task that will never run again, and nothing here hands the merge
-	// request back either (the only writer of Ownership=external is
-	// ownership.go's flipToExternal, driven by a HUMAN PUSH). Left at 200 the
-	// maintainer is told their take-over succeeded while the MR sits
-	// controller-owned by a dead Task, which is precisely the stranded shape
-	// #604 is about - just moved one state right.
+	// A takeover parked for any other UnparkNever reason is a Task that will
+	// never run again, and nothing here hands the merge request back either (the
+	// only writer of Ownership=external is ownership.go's flipToExternal, driven
+	// by a HUMAN PUSH). Left at 200 the maintainer is told their take-over
+	// succeeded while the MR sits controller-owned by a dead Task, which is
+	// precisely the stranded shape #604 is about - just moved one state right.
+	//
+	// WHAT IS AND IS NOT IN THIS SET, because the answer moved during #604's own
+	// review. implement-declined was this gate's headline example, since routing
+	// takeover into under-implementation made a decline reachable - but the skill
+	// that turn is required to invoke declines on an ORDINARY STAND-DOWN too, so
+	// the gate was refusing the most routine event in a takeover's life. That is
+	// fixed where it belongs, in the flip: parkOwnerTask upgrades a takeover's
+	// implement-declined park to ownership-lost (stage.UpgradeDeclineToOwnership
+	// Lost), so a divergence decline resumes and a DELIBERATE one - never followed
+	// by a flip - stays terminal. What this gate is left holding is the genuine
+	// terminals: exhaustion caps, operator errors, contract mismatches. A human
+	// push must not launder any of those into a resumable Task.
 	//
 	// UnparkHuman reasons (awaiting-human and friends) are deliberately NOT
 	// refused: those parks DO clear on a human comment. Note the timing though -
@@ -194,11 +204,10 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 	// "this park is clearable", not "this call clears it".
 	//
 	// THE REACHABLE SHAPE, spelled out because the ownership gate above hides it:
-	// a declined takeover still controller-owns its merge request and runs no
+	// an unresumable takeover still controller-owns its merge request and runs no
 	// pod, so nothing can call this endpoint at all until the human PUSHES. That
-	// push runs flipToExternal -> parkOwnerTask, which returns early on an
-	// already-parked Task (so the reason stays implement-declined, NOT
-	// ownership-lost) and then hands the controller ref to a review Task. THAT
+	// push runs flipToExternal -> parkOwnerTask (which leaves every reason in
+	// this set alone) and then hands the controller ref to a review Task. THAT
 	// review agent is the caller here, with ownership back at `external` - which
 	// is why this gate sits ahead of the already-tatara branch AND ahead of the
 	// flip, rather than inside either.
@@ -208,6 +217,12 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	} else if found && unresumableTakeoverPark(existing) {
+		// The endpoint's ONLY permanent refusal, and therefore the one that most
+		// needs a series: a merge request nobody can take over until ParkRetention
+		// collects the Task. Every sibling outcome here counts (the ownership 409,
+		// the three write 500s); a WarnContext alone is invisible to the takeover
+		// queries anyone runs before trusting a claim about this path.
+		obs.RestTakeoverRefusedTotal.WithLabelValues(existing.Status.ParkReason).Inc()
 		s.log.WarnContext(ctx, "restapi: takeover requested on a parked task that can never resume",
 			append(reqLogFields(r), "action", "mr_takeover_unresumable", "resource_id", mr.Name,
 				"user", cmt.Author, "task", existing.Name, "park_reason", existing.Status.ParkReason)...)

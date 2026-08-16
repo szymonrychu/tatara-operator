@@ -596,3 +596,101 @@ func TestReconcileOwnership_ClassifyWithoutLiveHeadDoesNotArmAFalseFlip(t *testi
 		t.Fatal("a real unattributable head must still flip to external")
 	}
 }
+
+// THE DIVERGENCE DECLINE (#604 review round 2).
+//
+// Routing takeover into `under-implementation` made `declined` a legal action
+// for a takeover pod, and the skill that pod is now REQUIRED to invoke
+// (tatara-implement-takeover) instructs exactly that on the ORDINARY
+// stand-down: an `ls-remote` mismatch or a non-fast-forward push rejection ->
+// submit_outcome(action="declined"). Both signals are LOCAL git calls, so the
+// pod reaches that verdict long before the operator's own flip does (webhook ->
+// mirror headSHA -> ReconcileOwnership).
+//
+// The agent-first order therefore parks the Task implement-declined, and
+// parkOwnerTask used to return early on it - leaving a park that
+// MintOrUnparkTakeoverTask refuses to resume, that DrainStandDownMerge cannot
+// re-drive, and that restapi.mrTakeover now answers 409. A human push, the very
+// thing the job text calls "normal and not a failure", became a seven-day
+// terminal.
+func TestReconcileOwnership_UpgradesADeclinedTakeoverParkToOwnershipLost(t *testing.T) {
+	ctx := context.Background()
+	d, proj, repo := newOwnershipDriver(t, ctx)
+	mr := seedTataraOwnedMRWithTakeoverTask(t, ctx, proj, repo, 41, "feat/human-41", "bot-head")
+	parkOwnerTaskForTest(t, ctx, ownerTaskOf(t, ctx, mr), stage.ReasonImplementDeclined)
+
+	flipped, err := d.ReconcileOwnership(ctx, proj, repo, mr, "human-head", nil)
+	if err != nil || !flipped {
+		t.Fatalf("expected flip, got flipped=%v err=%v", flipped, err)
+	}
+	got := ownerTaskOf(t, ctx, getMR(t, ctx, proj, repo, 41))
+	if !tatarav1alpha1.Parked(got) {
+		t.Fatal("the upgrade must never leave the Task un-parked, even momentarily")
+	}
+	if got.Status.ParkReason != stage.ReasonOwnershipLost {
+		t.Fatalf("a declined takeover whose branch the human took back must be parked %q, got %q: "+
+			"nothing resumes it otherwise and the re-take is refused 409",
+			stage.ReasonOwnershipLost, got.Status.ParkReason)
+	}
+	if got.Status.State != tatarav1alpha1.StateUnderImplementation {
+		t.Fatalf("the upgrade must not move State, got %q", got.Status.State)
+	}
+}
+
+// The upgrade is takeover-only, and DELIBERATELY so: implement-declined on a
+// takeover is the one place the platform itself instructs a decline for a cause
+// that is not a refusal. On any other kind it means what it says - the agent
+// looked at the work and declined it - and a human pushing to a tatara branch
+// afterwards must not reopen that verdict.
+func TestReconcileOwnership_LeavesANormalDeclinedOwnerParkedDeclined(t *testing.T) {
+	ctx := context.Background()
+	d, proj, repo := newOwnershipDriver(t, ctx)
+	mr := seedTataraOwnedMRWithNormalTask(t, ctx, proj, repo, 42, "tatara/feat-42", "bot-head")
+	name := tatarav1alpha1.IntakeTaskName(proj.Name, SweepIssueKind, repo.Name, 42)
+	var task tatarav1alpha1.Task
+	if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: proj.Namespace, Name: name}, &task); err != nil {
+		t.Fatalf("get owner task: %v", err)
+	}
+	parkOwnerTaskForTest(t, ctx, &task, stage.ReasonImplementDeclined)
+
+	if _, err := d.ReconcileOwnership(ctx, proj, repo, mr, "human-head", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: proj.Namespace, Name: name}, &task); err != nil {
+		t.Fatalf("re-get owner task: %v", err)
+	}
+	if task.Status.ParkReason != stage.ReasonImplementDeclined {
+		t.Fatalf("a NON-takeover decline is a refusal and must stay terminal, got %q", task.Status.ParkReason)
+	}
+}
+
+// Every OTHER unresumable park on a takeover is a genuine terminal - an
+// exhaustion cap, an operator error, a contract mismatch - and a human push
+// must not launder it into a resumable one. This is what keeps
+// restapi.mrTakeover's 409 gate alive after the upgrade above narrows it.
+func TestReconcileOwnership_LeavesOtherTakeoverParksAlone(t *testing.T) {
+	ctx := context.Background()
+	d, proj, repo := newOwnershipDriver(t, ctx)
+	mr := seedTataraOwnedMRWithTakeoverTask(t, ctx, proj, repo, 43, "feat/human-43", "bot-head")
+	parkOwnerTaskForTest(t, ctx, ownerTaskOf(t, ctx, mr), stage.ReasonStageDeadline)
+
+	if _, err := d.ReconcileOwnership(ctx, proj, repo, mr, "human-head", nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := ownerTaskOf(t, ctx, getMR(t, ctx, proj, repo, 43)); got.Status.ParkReason != stage.ReasonStageDeadline {
+		t.Fatalf("only implement-declined is upgraded; %q must survive a flip, got %q",
+			stage.ReasonStageDeadline, got.Status.ParkReason)
+	}
+}
+
+// parkOwnerTaskForTest parks an already-seeded owner Task through stage.Park,
+// so the fixture carries exactly the shape an outcome-driven park leaves.
+func parkOwnerTaskForTest(t *testing.T, ctx context.Context, task *tatarav1alpha1.Task, reason string) {
+	t.Helper()
+	if err := stage.Park(task, reason, task.Status.StateEnteredAt.Time); err != nil {
+		t.Fatalf("park %s: %v", reason, err)
+	}
+	if err := k8sClient.Status().Update(ctx, task); err != nil {
+		t.Fatalf("persist park %s: %v", reason, err)
+	}
+}

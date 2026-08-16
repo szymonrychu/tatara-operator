@@ -352,11 +352,23 @@ func (d *StageDriver) parkAndHandBack(ctx context.Context, proj *tatarav1alpha1.
 // non-done state can hold the flag; hasOwnershipLostParkEdge and its
 // ownership_flip_park_skipped log line are deleted with the question they
 // answered.
+//
+// ONE PARK IS UPGRADED RATHER THAN LEFT ALONE (#604 review). A takeover Task
+// parked implement-declined is the ordinary stand-down arriving agent-first: the
+// pod's divergence signal is a local git call and beats the operator's flip,
+// which waits on webhook -> mirror headSHA -> here. Left at implement-declined
+// it is UnparkNever, so the re-take is refused, DrainStandDownMerge cannot
+// re-drive an approved external head, and a branch a human merely took back
+// sits until ParkRetention. See stage.UpgradeDeclineToOwnershipLost for why the
+// upgrade is narrow on both kind and reason, and why it is not a repark.
 func (d *StageDriver) parkOwnerTask(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task) error {
 	if task.Spec.Kind == SweepReviewKind || tatarav1alpha1.TaskDone(task) {
 		return nil
 	}
 	if tatarav1alpha1.Parked(task) {
+		if task.Spec.Kind == takeoverKind && task.Status.ParkReason == stage.ReasonImplementDeclined {
+			return d.upgradeDeclinedTakeoverPark(ctx, proj, task)
+		}
 		return nil
 	}
 	if err := d.parkTask(ctx, proj, task, stage.ReasonOwnershipLost); err != nil {

@@ -76,25 +76,45 @@ func TakeoverTaskName(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Reposit
 // restapi.mrTakeover refuses unless the triggering comment exists in the mirror
 // AND its recorded author is a verified MAINTAINER, before it flips anything.
 //
-// A DECLINE IS TERMINAL FOR A TAKEOVER, and that is deliberate rather than
-// unnoticed. At `under-implementation` the implement outcome schema's only
+// A DELIBERATE DECLINE IS TERMINAL FOR A TAKEOVER, and that is deliberate rather
+// than unnoticed. At `under-implementation` the implement outcome schema's only
 // non-code action is `declined`, which parks(implement-declined) - UnparkNever -
 // and stage.go's GUARD 4 closes under-implementation -> done to every kind but
 // documentation, so a declined takeover parks rather than reaching a terminal
 // state. Nothing in this file hands the merge request back either: the ONLY
 // writer of Ownership=external is ownership.go's flipToExternal, which fires on
 // a HUMAN PUSH, and the un-park branch below only fires on ReasonOwnershipLost -
-// so a re-take comment on a DECLINED takeover cannot resume it. That case is
-// REFUSED at the door rather than silently accepted: restapi.mrTakeover answers
-// 409 for any UnparkNever park that is not ownership-lost (it used to answer 200
-// while doing nothing, forever). The two ways the MR does come back are both
-// real and both outside this path: the human pushes to it (flipToExternal stamps
-// `external` regardless of the Task already being parked), or the reaper
-// collects the parked Task at ParkRetention and releases ownership with it. The
-// takeover job text (assignment.go) therefore requires the agent to COMMENT on
-// the merge request explaining itself before it declines - a decline the
-// maintainer never sees is the failure mode this terminal would otherwise
-// produce.
+// so a re-take comment on a DELIBERATELY declined takeover cannot resume it.
+// That case is REFUSED at the door rather than silently accepted:
+// restapi.mrTakeover answers 409 for any UnparkNever park that is not
+// ownership-lost (it used to answer 200 while doing nothing, forever). The two
+// ways the MR does come back are both real and both outside this path: the human
+// pushes to it, or the reaper collects the parked Task at ParkRetention and
+// releases ownership with it. The takeover job text (assignment.go) therefore
+// requires the agent to COMMENT on the merge request explaining itself before it
+// declines - a decline the maintainer never sees is the failure mode this
+// terminal would otherwise produce.
+//
+// THE ORDINARY STAND-DOWN IS NOT THAT TERMINAL, and separating the two is #604's
+// review round 2. tatara-implement-takeover - the skill this pod is required to
+// invoke - instructs `declined` on a branch divergence (an ls-remote mismatch,
+// or a non-fast-forward push rejection), which is not a refusal at all: it is a
+// human taking their branch back, the single most routine event in a takeover's
+// life, and the job text calls it "normal and not a failure" in the same breath.
+// Both of the agent's signals are LOCAL git calls, so that verdict regularly
+// lands BEFORE the operator's own flip (webhook -> mirror headSHA ->
+// ReconcileOwnership), and the resulting implement-declined park is what the
+// paragraph above makes permanent.
+//
+// So the flip corrects it: parkOwnerTask upgrades a takeover's
+// implement-declined park to ownership-lost (stage.UpgradeDeclineToOwnershipLost),
+// and the un-park branch below then resumes it exactly as it would any other
+// stand-down. The distinction is made by the WORLD, not by parsing what the
+// agent wrote: a deliberate decline is never followed by a flip, so it keeps its
+// terminal; a divergence decline is followed by one by definition, because the
+// push the agent saw IS the push the flip is reacting to. The other order needs
+// nothing - restapi/outcome.go refuses an outcome on an already-parked Task, so
+// an operator-first stand-down never produces the decline in the first place.
 //
 // expectFrom (optional, see MintReviewTask/bindMRToTask) is forwarded to the
 // fresh-mint path's bindMRToTask call unchanged - fix #408: the takeover REST

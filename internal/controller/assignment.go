@@ -459,7 +459,10 @@ func agentJob(agentKind string, task *tatarav1alpha1.Task, proj *tatarav1alpha1.
 			"### 2. The work\n\n" +
 			"Read the merge request, its thread and its diff, then finish it. If a human pushes to the " +
 			"branch while you hold it they take it back and your Task stands down mid-turn - that is " +
-			"normal and not a failure.\n\n" +
+			"normal and not a failure. `tatara-implement-takeover` tells you to end that turn " +
+			"`declined`, and that is right: the operator recognises a decline that arrives with the " +
+			"branch already gone and records it as a STAND-DOWN, not as a refusal, so the maintainer " +
+			"can hand the merge request back to you later. Say so in the decline reason.\n\n" +
 			resumedBranchMergeRule +
 			ownYourPRRule +
 			"### 4. How this ends\n\n" +
@@ -467,10 +470,12 @@ func agentJob(agentKind string, task *tatarav1alpha1.Task, proj *tatarav1alpha1.
 			"change_significance=major|minor|patch)` once the merge request is clean by the three " +
 			"tests above. It then goes to review exactly like any other change.\n\n" +
 			"If you will not finish it, `submit_outcome(kind=implement, action=declined, " +
-			"decline_reason=...)`. **A DECLINE IS TERMINAL FOR A TAKEOVER.** It parks the Task " +
-			"permanently: nothing un-parks a declined takeover, and a second \"take over\" comment from " +
-			"the maintainer is REFUSED rather than resuming you. The merge request goes back to its " +
-			"author only when they push to it again, or when the Task is eventually collected. So " +
+			"decline_reason=...)`. **A DELIBERATE DECLINE IS TERMINAL FOR A TAKEOVER.** It parks the " +
+			"Task permanently: nothing un-parks it, and a second \"take over\" comment from the " +
+			"maintainer is REFUSED rather than resuming you. The merge request goes back to its author " +
+			"only when they push to it again, or when the Task is eventually collected. (The " +
+			"stand-down decline in section 2 is the exception, and the operator tells the two apart " +
+			"by whether the branch actually went back to the human - not by what you write.) So " +
 			"BEFORE you decline, `mr_write(action=\"comment\", ...)` on the merge request saying what " +
 			"you found and why you are handing it back - a decline the maintainer only discovers by " +
 			"noticing nothing happened is the failure this rule exists to prevent." +

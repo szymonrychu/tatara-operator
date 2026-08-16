@@ -402,6 +402,46 @@ func ParkTask(ctx context.Context, c client.Client, sp objbudget.Spiller, m *obs
 	return nil
 }
 
+// UpgradeDeclinedTakeoverPark is the write half of
+// stage.UpgradeDeclineToOwnershipLost: a kind=takeover Task parked
+// implement-declined, whose merge request has just gone back to its human, is
+// re-stamped parked(ownership-lost) so the re-take endpoint and
+// DrainStandDownMerge can still reach it (#604 review).
+//
+// It is deliberately NOT ParkTask with a different reason - ParkTask returns
+// early on an already-parked Task, which is the very early return that produced
+// the bug. Nor does it need ParkTask's other two jobs: the Task has been parked
+// since the decline, so its pod is long gone and its turn annotations are
+// already cleared. The only thing to do is the status write.
+//
+// The park counter is NOT re-fired. This is one park's reason being corrected,
+// not a second park, and double-counting it would overstate
+// operator_task_parked_total against a real park elsewhere. The upgrade has its
+// own counter, which is the honest series to ask about it.
+func UpgradeDeclinedTakeoverPark(ctx context.Context, c client.Client, sp objbudget.Spiller,
+	task *tatarav1alpha1.Task, now time.Time) error {
+
+	var upErr error
+	key := client.ObjectKeyFromObject(task)
+	if err := objbudget.FitTask(ctx, c, sp, key, func(t *tatarav1alpha1.Task) {
+		upErr = stage.UpgradeDeclineToOwnershipLost(t, now)
+	}); err != nil {
+		return fmt.Errorf("stage: upgrade declined takeover park on %s: %w", key.Name, err)
+	}
+	if upErr != nil {
+		return fmt.Errorf("stage: upgrade declined takeover park on %s: %w", key.Name, upErr)
+	}
+	if err := stage.UpgradeDeclineToOwnershipLost(task, now); err != nil {
+		return fmt.Errorf("stage: upgrade declined takeover park in memory: %w", err)
+	}
+
+	log.FromContext(ctx).Info("declined takeover park upgraded to ownership-lost",
+		"action", "takeover_decline_upgraded", "resource_id", task.Name, "task", task.Name,
+		"state", task.Status.State, "park_reason", stage.ReasonOwnershipLost, "kind", task.Spec.Kind)
+	obs.OwnershipDeclineUpgradedTotal.Inc()
+	return nil
+}
+
 // emitTerminalTokens fires operator_task_terminal_tokens_total once, on the
 // transition INTO a terminal state. The emit lived in the old machine's
 // setDeployState; that machine is gone, and this choke point is the only place
