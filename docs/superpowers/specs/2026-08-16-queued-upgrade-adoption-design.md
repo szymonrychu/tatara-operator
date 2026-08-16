@@ -113,14 +113,38 @@ that give an ALREADY RUNNING Task its next pod - are also priority 2
 Webhook-originated mints are priority 1.
 
 Enqueueing adoptions at priority 1 would let a twelve-MR Renovate run leapfrog
-the next stage of every task already underway. `admitPool` sorts by
-`(EffectivePriority, Seq)`, so those twelve would drain before any half-done
-implement or review task got its next pod, and the one-hour starvation guard
-would reserve exactly one slot after an hour of that.
+the next stage of every task already underway, INCLUDING an incident Task's
+downstream tickets, which `ensureTicket` puts at priority 0 only for the
+`incident` stage itself. `admitPool` sorts by `(EffectivePriority, Seq)`, so
+those twelve would drain before any half-done implement or review task got its
+next pod, and the one-hour starvation guard would reserve exactly one slot after
+an hour of that.
 
-No human waits on a Renovate bump. Priority 2 still admits the instant a slot
-frees, which is the entire objective; it merely declines to jump ahead of work
-already started.
+**Correction (whole-branch review): priority 2 does NOT decline to jump ahead of
+work already started.** An earlier draft of this section said it did, and that
+claim was false. `ensureTicket` allocates a ticket's `Spec.Seq` at TRANSITION
+time, not at Task-creation time, and `queueOrderBefore` sorts `(priority, seq)`
+ascending. Twelve adoptions enqueued at 06:35 therefore all carry a LOWER seq
+than a review ticket cut at 06:36 for a Task that started hours earlier, and each
+adoption that finds mint room takes a normal-pool slot ahead of it. What priority
+2 actually declines is jumping ahead of priorities 0 and 1 - incidents, an
+incident Task's downstream tickets, and human-originated webhook mints. That is
+still the right tier and the priority does not change: priority 1 would add the
+overtake of those tiers on top of the one that already exists, and no human waits
+on a Renovate bump.
+
+The overtake is BOUNDED, which is why it stays acceptable: `liveMintBudget` caps
+concurrent mints at `MaxLivePods`, so a starved ticket waits a few adopted-task
+lifetimes, not indefinitely.
+
+**Consequence of D1 nobody had written down.** Removing the two-lane adoption cap
+means a Renovate backlog can now hold priority-2 events in the normal pool for
+hours. A queued adoption older than `starvationBudget` (1h) trips
+`hasStarvingPriority2`, which permanently reserves ONE normal-pool slot
+(`QueueCapacity` minus `AlertCapacity`) for priority 2 for as long as the backlog
+persists - capacity taken away from priority-0/1 work by a mechanism that exists
+to protect the nightly doc batch, now driven by dependency bumps. Accepted: it is
+one slot, and the guard fires only after an hour of genuine starvation.
 
 ### D4 - The webhook keeps queued events fresh
 

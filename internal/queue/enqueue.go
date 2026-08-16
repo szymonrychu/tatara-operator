@@ -284,7 +284,15 @@ func QueuedEventName(projectRef, dedupKey string) string {
 // adoption. Both producers derive it from the same two facts they each already
 // hold - the Repository CR's NAME and the merge request number - so a webhook
 // enqueue and a sweep enqueue of the same merge request collide on
-// AlreadyExists at the API server and burn no sequence number.
+// AlreadyExists at the API server rather than creating two events.
+//
+// THE LOSER OF A GENUINELY CONCURRENT COLLISION HAS ALREADY BURNED A SEQUENCE
+// NUMBER, which this comment used to deny. EnqueueEvent allocates the seq
+// AFTER dedupExists but BEFORE Create, so only the dedup-hit path is free; the
+// AlreadyExists path has spent one by the time it collides. That is harmless -
+// seq is an ordering key and nothing counts it or requires it to be dense - but
+// the claim mattered enough to be written down twice, so it is corrected in
+// both places (see sweep.go's PRAdoptUpgrade arm).
 //
 // The Repository CR name, deliberately, not the forge slug: the webhook resolves
 // a Repository via matchRepo and the sweep iterates Repository CRs, so the CR

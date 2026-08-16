@@ -1751,15 +1751,28 @@ func (r *ProjectReconciler) sweepPRs(ctx context.Context, proj *tatarav1alpha1.P
 			//
 			// SAME DEDUP KEY AS THE WEBHOOK, deliberately: the deterministic
 			// QueuedEvent name makes a duplicate collide on AlreadyExists at the API
-			// server, which EnqueueEvent reports as created=false and which burns no
-			// sequence number. That is what makes this a true backstop for a
-			// delivery lost while the operator was down, rather than a second
-			// producer racing the first.
+			// server, which EnqueueEvent reports as created=false. That is what makes
+			// this a true backstop for a delivery lost while the operator was down,
+			// rather than a second producer racing the first.
+			//
+			// It does NOT always burn zero sequence numbers, as this comment and
+			// AdoptUpgradeDedupKey's both used to claim. EnqueueEvent allocates the
+			// seq BETWEEN the dedup check and the Create, so only the dedupExists hit
+			// path is free; a genuinely concurrent second producer passes dedup, burns
+			// a seq, and only then loses at Create. Seq gaps are harmless - admitPool
+			// orders on seq and never counts it - so the behaviour is fine and only
+			// the claim was wrong.
+			//
+			// Priority 2 for the same reason and with the same narrow meaning the
+			// webhook's enqueueAdoption spells out (design D3): it declines to jump
+			// ahead of priority 0/1, not ahead of work already started, since a
+			// ticket's seq is allocated at transition time.
+			//
+			// NO Provider AND NO PodRepo: see enqueueAdoption. The adoption path never
+			// reaches BuildTaskFromQueuedEvent, which is their only reader.
 			payload := tatarav1alpha1.QueuedEventPayload{
-				Kind:           adoptedUpgradeKind,
+				Kind:           AdoptedUpgradeKind,
 				RepositoryRef:  repo.Name,
-				Provider:       providerOf(proj),
-				PodRepo:        repo.Name,
 				AdoptedUpgrade: AdoptedUpgradeRefFromPR(pr),
 			}
 			dedupKey := queue.AdoptUpgradeDedupKey(repo.Name, pr.Number)

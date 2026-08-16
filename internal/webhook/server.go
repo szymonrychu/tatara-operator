@@ -662,18 +662,33 @@ func (s *Server) enqueueAdoption(ctx context.Context, w http.ResponseWriter, pro
 		HeadSHA: ev.HeadSHA, HeadBranch: ev.HeadBranch, Body: ev.Body, Labels: ev.Labels,
 		Repo: slug, HeadRepo: ev.HeadRepo,
 	}
+	// NO Provider AND NO PodRepo. Both are read only by
+	// queue.BuildTaskFromQueuedEvent, and an adoption event never reaches it:
+	// the dispatcher routes on IsAdoptedUpgradeMint into admitAdoptedUpgrade,
+	// which mints through Minter.MintAdoptedUpgradeTask - that derives the
+	// provider from the Project (providerOf) and calls agent.StampPodName itself.
+	// They were written by both producers, read by neither, and the two even
+	// disagreed on Provider's value (this side used the DELIVERY's provider, the
+	// sweep used the Project's).
 	payload := tatarav1.QueuedEventPayload{
-		Kind:           "upgrade",
+		Kind:           controller.AdoptedUpgradeKind,
 		RepositoryRef:  repo.Name,
-		Provider:       provider,
-		PodRepo:        repo.Name,
 		AdoptedUpgrade: controller.AdoptedUpgradeRefFromPR(pr),
 	}
 	dedupKey := queue.AdoptUpgradeDedupKey(repo.Name, ev.Number)
-	// Priority 2 is the cron/sweep tier (design D3). Priority 1 means a human is
-	// waiting on a thread, and admitPool sorts (priority, seq): a twelve-MR
-	// Renovate run at priority 1 would drain ahead of the next stage of every
-	// task already underway. Priority 2 still admits the instant a slot frees.
+	// Priority 2 is the cron/sweep tier (design D3), and what it buys is NARROWER
+	// than the first draft of this comment claimed. admitPool sorts (priority,
+	// seq) and a ticket's seq is allocated at TRANSITION time (ensureTicket,
+	// task_stage.go), so twelve adoptions enqueued at 06:35 all carry a lower seq
+	// than a review ticket cut at 06:36 for a Task already underway - and each
+	// adoption that finds mint room takes a normal-pool slot ahead of it.
+	// Priority 2 declines to jump ahead of priority 0 and 1 (incidents, and an
+	// incident Task's downstream tickets), NOT ahead of work already started.
+	// The overtake is bounded by MaxLivePods via liveMintBudget, so it is a delay
+	// of a few adopted-task lifetimes rather than an unbounded one, and priority 1
+	// would have been strictly worse: it would ALSO outrank every already-running
+	// incident Task's next stage. No human waits on a Renovate bump, and priority
+	// 2 still admits the instant a slot frees, which is the objective.
 	_, created, eerr := queue.EnqueueEvent(ctx, s.cfg.Client, s.cfg.Seq, proj,
 		tatarav1.QueueClassNormal, true, dedupKey, payload, queue.WithPriority(2))
 	if eerr != nil {

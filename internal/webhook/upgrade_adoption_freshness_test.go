@@ -11,9 +11,11 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -23,6 +25,7 @@ import (
 	tatarav1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/queue"
+	"github.com/szymonrychu/tatara-operator/internal/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -305,4 +308,106 @@ func TestMRSynchronizeAndClosed_NoQueuedAdoptionIsSilent(t *testing.T) {
 	postPRSynchronize(t, h, "fr6", secretVal,
 		prSynchronized("octocat", "some-branch", 99, "sha-x", "unrelated PR", "body"))
 	postPRClosed(t, h, "fr6", secretVal, prClosed("octocat", 99, false))
+}
+
+// qeBlindClient models a LAGGING INFORMER CACHE: every QueuedEvent Get answers
+// NotFound, every other read and every write passes straight through. It is what
+// production's cached client looks like in the seconds after a sibling replica
+// created the event this handler is looking for.
+type qeBlindClient struct {
+	client.Client
+}
+
+func (q qeBlindClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, isQE := obj.(*tatarav1.QueuedEvent); isQE {
+		return apierrors.NewNotFound(
+			schema.GroupResource{Group: "tatara.dev", Resource: "queuedevents"}, key.Name)
+	}
+	return q.Client.Get(ctx, key, obj, opts...)
+}
+
+// newServerWithAPIReader wires a cached Client and a DISTINCT uncached
+// APIReader, which is the only way to model the two genuinely separate reads
+// production has (mgr.GetClient() vs mgr.GetAPIReader()).
+func newServerWithAPIReader(t *testing.T, c client.Client, reader client.Reader) http.Handler {
+	t.Helper()
+	return webhook.NewServer(webhook.Config{
+		Client:    c,
+		APIReader: reader,
+		Namespace: ns,
+		Metrics:   obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		Seq:       &queue.SeqSource{Client: c, Namespace: ns},
+	}).Handler()
+}
+
+// A CLOSE DELIVERY MUST SEE AN EVENT THE INFORMER HAS NOT CAUGHT UP TO YET.
+// handleMROpened created it seconds earlier, possibly on a different one of the
+// three non-leader-elected replicas, and the admit-time backstop cannot cover
+// this: a FIRST adoption has no MergeRequest mirror CR, so
+// admitAdoptedUpgrade's merged/closed check sees nothing either. A cached read
+// here means dropQueuedAdoption no-ops silently and an agent pod is burned on an
+// already-merged merge request - exactly what design D4 exists to prevent.
+func TestMRClosed_DropsAnAdoptionTheCacheHasNotSeenYet(t *testing.T) {
+	const secretVal = "whsec-fresh9"
+	c := seedClient(t,
+		adoptionProject("fr9", "fr9-scm", "tatara-bot", "renovate/", 2, nil),
+		secret("fr9-scm", secretVal),
+		repository("charts", "fr9", baseRepoURL, "main"),
+	)
+	// The enqueue itself goes through the real client; only the READ BACK is blind.
+	h := newServerWithAPIReader(t, qeBlindClient{Client: c}, c)
+	postPROpened(t, h, "fr9", secretVal, prOpenedOnBranch("tatara-bot", "renovate/cilium", 91))
+	qe := adoptionEvent(t, c, "fr9", "charts", 91)
+
+	postPRClosed(t, h, "fr9", secretVal, prClosed("tatara-bot", 91, true))
+
+	var got tatarav1.QueuedEvent
+	err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: qe.Name}, &got)
+	require.True(t, apierrors.IsNotFound(err),
+		"the drop must read through the UNCACHED APIReader; a cached Get finds nothing and no-ops silently")
+}
+
+// The synchronize half of the same lag. A refresh that cannot see the event
+// leaves the dispatcher minting against a head SHA the engine already replaced,
+// and AdoptUpgradeMR clause (g) then rules a human's refusal on the wrong tree.
+func TestMRSynchronize_RefreshesAnAdoptionTheCacheHasNotSeenYet(t *testing.T) {
+	const secretVal = "whsec-fresh10"
+	c := seedClient(t,
+		adoptionProject("fra", "fra-scm", "tatara-bot", "renovate/", 2, nil),
+		secret("fra-scm", secretVal),
+		repository("charts", "fra", baseRepoURL, "main"),
+	)
+	h := newServerWithAPIReader(t, qeBlindClient{Client: c}, c)
+	postPROpened(t, h, "fra", secretVal, prOpenedOnBranch("tatara-bot", "renovate/cilium", 92))
+
+	postPRSynchronize(t, h, "fra", secretVal,
+		prSynchronized("tatara-bot", "renovate/cilium", 92, "sha-lagfree", "t", "b"))
+
+	qe := adoptionEvent(t, c, "fra", "charts", 92)
+	require.Equal(t, "sha-lagfree", qe.Spec.Payload.AdoptedUpgrade.HeadSHA,
+		"the refresh must read through the UNCACHED APIReader, or a lagging cache silently skips it")
+}
+
+// THE D4 REFRESH IS THE SECOND WRITER OF A BOUNDED FIELD and must clamp exactly
+// as the enqueue funnel does. Unclamped, its Update 422s for precisely the
+// grouped bumps whose per-dependency release notes are longest, and this
+// handler's failure policy is best-effort - so D4's freshness guarantee would
+// end silently for them.
+func TestMRSynchronize_ClampsAnOversizedRefreshedBody(t *testing.T) {
+	const secretVal = "whsec-freshb"
+	c := seedClient(t,
+		adoptionProject("frb", "frb-scm", "tatara-bot", "renovate/", 2, nil),
+		secret("frb-scm", secretVal),
+		repository("charts", "frb", baseRepoURL, "main"),
+	)
+	h, _ := newServer(t, c)
+	postPROpened(t, h, "frb", secretVal, prOpenedOnBranch("tatara-bot", "renovate/cilium", 93))
+
+	huge := strings.Repeat("x", tatarav1.MergeRequestBodyMaxBytes+4096)
+	postPRSynchronize(t, h, "frb", secretVal,
+		prSynchronized("tatara-bot", "renovate/cilium", 93, "sha-93b", "t", huge))
+
+	qe := adoptionEvent(t, c, "frb", "charts", 93)
+	require.Len(t, qe.Spec.Payload.AdoptedUpgrade.Body, tatarav1.MergeRequestBodyMaxBytes,
+		"the refresh write must clamp to the same cap AdoptedUpgradeRefFromPR does")
 }

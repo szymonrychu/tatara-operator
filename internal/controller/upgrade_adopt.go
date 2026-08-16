@@ -17,11 +17,15 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/upgrade"
 )
 
-// adoptedUpgradeKind is the Task kind an adopted third-party dependency merge
+// AdoptedUpgradeKind is the Task kind an adopted third-party dependency merge
 // request mints. It is `upgrade`, NOT `takeover`: the Task must get the upgrade
 // tool profile (so it has submit_outcome at all), the upgrade skill profile, the
 // upgrade outcome schema, and it must count against maxOpenUpgrades.
-const adoptedUpgradeKind = "upgrade"
+//
+// EXPORTED because the webhook is the OTHER producer of an adoption payload and
+// was carrying its own "upgrade" literal for the same field. Two spellings of
+// one contract, in two packages, with nothing holding them together.
+const AdoptedUpgradeKind = "upgrade"
 
 // AdoptedSignificanceFloor is the change significance an adopted merge request's
 // mirror is seeded with at mint.
@@ -75,7 +79,7 @@ const AdoptedSignificanceFloor = "patch"
 // what makes the mint idempotent, and idempotence is the WHOLE dedup mechanism
 // for adoption: one Task per merge request, no matter how many sweeps run.
 func AdoptedUpgradeTaskName(proj, repo string, number int) string {
-	return tatarav1alpha1.IntakeTaskName(proj, adoptedUpgradeKind, repo, number)
+	return tatarav1alpha1.IntakeTaskName(proj, AdoptedUpgradeKind, repo, number)
 }
 
 // MintAdoptedUpgradeTask mints an upgrade Task bound to an EXISTING
@@ -174,7 +178,7 @@ func (m *Minter) MintAdoptedUpgradeTask(ctx context.Context, proj *tatarav1alpha
 		Spec: tatarav1alpha1.TaskSpec{
 			ProjectRef:    proj.Name,
 			RepositoryRef: repo.Name,
-			Kind:          adoptedUpgradeKind,
+			Kind:          AdoptedUpgradeKind,
 			Goal: upgrade.GoalAdopted(slug, pr.HeadBranch, pr.Title,
 				pr.Number, proj.Spec.UpgradePolicy),
 			// `new`, so REVIEW GOES FIRST. Not under-implementation (which is
@@ -334,14 +338,45 @@ func adoptedTaskLabels(stamp map[string]string) map[string]string {
 	return labels
 }
 
+// ClampAdoptedUpgradeBody cuts a merge-request description to the byte budget
+// AdoptedUpgradeRef.Body's kubebuilder marker enforces (issue #495's class: a
+// bounded CRD field fed from an unbounded upstream one).
+//
+// UNCLAMPED, AN OVERSIZED BODY TAKES THE WEBHOOK DARK FOR THAT PROJECT. The
+// Create 422s, enqueueAdoption's failure policy is a 500 so the forge
+// redelivers, and it 500s again on every redelivery - and GitLab counts
+// consecutive delivery failures toward auto-disabling the project hook. The
+// sweep backstop fails enqueue_adopt_upgrade on every pass for as long as the
+// merge request is open, and refreshQueuedAdoption's Update is rejected the
+// same way, which is design D4's freshness guarantee silently ending for
+// exactly the merge requests whose changelogs are largest.
+//
+// MergeRequestBodyMaxBytes, not GoalMaxBytes: this string never becomes a Task
+// goal. It is copied onto MergeRequest.status.body (mrSnapshot ->
+// bindMRToTask -> SyncMergeRequest), whose own cap is this one, so anything
+// smaller would truncate the adopted mirror below what every other mirror path
+// stores for the same merge request.
+func ClampAdoptedUpgradeBody(body string) string {
+	return tatarav1alpha1.TruncateUTF8(body, tatarav1alpha1.MergeRequestBodyMaxBytes)
+}
+
 // AdoptedUpgradeRefFromPR snapshots a listing/delivery PRRef into the CRD shape
 // a QueuedEvent carries. Everything AdoptUpgradeMR and MintAdoptedUpgradeTask
 // read is copied, HeadRepo included - the fork guard fails CLOSED on an empty
 // one, so a lossy copy silently disarms adoption rather than breaking it loudly.
+//
+// IT IS ALSO THE ONE TRUNCATION FUNNEL for the snapshot, deliberately: both
+// producers (the webhook's enqueueAdoption and the sweep's PRAdoptUpgrade arm)
+// build their snapshot here and nowhere else, so a clamp on this line is a
+// clamp on both without either having to remember. Only Body is clamped -
+// neither AdoptedUpgradeRef.Title nor MergeRequest.status.title carries a
+// MaxLength marker, so clamping the title would be inventing a limit no
+// consumer imposes.
 func AdoptedUpgradeRefFromPR(pr scm.PRRef) *tatarav1alpha1.AdoptedUpgradeRef {
 	return &tatarav1alpha1.AdoptedUpgradeRef{
 		Number: pr.Number, Title: pr.Title, Author: pr.Author,
-		HeadSHA: pr.HeadSHA, HeadBranch: pr.HeadBranch, Body: pr.Body,
+		HeadSHA: pr.HeadSHA, HeadBranch: pr.HeadBranch,
+		Body:   ClampAdoptedUpgradeBody(pr.Body),
 		Labels: pr.Labels, Repo: pr.Repo, HeadRepo: pr.HeadRepo,
 	}
 }

@@ -2,7 +2,9 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/queue"
@@ -83,5 +85,47 @@ func TestAdoptedUpgradeRefRoundTripsThePRRef(t *testing.T) {
 		got.Title != pr.Title || got.Author != pr.Author || got.HeadSHA != pr.HeadSHA ||
 		got.HeadBranch != pr.HeadBranch || got.Body != pr.Body || len(got.Labels) != 1 {
 		t.Fatalf("round trip lost data: %+v", got)
+	}
+}
+
+// THE SNAPSHOT IS CLAMPED AT THE FUNNEL, and the funnel is the only clamp.
+// AdoptedUpgradeRef.Body carries a MaxLength marker and nothing truncated it, so
+// a grouped Renovate bump with per-dependency release notes made the QueuedEvent
+// Create 422 - which the webhook answers with a 500 on every redelivery (GitLab
+// counts consecutive failures toward auto-disabling the project hook) and which
+// the sweep answers with enqueue_adopt_upgrade every pass forever.
+//
+// Asserted through AdoptedUpgradeRefFromPR because BOTH producers build their
+// snapshot there and nowhere else; a per-producer test would prove nothing about
+// the other one.
+func TestAdoptedUpgradeRefFromPR_ClampsAnOversizedBody(t *testing.T) {
+	cap := tatarav1alpha1.MergeRequestBodyMaxBytes
+	pr := scm.PRRef{Number: 7, Body: strings.Repeat("x", cap+4096)}
+	got := AdoptedUpgradeRefFromPR(pr)
+	if len(got.Body) != cap {
+		t.Fatalf("clamped body = %d bytes, want %d (the CRD marker's own value)", len(got.Body), cap)
+	}
+	// A body that already fits must come back BYTE-IDENTICAL: TruncateUTF8's own
+	// contract, and callers compare stored values.
+	fits := scm.PRRef{Number: 7, Body: "release notes"}
+	if AdoptedUpgradeRefFromPR(fits).Body != "release notes" {
+		t.Fatal("a body that already fits must not be rewritten")
+	}
+}
+
+// THE CUT LANDS ON A RUNE BOUNDARY. A naive s[:max] on a multi-byte body
+// produces invalid UTF-8, which the API server's JSON encoder rejects even once
+// the LENGTH is legal - so an oversized CJK changelog would still 422 after a
+// "fix" that only counted bytes.
+func TestAdoptedUpgradeRefFromPR_ClampCutsOnARuneBoundary(t *testing.T) {
+	cap := tatarav1alpha1.MergeRequestBodyMaxBytes
+	// 3 bytes per rune divides 65536 with a remainder, so a naive cut splits one.
+	body := strings.Repeat("世", cap)
+	got := AdoptedUpgradeRefFromPR(scm.PRRef{Number: 7, Body: body}).Body
+	if len(got) > cap {
+		t.Fatalf("clamped body = %d bytes, want <= %d", len(got), cap)
+	}
+	if !utf8.ValidString(got) {
+		t.Fatal("the clamp cut mid-rune: the API server rejects invalid UTF-8 regardless of length")
 	}
 }

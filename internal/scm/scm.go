@@ -36,9 +36,18 @@ type WebhookEvent struct {
 	BaseSHA     string // push before-SHA (documentation agent diff base); empty for non-push events
 	HeadBranch  string // PR/MR source branch
 
-	// HeadRepo identifies the repository the HEAD branch lives in, in the same
-	// namespace as WebhookEvent.Repo's slug (a GitHub full_name, a GitLab
-	// path_with_namespace). It is the webhook-path input to AdoptUpgradeMR
+	// HeadRepo identifies the repository the HEAD branch lives in, as a FORGE
+	// SLUG (a GitHub full_name, a GitLab path_with_namespace).
+	//
+	// IT IS NOT IN Repo's NAMESPACE, whatever this comment claimed before the
+	// whole-branch review. Repo three fields above is a CLONE URL; the slug that
+	// belongs beside this one is scm.PRRef.Repo, which the webhook derives with
+	// its own repoSlug. AdoptUpgradeMR's fork clause compares the two and fails
+	// CLOSED on a mismatch, so reading Repo as a slug here would refuse every
+	// adoption for a project forever while every delivery still answered 202 -
+	// MEMORY.md 2026-08-16 records that exact near-miss.
+	//
+	// It is the webhook-path input to AdoptUpgradeMR
 	// clause (d): a merge request whose head is NOT the base repo is a FORK
 	// merge request and is never adopted, whatever its head branch is named.
 	// EMPTY means the forge did not report it, and every consumer fails CLOSED

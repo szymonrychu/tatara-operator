@@ -414,3 +414,47 @@ func TestWebhookActivityMatchesTheControllerConstant(t *testing.T) {
 			"and the producer's label have drifted apart", m[1], WebhookActivity)
 	}
 }
+
+// THE ADOPTION COUNTERS MUST BE SEEDABLE WITHOUT THE LEADER-ONLY PATH.
+// SeedSweepErrorsForProject runs from ProjectReconciler, which is
+// leader-elected, but AdoptionEnqueuedTotal{activity="webhook"} and
+// AdoptionEventDroppedTotal{reason="merged"|"closed"} are incremented by the
+// webhook on ALL replicas and merged/closed have no non-webhook producer at all.
+// A child born at value 1 is invisible to increase(...[1h]), so the non-leader
+// replicas need their own seeder (cmd/manager's adoptionSeedRunnable) and that
+// seeder needs this function to exist separately.
+func TestSeedAdoptionForProject(t *testing.T) {
+	wantEnq := len(adoptionActivities)
+	wantDrop := len(adoptionDropReasons)
+
+	beforeEnq := testutil.CollectAndCount(AdoptionEnqueuedTotal)
+	beforeDrop := testutil.CollectAndCount(AdoptionEventDroppedTotal)
+	SeedAdoptionForProject("adopt-seed-proj")
+	if got := testutil.CollectAndCount(AdoptionEnqueuedTotal) - beforeEnq; got != wantEnq {
+		t.Fatalf("seeding added %d enqueued series, want %d", got, wantEnq)
+	}
+	if got := testutil.CollectAndCount(AdoptionEventDroppedTotal) - beforeDrop; got != wantDrop {
+		t.Fatalf("seeding added %d dropped series, want %d", got, wantDrop)
+	}
+
+	afterEnq := testutil.CollectAndCount(AdoptionEnqueuedTotal)
+	SeedAdoptionForProject("adopt-seed-proj")
+	if again := testutil.CollectAndCount(AdoptionEnqueuedTotal); again != afterEnq {
+		t.Fatalf("re-seeding added %d series, want 0 (the webhook start hook and the Project reconcile both call it)", again-afterEnq)
+	}
+
+	// Every seeded child must be a genuine ZERO baseline, not a value.
+	if v := testutil.ToFloat64(AdoptionEventDroppedTotal.WithLabelValues("adopt-seed-proj", "merged")); v != 0 {
+		t.Fatalf("seeded merged series = %v, want 0", v)
+	}
+}
+
+// SeedSweepErrorsForProject must keep seeding the adoption pair too: the leader
+// covers a Project enrolled AFTER the webhook servers started, which is the one
+// case the start-time seeder cannot see.
+func TestSeedSweepErrorsForProjectStillSeedsAdoption(t *testing.T) {
+	SeedSweepErrorsForProject("adopt-via-sweep-proj")
+	if v := testutil.ToFloat64(AdoptionEnqueuedTotal.WithLabelValues("adopt-via-sweep-proj", WebhookActivity)); v != 0 {
+		t.Fatalf("webhook-activity series = %v, want a seeded 0", v)
+	}
+}

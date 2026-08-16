@@ -472,15 +472,39 @@ func SeedSweepErrorsForProject(project string) {
 		SweepStaleOwnerRepairedTotal.WithLabelValues(project, activity)
 		SweepTerminalOwnerReleasedTotal.WithLabelValues(project, activity)
 	}
-	enq := func(l ...string) { AdoptionEnqueuedTotal.WithLabelValues(l...) }
-	seedLabels(enq, []string{project}, adoptionActivities)
-	drop := func(l ...string) { AdoptionEventDroppedTotal.WithLabelValues(l...) }
-	seedLabels(drop, []string{project}, adoptionDropReasons)
+	SeedAdoptionForProject(project)
 	// MintOutcomeTotal carries NO project label, so this is process-global and
 	// idempotent - seeded here rather than in init() only because this is where
 	// its neighbours are, and its absence was the gap the #521 review found.
 	mint := func(l ...string) { MintOutcomeTotal.WithLabelValues(l...) }
 	seedLabels(mint, mintOutcomeKinds, mintOutcomes)
+}
+
+// SeedAdoptionForProject pre-seeds the closed label sets of the two adoption
+// counters for ONE project.
+//
+// IT IS SPLIT OUT OF SeedSweepErrorsForProject BECAUSE ITS PRODUCERS ARE NOT
+// LEADER-ELECTED AND ITS ONLY SEEDER WAS. SeedSweepErrorsForProject runs from
+// ProjectReconciler, which is leader-only; the webhook's enqueueAdoption
+// (activity="webhook", reason="repo_slug_unknown") and its freshness handlers
+// (reason="merged"/"closed") run on ALL replicas, and merged/closed have no
+// non-webhook producer at all. On the two non-leader replicas those series
+// therefore did not exist until their first increment, and a counter born at 1
+// is invisible to increase(...[1h]) - so the FIRST adoption event after every
+// pod roll was unobservable on two pods out of three, for the series this
+// operator's adoption path leans on hardest.
+//
+// Called from BOTH: the leader's Project reconcile (via
+// SeedSweepErrorsForProject, so a Project enrolled after start is covered) and
+// every replica's webhook-server start (cmd/manager/wire.go), which is the only
+// hook that precedes any delivery. Idempotent - WithLabelValues returns the
+// existing child - so calling it from two places costs map lookups and nothing
+// else.
+func SeedAdoptionForProject(project string) {
+	enq := func(l ...string) { AdoptionEnqueuedTotal.WithLabelValues(l...) }
+	seedLabels(enq, []string{project}, adoptionActivities)
+	drop := func(l ...string) { AdoptionEventDroppedTotal.WithLabelValues(l...) }
+	seedLabels(drop, []string{project}, adoptionDropReasons)
 }
 
 func init() {

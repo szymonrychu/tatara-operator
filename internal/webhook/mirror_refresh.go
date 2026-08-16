@@ -306,6 +306,19 @@ func (s *Server) handleMRSynchronize(ctx context.Context, w http.ResponseWriter,
 // holds. Every merge request in the platform receives synchronize and closed
 // deliveries and almost none has a queued adoption, so the miss path has to be
 // one cheap read.
+//
+// THE READ IS UNCACHED (s.reader(), the manager's APIReader), for the same
+// reason the review guards are and the dispatcher's own mintedTask is (fix
+// M28): the QueuedEvent this looks for was created SECONDS earlier by
+// handleMROpened, possibly on a DIFFERENT one of the three non-leader-elected
+// webhook replicas. A merge/close delivery arriving before that Create has
+// propagated into this replica's informer would find nothing through the cached
+// client, dropQueuedAdoption would no-op silently, and the admit-time backstop
+// cannot cover it - a FIRST adoption has no MergeRequest mirror CR at all, so
+// admitAdoptedUpgrade's merged/closed check sees nothing either (its own doc
+// comment says so). The cost of that miss is an agent pod burned reviewing an
+// already-merged merge request, which is exactly what design D4 exists to
+// prevent.
 func (s *Server) queuedAdoption(ctx context.Context, proj *tatarav1.Project,
 	repo *tatarav1.Repository, number int) *tatarav1.QueuedEvent {
 
@@ -314,7 +327,7 @@ func (s *Server) queuedAdoption(ctx context.Context, proj *tatarav1.Project,
 	}
 	name := queue.QueuedEventName(proj.Name, queue.AdoptUpgradeDedupKey(repo.Name, number))
 	var qe tatarav1.QueuedEvent
-	if err := s.cfg.Client.Get(ctx, objKey(s.cfg.Namespace, name), &qe); err != nil {
+	if err := s.reader().Get(ctx, objKey(s.cfg.Namespace, name), &qe); err != nil {
 		return nil
 	}
 	if !stillQueuedAdoption(&qe) {
@@ -347,8 +360,13 @@ func stillQueuedAdoption(qe *tatarav1.QueuedEvent) bool {
 // against a stale one rules on the wrong tree.
 //
 // GET-MUTATE-UPDATE UNDER retry.RetryOnConflict, re-Getting fresh INSIDE the
-// closure, mirroring fitMR/objbudget.FitIssue in this same file and
-// patchQueuedEventStatus in queue_controller.go. Production runs 3 webhook
+// closure THROUGH THE UNCACHED READER, mirroring fitMR/objbudget.FitIssue in
+// this same file and patchQueuedEventStatus in queue_controller.go. The reader
+// is what makes the retry mean anything: a re-Get through the informer cache
+// hands back the SAME stale resourceVersion the losing Update was built on, so
+// every retry re-submits the identical losing write and the loop just burns its
+// four attempts. It is also what lets this handler see an event a sibling
+// replica created moments ago at all (see queuedAdoption). Production runs 3 webhook
 // replicas with no leader election on this path, so two near-simultaneous
 // synchronize deliveries - literally "Renovate force-pushes each successive
 // bump", the case this whole handler exists for - can land on different
@@ -369,7 +387,7 @@ func (s *Server) refreshQueuedAdoption(ctx context.Context, proj *tatarav1.Proje
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		refreshed = false
 		var qe tatarav1.QueuedEvent
-		if gerr := s.cfg.Client.Get(ctx, key, &qe); gerr != nil {
+		if gerr := s.reader().Get(ctx, key, &qe); gerr != nil {
 			if apierrors.IsNotFound(gerr) {
 				return nil // no queued adoption at all: the normal case
 			}
@@ -383,7 +401,13 @@ func (s *Server) refreshQueuedAdoption(ctx context.Context, proj *tatarav1.Proje
 			qe.Spec.Payload.AdoptedUpgrade.Title = ev.Title
 		}
 		if ev.Body != "" {
-			qe.Spec.Payload.AdoptedUpgrade.Body = ev.Body
+			// CLAMPED, exactly as the enqueue funnel clamps it
+			// (controller.AdoptedUpgradeRefFromPR). This is the SECOND writer of
+			// this bounded field, and an unclamped write here would 422 the Update
+			// for precisely the grouped bumps whose per-dependency release notes are
+			// longest - ending design D4's freshness guarantee for them silently,
+			// since this handler's failure policy is best-effort.
+			qe.Spec.Payload.AdoptedUpgrade.Body = controller.ClampAdoptedUpgradeBody(ev.Body)
 		}
 		if uerr := s.cfg.Client.Update(ctx, &qe); uerr != nil {
 			if apierrors.IsNotFound(uerr) {

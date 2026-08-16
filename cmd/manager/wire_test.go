@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -8,12 +10,18 @@ import (
 	"time"
 
 	chiMiddleware "github.com/go-chi/chi/v5/middleware"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	tataradevv1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/config"
 	"github.com/szymonrychu/tatara-operator/internal/ingest"
 	"github.com/szymonrychu/tatara-operator/internal/memclient"
+	"github.com/szymonrychu/tatara-operator/internal/obs"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 func TestPodConfigFromConfig(t *testing.T) {
@@ -337,5 +345,55 @@ func TestNewMemoryFor_ReturnsPerProjectNoteFetcher(t *testing.T) {
 	projC := &tataradevv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "gamma"}}
 	if got := memoryFor(projC); got == nil {
 		t.Fatal("newMemoryFor must not return nil for a project with no memory status yet")
+	}
+}
+
+// TestAdoptionSeedRunnable_SeedsEveryProjectOnEveryReplica guards the reason
+// this runnable exists: obs.SeedSweepErrorsForProject runs only from the
+// LEADER-elected ProjectReconciler, while the webhook increments
+// AdoptionEnqueuedTotal{activity="webhook"} and
+// AdoptionEventDroppedTotal{reason="merged"|"closed"} on all replicas - and
+// merged/closed have no non-webhook producer at all. A CounterVec child that
+// first appears at value 1 is invisible to increase(...[1h]).
+func TestAdoptionSeedRunnable_SeedsEveryProjectOnEveryReplica(t *testing.T) {
+	if r := (adoptionSeedRunnable{}); r.NeedLeaderElection() {
+		t.Fatal("adoptionSeedRunnable.NeedLeaderElection() = true, want false: " +
+			"the replicas that need this seeding are exactly the ones that never win the election")
+	}
+	scheme := runtime.NewScheme()
+	if err := tataradevv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add scheme: %v", err)
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		&tataradevv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "seed-a", Namespace: "tatara"}},
+		&tataradevv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "seed-b", Namespace: "tatara"}},
+	).Build()
+
+	r := adoptionSeedRunnable{reader: c, namespace: "tatara"}
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	for _, p := range []string{"seed-a", "seed-b"} {
+		if v := testutil.ToFloat64(obs.AdoptionEventDroppedTotal.WithLabelValues(p, "merged")); v != 0 {
+			t.Fatalf("project %s: merged series = %v, want a seeded 0", p, v)
+		}
+	}
+}
+
+// A FAILED LIST MUST NOT STOP THE MANAGER. Start returning an error tears the
+// whole control plane down, and a metrics baseline is not worth that trade.
+func TestAdoptionSeedRunnable_ListFailureIsNotFatal(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := tataradevv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add scheme: %v", err)
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(interceptor.Funcs{
+		List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
+			return errors.New("injected list failure")
+		},
+	}).Build()
+	r := adoptionSeedRunnable{reader: c, namespace: "tatara"}
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start must swallow a list failure, got %v", err)
 	}
 }

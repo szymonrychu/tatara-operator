@@ -194,8 +194,64 @@ func addWebhookServer(ctx context.Context, mgr ctrl.Manager, cfg config.Config, 
 		},
 	}).Mount(httpMux, auth.Middleware(verifier, metrics))
 
+	// The adoption counters the WEBHOOK produces, seeded on every replica before
+	// the listener starts. See adoptionSeedRunnable.
+	if err := mgr.Add(adoptionSeedRunnable{reader: mgr.GetAPIReader(), namespace: cfg.Namespace}); err != nil {
+		return fmt.Errorf("add adoption metric seeder: %w", err)
+	}
+
 	return mgr.Add(webhook.NewHandlerRunnable(httpMux, cfg.HTTPAddr))
 }
+
+// adoptionSeedRunnable seeds obs.AdoptionEnqueuedTotal and
+// obs.AdoptionEventDroppedTotal for every enrolled Project, on EVERY replica.
+//
+// WHY IT CANNOT BE THE PROJECT RECONCILER'S JOB. That reconciler already calls
+// obs.SeedSweepErrorsForProject, but it is leader-elected, so on the other two
+// of production's three replicas those series simply did not exist. The
+// producers are not leader-elected: enqueueAdoption and the D4 freshness
+// handlers all run on whichever replica the webhook Service picked, and
+// AdoptionEventDroppedTotal{reason="merged"|"closed"} has NO producer anywhere
+// but the webhook. A CounterVec child that first appears at value 1 is invisible
+// to increase(...[1h]), so the first adoption event after every pod roll was
+// unobservable on two pods in three.
+//
+// WHY START AND NOT PER-DELIVERY. Seeding inside the handler would not help the
+// event it is handling - no scrape falls between the seed and the increment in
+// the same call - so the seed has to precede the first delivery, and the only
+// point that does is start. A Project enrolled AFTER start is covered by the
+// leader's Project reconcile on the leader replica; the residual gap is that
+// project's first adoption delivery landing on a non-leader replica within one
+// scrape of its enrollment, which is a strictly smaller hole than the one this
+// closes and not worth a watch to shave.
+//
+// A FAILED LIST IS NOT FATAL. Start returning an error stops the whole manager,
+// and a metrics baseline is not worth trading the control plane for; the series
+// then behave exactly as they did before this runnable existed.
+type adoptionSeedRunnable struct {
+	reader    client.Reader
+	namespace string
+}
+
+func (a adoptionSeedRunnable) Start(ctx context.Context) error {
+	var projects tataradevv1alpha1.ProjectList
+	if err := a.reader.List(ctx, &projects, client.InNamespace(a.namespace)); err != nil {
+		slog.WarnContext(ctx, "adoption metric seeding skipped; the series appear on first use",
+			"action", "adoption_seed_failed", "error", err.Error())
+		return nil
+	}
+	for i := range projects.Items {
+		obs.SeedAdoptionForProject(projects.Items[i].Name)
+	}
+	slog.InfoContext(ctx, "seeded the webhook-produced adoption counters",
+		"action", "adoption_seed", "projects", len(projects.Items))
+	return nil
+}
+
+// NeedLeaderElection implements manager.LeaderElectionRunnable. FALSE, and that
+// is the entire point: the replicas that need this seeding are exactly the ones
+// that never win the election.
+func (a adoptionSeedRunnable) NeedLeaderElection() bool { return false }
 
 // newSpillerFor builds the per-project A.7 spill-client resolver: the
 // tatara-memory client for that Project's status.memory.endpoint. The endpoint

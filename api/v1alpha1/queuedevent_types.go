@@ -143,9 +143,25 @@ type AdoptedUpgradeRef struct {
 	HeadSHA string `json:"headSHA,omitempty"`
 	// +optional
 	HeadBranch string `json:"headBranch,omitempty"`
-	// Body carries the changelog the review agent reads. Capped at the same
-	// budget the goal is: an engine release-notes body is unbounded upstream.
-	// +kubebuilder:validation:MaxLength=16384
+	// Body carries the changelog the review agent reads. It is capped at
+	// MergeRequestBodyMaxBytes (limits.go), NOT at GoalMaxBytes as it was until
+	// the whole-branch review: this string's DESTINATION is
+	// MergeRequest.status.body (mrSnapshot -> bindMRToTask -> SyncMergeRequest),
+	// whose own marker is 65536, so the smaller cap made the adopted mirror's
+	// body strictly shorter than the same merge request's body mirrored by any
+	// other path, for a field that never reaches a Task goal at all.
+	//
+	// NOTHING TRUNCATED IT AT ALL BEFORE THAT REVIEW, which is the real defect
+	// the cap value only frames: a grouped Renovate bump with per-dependency
+	// release notes routinely runs past any of these numbers, the QueuedEvent
+	// Create 422s, the webhook answers 500 on EVERY delivery for that merge
+	// request (GitLab counts consecutive failures toward auto-disabling the
+	// project hook), and the sweep fails enqueue_adopt_upgrade every pass
+	// forever. ClampAdoptedUpgradeBody (internal/controller/upgrade_adopt.go) is
+	// the one clamp; it runs inside AdoptedUpgradeRefFromPR so both producers
+	// inherit it, and again on the D4 refresh write.
+	// Go-side twin: MergeRequestBodyMaxBytes (limits.go).
+	// +kubebuilder:validation:MaxLength=65536
 	// +optional
 	Body string `json:"body,omitempty"`
 	// +optional
