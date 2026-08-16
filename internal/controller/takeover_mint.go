@@ -3,7 +3,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"slices"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -132,6 +131,23 @@ func (m *Minter) mintOrUnparkTakeoverTask(ctx context.Context, proj *tatarav1alp
 				return nil, fmt.Errorf("takeover: un-park %s: %w", existing.Name, eerr)
 			}
 		}
+		// INTERRUPTED MINT (#604). The fall-through is otherwise a pure no-op,
+		// which is what the endpoint's idempotency relies on - but a Task whose
+		// mrRefs are EMPTY is not a finished mint, it is one that died between
+		// createTaskRaceSafe and stampMintStatus with MR ownership already
+		// flipped. Returning it unchanged makes the maintainer's retry
+		// permanently unable to repair it, and at under-implementation an empty
+		// mrRefs is not survivable: submit_outcome(action=submitted) 400s
+		// no-open-mr, and mr_write(action=open) reads mrRefs for its
+		// idempotency check and would open a DUPLICATE PR on the human's branch.
+		// So re-run the bind and the stamp. Both are idempotent
+		// (ownMergeRequest no-ops when it already owns the CR; the stamp checks
+		// for the ref first), so this is safe on every repeat call.
+		if len(existing.Status.MRRefs) == 0 {
+			if rerr := m.bindAndStampTakeoverMR(ctx, proj, repo, mr, &existing, sp, expectFrom...); rerr != nil {
+				return nil, rerr
+			}
+		}
 		return &existing, nil
 	}
 	if !apierrors.IsNotFound(err) {
@@ -200,19 +216,28 @@ func (m *Minter) mintOrUnparkTakeoverTask(ctx context.Context, proj *tatarav1alp
 		return m.mintOrUnparkTakeoverTask(ctx, proj, repo, mr, requestingUser, commentBody, sp, true, expectFrom...)
 	}
 
-	ext := mrExtFromMR(mr)
-	if err := m.bindMRToTask(ctx, proj, repo, ext, task, sp, expectFrom...); err != nil {
-		return nil, err
-	}
-	mrName := tatarav1alpha1.MergeRequestName(repo.Name, mr.Spec.Number)
-	if err := m.stampMintStatus(ctx, task, func(fresh *tatarav1alpha1.Task) {
-		if !slices.Contains(fresh.Status.MRRefs, mrName) {
-			fresh.Status.MRRefs = append(fresh.Status.MRRefs, mrName)
-		}
-	}); err != nil {
+	if err := m.bindAndStampTakeoverMR(ctx, proj, repo, mr, task, sp, expectFrom...); err != nil {
 		return nil, err
 	}
 	return task, nil
+}
+
+// bindAndStampTakeoverMR is the LAST TWO of the takeover mint's three writes:
+// mirror-and-own the MergeRequest, then record it in status.mrRefs. Both the
+// fresh-mint path and the interrupted-mint repair above call it, so the repair
+// cannot drift from the thing it repairs.
+//
+// Both halves are idempotent - ownMergeRequest returns early when the Task
+// already controller-owns the CR, and the stamp checks for the ref first - which
+// is what makes it safe to re-run on an endpoint retry.
+func (m *Minter) bindAndStampTakeoverMR(ctx context.Context, proj *tatarav1alpha1.Project,
+	repo *tatarav1alpha1.Repository, mr *tatarav1alpha1.MergeRequest, task *tatarav1alpha1.Task,
+	sp objbudget.Spiller, expectFrom ...string) error {
+
+	if err := m.bindMRToTask(ctx, proj, repo, mrExtFromMR(mr), task, sp, expectFrom...); err != nil {
+		return err
+	}
+	return m.stampMRRef(ctx, task, tatarav1alpha1.MergeRequestName(repo.Name, mr.Spec.Number))
 }
 
 // mrExtFromMR builds the scm.MergeRequest snapshot bindMRToTask's SyncMergeRequest

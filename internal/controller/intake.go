@@ -547,15 +547,25 @@ func (m *Minter) bindMRToTask(ctx context.Context, proj *tatarav1alpha1.Project,
 	return m.ownMergeRequest(ctx, proj, tatarav1alpha1.MergeRequestName(repo.Name, ext.Number), task, ef)
 }
 
-// repairMRBinding heals a review mint that was interrupted between the Task
-// create and bindMRToTask: the Task is live but its MergeRequest CR is an UNBOUND
-// stub (no controller owner, empty status), or was never created at all. It
-// re-runs the SAME mirror-and-own bind against the existing twin and re-stamps
-// mrRefs. It NEVER steals: a CR already controller-owned - by the twin (the
-// idempotent re-run) or, defensively, by anyone else - is left untouched, so the
-// repair is safe to run on every backstop pass and race-safe under concurrency
-// (ownMergeRequest is the real arbiter; this Get is a cheap skip for the common
-// already-bound case).
+// repairMRBinding heals a mint that was interrupted between the Task create and
+// bindMRToTask: the Task is live but its MergeRequest CR is an UNBOUND stub (no
+// controller owner, empty status), or was never created at all. It re-runs the
+// SAME mirror-and-own bind against the existing twin and re-stamps mrRefs. It
+// NEVER steals: a CR controller-owned by ANOTHER Task is left completely
+// untouched, so the repair is safe to run on every backstop pass and race-safe
+// under concurrency (ownMergeRequest is the real arbiter; this Get is a cheap
+// skip for the common already-bound case).
+//
+// THE OWNED-BY-US CASE FALLS THROUGH TO THE REF STAMP (#604). It used to return
+// nil for ANY controller-owned CR, which conflated "someone else's, hands off"
+// with "ours, and the bind half already landed". The mint is THREE writes -
+// createTaskRaceSafe, bindMRToTask, stampMintStatus - so an interruption between
+// the second and third leaves exactly that shape: the CR is ours, and mrRefs is
+// empty. Skipping it there made this backstop structurally unable to repair the
+// window it exists for, and a takeover's MR ALWAYS has a controller owner, so
+// the backstop was inert for that kind entirely. The bind is not re-run (it
+// already happened and ownMergeRequest would no-op anyway); only the stamp is,
+// and stampMintStatus is idempotent on the ref.
 func (m *Minter) repairMRBinding(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository,
 	ext scm.MergeRequest, task *tatarav1alpha1.Task, sp objbudget.Spiller) error {
 
@@ -563,8 +573,12 @@ func (m *Minter) repairMRBinding(ctx context.Context, proj *tatarav1alpha1.Proje
 	var mr tatarav1alpha1.MergeRequest
 	err := m.Client.Get(ctx, types.NamespacedName{Namespace: proj.Namespace, Name: name}, &mr)
 	if err == nil {
-		if _, owned := own.ControllerOwner(&mr); owned {
-			return nil // already bound (or foreign-owned): never steal, never re-mirror
+		if ctrl, owned := own.ControllerOwner(&mr); owned {
+			if ctrl != task.Name {
+				return nil // foreign-owned: never steal, never re-mirror
+			}
+			// Already OURS: the bind landed, the mrRefs stamp may not have.
+			return m.stampMRRef(ctx, task, name)
 		}
 	} else if !apierrors.IsNotFound(err) {
 		return fmt.Errorf("intake: repair get mergerequest %s: %w", name, err)
@@ -574,6 +588,15 @@ func (m *Minter) repairMRBinding(ctx context.Context, proj *tatarav1alpha1.Proje
 	}
 	log.FromContext(ctx).Info("intake: repaired interrupted review mint binding",
 		"action", "intake_repair_bind", "resource_id", task.Name, "mr", name)
+	return m.stampMRRef(ctx, task, name)
+}
+
+// stampMRRef appends name to task.status.mrRefs, once. It is the LAST of the
+// three writes a mint makes, and the one an interruption most often loses -
+// mrRefs is what submit_outcome(action=submitted)'s open-MR gate and mr_write's
+// open-idempotency both read, so a Task missing it can neither finish nor
+// safely re-open.
+func (m *Minter) stampMRRef(ctx context.Context, task *tatarav1alpha1.Task, name string) error {
 	return m.stampMintStatus(ctx, task, func(fresh *tatarav1alpha1.Task) {
 		if !slices.Contains(fresh.Status.MRRefs, name) {
 			fresh.Status.MRRefs = append(fresh.Status.MRRefs, name)

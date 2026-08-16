@@ -1,9 +1,11 @@
 package restapi
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -12,6 +14,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/own"
+	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
 // mrTakeoverReq is the wire contract for POST /projects/{p}/scm/mr-takeover -
@@ -46,6 +49,42 @@ func takeoverTaskName(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Reposit
 // takeover Task (OP5's Minter.MintOrUnparkTakeoverTask), and move the MR
 // mirror's controller ownership onto it. The stand-down/takeover announcement
 // is posted by the MergeRequest reconcile drain (OP11), not here.
+// liveTakeoverTask reads the ONE deterministic takeover Task for (proj, repo,
+// number), if it exists. found=false means no takeover has ever been minted for
+// this merge request, which is the ordinary first-take case.
+func (s *Server) liveTakeoverTask(ctx context.Context, proj *tatarav1alpha1.Project,
+	repo *tatarav1alpha1.Repository, number int) (*tatarav1alpha1.Task, bool, error) {
+
+	name := controller.TakeoverTaskName(proj, repo, number)
+	var task tatarav1alpha1.Task
+	err := s.c.Get(ctx, types.NamespacedName{Namespace: s.ns, Name: name}, &task)
+	if apierrors.IsNotFound(err) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return &task, true, nil
+}
+
+// unresumableTakeoverPark reports whether t is parked in a way the takeover
+// endpoint can never clear: parked, for a reason that is NOT ownership-lost (the
+// one reason MintOrUnparkTakeoverTask acts on) and whose UnparkClass is
+// UnparkNever (so no human comment and no timer will clear it either).
+//
+// implement-declined is the member that matters and the reason this exists: see
+// the decline-terminal note on controller.MintOrUnparkTakeoverTask.
+func unresumableTakeoverPark(t *tatarav1alpha1.Task) bool {
+	if t == nil || !tatarav1alpha1.Parked(t) {
+		return false
+	}
+	if t.Status.ParkReason == stage.ReasonOwnershipLost {
+		return false // THE re-take path
+	}
+	class, ok := stage.UnparkClassFor(t.Status.ParkReason)
+	return ok && class == stage.UnparkNever
+}
+
 func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 	if !authorizeCaller(w, r) {
 		return
@@ -122,6 +161,38 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// #604. REFUSE a re-take the mint cannot act on, BEFORE the idempotent
+	// branch below can answer it 200.
+	//
+	// MintOrUnparkTakeoverTask un-parks on ReasonOwnershipLost and NOTHING else.
+	// A takeover parked for any other UnparkNever reason - implement-declined
+	// above all, which routing takeover into under-implementation made reachable
+	// - is a Task that will never run again, and nothing here hands the merge
+	// request back either (the only writer of Ownership=external is
+	// ownership.go's flipToExternal, driven by a HUMAN PUSH). Left at 200 the
+	// maintainer is told their take-over succeeded while the MR sits
+	// controller-owned by a dead Task, which is precisely the stranded shape
+	// #604 is about - just moved one state right.
+	//
+	// UnparkHuman reasons (awaiting-human and friends) are deliberately NOT
+	// refused: the maintainer's comment drives the ordinary comment un-park
+	// path, so 200 stays honest for them.
+	if existing, found, err := s.liveTakeoverTask(ctx, proj, repo, req.Number); err != nil {
+		s.log.ErrorContext(ctx, "restapi: read existing takeover task failed",
+			append(reqLogFields(r), "mr", mr.Name, "error", err)...)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	} else if found && unresumableTakeoverPark(existing) {
+		s.log.WarnContext(ctx, "restapi: takeover requested on a parked task that can never resume",
+			append(reqLogFields(r), "action", "mr_takeover_unresumable", "resource_id", mr.Name,
+				"user", cmt.Author, "task", existing.Name, "park_reason", existing.Status.ParkReason)...)
+		writeError(w, http.StatusConflict,
+			"the takeover task for this merge request is parked "+existing.Status.ParkReason+
+				" and cannot resume: only parked(ownership-lost) re-takes. Push to the branch to take "+
+				"it back, or wait for the parked task to be collected")
+		return
+	}
+
 	// Idempotent no-op: ownership is already tatara, so there is nothing to
 	// take over (a repeat "take over" comment after a prior takeover already
 	// succeeded, or a stray one on an MR tatara has authored from the start).
@@ -170,8 +241,8 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 	// Move (or re-assert) the MR mirror's controller ownership onto the
 	// takeover Task. A fresh mint above already did this atomically (via
 	// bindMRToTask, handed expectFrom); a re-take (an existing
-	// parked(ownership-lost) Task just re-entered approved) has not -
-	// MintOrUnparkTakeoverTask never touches owner refs on that branch. Re-Get
+	// parked(ownership-lost) Task just re-entered under-implementation) has
+	// not - MintOrUnparkTakeoverTask never touches owner refs on that branch. Re-Get
 	// and skip when already converged, so the fresh-mint path costs exactly
 	// the one Update the mint itself made - no redundant second Update on top
 	// of an atomic handover that already landed.
