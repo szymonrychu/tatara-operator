@@ -2,6 +2,7 @@ package scm
 
 import (
 	"net/http"
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -172,6 +173,33 @@ func TestGitLabDetectAndVerify_PipelineHook(t *testing.T) {
 			require.Equal(t, tt.want, got)
 		})
 	}
+}
+
+// TestGitLabDetectAndVerify_PipelineHook_RealPayload replays a real captured
+// Pipeline Hook delivery (testdata/gitlab_pipeline_hook.json) that used to
+// 401 every time: object_attributes.source is a STRING here
+// ("merge_request_event", naming what triggered the pipeline), but the same
+// glPayload struct also decodes object_attributes.source as an OBJECT for
+// Merge Request Hook deliveries (the MR's source project). One shared struct,
+// two incompatible JSON types for the same key, so json.Unmarshal failed for
+// every pipeline delivery on this repo and GitLab halted the webhook after
+// enough consecutive 401s. The fixture keeps the real shape - "name":null,
+// "duration":null, a non-empty builds[] and bridges[] - so a fix that only
+// special-cases a hand-trimmed body cannot pass this test by accident.
+func TestGitLabDetectAndVerify_PipelineHook_RealPayload(t *testing.T) {
+	const secret = "gl-token"
+	body, err := os.ReadFile("testdata/gitlab_pipeline_hook.json")
+	require.NoError(t, err)
+
+	h := http.Header{}
+	h.Set("X-Gitlab-Event", "Pipeline Hook")
+	h.Set("X-Gitlab-Token", secret)
+
+	ev, err := (&GitLab{}).DetectAndVerify(h, body, secret)
+	require.NoError(t, err)
+	require.Equal(t, "ci", ev.Kind)
+	require.Equal(t, "f1ce437b0064b77a1b5b2ff97fa53e7897a1aee2", ev.HeadSHA)
+	require.Equal(t, CIMirrorRunning, ev.CIStatus)
 }
 
 // MirrorCIStatus is the bridge between the two CI vocabularies this repo
