@@ -22,6 +22,7 @@ type glCIFake struct {
 	bridges  []map[string]any
 	statuses []map[string]any
 
+	jobsHits    int
 	bridgesHits int
 }
 
@@ -32,6 +33,7 @@ func (f *glCIFake) server(t *testing.T) *httptest.Server {
 		case "/projects/g%2Fp/merge_requests/9":
 			_ = json.NewEncoder(w).Encode(f.mr)
 		case "/projects/g%2Fp/pipelines/555/jobs":
+			f.jobsHits++
 			_ = json.NewEncoder(w).Encode(f.jobs)
 		case "/projects/g%2Fp/pipelines/555/bridges":
 			f.bridgesHits++
@@ -366,4 +368,42 @@ func TestGitLabPRChecksCommitStatusRows(t *testing.T) {
 	require.Equal(t, "external/build", got.Checks[1].Name)
 	require.Equal(t, "failure", got.Checks[1].Conclusion)
 	require.Empty(t, got.Checks[1].JobID, "a commit status has no fetchable job trace")
+}
+
+// TestGitLabPRChecksStaleHeadPipelineHasNoRows is the other half of the "the
+// status is explained by at least one row" invariant: a row that explains a
+// DIFFERENT commit explains nothing. The head pipeline here belongs to the
+// previous SHA, so the status is pending and its jobs are not this head's
+// checks - emitting them would show an agent four completed/success rows under
+// a pending status, which is the shape that reads as "CI passed".
+func TestGitLabPRChecksStaleHeadPipelineHasNoRows(t *testing.T) {
+	f := &glCIFake{
+		mr: map[string]any{
+			"sha":          "deadbeef",
+			"merge_status": "can_be_merged",
+			"head_pipeline": map[string]any{
+				"id":     int64(555),
+				"sha":    "0ldc0mm1t",
+				"status": "success",
+			},
+		},
+		jobs: []map[string]any{
+			{"id": int64(101), "name": "build", "status": "success", "web_url": "https://gitlab.example/j/101"},
+		},
+		bridges: []map[string]any{
+			{"id": int64(201), "name": "trigger:template", "status": "success"},
+		},
+	}
+	srv := f.server(t)
+	defer srv.Close()
+
+	c := &GitLab{apiBase: srv.URL}
+	got, err := c.PRChecks(context.Background(), "https://gitlab.example/g/p.git", "tok", 9)
+	require.NoError(t, err)
+
+	require.Equal(t, CIMirrorPending, got.Status, "a pipeline for a previous commit says nothing about this head")
+	require.Empty(t, got.Checks, "the stale pipeline's jobs belong to another SHA")
+	require.Zero(t, f.jobsHits, "no reason to page a pipeline whose rows are discarded")
+	require.Zero(t, f.bridgesHits, "same")
+	require.True(t, got.Mergeable, "mergeable subtracts red only; pending is not red")
 }

@@ -249,13 +249,19 @@ func (c *GitLab) PRChecks(ctx context.Context, repoURL, token string, number int
 		return CIResult{}, fmt.Errorf("gitlab: pr checks: get mr: %w", err)
 	}
 
-	status, commitStatuses, err := c.headCIStatus(ctx, proj, mr.SHA, token, mr.HeadPipeline)
+	ci, err := c.headCIStatus(ctx, proj, mr.SHA, token, mr.HeadPipeline)
 	if err != nil {
 		return CIResult{}, fmt.Errorf("gitlab: pr checks: head ci status: %w", err)
 	}
 
 	var checks []CICheck
 	switch {
+	case ci.StaleHead:
+		// The head pipeline is for a PREVIOUS commit, so its jobs are not this
+		// head's checks: paging them buys rows that explain another SHA, and
+		// completed/success rows under a pending status read as "CI passed".
+		// Status is pending, which needs no row to explain it.
+
 	case mr.HeadPipeline != nil:
 		// Every list here is paged at per_page=100 and followed to the end. A
 		// first page of green jobs hiding a failing one at index 22 is the same
@@ -308,12 +314,12 @@ func (c *GitLab) PRChecks(ctx context.Context, repoURL, token string, number int
 			})
 		}
 
-	case len(commitStatuses) > 0:
+	case len(ci.CommitStatuses) > 0:
 		// No head pipeline: the status was folded from commit statuses, so those
 		// statuses ARE the checks. Reporting red with an empty checks[] would
 		// leave the caller nothing to act on.
-		checks = make([]CICheck, 0, len(commitStatuses))
-		for _, s := range commitStatuses {
+		checks = make([]CICheck, 0, len(ci.CommitStatuses))
+		for _, s := range ci.CommitStatuses {
 			st, conclusion := glJobCIStatus(s.Status)
 			checks = append(checks, CICheck{
 				Name:       s.Name,
@@ -329,12 +335,12 @@ func (c *GitLab) PRChecks(ctx context.Context, repoURL, token string, number int
 
 	return CIResult{
 		HeadSHA: mr.SHA,
-		Status:  status,
+		Status:  ci.Status,
 		// merge_status answers "are there conflicts", not "is CI green": GitLab
 		// reports can_be_merged on a red pipeline. The only consumer is an agent
 		// deciding whether to submit, and "no conflicts but CI failed" is not
 		// mergeable in any sense that consumer cares about.
-		Mergeable: mr.MergeStatus == "can_be_merged" && status != CIMirrorRed,
+		Mergeable: mr.MergeStatus == "can_be_merged" && ci.Status != CIMirrorRed,
 		Checks:    checks,
 	}, nil
 }

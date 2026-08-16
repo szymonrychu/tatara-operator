@@ -508,10 +508,30 @@ type glHeadPipeline struct {
 	Status string `json:"status"`
 }
 
-// headCIStatus is THE GitLab CI derivation, in the MIRROR vocabulary
-// (none|pending|running|green|red). It answers from the pipeline object's OWN
-// aggregate status, which GitLab computes across bridges (child pipelines),
-// retries, allow_failure and manual gates.
+// glCIDerivation is headCIStatus's answer: the status, plus what a caller
+// needs in order to show rows that actually explain it.
+type glCIDerivation struct {
+	// Status is the MIRROR vocabulary: none|pending|running|green|red.
+	Status string
+	// CommitStatuses are the statuses Status was folded from, and are non-empty
+	// ONLY on the head==nil arm. PRChecks turns them into checks[] rows so the
+	// status it reports is explained by at least one row; GetPRState, which has
+	// nowhere to put them, discards them. Returning them beats re-fetching:
+	// there is one derivation and one round-trip.
+	CommitStatuses []glCommitStatus
+	// StaleHead is true when a head pipeline exists but belongs to a PREVIOUS
+	// commit. Its jobs are not this head's checks, so PRChecks emits no rows on
+	// that arm: a row that explains a different commit explains nothing, and
+	// four completed/success rows under a pending status read as "CI passed".
+	// The flag lives here so the staleness predicate is derived once, in the
+	// same place as the status it produces.
+	StaleHead bool
+}
+
+// headCIStatus is THE GitLab CI derivation, in the MIRROR vocabulary. It
+// answers from the pipeline object's OWN aggregate status, which GitLab
+// computes across bridges (child pipelines), retries, allow_failure and manual
+// gates.
 //
 // Do not re-derive this by folding a job list. /pipelines/{id}/jobs excludes
 // bridge jobs, so on any repo that generates its real gating into a child
@@ -520,13 +540,7 @@ type glHeadPipeline struct {
 // failed. That was #609.
 //
 // sha is the MR's current head; head may be nil.
-//
-// The second return is the commit statuses the answer was folded from, and is
-// non-empty ONLY on the head==nil arm. PRChecks turns them into checks[] rows
-// so the status it reports is explained by at least one row; GetPRState, which
-// has nowhere to put them, discards them. Returning them beats re-fetching:
-// there is one derivation and one round-trip.
-func (c *GitLab) headCIStatus(ctx context.Context, proj, sha, token string, head *glHeadPipeline) (string, []glCommitStatus, error) {
+func (c *GitLab) headCIStatus(ctx context.Context, proj, sha, token string, head *glHeadPipeline) (glCIDerivation, error) {
 	switch {
 	case head == nil:
 		// No pipeline attached yet; fall back to commit statuses so external CI
@@ -536,18 +550,21 @@ func (c *GitLab) headCIStatus(ctx context.Context, proj, sha, token string, head
 		// read and 401 on private projects.
 		statuses, err := c.commitStatuses(ctx, proj, sha, token)
 		if err != nil {
-			return "", nil, err
+			return glCIDerivation{}, err
 		}
 		// foldCommitStatuses folds EVERY status on the commit before it answers,
 		// so its success is an aggregate claim and MirrorCIStatus's contract holds.
-		return MirrorCIStatus(foldCommitStatuses(statuses)), statuses, nil
+		return glCIDerivation{
+			Status:         MirrorCIStatus(foldCommitStatuses(statuses)),
+			CommitStatuses: statuses,
+		}, nil
 	case head.SHA != "" && head.SHA != sha:
 		// Pipeline is present but belongs to a previous commit (lag window after
 		// a push). Treat as pending so nobody acts on a stale success.
-		return CIMirrorPending, nil, nil
+		return glCIDerivation{Status: CIMirrorPending, StaleHead: true}, nil
 	default:
 		// Pipeline is for the current SHA (or SHA field not reported by the API).
-		return glPipelineCIStatus(head.Status), nil, nil
+		return glCIDerivation{Status: glPipelineCIStatus(head.Status)}, nil
 	}
 }
 
@@ -576,7 +593,7 @@ func (c *GitLab) GetPRState(ctx context.Context, repoURL, token string, number i
 		return PRState{}, err
 	}
 
-	mirror, _, err := c.headCIStatus(ctx, proj, mr.SHA, token, mr.HeadPipeline)
+	ci, err := c.headCIStatus(ctx, proj, mr.SHA, token, mr.HeadPipeline)
 	if err != nil {
 		return PRState{}, err
 	}
@@ -585,7 +602,7 @@ func (c *GitLab) GetPRState(ctx context.Context, repoURL, token string, number i
 		Author:     mr.Author.Username,
 		HeadSHA:    mr.SHA,
 		HeadBranch: mr.SourceBranch,
-		CIStatus:   gateCIStatus(mirror),
+		CIStatus:   gateCIStatus(ci.Status),
 		Merged:     mr.State == "merged",
 		Closed:     mr.State == "closed",
 	}, nil
@@ -960,18 +977,13 @@ func (c *GitLab) setBoardLabel(ctx context.Context, token, itemURL, column strin
 // "pending" | "success" | "failure".
 // All pages are fetched (per_page=100) so a failing status beyond the
 // default 20-item first page is not missed.
+//
+// This is the reader path and it uses c.token. The writer path reaches the
+// same statuses through headCIStatus, which takes a per-call token: the writer
+// client from ByProvider has an empty c.token, so routing it here instead would
+// issue an unauthenticated read and 401 on private projects.
 func (c *GitLab) GetCommitCIStatus(ctx context.Context, owner, _ /*repo*/, sha string) (string, error) {
-	return c.commitCIStatus(ctx, owner, sha, c.token)
-}
-
-// commitCIStatus is the token-explicit core of GetCommitCIStatus, shared by
-// GetCommitCIStatus (reader path, token=c.token) and GetPRState (writer path,
-// per-call token). Keeping the token explicit prevents the empty-c.token writer
-// client (from ByProvider) issuing an unauthenticated statuses read - which
-// would 401 on private projects and break the merge gate when an MR has no head
-// pipeline yet.
-func (c *GitLab) commitCIStatus(ctx context.Context, owner, sha, token string) (string, error) {
-	statuses, err := c.commitStatuses(ctx, owner, sha, token)
+	statuses, err := c.commitStatuses(ctx, owner, sha, c.token)
 	if err != nil {
 		return "", err
 	}
