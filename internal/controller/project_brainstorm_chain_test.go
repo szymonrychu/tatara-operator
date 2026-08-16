@@ -10,25 +10,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
-
-// awaitWake drains wakes until a request for key arrives or d elapses. Requests
-// for OTHER projects are ignored rather than failed on: this package's tests
-// share one control plane and earlier tests leave Tasks behind.
-func awaitWake(wakes <-chan reconcile.Request, key types.NamespacedName, d time.Duration) bool {
-	deadline := time.After(d)
-	for {
-		select {
-		case req := <-wakes:
-			if req.NamespacedName == key {
-				return true
-			}
-		case <-deadline:
-			return false
-		}
-	}
-}
 
 // TestBrainstormChainWakesProjectReconcile runs a REAL manager against the
 // envtest control plane with the REAL brainstormChainEdge (the same function

@@ -15,9 +15,7 @@ import (
 // requests for key; every other request is accepted and discarded.
 //
 // The filter is on the WRITE side on purpose - see the test below for what
-// filtering on read alone costs. awaitWake filters again on read, which is
-// redundant and stays that way: a reader that trusts the writer's key is a
-// reader that silently passes when the writer's filter is wrong.
+// filtering on read alone costs.
 func recordWakesFor(key types.NamespacedName) (reconcile.Func, <-chan reconcile.Request) {
 	wakes := make(chan reconcile.Request, 32)
 	return func(_ context.Context, req reconcile.Request) (reconcile.Result, error) {
@@ -32,6 +30,24 @@ func recordWakesFor(key types.NamespacedName) (reconcile.Func, <-chan reconcile.
 		}
 		return reconcile.Result{}, nil
 	}, wakes
+}
+
+// awaitWake drains wakes until a request for key arrives or d elapses. The key
+// check is redundant against recordWakesFor - nothing else reaches the channel -
+// and stays that way: a reader that trusts the writer's key is a reader that
+// passes silently when the writer's filter is wrong.
+func awaitWake(wakes <-chan reconcile.Request, key types.NamespacedName, d time.Duration) bool {
+	deadline := time.After(d)
+	for {
+		select {
+		case req := <-wakes:
+			if req.NamespacedName == key {
+				return true
+			}
+		case <-deadline:
+			return false
+		}
+	}
 }
 
 // A recorder that buffers every request and filters on READ loses its own
@@ -56,10 +72,18 @@ func TestRecordWakesFor_KeepsItsOwnWakeUnderABurstOfOtherObjects(t *testing.T) {
 			t.Fatalf("record leftover %d: %v", i, err)
 		}
 	}
+	// Asserted BEFORE the keyed request and on occupancy, not on the outcome:
+	// "the keyed wake survived" only kills the write-filter-deleted mutant while
+	// the burst outruns the buffer, so a later "give it more headroom" edit to
+	// cap(wakes) would silently disarm this test - which is exactly the edit a
+	// drop diagnosis invites. Occupancy pins the property itself.
+	if got := len(wakes); got != 0 {
+		t.Fatalf("%d foreign requests reached the channel; the recorder must filter on write, not on read", got)
+	}
+
 	if _, err := rec(context.Background(), reconcile.Request{NamespacedName: key}); err != nil {
 		t.Fatalf("record the keyed wake: %v", err)
 	}
-
 	if !awaitWake(wakes, key, time.Second) {
 		t.Fatal("the keyed wake was dropped behind other objects' wakes; the recorder must filter on write, not on read")
 	}
