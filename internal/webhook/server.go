@@ -588,45 +588,105 @@ func (s *Server) minter() *controller.Minter {
 	}
 }
 
-// requestRepoSweep pulls a repository's issueScan sweep slot forward by stamping
-// SweepRequestedAnnotation, so the leader adopts a dependency-upgrade merge
-// request on its next reconcile instead of at the next four-hourly slot. Same
-// marker idiom handlePush already uses for re-ingest: an HTTP-goroutine write
-// consumed by a leader-only reconcile.
+// enqueueAdoption turns an adoptable dependency-upgrade delivery into a DURABLE
+// queue entry, which is the whole of this change.
 //
-// BEST-EFFORT ON PURPOSE, AND THE CALLER STILL 202s. Every failure here - an
-// unknown repository, a conflicting Update, a lost API call - costs LATENCY and
-// nothing else: the merge request is still open, the sweep still reaches it on
-// its ordinary slot, and adoption is still exactly as correct as it was before
-// this fast path existed. Answering 500 so the forge redelivers would trade that
-// for retry pressure on a request that is only ever an optimisation, and a
-// redelivery cannot make a conflicting Update succeed.
+// THE OLD FAST PATH WAS ONE SHOT AND SELF-CONSUMING. It stamped
+// SweepRequestedAnnotation to pull the repository's issueScan slot forward, and
+// the pass that ran computed one adoptHeadroom for the whole pass, adopted up to
+// that many merge requests oldest-first, and cleared the marker of every one it
+// skipped. Nothing re-drove the remainder: the third merge request of a
+// three-MR Renovate run was still unadopted four hours later with both siblings
+// already merged and zero live upgrade lanes. The cap behaved as a rate limiter
+// (2 per 4 hours per repository) rather than as a concurrency bound.
 //
-// The Update is a plain last-writer-wins on a timestamp, which is what makes a
-// burst collapse: five deliveries racing on this key produce one annotation
-// whose value is whichever instant landed last, and any of them is new enough to
-// make the repo due.
-func (s *Server) requestRepoSweep(ctx context.Context, proj *tatarav1.Project, ev scm.WebhookEvent) {
+// THE HANDLER STILL MINTS NOTHING, AND THAT PART OF THE OLD ARGUMENT SURVIVES
+// INTACT. This server runs on EVERY replica (HandlerRunnable.NeedLeaderElection()
+// is false) behind a load-balancing Service, so a check-then-create in this
+// function is a distributed race no in-process lock closes. What changed is
+// WHERE the bound lives: the queue IS the buffer, admission is the
+// leader-elected DispatcherReconciler's single serialized writer, and a
+// QueuedEvent's deterministic natural key makes five concurrent deliveries
+// collide at the API server on AlreadyExists.
+//
+// ENQUEUE IS NEVER CAPACITY-GATED. Gating the producer is precisely the defect
+// being removed; the surplus waits in the queue and admits the moment a slot
+// frees.
+//
+// THE SNAPSHOT'S repo IS A SLUG, NEVER THE CLONE URL scm.WebhookEvent.Repo
+// carries. AdoptUpgradeMR's fork clause is `pr.HeadRepo == "" || pr.HeadRepo !=
+// pr.Repo -> refuse` and it fails CLOSED, and ev.HeadRepo is already slug-shaped
+// from both parsers - so copying ev.Repo across would have every
+// webhook-originated adoption refused at admission while the enqueue itself
+// looked healthy.
+//
+// A FAILURE IS A 500. Unlike the old best-effort marker - whose every failure
+// cost latency and nothing else, because the ordinary sweep slot still adopted -
+// a lost enqueue is a lost signal, so the caller redelivers. Same policy as
+// MintTombstoneDeleted elsewhere in this file.
+func (s *Server) enqueueAdoption(ctx context.Context, w http.ResponseWriter, provider string,
+	proj *tatarav1.Project, ev scm.WebhookEvent) {
+
 	repo, err := s.matchRepo(ctx, proj.Name, ev.Repo)
-	if err != nil || repo == nil {
-		s.log.InfoContext(ctx, "mr: adoptable merge request on an unmatched repository; the ordinary sweep slot still covers it",
-			"action", "mr_sweep_request_skipped", "project", proj.Name, "issue_ref", ev.IssueRef,
-			"head_branch", ev.HeadBranch, "error", err)
+	if err != nil {
+		s.reject(w, http.StatusInternalServerError, "list repositories", provider, ev.Kind, ev.Action, "error")
 		return
 	}
-	if repo.Annotations == nil {
-		repo.Annotations = map[string]string{}
-	}
-	repo.Annotations[tatarav1.SweepRequestedAnnotation] = s.now().UTC().Format(time.RFC3339)
-	if uerr := s.cfg.Client.Update(ctx, repo); uerr != nil {
-		s.log.ErrorContext(ctx, "mr: could not pull the sweep slot forward; the ordinary slot still adopts",
-			"action", "mr_sweep_request_failed", "error", uerr,
-			"project", proj.Name, "repository", repo.Name, "number", ev.Number)
+	if repo == nil || ev.Number <= 0 {
+		// Not an enrolled repository, so there is nothing to adopt into and the
+		// sweep would never look at it either.
+		s.log.InfoContext(ctx, "mr: adoptable merge request on an unmatched repository; ignoring",
+			"action", "mr_adopt_unmatched", "project", proj.Name, "issue_ref", ev.IssueRef,
+			"head_branch", ev.HeadBranch)
+		s.accept(w, provider, ev.Kind, ev.Action, "ignored")
 		return
 	}
-	s.log.InfoContext(ctx, "mr: adoptable dependency merge request; sweep slot pulled forward",
-		"action", "mr_sweep_requested", "project", proj.Name, "repository", repo.Name,
-		"number", ev.Number, "head_branch", ev.HeadBranch, "author", ev.ActorLogin)
+	// scm.RepoSlugFromURL, not this file's repoSlug: the latter is GitHub-only
+	// (scm.OwnerRepo), and a GitLab group/project URL would yield "" - which the
+	// fork clause reads as a fork and refuses forever.
+	slug, serr := scm.RepoSlugFromURL(repo.Spec.URL)
+	if serr != nil {
+		s.log.ErrorContext(ctx, "mr: adoptable merge request whose repository URL yields no slug; ignoring",
+			"action", "mr_adopt_unsluggable", "error", serr,
+			"project", proj.Name, "repo", repo.Name, "number", ev.Number)
+		s.accept(w, provider, ev.Kind, ev.Action, "ignored")
+		return
+	}
+
+	pr := scm.PRRef{
+		Number: ev.Number, Title: ev.Title, Author: ev.ActorLogin,
+		HeadSHA: ev.HeadSHA, HeadBranch: ev.HeadBranch, Body: ev.Body, Labels: ev.Labels,
+		Repo: slug, HeadRepo: ev.HeadRepo,
+	}
+	payload := tatarav1.QueuedEventPayload{
+		Kind:           "upgrade",
+		RepositoryRef:  repo.Name,
+		Provider:       provider,
+		PodRepo:        repo.Name,
+		AdoptedUpgrade: controller.AdoptedUpgradeRefFromPR(pr),
+	}
+	dedupKey := queue.AdoptUpgradeDedupKey(repo.Name, ev.Number)
+	// Priority 2 is the cron/sweep tier (design D3). Priority 1 means a human is
+	// waiting on a thread, and admitPool sorts (priority, seq): a twelve-MR
+	// Renovate run at priority 1 would drain ahead of the next stage of every
+	// task already underway. Priority 2 still admits the instant a slot frees.
+	_, created, eerr := queue.EnqueueEvent(ctx, s.cfg.Client, s.cfg.Seq, proj,
+		tatarav1.QueueClassNormal, true, dedupKey, payload, queue.WithPriority(2))
+	if eerr != nil {
+		s.log.ErrorContext(ctx, "mr: enqueue adoption failed; the signal is still owed",
+			"action", "mr_adopt_enqueue_failed", "error", eerr,
+			"project", proj.Name, "repo", repo.Name, "number", ev.Number)
+		s.reject(w, http.StatusInternalServerError, "enqueue adoption", provider, ev.Kind, ev.Action, "error")
+		return
+	}
+	if created {
+		obs.AdoptionEnqueuedTotal.WithLabelValues(proj.Name, obs.WebhookActivity).Inc()
+		s.log.InfoContext(ctx, "mr: adoptable dependency merge request queued for adoption",
+			"action", "mr_adopt_enqueued", "resource_id", queue.QueuedEventName(proj.Name, dedupKey),
+			"project", proj.Name, "repo", repo.Name, "number", ev.Number,
+			"head_branch", ev.HeadBranch, "author", ev.ActorLogin)
+	}
+	s.accept(w, provider, ev.Kind, ev.Action, "accepted")
 }
 
 // repoSlug returns "owner/name" for a Repository URL, or "" on error. Local
@@ -770,17 +830,21 @@ func (s *Server) handleIssueOpened(ctx context.Context, w http.ResponseWriter, p
 // decremented when a lane frees is the kind of distributed state this repo
 // derives from reality instead. Minting here would be correct only by accident.
 //
-// THE LEADER'S SWEEP ALREADY HAS ALL OF IT: it is leader-only and serialized per
-// project (projectControllerBuilder's MaxConcurrentReconciles: 1, whose own
-// comment says "scan dedup/cap logic assumes serialised reconciles per kind"),
-// it computes the headroom once per pass and decrements it as it mints, it takes
-// the oldest merge requests first, and it re-reads the forge every pass so it
-// never acts on a merge request that was closed or superseded in the meantime.
-// So the fast path is not a second minter - it is a REQUEST that the one true
-// minter run NOW: AdoptionCandidate recognises the shape, the handler stamps
-// SweepRequestedAnnotation on the Repository, and reposDueForScan pulls that
-// repo's slot forward on the leader's next reconcile. Four hours becomes seconds
-// with exactly one minting path, one cap, and no distributed lock.
+// THE LEADER-ELECTED DISPATCHER ALREADY HAS ALL OF IT: it is the single
+// serialized writer of admission, it re-asks the adoption question against a
+// fresh mirror and live owner before it mints, and it holds the lane budget. So
+// the fast path is not a second minter - it ENQUEUES: AdoptionCandidate
+// recognises the shape, the handler writes a QueuedEvent carrying the merge
+// request snapshot, and admission mints it the moment a lane frees. Four hours
+// becomes seconds with exactly one minting path, one cap, and no distributed
+// lock.
+//
+// ENQUEUEING RATHER THAN STAMPING IS THE POINT. The predecessor stamped
+// SweepRequestedAnnotation to pull the repository's sweep slot forward, and the
+// pass it pulled forward cleared that one-shot marker for every merge request
+// its per-pass headroom made it skip - so a three-MR Renovate run left its third
+// merge request unadopted for four hours. A queue entry is durable and per merge
+// request; nothing has to re-drive it. See enqueueAdoption.
 //
 // A CANDIDATE IS A SHAPE, NOT A VERDICT. AdoptionCandidate answers only "prefix
 // configured, branch under it, author is an identity this project owns" - forks,
@@ -800,8 +864,7 @@ func (s *Server) handleMROpened(ctx context.Context, w http.ResponseWriter, prov
 	// treats as the merge request's author, so the identity this arm tests and
 	// the identity ClassifyPR later rules on are one value.
 	if controller.AdoptionCandidate(&proj, ev.HeadBranch, ev.ActorLogin) {
-		s.requestRepoSweep(ctx, &proj, ev)
-		s.accept(w, provider, ev.Kind, ev.Action, "accepted")
+		s.enqueueAdoption(ctx, w, provider, &proj, ev)
 		return
 	}
 	if isBotActor(&proj, ev.ActorLogin) {

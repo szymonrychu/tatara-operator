@@ -271,6 +271,24 @@ var MintOutcomeTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Help: "Intake mint attempts by task kind and typed outcome (contract B.4).",
 }, []string{"kind", "outcome"})
 
+// AdoptionEnqueuedTotal counts dependency-upgrade merge requests turned into a
+// QUEUED adoption, by project and by which producer saw it first. The webhook is
+// the fast path and the sweep is the backstop, so a healthy project's `sweep`
+// rate is near zero: a sustained `sweep` rate means webhook deliveries are being
+// lost, which is invisible on the mint counters (the sweep enqueues them either
+// way, just up to a full issueScan period later).
+var AdoptionEnqueuedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "operator_adoption_enqueued_total",
+	Help: "Dependency-upgrade merge requests enqueued for adoption, by project and producer activity (sweep|webhook).",
+}, []string{"project", "activity"})
+
+// adoptionActivities is AdoptionEnqueuedTotal's closed {activity} set: the two
+// producers of a queued adoption. Both are seeded even though only the webhook
+// produces today, because the pair is the whole point of the label - a `sweep`
+// series that only appears once the backstop fires cannot be compared against
+// `webhook` on the first lost delivery after a pod roll.
+var adoptionActivities = []string{"sweep", WebhookActivity}
+
 // AdoptionEventDroppedTotal counts QUEUED dependency-upgrade adoptions that never
 // became a Task, by reason. A queued snapshot is a POINTER to a live forge
 // object, and the dispatcher re-asks the adoption question at admit time rather
@@ -421,6 +439,8 @@ func SeedSweepErrorsForProject(project string) {
 		SweepStaleOwnerRepairedTotal.WithLabelValues(project, activity)
 		SweepTerminalOwnerReleasedTotal.WithLabelValues(project, activity)
 	}
+	enq := func(l ...string) { AdoptionEnqueuedTotal.WithLabelValues(l...) }
+	seedLabels(enq, []string{project}, adoptionActivities)
 	drop := func(l ...string) { AdoptionEventDroppedTotal.WithLabelValues(l...) }
 	seedLabels(drop, []string{project}, adoptionDropReasons)
 	// MintOutcomeTotal carries NO project label, so this is process-global and
@@ -441,6 +461,7 @@ func init() {
 		SweepStaleOwnerRepairedTotal,
 		SweepTerminalOwnerReleasedTotal,
 		MintOutcomeTotal,
+		AdoptionEnqueuedTotal,
 		AdoptionEventDroppedTotal,
 		SweepOrphanStrandedSeconds,
 	)
