@@ -86,8 +86,7 @@ func AdoptedUpgradeTaskName(proj, repo string, number int) string {
 // that function hardcodes kind, initial state, goal, name derivation and an
 // ownership-lost unpark, and all five differ here.
 //
-// IT DOES EXACTLY TWO THINGS A PLAIN TASK MINT DOES NOT, and the list is short
-// on purpose - an earlier draft had a third:
+// IT DOES EXACTLY THREE THINGS A PLAIN TASK MINT DOES NOT:
 //
 //  1. Binds the MergeRequest CR as the Task's, via bindMRToTask - which also
 //     CREATES it. ensureMergeRequestCR is reachable only through
@@ -97,17 +96,21 @@ func AdoptedUpgradeTaskName(proj, repo string, number int) string {
 //     bind, ownedMergeRequests returns empty, mrForRepo returns nil, and the
 //     merge corridor parks operator-error.
 //  2. Stamps AnnTakeoverHeadBranch (below).
+//  3. Stamps LabelUpgradeOrigin=adopted, so openUpgradeLaneCount can exclude
+//     this Task from the CRON's maxOpenUpgrades budget (design D2). Adopted
+//     work is bounded by the general pool; the cron's knob counts only its own.
 //
-// THE THIRD THING IS GONE: no ownership flip, no ownership reason, no
-// LastBotHeadSHA seed. AdoptUpgradeMR requires the merge request to be authored
-// by an identity adoptableAuthor accepts, and ownershipForAuthor asks the same
-// predicate, so the mirror classifies `tatara` on the first ReconcileOwnership
-// pass - which happens LATER IN THIS SAME SWEEP PASS, with a live head from
-// GetPRHead. That backfill also seeds LastBotHeadSHA in the same write, and an
-// absent seed cannot cause a flip anyway (ownership.go seeds and returns rather
-// than flipping when the baseline is empty). Stamping any of it here would make
-// this a SECOND writer of Status.Ownership, which ReconcileOwnership's own doc
-// block asks callers not to be.
+// NO OWNERSHIP FLIP, NO OWNERSHIP REASON, NO LASTBOTHEADSHA SEED. An earlier
+// draft stamped ownership here; this one does not. AdoptUpgradeMR requires the
+// merge request to be authored by an identity adoptableAuthor accepts, and
+// ownershipForAuthor asks the same predicate, so the mirror classifies
+// `tatara` on the first ReconcileOwnership pass - which happens LATER IN THIS
+// SAME SWEEP PASS, with a live head from GetPRHead. That backfill also seeds
+// LastBotHeadSHA in the same write, and an absent seed cannot cause a flip
+// anyway (ownership.go seeds and returns rather than flipping when the
+// baseline is empty). Stamping any of it here would make this a SECOND writer
+// of Status.Ownership, which ReconcileOwnership's own doc block asks callers
+// not to be.
 //
 // It does NOT stamp the head branch as a work branch on its own: that is
 // AnnTakeoverHeadBranch, read kind-agnostically by branchEnvValues, which is
@@ -118,9 +121,6 @@ func AdoptedUpgradeTaskName(proj, repo string, number int) string {
 // annotation the review pod would fall through to TaskBranch(task) - a
 // tatara/chore-<n>-<slug> branch that does not exist on the forge - and review
 // the wrong tree.
-//  3. Stamps LabelUpgradeOrigin=adopted, so openUpgradeLaneCount can exclude
-//     this Task from the CRON's maxOpenUpgrades budget (design D2). Adopted
-//     work is bounded by the general pool; the cron's knob counts only its own.
 //
 // `stamp` is the minting QueuedEvent's label set (queue.MintStamp) and may be
 // nil. It is TAKEN, not derived, because this mint builds its Task by hand
