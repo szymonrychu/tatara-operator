@@ -271,10 +271,19 @@ func TestRetainSweepOrphanStranded(t *testing.T) {
 // increase(...[1h]) is blind to it, and a seeded reason no site produces is a
 // permanently dead zero series. Fails both ways.
 //
-// TWO PRODUCERS, NOT ONE. The dispatcher drops a QUEUED adoption via drop(...);
-// the webhook refuses one BEFORE the enqueue, on the same counter, when the
-// repository URL yields no forge slug. Scanning only the dispatcher would have
-// called that second producer's reason a dead series.
+// THREE PRODUCERS, NOT ONE. The dispatcher drops a QUEUED adoption via
+// drop(...); the webhook refuses one BEFORE the enqueue, on the same counter,
+// when the repository URL yields no forge slug; and the webhook's freshness
+// handlers (handleMRSynchronize/handleMRClosed, mirror_refresh.go) drop one
+// whose merge request merged or closed while it waited. Scanning only the
+// dispatcher would have called every one of those other reasons a dead series.
+//
+// mirror_refresh.go's producer (dropQueuedAdoption) does not carry its reason
+// as a literal at the WithLabelValues call site - it takes `reason string` and
+// handleMRClosed passes its own local `state`, reusing the very value it just
+// mirrored onto MergeRequest.Status.State. The two literals this scan needs are
+// therefore where `state` is ASSIGNED (`state := "closed"` / `state =
+// "merged"`), not where dropQueuedAdoption is CALLED.
 func TestAdoptionDropReasonsMatchTheirProducers(t *testing.T) {
 	producers := []struct {
 		file string
@@ -285,6 +294,8 @@ func TestAdoptionDropReasonsMatchTheirProducers(t *testing.T) {
 			regexp.MustCompile(`drop\("([a-z_]+)"\)`)},
 		{"webhook/server.go", []string{"..", "webhook", "server.go"},
 			regexp.MustCompile(`AdoptionEventDroppedTotal\.WithLabelValues\([^)]*"([a-z_]+)"\)`)},
+		{"webhook/mirror_refresh.go", []string{"..", "webhook", "mirror_refresh.go"},
+			regexp.MustCompile(`\bstate\s*:?=\s*"([a-z_]+)"`)},
 	}
 	seeded := map[string]bool{}
 	for _, r := range adoptionDropReasons {

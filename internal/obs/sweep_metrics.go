@@ -314,7 +314,14 @@ var AdoptionEventDroppedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 // refuses every adoption for that repository forever, because AdoptUpgradeMR's
 // fork clause fails closed on the empty value. Unlike the dispatcher's reasons,
 // a sustained rate here is never the mechanism working.
-var adoptionDropReasons = []string{"not_adoptable", "repository_gone", "repo_slug_unknown"}
+//
+// merged and closed are the FRESHNESS handlers' own reasons
+// (internal/webhook/mirror_refresh.go's dropQueuedAdoption, driven by
+// handleMRClosed): a still-queued adoption whose merge request merged or closed
+// out from under it while it waited behind a full pool. Kept as two series, not
+// one, so a dashboard can tell a happy-path merge racing the queue apart from a
+// human or the engine withdrawing the proposal.
+var adoptionDropReasons = []string{"not_adoptable", "repository_gone", "repo_slug_unknown", "merged", "closed"}
 
 // sweepSkipReasons is the closed skip-reason set. Keep in sync with sweep.go's
 // SweepSkip* constants - enforced by TestSweepSkipReasonsMatchSweepConstants,

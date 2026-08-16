@@ -14,6 +14,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/own"
+	"github.com/szymonrychu/tatara-operator/internal/queue"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
 
@@ -291,7 +292,96 @@ func (s *Server) handleMRSynchronize(ctx context.Context, w http.ResponseWriter,
 			"action", "mr_synchronize_mirror", "project", proj.Name, "repository", repo.Name,
 			"number", ev.Number, "head_sha", ev.HeadSHA, "bot_push", bot)
 	}
+	s.refreshQueuedAdoption(ctx, &proj, repo, ev)
 	s.accept(w, provider, ev.Kind, ev.Action, "accepted")
+}
+
+// queuedAdoption returns the STILL-QUEUED adoption event for (proj, repo,
+// number), or nil when there is none or it has already been admitted.
+//
+// It is a single Get on the DETERMINISTIC name, not a list: QueuedEventName is a
+// pure function of (project, dedupKey) and AdoptUpgradeDedupKey is a pure
+// function of (repository CR name, number), both of which this handler already
+// holds. Every merge request in the platform receives synchronize and closed
+// deliveries and almost none has a queued adoption, so the miss path has to be
+// one cheap read.
+func (s *Server) queuedAdoption(ctx context.Context, proj *tatarav1.Project,
+	repo *tatarav1.Repository, number int) *tatarav1.QueuedEvent {
+
+	if repo == nil || number <= 0 {
+		return nil
+	}
+	name := queue.QueuedEventName(proj.Name, queue.AdoptUpgradeDedupKey(repo.Name, number))
+	var qe tatarav1.QueuedEvent
+	if err := s.cfg.Client.Get(ctx, objKey(s.cfg.Namespace, name), &qe); err != nil {
+		return nil
+	}
+	if qe.Spec.Payload.AdoptedUpgrade == nil {
+		return nil
+	}
+	// Admitted work is the Task's and the mirror's from here on. The empty state
+	// is a QueuedEvent whose post-Create status update was lost, which is still
+	// effectively Queued (isQueued's own rule).
+	if qe.Status.State != "" && qe.Status.State != tatarav1.QueueStateQueued {
+		return nil
+	}
+	return &qe
+}
+
+// refreshQueuedAdoption re-snapshots a still-queued adoption from a synchronize
+// delivery. Renovate FORCE-PUSHES each successive bump onto the same branch,
+// keeping the same number and the same merge request, so an event that waits
+// behind a full pool is pointing at a tree that no longer exists - and
+// AdoptUpgradeMR clause (g) binds its refusal marker to a head SHA, so minting
+// against a stale one rules on the wrong tree.
+func (s *Server) refreshQueuedAdoption(ctx context.Context, proj *tatarav1.Project,
+	repo *tatarav1.Repository, ev scm.WebhookEvent) {
+
+	qe := s.queuedAdoption(ctx, proj, repo, ev.Number)
+	if qe == nil {
+		return
+	}
+	qe.Spec.Payload.AdoptedUpgrade.HeadSHA = ev.HeadSHA
+	if ev.Title != "" {
+		qe.Spec.Payload.AdoptedUpgrade.Title = ev.Title
+	}
+	if ev.Body != "" {
+		qe.Spec.Payload.AdoptedUpgrade.Body = ev.Body
+	}
+	if err := s.cfg.Client.Update(ctx, qe); err != nil {
+		// BEST EFFORT, and unlike the enqueue this one really is: the event is
+		// still queued, the dispatcher still adopts, and the worst case is a mint
+		// at the previous head - which the merge corridor's own head pin catches.
+		s.log.ErrorContext(ctx, "mr: refresh of a queued adoption failed; the stale snapshot still mints",
+			"action", "mr_adopt_refresh_failed", "error", err,
+			"project", proj.Name, "repository", repo.Name, "number", ev.Number)
+		return
+	}
+	s.log.InfoContext(ctx, "mr: refreshed a queued dependency-upgrade adoption",
+		"action", "mr_adopt_refreshed", "resource_id", qe.Name, "project", proj.Name,
+		"repository", repo.Name, "number", ev.Number, "head_sha", ev.HeadSHA)
+}
+
+// dropQueuedAdoption deletes a still-queued adoption for a merge request that
+// merged or closed while it waited. Admitting it would spend an agent pod on a
+// merge request there is nothing left to review.
+func (s *Server) dropQueuedAdoption(ctx context.Context, proj *tatarav1.Project,
+	repo *tatarav1.Repository, number int, reason string) {
+
+	qe := s.queuedAdoption(ctx, proj, repo, number)
+	if qe == nil {
+		return
+	}
+	if err := s.cfg.Client.Delete(ctx, qe); err != nil && !apierrors.IsNotFound(err) {
+		s.log.ErrorContext(ctx, "mr: dropping a queued adoption failed; the dispatcher's own predicate re-check is the backstop",
+			"action", "mr_adopt_drop_failed", "error", err,
+			"project", proj.Name, "repository", repo.Name, "number", number)
+		return
+	}
+	obs.AdoptionEventDroppedTotal.WithLabelValues(proj.Name, reason).Inc()
+	s.log.InfoContext(ctx, "mr: dropped a queued dependency-upgrade adoption",
+		"action", "mr_adopt_dropped", "resource_id", qe.Name, "project", proj.Name,
+		"repository", repo.Name, "number", number, "reason", reason)
 }
 
 // handleMRClosed refreshes the mirror MergeRequest state on an out-of-band PR/MR
@@ -316,6 +406,9 @@ func (s *Server) handleMRClosed(ctx context.Context, w http.ResponseWriter, prov
 		s.log.InfoContext(ctx, "mr: mirrored out-of-band close/merge; reconcile converges",
 			"action", "mr_closed_mirror", "project", proj.Name, "repository", repo.Name, "number", ev.Number, "state", state)
 	}
+	// `state` is already merged|closed and is exactly the drop reason: a merged
+	// bump is the happy path racing the queue, a closed one is a withdrawal.
+	s.dropQueuedAdoption(ctx, &proj, repo, ev.Number, state)
 	// RESUME TRIGGER (maintainer close). Same signal as the comment trigger:
 	// a maintainer disposing of an item is engagement.
 	if tatarav1.IsMaintainer(&proj, repo, ev.ActorLogin) {
