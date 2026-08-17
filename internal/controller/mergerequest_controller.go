@@ -113,7 +113,18 @@ func (r *MergeRequestReconciler) doReconcile(ctx context.Context, req ctrl.Reque
 	cadence := MirrorCadence(owner)
 	ciCadence := CIRefreshCadence(owner)
 
-	if r.ReaderFor != nil && mirrorSyncDue(mr.Status.LastSyncedAt, cadence, r.now()) {
+	// THE TERMINAL EXCLUSION, same one refreshCI makes at :239. A merged or closed
+	// mirror's thread can no longer gate anything, so re-reading it on cadence
+	// forever is pure forge load - and it is the ONLY route by which a 404 could
+	// reach the gone branch below and rewrite a MERGE that already happened.
+	// mr.Status.State is not mirror-local: "merged" -> "closed" leaves
+	// stage.AllMRsTerminal true while AllMRsMerged goes false, which is exactly
+	// what terminalMREdge/ownMRsShippedEdge finalize the owner Task
+	// rejected(mr-closed-externally) on, with a public terminal comment on the
+	// driving issue. syncMergeRequestThread itself stays unguarded: it is shared
+	// with SyncMergeRequestOnDemand, the deliberate off-cadence path.
+	terminalMirror := mr.Status.State == "merged" || mr.Status.State == "closed"
+	if r.ReaderFor != nil && !terminalMirror && mirrorSyncDue(mr.Status.LastSyncedAt, cadence, r.now()) {
 		reader, err := mirrorReaderFor(ctx, r.Client, r.ReaderFor, &proj)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -295,11 +306,27 @@ func ciOwnerRepo(repoURL, provider string) (string, string, error) {
 	return owner, name, nil
 }
 
+// mrMergeIsRecorded reports whether this mirror already records a completed
+// merge, which no forge 404 may overwrite.
+//
+// "closed" is a strictly weaker claim than "merged" and rewriting one into the
+// other is not a mirror-local edit: stage.AllMRsTerminal stays true while
+// AllMRsMerged goes false, so terminalMREdge/ownMRsShippedEdge finalize the
+// owner Task rejected(mr-closed-externally) - and WithTerminalIssueRelease posts
+// that verdict publicly on the driving issue - instead of done. A 404 proves the
+// forge will not answer for this number; it does not disprove a merge the
+// operator itself performed and stamped. MergedAt is checked too because it is
+// the merge path's own receipt (stampMerged, merge.go) and is the field
+// review_apply.go and stage.go already treat as the durable one.
+func mrMergeIsRecorded(mr *tatarav1alpha1.MergeRequest) bool {
+	return mr.Status.State == "merged" || mr.Status.MergedAt != nil
+}
+
 // markMergeRequestGone stamps a permanently-404ing MergeRequest's mirror as
 // closed, the same terminal state a real forge close leaves. Idempotent: a
 // second 404 on an already-closed mirror is a no-op write.
 func markMergeRequestGone(ctx context.Context, c client.Client, sp objbudget.Spiller, mr *tatarav1alpha1.MergeRequest) error {
-	if mr.Status.State == "closed" {
+	if mr.Status.State == "closed" || mrMergeIsRecorded(mr) {
 		return nil
 	}
 	key := client.ObjectKeyFromObject(mr)
@@ -318,21 +345,22 @@ func markMergeRequestGone(ctx context.Context, c client.Client, sp objbudget.Spi
 // and every pass in between runs the CI backstop and the drains normally.
 // LastSyncedAt is unconditional here, unlike the state, because a second 404 an
 // hour later is a fresh confirmation and must re-arm the interval.
+//
+// It refuses a recorded merge for the reason mrMergeIsRecorded gives. The
+// caller's terminal exclusion at :116 already stops that being reachable on the
+// cadence path; the refusal lives here because the invariant belongs to the
+// write, not to one of its call sites.
 func markMergeRequestThreadGone(ctx context.Context, c client.Client, sp objbudget.Spiller,
 	mr *tatarav1alpha1.MergeRequest, now time.Time) error {
 
+	if mrMergeIsRecorded(mr) {
+		return nil
+	}
 	stamp := metav1.NewTime(now)
-	key := client.ObjectKeyFromObject(mr)
-	if err := objbudget.FitMergeRequest(ctx, c, sp, key, func(m *tatarav1alpha1.MergeRequest) {
+	return objbudget.FitMergeRequest(ctx, c, sp, client.ObjectKeyFromObject(mr), func(m *tatarav1alpha1.MergeRequest) {
 		m.Status.State = "closed"
 		m.Status.LastSyncedAt = &stamp
-	}); err != nil {
-		return err
-	}
-	// Fold onto the in-memory copy the rest of this reconcile still reads.
-	mr.Status.State = "closed"
-	mr.Status.LastSyncedAt = &stamp
-	return nil
+	})
 }
 
 // SetupWithManager registers the MergeRequest reconciler.

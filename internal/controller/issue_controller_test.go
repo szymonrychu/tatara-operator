@@ -397,10 +397,67 @@ func TestIssueReconcile_MirrorReadPermanent404SkipsSyncAndContinues(t *testing.T
 	if got.Status.State != "open" {
 		t.Fatalf("a failed READ must not move Issue.Status.State, got %q", got.Status.State)
 	}
-	// Not stamping LastSyncedAt is what keeps the read retried once per cadence
-	// rather than abandoned.
-	if got.Status.LastSyncedAt != nil {
-		t.Fatalf("LastSyncedAt was stamped on a sync that never happened: %v", got.Status.LastSyncedAt)
+	// mirrorSyncDue (mirror.go:742) keys ONLY on LastSyncedAt: leaving it unstamped
+	// means the read is due on EVERY reconcile, and since this reconcile returns
+	// nil, controller-runtime's exponential backoff no longer rate-limits it
+	// either. The stamp is what actually bounds the cost to once per cadence.
+	// Status.State is deliberately still untouched (a failed READ is not entitled
+	// to move it) - the stamp only says "the mirror sync ran", not "it succeeded".
+	// Without it, any watch-triggered reconcile (a webhook comment append, the
+	// sweep, /outcome) would pay ListIssueComments plus the repo probe every time.
+	if got.Status.LastSyncedAt == nil {
+		t.Fatal("LastSyncedAt was not stamped: the gone thread will be re-read on every reconcile")
+	}
+}
+
+// TestIssueReconcile_GoneThreadStopsRereadingUntilTheNextCadence is the Issue
+// twin of TestReconcile_MirrorReadGoneStopsRereadingUntilTheNextCadence: the
+// SECOND reconcile must make no forge call at all, now that the stamp from the
+// first reconcile has moved mirrorSyncDue to false.
+func TestIssueReconcile_GoneThreadStopsRereadingUntilTheNextCadence(t *testing.T) {
+	proj, repo := mirrorProject("tatara-bot"), mirrorRepo()
+	task := taskAtStage(tatarav1alpha1.StateRefined, "")
+	iss := ownedIssue(tatarav1alpha1.IssueName(repo.Name, 62), 62, task,
+		tatarav1alpha1.IssueStatus{State: "open"})
+	c := newMirrorClient(t, proj, repo, task, iss, scmSecret())
+	rd := &mirrorReader{commentsErr: &scm.HTTPError{Status: 404, Path: "/x", Body: `{"message":"Not Found"}`}}
+	r := newIssueReconciler(c, &mirrorWriter{}, rd)
+
+	reconcileIssue(t, r, iss.Name)
+	reconcileIssue(t, r, iss.Name)
+
+	if rd.calls != 1 || rd.headSHACalls != 1 {
+		t.Fatalf("second reconcile re-read the gone thread: calls=%d headSHACalls=%d, want 1 and 1",
+			rd.calls, rd.headSHACalls)
+	}
+}
+
+// TestIssueReconcile_GoneDrainIsVisibleInPrometheus: the drain guard swallows
+// 404/410 out of listThreadComments, CloseIssue, Comment, AddLabel and
+// EditIssue, and the drain returns at the FIRST failing intent, so every later
+// intent on that Issue is head-of-line blocked with no ERROR line and no
+// condition. The counter is the only signal left that a repo is silently
+// refusing every forge write.
+func TestIssueReconcile_GoneDrainIsVisibleInPrometheus(t *testing.T) {
+	proj, repo := mirrorProject("tatara-bot"), mirrorRepo()
+	task := taskAtStage(tatarav1alpha1.StateRefined, "")
+	iss := ownedIssue(tatarav1alpha1.IssueName(repo.Name, 62), 62, task,
+		tatarav1alpha1.IssueStatus{
+			State:           "open",
+			PendingComments: []tatarav1alpha1.PendingComment{{RequestID: "req-1", Body: "hello"}},
+		})
+	c := newMirrorClient(t, proj, repo, task, iss, scmSecret())
+	gone := &scm.HTTPError{Status: 404, Path: "/x", Body: `{"message":"Not Found"}`}
+	rd := &mirrorReader{commentsErr: gone}
+	r := newIssueReconciler(c, &mirrorWriter{}, rd)
+	m := obs.NewOperatorMetrics(prometheus.NewRegistry())
+	r.Driver = mdNewDriverWithReader(t, newFakeForge(t), c, rd)
+	r.Driver.Metrics = m
+
+	reconcileIssue(t, r, iss.Name)
+
+	if got := testutil.ToFloat64(m.SCMRequestErrorByStatusCounter("github", "drain_pending_comments", "404")); got != 1 {
+		t.Fatalf("operator_scm_request_errors_by_status_total{verb=\"drain_pending_comments\",status=\"404\"} = %v, want 1", got)
 	}
 }
 

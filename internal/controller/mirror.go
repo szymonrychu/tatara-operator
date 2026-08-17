@@ -631,6 +631,15 @@ func syncMergeRequestThread(ctx context.Context, c client.Client, sp objbudget.S
 //     thread in that repo, and silently closing every mirror in it on that signal
 //     is destructive - so an unreadable repo answers false and the error stays
 //     loud, which is the correct disposition for a credential/enrolment fault.
+//     "One read" is one SCMReader call, not one HTTP request: both providers
+//     resolve the default branch and then its head, so budget two GETs.
+//
+// It cannot see a repo-WIDE gone that still answers on /repos: a repo deleted
+// and recreated under the same name, a retargeted Repository.spec.URL, or (on
+// GitHub) a repo with Issues DISABLED, which answers 410 across the whole
+// /issues family. That is why the MergeRequest call site narrows to 404 and why
+// its disposition additionally refuses a recorded merge - the probe is a filter,
+// never a proof.
 //
 // The probe runs ONLY on the 404/410 path, so steady-state forge load is
 // unchanged. ciOwnerRepo, not scm.OwnerRepo, because GitLab wants the full
@@ -741,6 +750,25 @@ func mirrorOwnerTask(ctx context.Context, c client.Client, obj client.Object) *t
 // mirrorSyncDue reports whether lastSyncedAt is older than the cadence.
 func mirrorSyncDue(lastSyncedAt *metav1.Time, cadence time.Duration, now time.Time) bool {
 	return lastSyncedAt == nil || now.Sub(lastSyncedAt.Time) >= cadence
+}
+
+// stampIssueMirrorChecked re-arms the mirror interval for an Issue whose thread
+// is permanently gone upstream (#621), WITHOUT touching Status.State.
+//
+// It is the Issue counterpart of the stamp markMergeRequestThreadGone writes,
+// and it is the whole disposition on this side: Issue.Status.State="closed"
+// drives handleIssueClosed and the WS3-I3 stop edge, so a failed READ may not
+// write it. What the read IS entitled to record is that it happened, and
+// mirrorSyncDue keys on nothing else - unstamped means due on every reconcile,
+// which is a live cost now that this arm returns nil and no longer earns the
+// controller-runtime backoff.
+func stampIssueMirrorChecked(ctx context.Context, c client.Client, sp objbudget.Spiller,
+	iss *tatarav1alpha1.Issue, now time.Time) error {
+
+	stamp := metav1.NewTime(now)
+	return objbudget.FitIssue(ctx, c, sp, client.ObjectKeyFromObject(iss), func(cur *tatarav1alpha1.Issue) {
+		cur.Status.LastSyncedAt = &stamp
+	})
 }
 
 // mirrorSCMToken reads the project's SCM token. It is the same secret every

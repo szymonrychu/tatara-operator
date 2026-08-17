@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -229,6 +230,118 @@ func TestReconcile_MirrorRead404WithUnreadableRepoStaysLoud(t *testing.T) {
 	}
 	if got := mdGetMR(t, c, mr.Name); got.Status.State != "open" {
 		t.Fatalf("want state left open when the repo itself is unreadable, got %q", got.Status.State)
+	}
+}
+
+// TestReconcile_TerminalMirrorIsNotThreadRead is tatara-operator#436's own
+// exclusion (mergerequest_controller.go:237-241) pushed up to the thread READ:
+// a merged or closed mirror's thread can no longer gate anything, and re-reading
+// it forever is pure forge load. It is also the ONLY way a 404 can reach the
+// mark-closed function and flip an already-merged mirror to closed.
+func TestReconcile_TerminalMirrorIsNotThreadRead(t *testing.T) {
+	for _, state := range []string{"merged", "closed"} {
+		t.Run(state, func(t *testing.T) {
+			rd := &mirrorReader{}
+			c, r, mr := mrGoneFixture(t, rd)
+
+			live := mdGetMR(t, c, mr.Name)
+			live.Status.State = state
+			if err := c.Status().Update(context.Background(), live); err != nil {
+				t.Fatalf("set state=%s: %v", state, err)
+			}
+
+			if _, err := r.Reconcile(context.Background(), reqFor(mr)); err != nil {
+				t.Fatalf("reconcile: %v", err)
+			}
+			if rd.prCalls != 0 || rd.calls != 0 || rd.headSHACalls != 0 {
+				t.Fatalf("terminal mirror was read: prCalls=%d calls=%d headSHACalls=%d, want 0/0/0",
+					rd.prCalls, rd.calls, rd.headSHACalls)
+			}
+			if got := mdGetMR(t, c, mr.Name); got.Status.LastSyncedAt != nil {
+				t.Fatalf("LastSyncedAt was stamped on a mirror that was never read: %v", got.Status.LastSyncedAt)
+			}
+		})
+	}
+}
+
+// TestReconcile_MergedMirrorIsNeverMarkedClosed is tatara-operator#621.
+// MergeRequest.Status.State is not mirror-local: "merged" -> "closed" makes
+// stage.AllMRsMerged false while AllMRsTerminal stays true, so terminalMREdge
+// / ownMRsShippedEdge (reviewpost.go:421-429, :463-465) finalize the owner Task
+// rejected(mr-closed-externally) with a public terminal comment on the driving
+// issue, instead of done. A forge 404 may stop work; it may not rewrite a merge
+// that already happened.
+func TestReconcile_MergedMirrorIsNeverMarkedClosed(t *testing.T) {
+	ctx := context.Background()
+	task := mdTask("t1", "implement", tatarav1alpha1.StateMerged)
+	mr := mdMR(task, "helmfile", 1311)
+	mr.Status.State = "merged"
+	now := metav1.Now()
+	mr.Status.Ownership = tatarav1alpha1.OwnershipTatara
+	mr.Status.OwnershipReason = "takeover-requested-by:alice"
+	mr.Status.OwnershipChangedAt = &now
+
+	c := newMirrorClient(t, mdProject(), mdSecret(), mdRepo("helmfile"), task, mr)
+	f := newFakeForge(t)
+	f.commentErr = &scm.HTTPError{Status: 404, Path: "/projects/szymonrychu%2Fhelmfile/issues/1311/notes", Body: `{"message":"404 Not found"}`}
+
+	d := mdNewDriver(t, f, c)
+	r := mdMRReconciler(c, d)
+
+	res, err := r.Reconcile(ctx, reqFor(mr))
+	if err != nil {
+		t.Fatalf("reconcile must NOT propagate a permanent 404 into an error requeue, got: %v", err)
+	}
+	if res.RequeueAfter <= 0 {
+		t.Fatalf("want a normal cadence requeue (the loop must still be stopped), got %+v", res)
+	}
+
+	got := mdGetMR(t, c, mr.Name)
+	if got.Status.State != "merged" {
+		t.Fatalf("a permanent 404 rewrote an already-merged mirror to %q", got.Status.State)
+	}
+}
+
+// TestMarkMergeRequestThreadGone_RefusesARecordedMerge is the same invariant one
+// layer down, driven directly because the caller's terminal exclusion makes it
+// unreachable through Reconcile. The refusal lives on the WRITE, not on that one
+// call site, so it has to be pinned there: whoever adds a second caller must not
+// have to rediscover why "closed" may not overwrite a merge.
+//
+// MergedAt is the second arm because it is the merge path's own receipt and
+// survives any later edit to State.
+func TestMarkMergeRequestThreadGone_RefusesARecordedMerge(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		state string
+		merge bool
+	}{
+		{"state merged", "merged", false},
+		{"mergedAt stamped", "open", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, r, mr := mrGoneFixture(t, &mirrorReader{})
+			live := mdGetMR(t, c, mr.Name)
+			live.Status.State = tc.state
+			if tc.merge {
+				now := metav1.Now()
+				live.Status.MergedAt = &now
+			}
+			if err := c.Status().Update(context.Background(), live); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+
+			if err := markMergeRequestThreadGone(context.Background(), c, r.spiller(nil), live, time.Now()); err != nil {
+				t.Fatalf("markMergeRequestThreadGone: %v", err)
+			}
+			got := mdGetMR(t, c, mr.Name)
+			if got.Status.State != tc.state {
+				t.Fatalf("a recorded merge was rewritten to %q", got.Status.State)
+			}
+			if got.Status.LastSyncedAt != nil {
+				t.Fatalf("the refused write still stamped LastSyncedAt: %v", got.Status.LastSyncedAt)
+			}
+		})
 	}
 }
 
