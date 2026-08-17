@@ -113,6 +113,54 @@ var unparkClasses = map[string]UnparkClass{
 	ReasonFoldAdoptionUnverified: UnparkNever,
 }
 
+// mergeStageParks is the SECOND axis park reasons divide on, and it is
+// ORTHOGONAL to UnparkClass: not who un-parks, but WHERE IN THE LIFECYCLE the
+// park was written.
+//
+// A member can only be written once the implementation has been ACCEPTED and
+// the work is at or past the merge. What blocks it is therefore OUTSIDE the
+// code - a credential, a protected branch, a sibling repo that already landed,
+// somebody else pushing to the branch - so a fresh implementation Task cannot
+// clear the obstacle, and minting one CLOSES the reviewed merge request that
+// holds the only copy of the finished work. Measured twice on 2026-08-10:
+// ansible!16 and terraform!215, both approved and conflict-free, closed unmerged
+// by the automatic re-entry lap with their blocker untouched.
+//
+// PER MEMBER, the writer that makes it merge-stage:
+//
+//	merge-timeout        the merged-state stage deadline, after review
+//	merge-blocked        repark of merge-timeout at MaxMergeReentries
+//	merge-auth-refused   the forge refused the merge CREDENTIAL (merge.go)
+//	merge-order-missing  ReconcileMerging entered with an empty mergeOrder
+//	head-moving          MaxHeadMoveReentries: somebody else owns the branch
+//	ci-red               CIRed's anyMerged arm ONLY: part of mergeOrder LANDED
+//	deploy-timeout       the deployed-state stage deadline, post-merge
+//	deploy-blocked       repark of deploy-timeout at MaxDeployReentries
+//
+// ci-blocked IS THE BOUNDARY CASE AND IS DELIBERATELY OUT. stage.CIRed reaches
+// it only when NOTHING in mergeOrder has merged, and red CI on an unmerged
+// branch is fixed by a new commit and nothing else - so re-implementing is the
+// remedy there, not a way of destroying one. Every other park reason is written
+// at or before review, about the attempt itself, and keeps its existing
+// treatment; ownership-lost is doubly out, because the merge request is a
+// HUMAN's and ourMR already refuses to touch it.
+var mergeStageParks = map[string]bool{
+	ReasonMergeTimeout:      true,
+	ReasonMergeBlocked:      true,
+	ReasonMergeAuthRefused:  true,
+	ReasonMergeOrderMissing: true,
+	ReasonHeadMoving:        true,
+	ReasonCIRed:             true,
+	ReasonDeployTimeout:     true,
+	ReasonDeployBlocked:     true,
+}
+
+// IsMergeStagePark reports whether reason was written at or after the merge, on
+// work that was already implemented and reviewed. Callers use it to refuse the
+// two things that destroy such work: an automatic re-implementation, and the
+// close of the merge request it would replace.
+func IsMergeStagePark(reason string) bool { return mergeStageParks[reason] }
+
 // UnparkClassFor reports who un-parks a park reason. ok is false for a reason
 // that is not a park reason at all.
 func UnparkClassFor(reason string) (UnparkClass, bool) {
