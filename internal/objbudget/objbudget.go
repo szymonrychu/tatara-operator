@@ -261,23 +261,27 @@ func spillEvicted(ctx context.Context, sp Spiller, kind, name string, batch any,
 	return trackID, true, nil
 }
 
-// commentKey identifies a comment for exclusion.
+// commentKey identifies a comment for exclusion. It is ExternalID and NOTHING
+// ELSE, because ExternalID is the only field of a mirrored comment that cannot
+// change under the guard: mergeComments/mergeOneComment
+// (internal/controller/mirror.go) take body, author and CreatedAt from the
+// forge listing and UPSERT them, so a body edited on the forge between the
+// Phase-1 read that chose the eviction batch and the Phase-2 read that applies
+// it would move any key that included them - and a key that no longer matches
+// spills a comment AND retains it, which is the exact tie this exclusion
+// replaced a timestamp filter to avoid.
 //
-// ExternalID ALONE IS NOT AN IDENTITY. mergeComments
-// (internal/controller/mirror.go) dedupes on `ok && c.ExternalID != ""`, so it
-// deliberately lets several empty-id comments coexist; keying on the id alone
-// would let ONE evicted empty-id comment exclude every retained one - dropped
-// from the object and never spilled. The whole value is the key instead.
-// CreatedAt collapses to Unix seconds because that is the granularity
-// metav1.Time round-trips at, and comparing time.Time directly would compare
-// monotonic readings and locations that do not survive a round trip.
-type commentKey struct {
-	id, author, body string
-	at               int64
-}
+// ExternalID alone is only safe BECAUSE the exclusion is a multiset (see
+// evictedComments). mergeComments dedupes on `ok && c.ExternalID != ""`, so it
+// deliberately lets several empty-id comments coexist; as a SET, "" would let
+// one evicted empty-id comment exclude every retained one. As a counted
+// multiset it excludes exactly as many as were evicted, and since both lists
+// are ordered oldest-first and eviction takes from the front, those are the
+// right ones.
+type commentKey struct{ id string }
 
 func keyOfComment(c tatarav1alpha1.Comment) commentKey {
-	return commentKey{id: c.ExternalID, author: c.Author, body: c.Body, at: c.CreatedAt.Unix()}
+	return commentKey{id: c.ExternalID}
 }
 
 // evictedComments is excludeComments' key MULTISET: it COUNTS occurrences, so

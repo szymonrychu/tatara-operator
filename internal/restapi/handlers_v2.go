@@ -412,6 +412,13 @@ func (s *Server) postNote(w http.ResponseWriter, r *http.Request) {
 		// tatara-memory outage, or an endpoint the Project has not published
 		// yet. A Project that is memory-free BY CONFIGURATION no longer reaches
 		// here at all - it resolves to objbudget.Discarding and the note lands.
+		//
+		// outcome.commit deliberately does NOT block the same way, and the two
+		// must not be "unified" later: refusing HERE has no side effect (the
+		// agent retries and the journal is untouched), while commit runs after
+		// a non-idempotent forge write, so refusing there strands it and the
+		// retry duplicates it. commit therefore drops the COUNT cap and commits
+		// over it; only the byte guard blocks on both paths.
 		s.log.ErrorContext(ctx, "restapi: spilling oldest notes failed",
 			append(reqLogFields(r), "task", task.Name, "notes_to_spill", spillN, "error", err)...)
 		writeRetryAfter(w, "note spill is unavailable; retry")

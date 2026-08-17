@@ -11,6 +11,9 @@ import (
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 // droppingMetrics captures the two eviction-outcome counters so a test can
@@ -321,5 +324,68 @@ func TestFitIssue_AnEmptyExternalIDIsNotAnIdentity(t *testing.T) {
 	if !newest.CreatedAt.Time.Equal(at.Add(119 * time.Second)) {
 		t.Fatalf("newest retained comment is at %v, want the empty-id one at +119s: an evicted empty id took a retained one with it",
 			newest.CreatedAt.Time)
+	}
+}
+
+// TestFitIssue_ABodyEditedBetweenThePhasesStillExcludesTheComment pins the
+// other half of the identity choice. mergeComments/mergeOneComment
+// (internal/controller/mirror.go) UPSERT a body edited on the forge, so any
+// mutable field in the exclusion key can change between the Phase-1 read that
+// decided the eviction and the Phase-2 read that applies it. When it does, the
+// key no longer matches, the comment is spilled AND retained, and the write
+// either fails ErrObjectTooLarge on the size re-check or leaves a duplicate
+// under budget - the exact tie the positional/identity rewrite was meant to
+// end. Only ExternalID is immutable, so only ExternalID keys.
+func TestFitIssue_ABodyEditedBetweenThePhasesStillExcludesTheComment(t *testing.T) {
+	ctx := context.Background()
+	at := time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
+	comments := make([]tatarav1alpha1.Comment, 0, 120)
+	for i := 0; i < 120; i++ {
+		comments = append(comments, tatarav1alpha1.Comment{
+			ExternalID: "c" + strconv.Itoa(i), Author: "someone",
+			Body: strings.Repeat("x", 8000), CreatedAt: metav1.NewTime(at.Add(time.Duration(i) * time.Second)),
+		})
+	}
+	issue := &tatarav1alpha1.Issue{
+		ObjectMeta: metav1.ObjectMeta{Name: "iss-repo-edited", Namespace: "tatara"},
+		Spec:       tatarav1alpha1.IssueSpec{RepositoryRef: "repo", Number: 1, URL: "https://example.invalid/1"},
+		Status:     tatarav1alpha1.IssueStatus{Comments: comments, CommentCount: 120},
+	}
+	s := newTestScheme(t)
+	gets := 0
+	c := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(issue).
+		WithStatusSubresource(&tatarav1alpha1.Issue{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, cli client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if err := cli.Get(ctx, key, obj, opts...); err != nil {
+					return err
+				}
+				gets++
+				// The Phase-2 read sees the oldest comment's body as the forge
+				// now reports it; the Phase-1 read that chose the batch did not.
+				if iss, ok := obj.(*tatarav1alpha1.Issue); ok && gets > 1 && len(iss.Status.Comments) > 0 {
+					iss.Status.Comments[0].Body = strings.Repeat("y", 8000)
+				}
+				return nil
+			},
+		}).
+		Build()
+	sp := &fakeSpiller{}
+	key := types.NamespacedName{Name: issue.Name, Namespace: "tatara"}
+
+	if err := FitIssue(ctx, c, sp, key, func(*tatarav1alpha1.Issue) {}); err != nil {
+		t.Fatalf("FitIssue: %v", err)
+	}
+
+	got := &tatarav1alpha1.Issue{}
+	if err := c.Get(ctx, key, got); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	for _, cm := range got.Status.Comments {
+		if cm.ExternalID == "c0" {
+			t.Fatal("the oldest comment survived its own eviction: an edited body changed its exclusion key")
+		}
 	}
 }

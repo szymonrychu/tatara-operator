@@ -725,22 +725,54 @@ func (o *outcomeCtx) commit(mutate func(*tatarav1alpha1.Task) error) bool {
 	// handler enforced one. That asymmetry is what pushed a Task to 53 notes and
 	// made every subsequent agent note need a bigger spill batch than the last
 	// (#616).
-	err := objbudget.FitTask(ctx, s.c, s.spillerForOrNil(o.proj), key, func(t *tatarav1alpha1.Task) {
-		if mutate != nil {
-			if err := mutate(t); err != nil {
-				mutErr = err
-				return
+	fit := func(opts ...objbudget.FitOption) error {
+		mutErr = nil
+		return objbudget.FitTask(ctx, s.c, s.spillerForOrNil(o.proj), key, func(t *tatarav1alpha1.Task) {
+			if mutate != nil {
+				if err := mutate(t); err != nil {
+					mutErr = err
+					return
+				}
 			}
-		}
-		to, toReason, toPark = t.Status.State, t.Status.StateReason, t.Status.ParkReason
-		setCondition(t, metav1.Condition{
-			Type:               outcomeAcceptedCondition,
-			Status:             metav1.ConditionTrue,
-			Reason:             conditionReason(o.kind),
-			Message:            o.fp,
-			LastTransitionTime: metav1.NewTime(s.now()),
-		})
-	}, objbudget.WithNoteCap())
+			to, toReason, toPark = t.Status.State, t.Status.StateReason, t.Status.ParkReason
+			setCondition(t, metav1.Condition{
+				Type:               outcomeAcceptedCondition,
+				Status:             metav1.ConditionTrue,
+				Reason:             conditionReason(o.kind),
+				Message:            o.fp,
+				LastTransitionTime: metav1.NewTime(s.now()),
+			})
+		}, opts...)
+	}
+	err := fit(objbudget.WithNoteCap())
+	if mutErr == nil && (errors.Is(err, objbudget.ErrSpillFailed) || errors.Is(err, objbudget.ErrSpillerUnconfigured)) {
+		// THE CAP YIELDS TO THE TRANSITION. commit IS the stage transition - to,
+		// toReason, toPark and the OutcomeAccepted condition are all written in
+		// the closure above - and the rule that keeps the dozen other FitTask
+		// callers off WithNoteCap is that a tatara-memory blip must never block
+		// one. commit has to carry the cap anyway (it is the one door every
+		// agentNote goes through), so it gets the exemption instead: when the
+		// COUNT cap alone is what needed the spiller, re-run without it.
+		//
+		// Refusing here is worse than running one note over. commit lands AFTER
+		// the handler's non-idempotent forge write (incident file_issue's
+		// CreateIssue, brainstorm propose's), and holding the claim only buys
+		// OutcomeClaimTTL: classifyOutcomeClaim then re-claims the orphaned stub,
+		// the handler re-runs from the top, and CreateIssue fires AGAIN - one
+		// duplicate tracker issue per TTL for the length of the outage, with the
+		// Task never leaving its stage. The uncapped write loses nothing: the
+		// journal sits over MaxNotes until the next successful note write trims
+		// it, which is exactly the pre-#616 status quo.
+		//
+		// If the second call ALSO returns a spill error the eviction was
+		// BYTE-driven, A.7's SPILL FIRST genuinely applies (dropping is real
+		// loss, and the object is unwritable either way), and the 503 below is
+		// the right answer.
+		s.log.WarnContext(ctx, "restapi: the note cap needed a spill and could not have one; committing the outcome over the cap rather than stranding it",
+			append(reqLogFields(o.r), "action", "outcome_note_cap_yielded", "task", o.task.Name,
+				"kind", o.kind, "error", err)...)
+		err = fit()
+	}
 	if mutErr != nil {
 		var ill *stage.IllegalTransitionError
 		if errors.As(mutErr, &ill) {
@@ -769,14 +801,19 @@ func (o *outcomeCtx) commit(mutate func(*tatarav1alpha1.Task) error) bool {
 		return false
 	}
 	if errors.Is(err, objbudget.ErrSpillFailed) || errors.Is(err, objbudget.ErrSpillerUnconfigured) {
+		// BYTE-DRIVEN EVICTION ONLY, by the time control reaches here: the
+		// count cap already yielded above. The object genuinely does not fit
+		// ObjectByteBudget, so there is no version of this write that both
+		// lands and keeps the evicted notes.
+		//
 		// SAME ANSWER postNote GIVES, because it is the same condition on the
-		// same journal: WithNoteCap made these two reachable here (#616), and
-		// both are transient - a tatara-memory outage, or an endpoint the
-		// Project has not published yet. writeClientErr would map them to 500
-		// "internal error" with no Retry-After, which tells the agent to give
-		// up on something that clears by itself, and disagrees with what
-		// postNote answers for the very same Task. A memory-free-BY-CONFIG
-		// Project never reaches here: it resolves to objbudget.Discarding.
+		// same journal, and both causes are transient - a tatara-memory outage,
+		// or an endpoint the Project has not published yet. writeClientErr
+		// would map them to 500 "internal error" with no Retry-After, which
+		// tells the agent to give up on something that clears by itself, and
+		// disagrees with what postNote answers for the very same Task. A
+		// memory-free-BY-CONFIG Project never reaches here: it resolves to
+		// objbudget.Discarding.
 		//
 		// THE CLAIM IS HELD, not released, and that is deliberate: unlike the
 		// illegal-transition branch above, this rejection can follow a
