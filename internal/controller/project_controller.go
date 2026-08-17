@@ -445,7 +445,7 @@ func (r *ProjectReconciler) doReconcile(ctx context.Context, req ctrl.Request) (
 			// correctness, so it is logged and tolerated rather than failing the
 			// reconcile - matching stampScan's own cron-path callers.
 			if created := r.brainstorm(ctx, &project, scanRdr, scanRepos, scanExisting, *cron); created {
-				if serr := r.stampScan(ctx, &project, "brainstorm"); serr != nil {
+				if serr := r.stampScan(ctx, &project, "brainstorm", time.Now()); serr != nil {
 					l.Error(serr, "scan: persist brainstorm stamp failed (event-driven refill)",
 						"action", "scan_stamp_error", "resource_id", project.Name, "activity", "brainstorm")
 					obs.SweepErrorsTotal.WithLabelValues(project.Name, "brainstorm", "stamp_failed").Inc()

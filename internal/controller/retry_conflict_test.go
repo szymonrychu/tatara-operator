@@ -73,7 +73,7 @@ func TestStampScanRetriesOnConflict(t *testing.T) {
 		Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry()),
 	}
 
-	require.NoError(t, r.stampScan(ctx, proj, "issueScan"))
+	require.NoError(t, r.stampScan(ctx, proj, "issueScan", time.Now()))
 
 	// Verify the stamp landed despite the initial conflict.
 	var got tatarav1alpha1.Project
@@ -109,7 +109,7 @@ func TestStampScanSetsHeartbeatGauge(t *testing.T) {
 	}
 
 	before := time.Now().Unix()
-	require.NoError(t, r.stampScan(ctx, proj, "brainstorm"))
+	require.NoError(t, r.stampScan(ctx, proj, "brainstorm", time.Now()))
 	got := testutil.ToFloat64(obs.SweepLastSuccessTimestamp.WithLabelValues("stamp-heartbeat-proj", "brainstorm"))
 	require.GreaterOrEqual(t, got, float64(before),
 		"obs.SweepLastSuccessTimestamp{project=stamp-heartbeat-proj,activity=brainstorm} must be set on a successful stampScan")
