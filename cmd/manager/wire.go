@@ -480,13 +480,13 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 	// Hoisted above ProjectReconciler's setup (was defined further down, just
 	// above TaskReconciler's) so ProjectReconciler.SpillerFor below - and driver()/
 	// minter()'s wiring of it - has it in scope.
-	spillerFor := func(proj *tataradevv1alpha1.Project) objbudget.Spiller {
-		endpoint := ""
-		if proj.Status.Memory != nil {
-			endpoint = proj.Status.Memory.Endpoint
-		}
-		return memclient.New(endpoint, memoryTokens.Token, nil)
-	}
+	//
+	// It is newSpillerFor's body, not a THIRD hand-rolled copy of it. The copy
+	// that used to live here carried the #616 defect independently: a Project
+	// with memory disabled resolved to a client aimed at "", so the reconciler
+	// mirror path had the same latent FitIssue/FitMergeRequest wedge the REST
+	// note path already had.
+	spillerFor := newSpillerFor(mgr, cfg)
 
 	// Built here, ahead of ProjectReconciler, so ProjectReconciler.Tasks below
 	// can point at the SAME *TaskReconciler instance the manager registers

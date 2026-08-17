@@ -512,6 +512,15 @@ func FitTask(ctx context.Context, c client.Client, sp Spiller, key types.Namespa
 				drop = max(drop, len(fresh.Status.Notes)-tatarav1alpha1.MaxNotes)
 			}
 			drop = min(drop, len(fresh.Status.Notes))
+			if drop > evictedN {
+				// The surplus is dropped WITHOUT having been spilled: the batch
+				// went to tatara-memory before this re-read existed. Rare (it needs
+				// an uncapped appender to land inside the two Gets) and bounded by
+				// that race, but it is real loss, so it is never silent.
+				slog.WarnContext(ctx, "objbudget: note journal grew between the eviction decision and the write; the surplus is dropped unspilled",
+					"action", "objbudget_surplus_dropped", "kind", kind, "resource_id", key.Name,
+					"spilled", evictedN, "dropped", drop)
+			}
 			fresh.Status.Notes = fresh.Status.Notes[drop:]
 			fresh.Status.Stats.NotesSpilled += drop
 			if stored {

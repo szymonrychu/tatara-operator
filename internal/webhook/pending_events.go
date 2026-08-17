@@ -65,31 +65,24 @@ func (s *Server) deliverPendingEvent(ctx context.Context, proj tatarav1.Project,
 	}
 	isBot := botLogin != "" && ev.ActorLogin != "" && ev.ActorLogin == botLogin
 
+	// sp may be nil (#616): a nil Spiller only blocks a write that actually
+	// needs eviction, so pass it through instead of skipping the write outright.
 	sp := s.cfg.SpillerFor(&proj)
-	if sp != nil {
-		cmt := tatarav1.Comment{
-			ExternalID: externalID,
-			Author:     ev.ActorLogin,
-			Body:       ev.CommentBody,
-			CreatedAt:  metav1.Now(),
-			IsBot:      isBot,
-		}
-		if err := controller.AppendCommentToMirror(ctx, s.cfg.Client, sp, obj, cmt); err != nil {
-			// The function continues past this and still enqueues the TaskEvent
-			// below, so a HUMAN comment is lost from the mirror while the unpark
-			// event still fires - the agent gets unparked by a comment its bundle
-			// does not contain.
-			obs.MirrorWriteDroppedTotal.WithLabelValues(proj.Name, kind, "comment_append").Inc()
-			s.log.WarnContext(ctx, "pendingEvents: mirror comment append failed; comment lost from mirror but the unpark event still fires",
-				"error", err, "kind", kind, "project", proj.Name)
-		}
-	} else {
-		// Same consequence as the AppendCommentToMirror error above: no Spiller
-		// means the comment never lands on the mirror, but the TaskEvent below is
-		// still enqueued and can still unpark the Task.
+	cmt := tatarav1.Comment{
+		ExternalID: externalID,
+		Author:     ev.ActorLogin,
+		Body:       ev.CommentBody,
+		CreatedAt:  metav1.Now(),
+		IsBot:      isBot,
+	}
+	if err := controller.AppendCommentToMirror(ctx, s.cfg.Client, sp, obj, cmt); err != nil {
+		// The function continues past this and still enqueues the TaskEvent
+		// below, so a HUMAN comment is lost from the mirror while the unpark
+		// event still fires - the agent gets unparked by a comment its bundle
+		// does not contain.
 		obs.MirrorWriteDroppedTotal.WithLabelValues(proj.Name, kind, "comment_append").Inc()
-		s.log.WarnContext(ctx, "pendingEvents: no Spiller configured; mirror comment append skipped, comment lost from mirror but the unpark event still fires",
-			"kind", kind, "project", proj.Name)
+		s.log.WarnContext(ctx, "pendingEvents: mirror comment append failed; comment lost from mirror but the unpark event still fires",
+			"error", err, "kind", kind, "project", proj.Name)
 	}
 
 	// E.3 enqueue filter: a BOT-authored event is NEVER enqueued. Without it the
@@ -460,17 +453,14 @@ func (s *Server) syncOwnedIssueThread(ctx context.Context, proj *tatarav1.Projec
 		attrs := []any{"action", "pending_event_issue_sync_failed",
 			"task", task.Name, "project", proj.Name, "issue", key}
 		if err != nil {
-			// The no-Spiller branch has no error to report; an "error": null field
-			// on a JSON log line reads like a nil deref that was swallowed.
 			attrs = append(attrs, "error", err)
 		}
 		s.log.ErrorContext(ctx, "pendingEvents: "+msg+"; the cited comment may not be visible to the gate", attrs...)
 	}
+	// sp may be nil (#616): passed through to SyncIssueOnDemand rather than
+	// short-circuited, since a nil Spiller only blocks a write that actually
+	// needs eviction.
 	sp := s.cfg.SpillerFor(proj)
-	if sp == nil {
-		fail("no Spiller configured; on-demand issue sync skipped", nil)
-		return
-	}
 	reader, err := s.scmReader(ctx, proj)
 	if err != nil {
 		fail("build scm reader failed", err)

@@ -109,34 +109,28 @@ func (s *Server) handleIssueEdited(ctx context.Context, w http.ResponseWriter, p
 		return
 	}
 
+	// sp may be nil (#616): passed through to FitIssue rather than short-
+	// circuited, since a nil Spiller only blocks a write that actually needs
+	// eviction.
 	sp := s.cfg.SpillerFor(&proj)
 	changed := false
-	if sp != nil {
-		if ferr := objbudget.FitIssue(ctx, s.cfg.Client, sp, key,
-			func(i *tatarav1.Issue) {
-				// Diff and write in the SAME fitForWrite transaction: keying the
-				// reaction on the actual mirror DIFF (not the action string) is what
-				// gives GitHub/GitLab parity across their divergent action vocabularies.
-				body := tatarav1.TruncateUTF8(ev.Body, tatarav1.IssueBodyMaxBytes)
-				changed = i.Status.Body != body || i.Status.Title != ev.Title
-				i.Status.Body = body
-				i.Status.Title = ev.Title
-			}); ferr != nil {
-			// changed never flips true (the closure that sets it never ran), so the
-			// !changed check below returns early and the owning Task never gets its
-			// issue_edited TaskEvent - this drop silently suppresses the derived
-			// unpark-worthy event, not just the mirror body/title.
-			obs.MirrorWriteDroppedTotal.WithLabelValues(proj.Name, "Issue", "issue_body_title").Inc()
-			s.log.WarnContext(ctx, "issues: mirror body/title refresh failed; issue_edited event also suppressed (changed stays false)",
-				"error", ferr, "project", proj.Name, "issue_ref", ev.IssueRef)
-		}
-	} else {
-		// Same consequence as the FitIssue error above: no Spiller means the mirror
-		// is never touched, changed stays false, and the issue_edited TaskEvent is
-		// silently suppressed along with the body/title refresh.
+	if ferr := objbudget.FitIssue(ctx, s.cfg.Client, sp, key,
+		func(i *tatarav1.Issue) {
+			// Diff and write in the SAME fitForWrite transaction: keying the
+			// reaction on the actual mirror DIFF (not the action string) is what
+			// gives GitHub/GitLab parity across their divergent action vocabularies.
+			body := tatarav1.TruncateUTF8(ev.Body, tatarav1.IssueBodyMaxBytes)
+			changed = i.Status.Body != body || i.Status.Title != ev.Title
+			i.Status.Body = body
+			i.Status.Title = ev.Title
+		}); ferr != nil {
+		// changed never flips true (the closure that sets it never ran), so the
+		// !changed check below returns early and the owning Task never gets its
+		// issue_edited TaskEvent - this drop silently suppresses the derived
+		// unpark-worthy event, not just the mirror body/title.
 		obs.MirrorWriteDroppedTotal.WithLabelValues(proj.Name, "Issue", "issue_body_title").Inc()
-		s.log.WarnContext(ctx, "issues: no Spiller configured; mirror body/title refresh skipped, issue_edited event also suppressed",
-			"project", proj.Name, "issue_ref", ev.IssueRef)
+		s.log.WarnContext(ctx, "issues: mirror body/title refresh failed; issue_edited event also suppressed (changed stays false)",
+			"error", ferr, "project", proj.Name, "issue_ref", ev.IssueRef)
 	}
 
 	if !changed {
@@ -542,12 +536,12 @@ func (s *Server) handleMRClosed(ctx context.Context, w http.ResponseWriter, prov
 }
 
 // stampIssueState upserts Issue.Status.State on the mirror CR. Returns false when
-// the CR is absent (nothing to refresh) or no Spiller is configured.
+// the CR is absent (nothing to refresh).
 func (s *Server) stampIssueState(ctx context.Context, proj *tatarav1.Project, repo *tatarav1.Repository, number int, state string) bool {
+	// sp may be nil (#616): passed through to FitIssue rather than short-
+	// circuited, since a nil Spiller only blocks a write that actually needs
+	// eviction.
 	sp := s.cfg.SpillerFor(proj)
-	if sp == nil {
-		return false
-	}
 	key := types.NamespacedName{Namespace: s.cfg.Namespace, Name: tatarav1.IssueName(repo.Name, number)}
 	if err := s.cfg.Client.Get(ctx, key, &tatarav1.Issue{}); err != nil {
 		return false
@@ -666,10 +660,10 @@ func (s *Server) stampMRCI(ctx context.Context, proj *tatarav1.Project, repo *ta
 }
 
 func (s *Server) fitMR(ctx context.Context, proj *tatarav1.Project, repo *tatarav1.Repository, number int, mut func(*tatarav1.MergeRequest)) bool {
+	// sp may be nil (#616): passed through to FitMergeRequest rather than
+	// short-circuited, since a nil Spiller only blocks a write that actually
+	// needs eviction.
 	sp := s.cfg.SpillerFor(proj)
-	if sp == nil {
-		return false
-	}
 	key := types.NamespacedName{Namespace: s.cfg.Namespace, Name: tatarav1.MergeRequestName(repo.Name, number)}
 	if err := s.cfg.Client.Get(ctx, key, &tatarav1.MergeRequest{}); err != nil {
 		return false
