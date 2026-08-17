@@ -777,6 +777,13 @@ func (o *outcomeCtx) commit(mutate func(*tatarav1alpha1.Task) error) bool {
 		// up on something that clears by itself, and disagrees with what
 		// postNote answers for the very same Task. A memory-free-BY-CONFIG
 		// Project never reaches here: it resolves to objbudget.Discarding.
+		//
+		// THE CLAIM IS HELD, not released, and that is deliberate: unlike the
+		// illegal-transition branch above, this rejection can follow a
+		// NON-IDEMPOTENT forge write (brainstorm propose's CreateIssue runs
+		// before commit), so releasing would let the retry duplicate it. A
+		// retry inside OutcomeClaimTTL therefore gets 409 "outcome in flight,
+		// retry" - still a retry instruction - and re-validates after the TTL.
 		s.log.ErrorContext(ctx, "restapi: spilling oldest notes failed",
 			append(reqLogFields(o.r), "task", o.task.Name, "kind", o.kind, "error", err)...)
 		writeRetryAfter(o.w, "note spill is unavailable; retry")
