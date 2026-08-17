@@ -207,14 +207,25 @@ jobs:
             echo "detail=$2" >> "$GITHUB_OUTPUT"
           }
 
+          # Anchored and dot-escaped: `.` is regex-any and the match used to be
+          # unanchored, so `version: 3.4.0` was satisfied by `13.4.0` or
+          # `3.4.0-rc1`. And it demands ALL FOUR pins the bump job rewrites in
+          # one commit (tatara-operator plus the three tatara-project releases);
+          # matching "somewhere in the file" let a partially-applied fan-out -
+          # one of the four apply-pins regexes having drifted - read as landed.
+          BARE_RE="${BARE//./\\.}"
+          VER_RE="${VERSION//./\\.}"
+          OPERATOR_PINS=4
+
           # 0 pinned, 1 not pinned, 2 could not read. "Could not read" is NOT
           # "not pinned": conflating the two is what produced a false alarm.
           pinned_on() { # <ref>
-            local hf vals
+            local hf vals n
             hf="$(raw "repos/${PARENT}/contents/helmfile.yaml.gotmpl?ref=$1")" || return 2
             vals="$(raw "repos/${PARENT}/contents/values/tatara-operator/common.yaml?ref=$1")" || return 2
-            printf '%s' "$hf" | grep -q "version: ${BARE}" || return 1
-            printf '%s' "$vals" | grep -q "tag: \"${VERSION}\"" || return 1
+            n="$(printf '%s' "$hf" | grep -cE "^[[:space:]]*version: ${BARE_RE}[[:space:]]*$" || true)"
+            [ "$n" -ge "$OPERATOR_PINS" ] || return 1
+            printf '%s' "$vals" | grep -qE "^[[:space:]]*tag: \"${VER_RE}\"[[:space:]]*$" || return 1
           }
 
           # 1. Fast path. A healthy cascade lands in minutes, so poll briefly
@@ -277,11 +288,21 @@ jobs:
 
           red=""
           if [ -n "$head_sha" ]; then
+            # Guarded like every other read here, and for the same reason: a
+            # bare assignment under `set -e` dies WITHOUT writing a verdict, and
+            # the alarm then reports "the bump job failed first" on a healthy,
+            # armed, correct PR. curl does not retry a 403 secondary rate limit,
+            # so this is reachable.
             # per_page=100: check-runs pages at 30 by default, and a red run on
             # page 2 would read as "green, in flight" - the exact false-negative
             # this verdict exists to remove.
-            red="$(api "repos/${PARENT}/commits/${head_sha}/check-runs?per_page=100" \
-              | jq -r '[.check_runs[]
+            if ! checks="$(api "repos/${PARENT}/commits/${head_sha}/check-runs?per_page=100")"; then
+              echo "::error::CD pin fan-out: ${PARENT}#${num} carries ${VERSION} and is armed, but its check runs could not be read: ${url}"
+              verdict forge-unreadable "${PARENT}#${num} (${url}) carries ${VERSION} and is armed, but its check runs could not be read."
+              exit 1
+            fi
+            red="$(printf '%s' "$checks" \
+              | jq -r '[.check_runs[]?
                         | select(.conclusion == "failure" or .conclusion == "timed_out"
                                  or .conclusion == "cancelled" or .conclusion == "action_required")
                         | .name] | join(", ")')"
@@ -395,9 +416,21 @@ jobs:
           # and far more tightly, and it was 503ing throughout the 2026-08-17
           # outage. /issues returns PULL REQUESTS too, hence the filter - a
           # bot-authored PR whose title happens to match is not the tracker.
-          existing=$(api "repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=100" \
-            | jq -r --arg t "CD pin fan-out stalled" \
-              '[.[] | select(has("pull_request") | not) | select(.title | startswith($t))][0].number // empty')
+          # Paged: /issues counts PULL REQUESTS toward per_page BEFORE the
+          # filter below, so a single 100-item page is not enough to find the
+          # tracker once this repo has a normal number of open PRs - and a miss
+          # opens a DUPLICATE tracker every failed release. /search/issues had
+          # no such cap; this is the cost of dropping it, and it is bounded.
+          existing=""
+          page=1
+          while [ "$page" -le 5 ]; do
+            batch="$(api "repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=100&page=${page}")"
+            existing="$(printf '%s' "$batch" | jq -r --arg t "CD pin fan-out stalled" \
+              '[.[]? | select(has("pull_request") | not) | select(.title | startswith($t))][0].number // empty')"
+            if [ -n "$existing" ]; then break; fi
+            if [ "$(printf '%s' "$batch" | jq 'length')" -lt 100 ]; then break; fi
+            page=$((page + 1))
+          done
           if [ -n "$existing" ]; then
             jq -n --arg b "$BODY" '{body:$b}' \
               | post "repos/${GITHUB_REPOSITORY}/issues/${existing}/comments" >/dev/null

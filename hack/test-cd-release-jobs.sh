@@ -125,7 +125,15 @@ expect_eq() {
 
 # --- fixtures ---------------------------------------------------------------
 
-PINNED_HELMFILE='  - name: tatara-operator
+PINNED_HELMFILE='  - name: tatara-chat
+    version: 0.1.3
+  - name: tatara-operator
+    version: 3.4.0
+  - name: project-tatara
+    version: 3.4.0
+  - name: project-infrastructure
+    version: 3.4.0
+  - name: project-mtg
     version: 3.4.0'
 PINNED_VALUES='  image:
     tag: "v3.4.0"'
@@ -133,6 +141,22 @@ STALE_HELMFILE='  - name: tatara-operator
     version: 3.3.0'
 STALE_VALUES='  image:
     tag: "v3.3.0"'
+# The bump rewrites FOUR version pins in helmfile.yaml.gotmpl in one commit
+# (tatara-operator + the three tatara-project releases). A file where only some
+# of them moved is a broken fan-out, not a landed one.
+PARTIAL_HELMFILE='  - name: tatara-operator
+    version: 3.4.0
+  - name: project-tatara
+    version: 3.4.0
+  - name: project-infrastructure
+    version: 3.4.0
+  - name: project-mtg
+    version: 3.3.0'
+# `.` is regex-any and the old check was unanchored, so 13.4.0 matched 3.4.0.
+LOOKALIKE_HELMFILE='  - name: tatara-chat
+    version: 13.4.0
+  - name: other
+    version: 3.4.0-rc1'
 
 pr_json() { # <auto_merge json>
   printf '[{"number":423,"html_url":"%s","head":{"sha":"%s"},"auto_merge":%s}]' \
@@ -257,6 +281,62 @@ test_an_unreadable_forge_is_not_a_missing_pr() {
   expect_eq "$(step_output "$d" state)" "forge-unreadable"
 }
 
+test_a_check_runs_failure_is_a_verdict_not_a_silent_death() {
+  it "check-runs read fails -> exit 1 WITH a verdict, not errexit with none"
+  local d; d="$(make_stub_dir)"
+  routes "$d" \
+    "$(contents_routes "$d" main stale)" \
+    "$(contents_routes "$d" cd/deploy-train pinned)" \
+    "pulls?state=open|0|$(pr_json '{"merge_method":"squash"}')" \
+    "check-runs|22|"
+  run_script "$d" "$(verify_script)" "${VERIFY_ENV[@]}"
+  expect_rc 1
+  expect_has "$OUT" "::error::"
+  # A bare assignment under `set -e` dies here writing NO state, and the alarm
+  # then reports "the bump job failed first" on a healthy, armed, correct PR.
+  expect_eq "$(step_output "$d" state)" "forge-unreadable"
+}
+
+test_check_runs_is_paged_at_100() {
+  it "check-runs is requested with per_page=100 (a red run on page 2 counts)"
+  local d; d="$(make_stub_dir)"
+  routes "$d" \
+    "$(contents_routes "$d" main stale)" \
+    "$(contents_routes "$d" cd/deploy-train pinned)" \
+    "pulls?state=open|0|$(pr_json '{"merge_method":"squash"}')" \
+    "check-runs|0|$(checks_json success)"
+  run_script "$d" "$(verify_script)" "${VERIFY_ENV[@]}"
+  expect_has "$(cat "$d/curl.log")" "check-runs?per_page=100"
+}
+
+test_a_partially_applied_pin_is_not_reported_as_pinned() {
+  it "3 of the 4 operator pins moved -> NOT pinned, not a silent exit 0"
+  local d; d="$(make_stub_dir)"
+  body_file "$d" hf-part "$PARTIAL_HELMFILE"
+  body_file "$d" val-part "$PINNED_VALUES"
+  routes "$d" \
+    "contents/helmfile.yaml.gotmpl?ref=main|0|@hf-part" \
+    "contents/values/tatara-operator/common.yaml?ref=main|0|@val-part" \
+    "pulls?state=open|0|[]"
+  run_script "$d" "$(verify_script)" "${VERIFY_ENV[@]}"
+  expect_rc 1
+  expect_eq "$(step_output "$d" state)" "no-pr"
+}
+
+test_a_longer_version_is_not_mistaken_for_this_one() {
+  it "unanchored grep: version 13.4.0 must not satisfy a 3.4.0 pin"
+  local d; d="$(make_stub_dir)"
+  body_file "$d" hf-look "$LOOKALIKE_HELMFILE"
+  body_file "$d" val-look "$PINNED_VALUES"
+  routes "$d" \
+    "contents/helmfile.yaml.gotmpl?ref=main|0|@hf-look" \
+    "contents/values/tatara-operator/common.yaml?ref=main|0|@val-look" \
+    "pulls?state=open|0|[]"
+  run_script "$d" "$(verify_script)" "${VERIFY_ENV[@]}"
+  expect_rc 1
+  expect_eq "$(step_output "$d" state)" "no-pr"
+}
+
 test_the_fast_path_polls_before_giving_a_verdict() {
   it "main is polled VERIFY_POLL_ATTEMPTS times before the state query"
   local d; d="$(make_stub_dir)"
@@ -272,7 +352,10 @@ test_every_curl_retries_transient_forge_errors() {
   it "no bare curl: a 503 must not decide the verdict (att 8 died on one)"
   local script line
   script="$(verify_script)$(alarm_script)"
+  local bare
   while IFS= read -r line; do
+    bare="${line#"${line%%[![:space:]]*}"}"
+    case "$bare" in \#*) continue ;; esac
     case "$line" in
       *curl\ *)
         case "$line" in
@@ -336,6 +419,27 @@ test_alarm_dedupes_onto_the_open_tracker() {
     BUMP_RESULT=failure VERIFY_RESULT=failure VERIFY_STATE=no-pr VERIFY_DETAIL=""
   expect_rc 0
   expect_has "$OUT" "622"
+  expect_has "$(cat "$d/curl.log")" "issues/622/comments"
+}
+
+test_alarm_finds_a_tracker_past_the_first_page() {
+  it "100 open issues before the tracker -> still comments, does not duplicate"
+  local d; d="$(make_stub_dir)"
+  # A full page of open PRs (which /issues returns and which count toward the
+  # 100 BEFORE the pull_request filter), then the tracker on page 2.
+  local filler i
+  filler="$(for i in $(seq 1 100); do
+    printf '{"number":%d,"title":"filler","pull_request":{"url":"x"}},' "$i"
+  done)"
+  body_file "$d" page1 "[${filler%,}]"
+  body_file "$d" page2 "$(issues_json 'CD pin fan-out stalled: v3.3.0 is not pinned in tatara-helmfile')"
+  routes "$d" \
+    "page=2|0|@page2" \
+    "issues?state=open|0|@page1" \
+    "issues/622/comments|0|{}"
+  run_script "$d" "$(alarm_script)" "${ALARM_ENV[@]}" \
+    BUMP_RESULT=failure VERIFY_RESULT=failure VERIFY_STATE=no-pr VERIFY_DETAIL=""
+  expect_rc 0
   expect_has "$(cat "$d/curl.log")" "issues/622/comments"
 }
 
