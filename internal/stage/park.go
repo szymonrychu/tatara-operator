@@ -531,6 +531,52 @@ func UnparkForMRTerminal(t *v1alpha1.Task, to, reason string) error {
 // reason change, and StageElapsedCarrySeconds PRESERVED - so the 24h residency
 // dead-man switch stays cumulative across the migration and a Task that had
 // already burned 20 hours does not buy a fresh day by being un-parked.
+// UnparkCIRecovered releases a parked(implement-declined) Task whose decline was
+// a verdict on the INFRASTRUCTURE rather than on the change: the agent could not
+// hand the work on because the operator's own submission gate answered 409
+// ci-red, the blocker has since cleared, and the merge request tatara owns end
+// to end is green at the very head the agent gave up at.
+//
+// IT IS A DRIVER'S PRIMITIVE, NOT A RE-ENTRY RULE, and the distinction is the
+// whole safety argument. implement-declined stays UnparkNever: stage.Unpark has
+// no arm for it and must not grow one, because the reaper's unparkFires probe
+// calls Unpark to decide whether a park is somebody's to re-enter, and an arm
+// here would hold EVERY declined Task alive past ParkRetention - including the
+// overwhelming majority whose decline was a genuine verdict on the change.
+// Reclassifying it as UnparkTimer is refused for the reason unparkClasses gives:
+// a timer class requires a bounding counter and there is no CRD field to hold
+// one. The bound this recovery does have lives on ANNOTATIONS, read by
+// controller.driveCIRecoveryUnparks, exactly as driveRetiredUnparks' latch does.
+//
+// TAKEOVER IS EXCLUDED, and not defensively. On kind=takeover, implement-declined
+// is the agent's LOCAL-GIT name for a human push - the takeover skill declines on
+// an ls-remote mismatch or a non-fast-forward rejection, both local calls that
+// land before the operator's ownership flip - and UpgradeDeclineToOwnershipLost
+// already owns that reason there. Re-driving it would put an agent back on a
+// branch whose author has taken it back, in exactly the window before the flip
+// is recorded.
+//
+// reArm, not stampEnter: no state change, no reason change, and
+// StageElapsedCarrySeconds PRESERVED, so the residency dead-man switch stays
+// cumulative across the recovery. The Task lands back in the state it parked in -
+// under-implementation - where the reconciler mints a fresh implement pod, the
+// agent finds its own pushed work and a green pipeline, and the submission that
+// was refused goes through.
+func UnparkCIRecovered(t *v1alpha1.Task, now time.Time) error {
+	if t.Status.ParkReason != ReasonImplementDeclined {
+		return fmt.Errorf("ci-recovery un-park requires parkReason=%s, got %q",
+			ReasonImplementDeclined, t.Status.ParkReason)
+	}
+	if t.Spec.Kind == kindTakeover {
+		return fmt.Errorf("ci-recovery un-park is never for a takeover: implement-declined there names a human push")
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	reArm(t, now)
+	return nil
+}
+
 func UnparkRetiredPark(t *v1alpha1.Task, now time.Time) error {
 	class, ok := UnparkClassFor(t.Status.ParkReason)
 	if !ok || class != UnparkRetired {
