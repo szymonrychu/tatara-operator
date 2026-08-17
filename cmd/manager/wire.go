@@ -263,6 +263,17 @@ func (a adoptionSeedRunnable) NeedLeaderElection() bool { return false }
 // is per-project, so the Spiller is resolved per write, not captured once. It is
 // the SAME construction the mirror reconcilers use (addReconcilers), shared so
 // the webhook pendingEvents path spills to the identical per-project endpoint.
+//
+// It resolves THREE states, not two (#616):
+//
+//	memory disabled by spec -> objbudget.Discarding (evict and drop)
+//	enabled, no endpoint yet -> nil                 (block: unconfigured, 503)
+//	enabled, endpoint set    -> *memclient.Client   (spill)
+//
+// The middle case keys on the SPEC and not on the empty endpoint, and that
+// distinction is the whole point: a Project mid-provision also has an empty
+// endpoint, and it must keep blocking so nothing is destroyed a minute before
+// the stack it could have spilled to comes up.
 func newSpillerFor(mgr ctrl.Manager, cfg config.Config) func(*tataradevv1alpha1.Project) objbudget.Spiller {
 	memoryTokens := auth.NewTokenSource(auth.TokenSourceConfig{
 		TokenURL:     cfg.OIDCIssuer + "/protocol/openid-connect/token",
@@ -271,12 +282,30 @@ func newSpillerFor(mgr ctrl.Manager, cfg config.Config) func(*tataradevv1alpha1.
 		Audience:     "tatara-memory",
 	})
 	return func(proj *tataradevv1alpha1.Project) objbudget.Spiller {
-		endpoint := ""
-		if proj.Status.Memory != nil {
-			endpoint = proj.Status.Memory.Endpoint
+		if tataradevv1alpha1.MemoryDisabled(proj) {
+			return objbudget.Discarding
+		}
+		endpoint := memoryEndpointOf(proj)
+		if endpoint == "" {
+			return nil
 		}
 		return memclient.New(endpoint, memoryTokens.Token, nil)
 	}
+}
+
+// memoryEndpointOf is the nil-safe read of a Project's tatara-memory endpoint.
+//
+// status.memory is left NON-NIL when memory is disabled - disableMemory only
+// blanks Endpoint/ExternalEndpoint - so the struct's nil-ness says nothing
+// about whether there is a spill target. Both resolvers here therefore key on
+// the spec (MemoryDisabled) and on the endpoint STRING, never on the struct
+// pointer: that is the check #555 taught pod.go, assignment.go and
+// repository_controller.go, and did not teach this file.
+func memoryEndpointOf(proj *tataradevv1alpha1.Project) string {
+	if proj == nil || proj.Status.Memory == nil {
+		return ""
+	}
+	return proj.Status.Memory.Endpoint
 }
 
 // newMemoryFor builds the per-project restapi.NoteFetcher resolver: the
@@ -295,9 +324,12 @@ func newMemoryFor(mgr ctrl.Manager, cfg config.Config) func(*tataradevv1alpha1.P
 		Audience:     "tatara-memory",
 	})
 	return func(proj *tataradevv1alpha1.Project) restapi.NoteFetcher {
-		endpoint := ""
-		if proj.Status.Memory != nil {
-			endpoint = proj.Status.Memory.Endpoint
+		if tataradevv1alpha1.MemoryDisabled(proj) {
+			return nil
+		}
+		endpoint := memoryEndpointOf(proj)
+		if endpoint == "" {
+			return nil
 		}
 		return memclient.New(endpoint, memoryTokens.Token, nil)
 	}

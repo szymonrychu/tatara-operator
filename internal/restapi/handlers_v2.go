@@ -36,10 +36,10 @@ const (
 	// marker they all mirror, and the copy that was never written at all cost
 	// #495.
 	noteBodyMaxBytes = tatarav1alpha1.NoteBodyMaxBytes
-	// maxNotes is the Go-side note cap (C.2.6). At the cap the OLDEST note is
-	// spilled to tatara-memory and dropped. There is NO 409-on-cap: an agent
-	// must ALWAYS be able to write its handoff.
-	maxNotes = 50
+	// The C.2.6 note cap is tatarav1alpha1.MaxNotes, enforced by
+	// objbudget.FitTask(..., WithNoteCap()). It used to be a private constant
+	// here and only here, which is exactly why the three operator-side note
+	// appenders never obeyed it (#616).
 	// logTailMaxBytes caps the CI log tail served for a FAILING check (C.2.10).
 	logTailMaxBytes = 4000
 	// ciPacerEntries bounds the in-process CI pacer LRU.
@@ -241,9 +241,13 @@ func (s *Server) taskContext(w http.ResponseWriter, r *http.Request) {
 		// shortfall against what actually came back is the honest figure. It
 		// keeps the bundle's <notes> total (and therefore elided) truthful
 		// instead of silently redefining the history as "what we could read".
-		if failedRefs > 0 {
-			unavailableNotes = max(task.Status.Stats.NotesSpilled-len(rehydrated), 0)
-		}
+		//
+		// UNCONDITIONAL, not gated on failedRefs > 0. On a memory-disabled
+		// Project the cap DISCARDS: notesSpilled climbs while notesSpilledRefs
+		// stays empty, so there is no ref to fail and the gate made the bundle
+		// claim a complete history it does not have (#616). The expression is
+		// already 0 on a healthy read, so the gate bought nothing.
+		unavailableNotes = max(task.Status.Stats.NotesSpilled-len(rehydrated), 0)
 		notesTotal = len(notes) + unavailableNotes
 	}
 
@@ -271,7 +275,9 @@ func (s *Server) taskContext(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, contextResp{
 		Task: task.Name, Bundle: bundle,
-		NotesTruncated: unavailableRefs > 0, NotesUnavailableRefs: unavailableRefs,
+		// Truncated on EITHER signal: a ref that would not resolve, or notes
+		// that were discarded and have no ref to resolve at all.
+		NotesTruncated: unavailableRefs > 0 || unavailableNotes > 0, NotesUnavailableRefs: unavailableRefs,
 	})
 }
 
@@ -388,46 +394,29 @@ func (s *Server) postNote(w http.ResponseWriter, r *http.Request) {
 
 	spiller := s.spillerForOrNil(proj)
 
-	// The 50-note cap: spill the OLDEST batch to tatara-memory ONCE, outside
-	// the retry loop (a spill is a non-idempotent network call), then let the
-	// pure trim re-run on every conflict.
-	spillN := len(task.Status.Notes) + 1 - maxNotes
-	trackID := ""
-	if spillN > 0 {
-		// The write BLOCKS when it cannot spill - that is the deliberate A.7
-		// policy (SPILL FIRST, DROP ONLY ON SPILL SUCCESS), and a memory outage
-		// is a repairable fault, so no note is dropped meanwhile. What changed
-		// is only how the block is REPORTED: 500/502 reads as an operator bug
-		// and invites the agent to give up, while 503 + Retry-After says
-		// "temporarily unavailable, come back" - which is exactly true.
-		if spiller == nil {
-			objbudget.SpillBlocked(ctx, "Task", task.Name, objbudget.SpillBlockedReasonUnconfigured, spillN)
-			s.log.ErrorContext(ctx, "restapi: note cap reached with no spiller configured",
-				append(reqLogFields(r), "task", task.Name, "notes_to_spill", spillN)...)
-			writeRetryAfter(w, "note spill is unavailable; retry")
-			return
-		}
-		trackID, err = spiller.Spill(ctx, "Task", task.Name, task.Status.Notes[:spillN])
-		if err != nil {
-			objbudget.SpillBlocked(ctx, "Task", task.Name, objbudget.SpillBlockedReasonError, spillN)
-			s.log.ErrorContext(ctx, "restapi: spilling oldest notes failed",
-				append(reqLogFields(r), "task", task.Name, "notes_to_spill", spillN, "error", err)...)
-			writeRetryAfter(w, "note spill is unavailable; retry")
-			return
-		}
-	}
+	// The note cap is FitTask's now (WithNoteCap), not this handler's. It used
+	// to be enforced here and only here, so the three operator-side appenders
+	// grew the same journal past the cap unchecked and each overshoot made the
+	// next agent note need a bigger spill batch (#616).
+	spillN := max(len(task.Status.Notes)+1-tatarav1alpha1.MaxNotes, 0)
 
 	key := types.NamespacedName{Namespace: s.ns, Name: task.Name}
 	err = objbudget.FitTask(ctx, s.c, spiller, key, func(t *tatarav1alpha1.Task) {
 		t.Status.Notes = append(t.Status.Notes, note)
-		if spillN > 0 && len(t.Status.Notes) > maxNotes {
-			drop := len(t.Status.Notes) - maxNotes
-			t.Status.Notes = t.Status.Notes[drop:]
-			t.Status.Stats.NotesSpilled += drop
-			t.Status.Stats.NotesSpilledRefs = append(t.Status.Stats.NotesSpilledRefs, trackID)
-		}
 		t.Status.PinnedPlanNoteID = pinnedPlanNoteID(t)
-	})
+	}, objbudget.WithNoteCap())
+	if errors.Is(err, objbudget.ErrSpillFailed) || errors.Is(err, objbudget.ErrSpillerUnconfigured) {
+		// The write BLOCKS when it cannot spill - the deliberate A.7 policy
+		// (SPILL FIRST, DROP ONLY ON SPILL SUCCESS). 503 + Retry-After rather
+		// than 500/502 because both remaining cases are genuinely temporary: a
+		// tatara-memory outage, or an endpoint the Project has not published
+		// yet. A Project that is memory-free BY CONFIGURATION no longer reaches
+		// here at all - it resolves to objbudget.Discarding and the note lands.
+		s.log.ErrorContext(ctx, "restapi: spilling oldest notes failed",
+			append(reqLogFields(r), "task", task.Name, "notes_to_spill", spillN, "error", err)...)
+		writeRetryAfter(w, "note spill is unavailable; retry")
+		return
+	}
 	if errors.Is(err, objbudget.ErrObjectTooLarge) {
 		// The ONE way this write can still fail (fix L32). It does not 409 the
 		// agent: it fails the TASK, loudly, via a minimal patch that carries

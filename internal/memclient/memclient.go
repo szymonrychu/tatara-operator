@@ -365,6 +365,14 @@ func (c *Client) doOnce(ctx context.Context, method, path string, body []byte, t
 
 	resp, err := c.http.Do(req)
 	if err != nil {
+		// A URL with no scheme or host never left the process: this is a
+		// MISCONFIGURED client (an empty baseURL from a Project with no
+		// tatara-memory endpoint), not a transient transport fault. Classifying
+		// it retryable made every call burn the whole backoff schedule before
+		// failing, and reported a permanent wiring gap as an outage (#616).
+		if req.URL.Scheme == "" || req.URL.Host == "" {
+			return nil, fmt.Errorf("memclient: %s: %w", path, err)
+		}
 		return nil, &RetryableError{Path: path, Err: err}
 	}
 	defer func() { _ = resp.Body.Close() }()

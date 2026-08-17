@@ -176,6 +176,18 @@ const (
 	// (A.7): half the ~1.5MiB etcd object ceiling, the headroom reserved for
 	// metadata.managedFields growth we do not control.
 	ObjectByteBudget = 800_000
+	// MaxNotes is the C.2.6 note-count cap on Task.status.notes. It is a COUNT,
+	// deliberately, on top of the byte budget: notes are the only continuation
+	// state between pods, and an unbounded journal makes every turn-0 bundle
+	// grow without ever crossing ObjectByteBudget. At the cap the OLDEST note is
+	// evicted. There is NO 409-on-cap: an agent must ALWAYS be able to write its
+	// handoff.
+	//
+	// It lives here rather than in internal/restapi because the cap is a
+	// property of the OBJECT, not of the agent-facing REST path. Enforcing it in
+	// one handler while three operator-side appenders grew the same list without
+	// a cap is what wedged a memory-disabled Project past 50 notes (#616).
+	MaxNotes = 50
 	// OutcomeHandlerBudget is the maximum wall-clock a SINGLE /outcome handler may
 	// run: postOutcome bounds its request context with it, at the top, before the
 	// claim. Nothing else bounds that handler - internal/webhook/server.go sets only

@@ -720,6 +720,11 @@ func (o *outcomeCtx) commit(mutate func(*tatarav1alpha1.Task) error) bool {
 	var mutErr error
 	from := o.task.Status.State
 	var to, toReason, toPark string
+	// WithNoteCap: commit is the ONE door every agentNote write goes through,
+	// and it used to grow status.notes without a cap while only the REST note
+	// handler enforced one. That asymmetry is what pushed a Task to 53 notes and
+	// made every subsequent agent note need a bigger spill batch than the last
+	// (#616).
 	err := objbudget.FitTask(ctx, s.c, s.spillerForOrNil(o.proj), key, func(t *tatarav1alpha1.Task) {
 		if mutate != nil {
 			if err := mutate(t); err != nil {
@@ -735,7 +740,7 @@ func (o *outcomeCtx) commit(mutate func(*tatarav1alpha1.Task) error) bool {
 			Message:            o.fp,
 			LastTransitionTime: metav1.NewTime(s.now()),
 		})
-	})
+	}, objbudget.WithNoteCap())
 	if mutErr != nil {
 		var ill *stage.IllegalTransitionError
 		if errors.As(mutErr, &ill) {
