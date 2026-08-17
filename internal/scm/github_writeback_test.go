@@ -202,6 +202,57 @@ func TestGitHubEditIssue_404Benign(t *testing.T) {
 	require.NoError(t, c.EditIssue(context.Background(), "t", "o/r", 7, EditIssueReq{Body: &body}))
 }
 
+// EditPR is the PULL-REQUEST twin of EditIssue and carries the same PATCH
+// semantic: a title-only edit must not blank the body. That is the whole reason
+// the request type is pointer-shaped, and the reason submit_outcome's title can
+// now reach the forge at all.
+func TestGitHubEditPR_PatchesOnlyProvided(t *testing.T) {
+	var gotBody map[string]any
+	c := newGitHub(t, func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodPatch, r.Method)
+		require.Equal(t, "/repos/o/r/pulls/7", r.URL.Path)
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"number":7}`))
+	})
+	title := "chore(deps): bump terraform 42.99.0 to 43.4.4"
+	require.NoError(t, c.EditPR(context.Background(), "https://github.com/o/r.git", "t", 7, EditPRReq{Title: &title}))
+	require.Equal(t, "chore(deps): bump terraform 42.99.0 to 43.4.4", gotBody["title"])
+	_, bodyPresent := gotBody["body"]
+	require.False(t, bodyPresent, "body must NOT be sent when Body is nil")
+}
+
+func TestGitHubEditPR_BodyOnly(t *testing.T) {
+	var gotBody map[string]any
+	c := newGitHub(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusOK)
+	})
+	body := "the corrected description"
+	require.NoError(t, c.EditPR(context.Background(), "https://github.com/o/r.git", "t", 7, EditPRReq{Body: &body}))
+	require.Equal(t, "the corrected description", gotBody["body"])
+	_, titlePresent := gotBody["title"]
+	require.False(t, titlePresent, "title must NOT be sent when Title is nil")
+}
+
+// An empty request reaches the forge NEVER, rather than as a PATCH with an
+// empty object: the caller decides there is nothing to write, and a request
+// that spends a rate-limit token to say so is a bug.
+func TestGitHubEditPR_EmptyReqMakesNoCall(t *testing.T) {
+	c := newGitHub(t, func(_ http.ResponseWriter, _ *http.Request) {
+		t.Fatal("EditPR called the forge with no non-nil field")
+	})
+	require.NoError(t, c.EditPR(context.Background(), "https://github.com/o/r.git", "t", 7, EditPRReq{}))
+}
+
+func TestGitHubEditPR_404Benign(t *testing.T) {
+	c := newGitHub(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	})
+	title := "x"
+	require.NoError(t, c.EditPR(context.Background(), "https://github.com/o/r.git", "t", 7, EditPRReq{Title: &title}))
+}
+
 func TestGitHubEnableAutoMerge(t *testing.T) {
 	var gotGraphQL string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
