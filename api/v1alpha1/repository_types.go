@@ -89,6 +89,14 @@ type RepositoryStatus struct {
 	// this repo. Computed on reconcile.
 	// +optional
 	OpenIncidentsCount int `json:"openIncidentsCount,omitempty"`
+	// LastIssueScan is the last time the issueScan/sweep pass covered THIS
+	// repository. It exists because Project.Status.LastIssueScan is project-wide:
+	// a pass that swept some repos advanced the shared base past the fire time of
+	// the repos it did not sweep, deferring them a full cron period - every
+	// period, deterministically, to whichever repo's offset lost the race with
+	// reconcile jitter.
+	// +optional
+	LastIssueScan *metav1.Time `json:"lastIssueScan,omitempty"`
 }
 
 // +kubebuilder:object:root=true
