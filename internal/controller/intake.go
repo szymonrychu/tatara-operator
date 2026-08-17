@@ -513,13 +513,39 @@ func (m *Minter) mergeRequestCR(ctx context.Context, proj *tatarav1alpha1.Projec
 // C5). mutate must be idempotent (it runs on every retry against the fresh
 // object).
 func (m *Minter) stampMintStatus(ctx context.Context, task *tatarav1alpha1.Task, mutate func(*tatarav1alpha1.Task)) error {
+	return m.stampMintStatusIfChanged(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
+		mutate(fresh)
+		return true
+	})
+}
+
+// stampMintStatusIfChanged is stampMintStatus with a mutator that REPORTS
+// whether it changed anything. A false return skips the Status().Update
+// entirely and still refreshes the caller's copy.
+//
+// The distinction is only worth having because the decision must be made
+// against the FRESH object, never the caller's in-memory one. Since #604,
+// repairMRBinding's owned-by-us branch reaches the mrRefs stamp on paths that
+// run per open merge request per sweep pass, so an unconditional Update spent
+// an apiserver round trip - and a RetryOnConflict path under contention - on
+// every already-converged object, writing bytes identical to the ones there.
+// Short-circuiting on the CALLER's copy instead would be a correctness bug, not
+// an optimisation: a stale copy that still lists the ref is exactly the state an
+// interrupted mint leaves behind, and skipping there would decline to perform
+// the repair this function exists for.
+func (m *Minter) stampMintStatusIfChanged(ctx context.Context, task *tatarav1alpha1.Task,
+	mutate func(*tatarav1alpha1.Task) bool) error {
+
 	key := client.ObjectKeyFromObject(task)
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.Task{}
 		if err := m.Client.Get(ctx, key, fresh); err != nil {
 			return err
 		}
-		mutate(fresh)
+		if !mutate(fresh) {
+			*task = *fresh
+			return nil
+		}
 		if err := m.Client.Status().Update(ctx, fresh); err != nil {
 			return err
 		}
@@ -547,15 +573,25 @@ func (m *Minter) bindMRToTask(ctx context.Context, proj *tatarav1alpha1.Project,
 	return m.ownMergeRequest(ctx, proj, tatarav1alpha1.MergeRequestName(repo.Name, ext.Number), task, ef)
 }
 
-// repairMRBinding heals a review mint that was interrupted between the Task
-// create and bindMRToTask: the Task is live but its MergeRequest CR is an UNBOUND
-// stub (no controller owner, empty status), or was never created at all. It
-// re-runs the SAME mirror-and-own bind against the existing twin and re-stamps
-// mrRefs. It NEVER steals: a CR already controller-owned - by the twin (the
-// idempotent re-run) or, defensively, by anyone else - is left untouched, so the
-// repair is safe to run on every backstop pass and race-safe under concurrency
-// (ownMergeRequest is the real arbiter; this Get is a cheap skip for the common
-// already-bound case).
+// repairMRBinding heals a mint that was interrupted between the Task create and
+// bindMRToTask: the Task is live but its MergeRequest CR is an UNBOUND stub (no
+// controller owner, empty status), or was never created at all. It re-runs the
+// SAME mirror-and-own bind against the existing twin and re-stamps mrRefs. It
+// NEVER steals: a CR controller-owned by ANOTHER Task is left completely
+// untouched, so the repair is safe to run on every backstop pass and race-safe
+// under concurrency (ownMergeRequest is the real arbiter; this Get is a cheap
+// skip for the common already-bound case).
+//
+// THE OWNED-BY-US CASE FALLS THROUGH TO THE REF STAMP (#604). It used to return
+// nil for ANY controller-owned CR, which conflated "someone else's, hands off"
+// with "ours, and the bind half already landed". The mint is THREE writes -
+// createTaskRaceSafe, bindMRToTask, stampMintStatus - so an interruption between
+// the second and third leaves exactly that shape: the CR is ours, and mrRefs is
+// empty. Skipping it there made this backstop structurally unable to repair the
+// window it exists for, and a takeover's MR ALWAYS has a controller owner, so
+// the backstop was inert for that kind entirely. The bind is not re-run (it
+// already happened and ownMergeRequest would no-op anyway); only the stamp is,
+// and stampMintStatus is idempotent on the ref.
 func (m *Minter) repairMRBinding(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository,
 	ext scm.MergeRequest, task *tatarav1alpha1.Task, sp objbudget.Spiller) error {
 
@@ -563,8 +599,12 @@ func (m *Minter) repairMRBinding(ctx context.Context, proj *tatarav1alpha1.Proje
 	var mr tatarav1alpha1.MergeRequest
 	err := m.Client.Get(ctx, types.NamespacedName{Namespace: proj.Namespace, Name: name}, &mr)
 	if err == nil {
-		if _, owned := own.ControllerOwner(&mr); owned {
-			return nil // already bound (or foreign-owned): never steal, never re-mirror
+		if ctrl, owned := own.ControllerOwner(&mr); owned {
+			if ctrl != task.Name {
+				return nil // foreign-owned: never steal, never re-mirror
+			}
+			// Already OURS: the bind landed, the mrRefs stamp may not have.
+			return m.stampMRRef(ctx, task, name)
 		}
 	} else if !apierrors.IsNotFound(err) {
 		return fmt.Errorf("intake: repair get mergerequest %s: %w", name, err)
@@ -572,16 +612,46 @@ func (m *Minter) repairMRBinding(ctx context.Context, proj *tatarav1alpha1.Proje
 	if err := m.bindMRToTask(ctx, proj, repo, ext, task, sp); err != nil {
 		return err
 	}
-	log.FromContext(ctx).Info("intake: repaired interrupted review mint binding",
-		"action", "intake_repair_bind", "resource_id", task.Name, "mr", name)
-	return m.stampMintStatus(ctx, task, func(fresh *tatarav1alpha1.Task) {
-		if !slices.Contains(fresh.Status.MRRefs, name) {
-			fresh.Status.MRRefs = append(fresh.Status.MRRefs, name)
+	log.FromContext(ctx).Info("intake: repaired interrupted mint binding",
+		"action", "intake_repair_bind", "resource_id", task.Name, "mr", name,
+		"kind", task.Spec.Kind)
+	return m.stampMRRef(ctx, task, name)
+}
+
+// stampMRRef appends name to task.status.mrRefs, once. It is the LAST of the
+// three writes a mint makes, and the one an interruption most often loses -
+// mrRefs is what submit_outcome(action=submitted)'s open-MR gate and mr_write's
+// open-idempotency both read, so a Task missing it can neither finish nor
+// safely re-open.
+//
+// It writes only when the ref is genuinely absent from the FRESH object - see
+// stampMintStatusIfChanged for why that distinction is load-bearing rather than
+// a micro-optimisation.
+func (m *Minter) stampMRRef(ctx context.Context, task *tatarav1alpha1.Task, name string) error {
+	return m.stampMintStatusIfChanged(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
+		if slices.Contains(fresh.Status.MRRefs, name) {
+			return false
 		}
+		fresh.Status.MRRefs = append(fresh.Status.MRRefs, name)
+		return true
 	})
 }
 
-// repairIssueBinding is repairMRBinding's Issue-mint counterpart.
+// repairIssueBinding is repairMRBinding's Issue-mint counterpart, and it carries
+// the same OWNED-BY-US fall-through for the same reason (#604 review). The Issue
+// mint is three writes too - createTaskRaceSafe, SyncIssue+ownIssueForTask,
+// stampMintStatus - so an interruption between the last two leaves an Issue CR
+// controller-owned by THIS Task and an EMPTY status.issueRefs, and the old
+// blanket "any controller owner means hands off" skip declined to repair exactly
+// that.
+//
+// It matters MORE here than on the merge-request side, because issueRefs is what
+// verifyApprovalScope counts: a Task carrying none is refused no-live-issue at
+// `refined` forever - the #604 strand itself, arrived at from the other
+// direction and on the LIVE issue path rather than a dead one.
+//
+// The bind is not re-run when the CR is already ours (ownIssueForTask would
+// no-op); only the stamp is, and it is idempotent on the ref.
 func (m *Minter) repairIssueBinding(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository,
 	ext scm.Issue, task *tatarav1alpha1.Task, sp objbudget.Spiller) error {
 
@@ -589,8 +659,12 @@ func (m *Minter) repairIssueBinding(ctx context.Context, proj *tatarav1alpha1.Pr
 	var iss tatarav1alpha1.Issue
 	err := m.Client.Get(ctx, types.NamespacedName{Namespace: proj.Namespace, Name: name}, &iss)
 	if err == nil {
-		if _, owned := own.ControllerOwner(&iss); owned {
-			return nil // already bound (or foreign-owned): never steal, never re-mirror
+		if ctrl, owned := own.ControllerOwner(&iss); owned {
+			if ctrl != task.Name {
+				return nil // foreign-owned: never steal, never re-mirror
+			}
+			// Already OURS: the bind landed, the issueRefs stamp may not have.
+			return m.stampIssueRef(ctx, task, name)
 		}
 	} else if !apierrors.IsNotFound(err) {
 		return fmt.Errorf("intake: repair get issue %s: %w", name, err)
@@ -603,10 +677,24 @@ func (m *Minter) repairIssueBinding(ctx context.Context, proj *tatarav1alpha1.Pr
 	}
 	log.FromContext(ctx).Info("intake: repaired interrupted issue mint binding",
 		"action", "intake_repair_bind", "resource_id", task.Name, "issue", name)
-	return m.stampMintStatus(ctx, task, func(fresh *tatarav1alpha1.Task) {
-		if !slices.Contains(fresh.Status.IssueRefs, name) {
-			fresh.Status.IssueRefs = append(fresh.Status.IssueRefs, name)
+	return m.stampIssueRef(ctx, task, name)
+}
+
+// stampIssueRef is stampMRRef's Issue counterpart: it appends name to
+// task.status.issueRefs, once, and only when the ref is genuinely absent from
+// the FRESH object.
+//
+// The freshness is the whole point, exactly as it is for stampMRRef: an
+// interrupted mint leaves a CALLER whose in-memory copy may still list the ref
+// it never persisted, so deciding against the caller's copy would decline to
+// perform the repair this function exists for.
+func (m *Minter) stampIssueRef(ctx context.Context, task *tatarav1alpha1.Task, name string) error {
+	return m.stampMintStatusIfChanged(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
+		if slices.Contains(fresh.Status.IssueRefs, name) {
+			return false
 		}
+		fresh.Status.IssueRefs = append(fresh.Status.IssueRefs, name)
+		return true
 	})
 }
 

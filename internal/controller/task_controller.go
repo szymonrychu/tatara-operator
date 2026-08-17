@@ -113,11 +113,7 @@ type TaskReconciler struct {
 // +kubebuilder:rbac:groups=tatara.dev,resources=tasks/finalizers,verbs=update
 // +kubebuilder:rbac:groups=tatara.dev,resources=issues;mergerequests,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=tatara.dev,resources=issues/status;mergerequests/status,verbs=get;update;patch
-// repositories update/patch is what lets a freed upgrade lane stamp
-// SweepRequestedAnnotation on a repository that deferred an adoptable merge
-// request (releaseUpgradeLane). It is a metadata marker, never spec or status.
 // +kubebuilder:rbac:groups=tatara.dev,resources=projects;repositories,verbs=get;list;watch
-// +kubebuilder:rbac:groups=tatara.dev,resources=repositories,verbs=update;patch
 // +kubebuilder:rbac:groups="",resources=pods;services,verbs=get;list;watch;create;update;patch;delete
 
 // isFieldSelectorUnsupported reports whether a list error is "field label not
@@ -307,13 +303,6 @@ func (r *TaskReconciler) reconcileStage(ctx context.Context, project *tatarav1al
 	// parked binding repair above and the external-terminal finalize, the two
 	// narrow self-heals that may run first.
 	if tatarav1alpha1.TaskDone(task) || tatarav1alpha1.Parked(task) {
-		// THE FREED UPGRADE LANE. This early return is where every path to
-		// terminal-or-parked converges on the leader, whichever actor wrote the
-		// state, on the Task's own event - so it is where an upgrade Task's lane
-		// against maxOpenUpgrades is observed to be free. It stamps a sweep
-		// request and mints nothing; see releaseUpgradeLane. Latched, so the many
-		// later reconciles of the same terminal Task cost one cached List.
-		r.releaseUpgradeLane(ctx, project, task, now)
 		return ctrl.Result{}, nil
 	}
 

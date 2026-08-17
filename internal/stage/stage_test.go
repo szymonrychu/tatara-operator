@@ -15,28 +15,35 @@ import (
 // The transition table IS the contract.
 // ---------------------------------------------------------------------------
 
-// TWENTY-SIX edges. A new edge is a design decision, not a diff. The #521 plan
+// TWENTY-FIVE edges. A new edge is a design decision, not a diff. The #521 plan
 // specified 21; the 22nd and 23rd are both the nightly DOCUMENTATION BATCH,
 // which the plan did not trace: it is MINTED straight into under-implementation
 // (no driving issue to triage, no approval to gate) and it FINISHES at
-// done(doc-timeout) having opened no MR, so neither `refined -> done` nor
-// `(create) -> refined` reaches it. The 25th and 26th are `(create) -> done`
-// and `(create) -> rejected`, the #521 TERMINAL-RESET GUARD: pruning removed
-// status.stage on the read path, every pre-#521 Task is served stateless and
-// re-takes the create edge, and one that had already finished must land on its
-// terminal instead of being re-triaged.
-func TestTransitionTableHasExactlyTwentySixEdges(t *testing.T) {
+// done(doc-timeout) having opened no MR, so `refined -> done` does not reach it.
+// The 24th and 25th are `(create) -> done` and `(create) -> rejected`, the #521
+// TERMINAL-RESET GUARD: pruning removed status.stage on the read path, every
+// pre-#521 Task is served stateless and re-takes the create edge, and one that
+// had already finished must land on its terminal instead of being re-triaged.
+//
+// It was TWENTY-SIX until #604 deleted `(create) -> refined`. That edge had
+// exactly one occupant - the maintainer-gated takeover mint - and takeover owns
+// ZERO Issue CRs by construction, so the approval gate the state exists to run
+// could never grant for the only kind the edge served: every takeover burned a
+// pod and then parked awaiting-human, permanently. Takeover now rides
+// `(create) -> under-implementation`, which is where its own re-take un-park
+// already landed.
+func TestTransitionTableHasExactlyTwentyFiveEdges(t *testing.T) {
 	n := 0
 	for _, edges := range stage.Transitions {
 		n += len(edges)
 	}
-	require.Equal(t, 26, n,
+	require.Equal(t, 25, n,
 		"the table is the contract; a new edge is a design decision, not a diff")
 }
 
 func TestTransitionTableIsExactlyTheDocumentedShape(t *testing.T) {
 	want := map[string][]string{
-		stage.Create: {v1alpha1.StateNew, v1alpha1.StateRefined, v1alpha1.StateUnderImplementation,
+		stage.Create: {v1alpha1.StateNew, v1alpha1.StateUnderImplementation,
 			v1alpha1.StateDone, v1alpha1.StateRejected},
 		v1alpha1.StateNew:                 {v1alpha1.StateRefined, v1alpha1.StateAwaitingReview, v1alpha1.StateRejected},
 		v1alpha1.StateRefined:             {v1alpha1.StateUnderImplementation, v1alpha1.StateDone, v1alpha1.StateRejected},
@@ -315,16 +322,26 @@ func TestEnterFromAnEmptyStateUsesTheCreateEdge(t *testing.T) {
 	require.NoError(t, stage.Enter(tk, nil, v1alpha1.StateNew, "", now))
 	require.Equal(t, v1alpha1.StateNew, tk.Status.State)
 
-	tk2 := &v1alpha1.Task{Spec: v1alpha1.TaskSpec{Kind: "documentation"}}
-	require.NoError(t, stage.Enter(tk2, nil, v1alpha1.StateRefined, "", now))
+	// #604: NO mint may land on `refined` any more, whatever its kind. The gate
+	// state is reachable through TRIAGE only, so the kind arriving there has
+	// always been decided by triageTarget - which is what makes "did anyone
+	// check this kind owns an Issue?" answerable in one place.
+	tk2 := &v1alpha1.Task{Spec: v1alpha1.TaskSpec{Kind: "takeover"}}
+	require.Error(t, stage.Enter(tk2, nil, v1alpha1.StateRefined, "", now),
+		"a takeover minted into `refined` owns zero Issues, so the gate can never grant and it "+
+			"strands there: the edge was deleted in #604")
 
 	tk3 := &v1alpha1.Task{Spec: v1alpha1.TaskSpec{Kind: "documentation"}}
 	require.NoError(t, stage.Enter(tk3, nil, v1alpha1.StateUnderImplementation, "", now),
 		"the nightly documentation batch is minted straight into implementation work")
 
+	tk3b := &v1alpha1.Task{Spec: v1alpha1.TaskSpec{Kind: "takeover"}}
+	require.NoError(t, stage.Enter(tk3b, nil, v1alpha1.StateUnderImplementation, "", now),
+		"a takeover is minted straight into the work, where its own re-take un-park already lands")
+
 	tk4 := &v1alpha1.Task{Spec: v1alpha1.TaskSpec{Kind: "implement"}}
 	require.Error(t, stage.Enter(tk4, nil, v1alpha1.StateMerged, "", now),
-		"a mint may only land on new, refined, under-implementation or a terminal")
+		"a mint may only land on new, under-implementation or a terminal")
 }
 
 // THE #521 TERMINAL-RESET EDGES. Pruning removed status.stage on the READ path,
@@ -414,7 +431,7 @@ func TestPodNotReadyIsNotAReason(t *testing.T) {
 }
 
 func TestReasonsIsTheClosedSetAndTheThreeVocabulariesAreDisjoint(t *testing.T) {
-	require.Len(t, stage.Reasons, 36)
+	require.Len(t, stage.Reasons, 37)
 	for _, r := range stage.RejectReasons {
 		require.False(t, stage.IsParkReason(r), "%q cannot be both a reject and a park reason", r)
 		require.False(t, stage.IsDoneReason(r))
@@ -1028,10 +1045,12 @@ func TestReenterOnReviewChangesRequested(t *testing.T) {
 func TestReenterOnReviewChangesRequested_ResetsMergeAndHeadBudgets(t *testing.T) {
 	tk := task(v1alpha1.StateMerged)
 	tk.Status.MergeReentries, tk.Status.HeadMoveReentries, tk.Status.CIRedReentries = 2, 2, 2
+	tk.Status.MergeConflictReentries = 2
 	require.True(t, stage.ReenterOnReviewChangesRequested(tk, []v1alpha1.MergeRequest{{}}, now))
 	require.Zero(t, tk.Status.MergeReentries)
 	require.Zero(t, tk.Status.HeadMoveReentries)
 	require.Zero(t, tk.Status.CIRedReentries)
+	require.Zero(t, tk.Status.MergeConflictReentries)
 }
 
 func TestReenterOnReviewChangesRequested_MergeTimeoutAccounting(t *testing.T) {

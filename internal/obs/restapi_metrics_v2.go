@@ -80,6 +80,29 @@ var (
 		Name: "operator_rest_title_clamped_total",
 		Help: "Agent-supplied issue titles rewritten by the forge-title clamp, by call site (#529).",
 	}, []string{"site"})
+
+	// RestTakeoverRefusedTotal counts mr_takeover_request calls REFUSED because
+	// the merge request's takeover Task is parked for a reason nothing can
+	// resume (#604 review). It is separate from RestTakeoverErrorTotal on
+	// purpose: that one counts operator faults (a mint, owner-ref or stamp write
+	// that failed), this one counts a CORRECT refusal - and conflating a 409 the
+	// design intends with a 500 it does not would make both unreadable.
+	//
+	// It is the endpoint's only PERMANENT refusal: a merge request nobody can
+	// take over until the Task ages out at ParkRetention. Labelled by park
+	// reason, because "which terminal is stranding maintainers" is the only
+	// interesting question about it - and it is the series that makes this dead
+	// end visible to the same sweep that checks whether takeover has ever fired
+	// at all.
+	//
+	// NOT pre-seeded. The label is a park reason, and pre-seeding would mint a
+	// series per UnparkNever/UnparkRetired reason for a path that has never once
+	// fired in production; the query that matters here is a sum over retention,
+	// not a rate on a named reason.
+	RestTakeoverRefusedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "operator_rest_takeover_refused_total",
+		Help: "mr_takeover_request calls refused because the takeover task is parked unresumably, by park reason.",
+	}, []string{"reason"})
 )
 
 // The call sites of RestTitleClampedTotal, pre-seeded below so a healthy
@@ -90,6 +113,10 @@ const (
 	TitleSiteBrainstormPropose = "brainstorm_propose"
 	TitleSiteIssueCreate       = "issue_create"
 	TitleSiteIssueEdit         = "issue_edit"
+	// TitleSiteMREdit is the submit_outcome title on its way to the merge
+	// request. It is the one non-issue site: a forge caps a merge request title
+	// at the same length it caps an issue title, so the same clamp applies.
+	TitleSiteMREdit = "mr_edit"
 )
 
 func init() {
@@ -101,6 +128,7 @@ func init() {
 		RestTakeoverErrorTotal,
 		RestNotesRehydrateFailedTotal,
 		RestTitleClampedTotal,
+		RestTakeoverRefusedTotal,
 	)
 	// Pre-seed the three real takeover-error stage label sets so a healthy
 	// operator exposes a zero baseline from startup (metric-wiring audit
@@ -113,4 +141,5 @@ func init() {
 	RestTitleClampedTotal.WithLabelValues(TitleSiteBrainstormPropose)
 	RestTitleClampedTotal.WithLabelValues(TitleSiteIssueCreate)
 	RestTitleClampedTotal.WithLabelValues(TitleSiteIssueEdit)
+	RestTitleClampedTotal.WithLabelValues(TitleSiteMREdit)
 }

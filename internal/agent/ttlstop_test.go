@@ -126,9 +126,26 @@ type directNoteAppender struct {
 }
 
 func (a *directNoteAppender) AppendNote(ctx context.Context, taskName string, n tatarav1alpha1.Note) error {
+	return a.append(ctx, taskName, n, false)
+}
+
+func (a *directNoteAppender) AppendNoteOnce(ctx context.Context, taskName string, n tatarav1alpha1.Note) error {
+	return a.append(ctx, taskName, n, true)
+}
+
+func (a *directNoteAppender) append(ctx context.Context, taskName string, n tatarav1alpha1.Note, once bool) error {
 	fresh := &tatarav1alpha1.Task{}
 	if err := a.c.Get(ctx, types.NamespacedName{Namespace: a.ns, Name: taskName}, fresh); err != nil {
 		return err
+	}
+	// Deduped against the object just read, matching FitNoteAppender: the point of
+	// AppendNoteOnce is that the decision and the mutation see one version.
+	if once {
+		for _, have := range fresh.Status.Notes {
+			if have.Agent == n.Agent && have.Body == n.Body {
+				return nil
+			}
+		}
 	}
 	fresh.Status.Notes = append(fresh.Status.Notes, n)
 	return a.c.Status().Update(ctx, fresh)

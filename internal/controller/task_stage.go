@@ -1002,14 +1002,21 @@ func (r *TaskReconciler) reconcileTriaging(ctx context.Context, proj *tatarav1al
 // through to the no-row branch means a documentation Task that somehow does
 // arrive at `new` parks at triage-stalled, loudly and once, instead of grinding
 // against an edge that does not exist.
+//
+// THERE IS NO `takeover` ROW EITHER, for the same reason, since #604. It used to
+// return `refined` - the SECOND enforcement site for a routing that could never
+// work, because a takeover owns zero Issue CRs and the gate at `refined` refuses
+// no-live-issue forever. Deleting only the mint would have left this row able to
+// put a takeover back in front of that gate, which is the two-enforcement-sites
+// trap MEMORY.md records. takeover_mint.go mints straight into
+// under-implementation and a takeover never reaches triage; one that somehow
+// does now parks triage-stalled, loudly, exactly as documentation does.
 func triageTarget(task *tatarav1alpha1.Task) (string, bool) {
 	if task == nil {
 		return "", false
 	}
 	switch task.Spec.Kind {
 	case stage.AgentBrainstorm, stage.AgentIncident, stage.AgentRefine, stage.AgentImplement:
-		return tatarav1alpha1.StateRefined, true
-	case "takeover":
 		return tatarav1alpha1.StateRefined, true
 	case stage.AgentReview:
 		return tatarav1alpha1.StateAwaitingReview, true
@@ -1395,6 +1402,8 @@ func (r *TaskReconciler) stalledTurnStop(ctx context.Context, proj *tatarav1alph
 		// idle, so this caller almost always lands on the synthetic note.
 		LastFinalText: task.Status.LastTurnFinalText,
 		PushedRepos:   task.Status.LastTurnPushedRepos,
+		FailedRepos:   task.Status.LastTurnFailedRepos,
+		ReposTurnID:   task.Status.LastTurnReposTurnID,
 	})
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("stalled turn stop %s: %w", task.Name, err)
@@ -1463,6 +1472,8 @@ func (r *TaskReconciler) ttlStop(ctx context.Context, proj *tatarav1alpha1.Proje
 		// the non-empty-notes guarantee vacuous (#527).
 		LastFinalText: task.Status.LastTurnFinalText,
 		PushedRepos:   task.Status.LastTurnPushedRepos,
+		FailedRepos:   task.Status.LastTurnFailedRepos,
+		ReposTurnID:   task.Status.LastTurnReposTurnID,
 	}
 	res, err := stopper.StopWithHandoff(ctx, task, in)
 	if err != nil {
@@ -1532,6 +1543,13 @@ func logTTLStop(ctx context.Context, okMsg, lostMsg, action string, res agent.TT
 func clearLastTurn(t *tatarav1alpha1.Task) {
 	t.Status.LastTurnFinalText = ""
 	t.Status.LastTurnPushedRepos = nil
+	// The failed set is the one whose staleness does more than misreport. A
+	// leftover non-empty list makes the NEXT stop compute contentFree=false, so a
+	// pod that produced nothing at all writes a normal-looking note, skips
+	// syntheticNoteLostBody() and never fires RecordEmptySynthetic - the #527
+	// detector disarmed by a slice nobody retired.
+	t.Status.LastTurnFailedRepos = nil
+	t.Status.LastTurnReposTurnID = ""
 }
 
 // turn0Marker identifies the pod turn-0 was submitted to. A respawn re-stamps

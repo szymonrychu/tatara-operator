@@ -498,6 +498,45 @@ func TestPublishNextExpected_ThroughRunScans(t *testing.T) {
 	})
 }
 
+// TestPublishNextExpected_AfterSweepIsNotInThePast is the code review
+// Finding 2 regression: stampRepoScan persisted its stamp to etcd but never
+// updated the caller's in-memory copy, and dueRepos elements are COPIES of
+// the matching `repos` entry (reposDueForScan appends repos[i] by value) - so
+// the deferred publishNextExpected -> earliestIssueScanFire kept reading each
+// swept repo's PRE-pass stamp. For a repo that already carried its own
+// per-repo stamp from an earlier period, that stale stamp recomputes to the
+// SAME fire that just triggered this pass - a timestamp now in the past.
+func TestPublishNextExpected_AfterSweepIsNotInThePast(t *testing.T) {
+	ctx := context.Background()
+	cronSpec := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *"}}
+	proj, repo := seedScanProject(t, "nx-not-past", cronSpec)
+
+	// The repo already carries its OWN per-repo stamp from long enough ago
+	// that its next occurrence is comfortably in the past - due via
+	// repoIssueScanBase's own-stamp branch, not the project-wide fallback
+	// (which stampScan's in-memory update already keeps correct regardless
+	// of this finding).
+	stale := metav1.NewTime(time.Now().Add(-3 * time.Hour))
+	repo.Status.LastIssueScan = &stale
+	if err := k8sClient.Status().Update(ctx, repo); err != nil {
+		t.Fatalf("seed repo LastIssueScan: %v", err)
+	}
+
+	r := newScanReconciler(&fakeReader{})
+
+	before := time.Now()
+	if _, _, _, _, err := r.runScans(ctx, proj); err != nil {
+		t.Fatalf("runScans: %v", err)
+	}
+
+	got := testutil.ToFloat64(obs.SweepNextExpectedTimestamp.WithLabelValues(proj.Name, "issueScan"))
+	if got < float64(before.Unix()) {
+		t.Fatalf("SweepNextExpectedTimestamp{issueScan} = %v (%s), published a fire in the PAST relative to "+
+			"the pass that just swept the repo (before=%v) - the deferred publish read the repo's pre-pass stamp",
+			got, time.Unix(int64(got), 0), before)
+	}
+}
+
 // TestRunScans_CronClearedRetractsNextExpected: a Project whose spec.scm.cron
 // (or spec.scm itself) transitions to nil - both +optional pointers - hits
 // runScans' early-return guard, which returns BEFORE the publishNextExpected

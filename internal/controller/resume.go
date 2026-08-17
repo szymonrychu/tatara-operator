@@ -373,6 +373,30 @@ func (r *ProjectReconciler) liveIssue(ctx context.Context, ns, name string) (*ta
 // shares ourMR + the AnnTerminalClosed marker with the reaper's closeOwnMRs.
 func (r *ProjectReconciler) closeTaskBotMRs(ctx context.Context, proj *tatarav1alpha1.Project,
 	t *tatarav1alpha1.Task, trigger string) error {
+
+	// A MERGE-STAGE park's merge request is FINISHED, REVIEWED WORK whose blocker
+	// is outside the code (stage.IsMergeStagePark), so closing it to make room for
+	// a re-implementation destroys the work and leaves the blocker untouched -
+	// ansible!16 and terraform!215, 2026-08-10, both approved and conflict-free.
+	// The guard lives HERE, at the irreversible forge write, and not at
+	// resumeOne's call site: this is the function every present and future caller
+	// has to come through, and a call-site copy would be a second thing to keep
+	// true. driveStrandedParks no longer reaches this path at all for these
+	// reasons; the HUMAN-REPLY caller does, and is refused too, because the
+	// merge-stage notice invites exactly that reply and must not bait a
+	// maintainer into the destruction it just warned about.
+	//
+	// resumeTriggerAutoCollect IS EXEMPT and must stay exempt: it re-mints
+	// nothing and every owned issue is already closed, so the PR is being cleaned
+	// up rather than superseded, and leaving it open there would strand an open
+	// forge PR whose mirror cascades away with the Task the collect then deletes.
+	if trigger != resumeTriggerAutoCollect && stage.IsMergeStagePark(t.Status.ParkReason) {
+		log.FromContext(ctx).Info("resume: refusing to close a merge-stage-parked task's reviewed merge requests",
+			"action", "resume_close_refused", "resource_id", t.Name,
+			"park_reason", t.Status.ParkReason, "trigger", trigger)
+		return nil
+	}
+
 	mrs, err := r.ownedMRs(ctx, t)
 	if err != nil {
 		return err

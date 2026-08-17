@@ -196,7 +196,17 @@ type TaskSpec struct {
 	// rename because the create edge can now land in TWO orthogonal places at
 	// once: a sweep-minted backlog owner is `new` AND parked(backlog-sweep), and
 	// `parked` is no longer a state it could have been expressed as.
-	// +kubebuilder:validation:Enum=new;refined;under-implementation
+	//
+	// `refined` was REMOVED from the enum by #604, in lockstep with deleting the
+	// `(create) -> refined` edge from stage.Transitions. The two must move
+	// together: an admitted `initialState: refined` whose edge no longer exists
+	// makes stage.Enter return *IllegalTransitionError on EVERY reconcile pass
+	// forever, incrementing operator_illegal_state_transition_total - whose alert
+	// declares any non-zero value a table bug rather than a spec bug. Narrowing
+	// the enum turns that permanent silent loop into an admission rejection at
+	// the moment the bad spec is written. Safe to narrow: `refined` had exactly
+	// one writer (the takeover mint) and no Task carrying it exists.
+	// +kubebuilder:validation:Enum=new;under-implementation
 	// +optional
 	InitialState string `json:"initialState,omitempty"`
 	// InitialParkReason is the park flag a mint stamps ALONGSIDE InitialState
@@ -511,7 +521,7 @@ type TaskStatus struct {
 	// stage.Enter asserts ParkReason == "" on every non-park edge and refuses
 	// otherwise, and stage.Unpark is the ONE function that clears it. Nothing
 	// else in the codebase may assign to this field.
-	// +kubebuilder:validation:Enum=backlog-sweep;triage-stalled;name-too-long;stage-deadline;awaiting-human;identity-unverified;implement-declined;review-loop-exhausted;review-post-refused;merge-timeout;merge-blocked;merge-order-missing;deploy-timeout;deploy-blocked;no-outcome;turn-budget-exhausted;pod-recreation-exhausted;object-too-large;fold-adoption-unverified;admission-starved;agent-contract-mismatch;operator-error;head-moving;handoff-stalled;ownership-lost;merge-auth-refused;ci-red;ci-blocked
+	// +kubebuilder:validation:Enum=backlog-sweep;triage-stalled;name-too-long;stage-deadline;awaiting-human;identity-unverified;implement-declined;review-loop-exhausted;review-post-refused;merge-timeout;merge-blocked;merge-order-missing;deploy-timeout;deploy-blocked;no-outcome;turn-budget-exhausted;pod-recreation-exhausted;object-too-large;fold-adoption-unverified;admission-starved;agent-contract-mismatch;operator-error;head-moving;handoff-stalled;ownership-lost;merge-auth-refused;ci-red;ci-blocked;merge-conflict
 	// +optional
 	ParkReason string `json:"parkReason,omitempty"`
 	// +optional
@@ -706,6 +716,18 @@ type TaskStatus struct {
 	// Cap 3 -> failed(ci-blocked).
 	// +optional
 	CIRedReentries int `json:"ciRedReentries,omitempty"`
+	// MergeConflictReentries bounds the SIXTH cycle: the conflict self-heal.
+	// A TATARA-OWNED merge request the forge reports DIRTY is a textual conflict
+	// with the base, and the merge corridor is pod-less, so polling it until the
+	// 4h budget parks it is a permanent dead end - nobody else is coming for the
+	// branch, and an adopted upgrade merge request its bot will not touch again
+	// (Renovate freezes on a branch an agent has committed to) is stuck forever.
+	// The Task therefore goes back to implementing, where an agent can reconcile
+	// and push. Like every other bounce it spawns pods, so it gets a counter.
+	// Cap 3 -> parked(merge-blocked), which is exactly where the stall-and-time-out
+	// path landed it before this cycle existed.
+	// +optional
+	MergeConflictReentries int `json:"mergeConflictReentries,omitempty"`
 	// CIWaitSince is THE CI HOLD (PR B): the implement outcome was ACCEPTED, the
 	// code is pushed, and the advance to awaiting-review is HELD because CI at
 	// the pushed head is still pending/running. It is the timestamp of the accept
@@ -807,6 +829,50 @@ type TaskStatus struct {
 	// +optional
 	// +kubebuilder:validation:MaxItems=20
 	LastTurnPushedRepos []string `json:"lastTurnPushedRepos,omitempty"`
+	// LastTurnFailedRepos is the set of repos whose commit/push FAILED on the
+	// finishing turn, and it is the other half of the same sentence
+	// LastTurnPushedRepos starts.
+	//
+	// The wrapper's turn-end loop used to abort on the first repo that errored,
+	// so a failure was total and loud. It now attempts every repo and joins the
+	// errors (tatara-claude-code-wrapper#167), which turns one loud failure into a
+	// partial success - and a SHORT pushedRepos list is indistinguishable from a
+	// turn that simply had nothing to push in those repos. Without this field the
+	// operator stamps a truthful-looking partial as the turn's whole result.
+	//
+	// It matters more than pushedRepos, not less: /workspace is the container
+	// writable layer with no volume, so a repo that failed to push holds commits
+	// that exist nowhere but on a disk about to disappear. It is rendered into the
+	// G.7 synthetic handoff note for exactly that reason.
+	//
+	// Written under the same known/unknown gate as LastTurnPushedRepos: the poll
+	// backstop's TurnResult carries no such field, so it leaves whatever the
+	// callback recorded alone - but only for its OWN turn, see
+	// LastTurnReposTurnID.
+	// +optional
+	// +kubebuilder:validation:MaxItems=20
+	LastTurnFailedRepos []string `json:"lastTurnFailedRepos,omitempty"`
+	// LastTurnReposTurnID names the turn the two repo lists above describe. It
+	// exists because the poll backstop stamps a NEWER turn's final text while
+	// knowing nothing about that turn's repos, which would otherwise leave the
+	// previous turn's lists attached to it.
+	//
+	// The two lists are then treated differently, and deliberately so: a stale
+	// pushedRepos is optimistic and inert (the commits it names really are on
+	// origin, they are simply older than the text beside them), while a stale
+	// failedRepos is an active instruction to redo work that has since landed -
+	// and it would additionally make a content-free stop compute contentFree=false,
+	// re-disarming the #527 empty-synthetic detector. So the failures are dropped
+	// when they belong to an older turn and the pushes are kept.
+	//
+	// The id is the WRAPPER's, and nothing operator-side bounds it, so the write
+	// path clamps it to MaxLength rather than letting an over-long one have the
+	// apiserver reject the whole status update - which would lose the final text
+	// and both lists, not just the id. The ownership comparison clamps the same
+	// way, so a clamped id still matches the turn that wrote it.
+	// +optional
+	// +kubebuilder:validation:MaxLength=256
+	LastTurnReposTurnID string `json:"lastTurnReposTurnId,omitempty"`
 }
 
 // +kubebuilder:object:root=true

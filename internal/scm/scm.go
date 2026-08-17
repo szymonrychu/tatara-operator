@@ -15,26 +15,45 @@ import (
 
 // WebhookEvent is the provider-agnostic parse of an inbound SCM webhook.
 type WebhookEvent struct {
-	Kind         string // "push" | "issue" | "mr" | "ci" | "other"
-	Repo         string // remote URL
-	Branch       string // for push
-	Labels       []string
-	Title        string
-	Body         string // issue/PR/MR description body
-	CommentBody  string // the comment text for issue_comment/note (created) events
-	CommentID    int    // provider comment id for idempotency (0 when not a comment event)
-	IsComment    bool   // true only for issue_comment/Note-Hook events (not label/state events)
-	IssueRef     string // owner/repo#123 (github) or group/proj!iid (gitlab)
-	URL          string
-	AuthorLogin  string // login of the issue/PR/MR author (the resource author)
-	ActorLogin   string // login of the user who triggered the event (the sender)
-	Action       string // opened|labeled|unlabeled|closed|synchronize|submitted|created|other
-	Number       int    // issue/PR/MR number (github) or iid (gitlab)
-	IsPR         bool   // true for mr/pull_request events
-	Merged       bool   // true when a PR/MR-close delivery is a MERGE (GitHub pull_request.merged / GitLab action=merge)
-	HeadSHA      string // PR/MR head commit (for CI lookup); push after-SHA (documentation agent diff head)
-	BaseSHA      string // push before-SHA (documentation agent diff base); empty for non-push events
-	HeadBranch   string // PR/MR source branch
+	Kind        string // "push" | "issue" | "mr" | "ci" | "other"
+	Repo        string // remote URL
+	Branch      string // for push
+	Labels      []string
+	Title       string
+	Body        string // issue/PR/MR description body
+	CommentBody string // the comment text for issue_comment/note (created) events
+	CommentID   int    // provider comment id for idempotency (0 when not a comment event)
+	IsComment   bool   // true only for issue_comment/Note-Hook events (not label/state events)
+	IssueRef    string // owner/repo#123 (github) or group/proj!iid (gitlab)
+	URL         string
+	AuthorLogin string // login of the issue/PR/MR author (the resource author)
+	ActorLogin  string // login of the user who triggered the event (the sender)
+	Action      string // opened|labeled|unlabeled|closed|synchronize|submitted|created|other
+	Number      int    // issue/PR/MR number (github) or iid (gitlab)
+	IsPR        bool   // true for mr/pull_request events
+	Merged      bool   // true when a PR/MR-close delivery is a MERGE (GitHub pull_request.merged / GitLab action=merge)
+	HeadSHA     string // PR/MR head commit (for CI lookup); push after-SHA (documentation agent diff head)
+	BaseSHA     string // push before-SHA (documentation agent diff base); empty for non-push events
+	HeadBranch  string // PR/MR source branch
+
+	// HeadRepo identifies the repository the HEAD branch lives in, as a FORGE
+	// SLUG (a GitHub full_name, a GitLab path_with_namespace).
+	//
+	// IT IS NOT IN Repo's NAMESPACE, whatever this comment claimed before the
+	// whole-branch review. Repo three fields above is a CLONE URL; the slug that
+	// belongs beside this one is scm.PRRef.Repo, which the webhook derives with
+	// its own repoSlug. AdoptUpgradeMR's fork clause compares the two and fails
+	// CLOSED on a mismatch, so reading Repo as a slug here would refuse every
+	// adoption for a project forever while every delivery still answered 202 -
+	// MEMORY.md 2026-08-16 records that exact near-miss.
+	//
+	// It is the webhook-path input to AdoptUpgradeMR
+	// clause (d): a merge request whose head is NOT the base repo is a FORK
+	// merge request and is never adopted, whatever its head branch is named.
+	// EMPTY means the forge did not report it, and every consumer fails CLOSED
+	// on empty - it is never defaulted to the base repo.
+	HeadRepo string // PR/MR source repository slug; empty when unreported
+
 	ChangedLabel string // for labeled/unlabeled: the single label added/removed
 
 	// CIStatus is set ONLY on Kind:"ci" deliveries (GitHub check_suite /
@@ -115,6 +134,20 @@ type EditIssueReq struct {
 	Title  *string
 	Body   *string
 	Labels *[]string
+}
+
+// EditPRReq is a PATCH on a pull/merge request: only non-nil fields are sent.
+//
+// It has NO Labels field, unlike EditIssueReq, and that omission is deliberate.
+// A merge request's labels already have two writers - the semver projection
+// (MergeRequest.status.significance -> semver:<level>, applied by the operator
+// immediately before the merge) and the trigger-label logic - and CI cuts the
+// release tag from that label. A third writer reaching the same field through
+// this request would be a race over what version ships. Label writes go through
+// AddLabel/RemoveLabel, which are per-label and do not clobber the set.
+type EditPRReq struct {
+	Title *string
+	Body  *string
 }
 
 // BoardItem is one project-board item listed for cron issue-triage.
@@ -243,6 +276,14 @@ type SCMWriter interface {
 	// never had auto-merge armed returns an error callers treat as non-fatal.
 	DisableAutoMerge(ctx context.Context, repoURL, token, prURL string) error
 	ClosePR(ctx context.Context, repoURL, token string, number int, body string) error
+	// EditPR updates a pull/merge request with only the non-nil fields in req,
+	// so a title-only edit never blanks the body. A 404 (the PR/MR is gone) is
+	// benign and returns nil, as in EditIssue.
+	//
+	// It is what makes a reviewer's "correct the title" finding actionable: the
+	// title and body an agent submits on submit_outcome reach the forge through
+	// here, and there is no other writer for either field.
+	EditPR(ctx context.Context, repoURL, token string, number int, req EditPRReq) error
 	AddBoardItem(ctx context.Context, token string, board BoardRef, itemURL string) error
 	SetBoardColumn(ctx context.Context, token string, board BoardRef, itemURL, column string) error
 	CloseIssue(ctx context.Context, token, repo string, number int, comment string) error
@@ -252,8 +293,14 @@ type SCMWriter interface {
 	// EnsureLabel ensures a label exists on the repo with the given hex color
 	// (6 hex digits, no '#'), creating it or updating its color. Idempotent.
 	EnsureLabel(ctx context.Context, repoURL, token, name, color string) error
-	// GetMergeState returns the provider-neutral mergeability of the PR/MR,
-	// used by the conflict self-heal (merge gate + stranded-DIRTY-PR sweep).
+	// GetMergeState returns the provider-neutral mergeability of the PR/MR. It has
+	// exactly ONE caller, the merge gate (controller/merge.go), which splits its
+	// answer three ways: dirty on a tatara-owned merge request routes the Task
+	// back to an agent that can reconcile the branch, dirty on an external one and
+	// blocked stall, and everything else attempts the merge. The comment here used
+	// to promise a "stranded-DIRTY-PR sweep" as well; no such sweep was ever
+	// written, and a comment describing a mechanism that does not exist is how the
+	// next reader concludes the case is already handled.
 	GetMergeState(ctx context.Context, repoURL, token string, number int) (MergeState, error)
 	// AddSubIssue makes childNumber a sub-issue of parentRef (owner/repo#parent).
 	// GitHub keys the sub-issues API on the child's numeric id (NOT its number),

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"hash/fnv"
+	"math/bits"
 	"sort"
 	"strconv"
 	"strings"
@@ -102,7 +103,14 @@ func scanOffset(project, repo, activity string, period time.Duration) time.Durat
 	}
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(project + "\x00" + repo + "\x00" + activity))
-	return time.Duration(uint64(h.Sum32()) % uint64(period))
+	// hash * period / 2^32 via exact 128-bit multiplication, not `hash %
+	// period`: period is a time.Duration in NANOSECONDS (1.44e13 for a 4h
+	// cron), while h.Sum32() maxes at 2^32-1 (4.29e9) - a plain modulo is a
+	// no-op against anything past a ~4.3s period, and every offset collapsed
+	// into [0, 4.3s) regardless of the configured period (the production
+	// regression this replaces).
+	hi, lo := bits.Mul64(uint64(h.Sum32()), uint64(period))
+	return time.Duration(hi<<32 | lo>>32)
 }
 
 // cronPeriod returns the nominal interval between two consecutive fires of a
@@ -117,6 +125,27 @@ func cronPeriod(sched cron.Schedule, base time.Time) time.Duration {
 // given the base cron schedule and the repo's deterministic offset.
 func repoNextFire(sched cron.Schedule, offset time.Duration, after time.Time) time.Time {
 	return sched.Next(after.Add(-offset)).Add(offset)
+}
+
+// repoIssueScanBase resolves the base time a repo's phase-shifted issueScan
+// fire anchors on: its own Status.LastIssueScan stamp when it has one, else
+// the project-wide projectBase. Without this, EVERY repo shared one
+// project-wide stamp - a pass that swept some repos advanced that shared base
+// past the fire of the repos it did not sweep (reconcile jitter losing to a
+// pass that takes several seconds against offsets spread by mere seconds
+// under the old collapsed scanOffset, or simply an unlucky small offset even
+// with scanOffset fixed), deferring them a FULL cron period, every period,
+// deterministically. Anchoring per-repo breaks that: once a repo is actually
+// swept it owns its own schedule and stops drifting with every other repo's
+// pass duration. The fallback is what makes the upgrade land cleanly - on the
+// first pass after rollout every never-stamped repo computes a fire that is
+// already in the past (dueBase's own creationTimestamp/never-run contract)
+// and is swept immediately.
+func repoIssueScanBase(repo *tatarav1alpha1.Repository, projectBase time.Time) time.Time {
+	if repo.Status.LastIssueScan != nil {
+		return repo.Status.LastIssueScan.Time
+	}
+	return projectBase
 }
 
 // label key aliases for readability within this package.
@@ -458,34 +487,6 @@ func (r *ProjectReconciler) activityDue(proj *tatarav1alpha1.Project, activity s
 	return base, !time.Now().Before(next), next, true
 }
 
-// sweepRequested reports whether a webhook has asked for this repo's slot to be
-// pulled forward SINCE the pass anchored at base last ran. It is the pulled-
-// forward half of reposDueForScan's due test; see SweepRequestedAnnotation for
-// why the request is a compared instant rather than a cleared flag.
-//
-// issueScan ONLY. brainstorm and documentation run through activityDue with no
-// per-repo slot at all, and nothing stamps a request for them - honouring the
-// marker for every activity would let one webhook drag unrelated crons forward.
-//
-// FAILS INERT, NOT OPEN. An absent, empty or unparseable value is simply not a
-// request: a marker that made a repo permanently due would turn the 30s project
-// reconcile into a 30s forge-listing loop, which is a worse failure than the
-// four-hour wait this whole mechanism exists to remove.
-func sweepRequested(repo *tatarav1alpha1.Repository, activity string, base time.Time) bool {
-	if activity != "issueScan" || repo == nil {
-		return false
-	}
-	raw := repo.Annotations[tatarav1alpha1.SweepRequestedAnnotation]
-	if raw == "" {
-		return false
-	}
-	at, err := time.Parse(time.RFC3339, raw)
-	if err != nil {
-		return false
-	}
-	return at.After(base)
-}
-
 // reposDueForScan returns the repos whose deterministic phase-shifted fire for
 // `activity` has occurred since the last project-level scan stamp, plus the
 // soonest upcoming per-repo fire (for requeue). ok=false when the schedule is
@@ -507,8 +508,12 @@ func (r *ProjectReconciler) reposDueForScan(proj *tatarav1alpha1.Project, activi
 	var due []tatarav1alpha1.Repository
 	var soonest time.Time
 	for i := range repos {
+		repoBase := base
+		if activity == "issueScan" {
+			repoBase = repoIssueScanBase(&repos[i], base)
+		}
 		off := scanOffset(proj.Name, repos[i].Name, activity, period)
-		if fire := repoNextFire(sched, off, base); !now.Before(fire) || sweepRequested(&repos[i], activity, base) {
+		if fire := repoNextFire(sched, off, repoBase); !now.Before(fire) {
 			due = append(due, repos[i])
 		}
 		if nf := repoNextFire(sched, off, now); soonest.IsZero() || nf.Before(soonest) {
@@ -523,9 +528,55 @@ func (r *ProjectReconciler) reposDueForScan(proj *tatarav1alpha1.Project, activi
 	return due, soonest, true
 }
 
-// stampScan records the per-activity Last*Scan and persists status.
-// RetryOnConflict handles racing reconcile updates so the stamp always lands.
-// Returns non-nil on persistent failure so the caller can log+metric the event.
+// stampRepoScan records Status.LastIssueScan on ONE repo the pass just swept,
+// using `now` - the CALLER's reconcile evaluation time, the same value
+// reposDueForScan was called with - never a fresh wall-clock read (review
+// Finding 1). SweepProject can take real seconds against the forge; a fresh
+// read taken after it returns would already be past the fire of any repo
+// whose slot fell inside that window, corrupting the fallback base for every
+// repo repoIssueScanBase has not yet given its own stamp exactly the way
+// Finding 1 describes. Using the evaluation `now` cannot step over an unfired
+// slot: a repo not yet due at `now` has `off <= now-off < sched.Next(base-off)`,
+// and sched.Next is constant on that whole half-open interval, so moving the
+// base to `now` preserves the fire exactly.
+//
+// Copies stampScan's RetryOnConflict pattern (three replicas race this same
+// write). On success it ALSO writes `now` into the caller's own `repo`
+// pointer (review Finding 2) - callers pass a dueRepos element, a COPY of the
+// entry in the `repos` slice reposDueForScan built, so writing only the
+// freshly-fetched-and-updated etcd copy would leave publishNextExpected's
+// deferred earliestIssueScanFire reading the PRE-pass stamp off the untouched
+// `repos` slice and publishing a fire already in the past.
+//
+// A stamp failure is logged and metered like stampScan's stamp_failed path by
+// the caller, not fatal - a repo that misses its stamp this pass simply falls
+// back to the project-wide base on the next evaluation instead of being lost.
+func (r *ProjectReconciler) stampRepoScan(ctx context.Context, repo *tatarav1alpha1.Repository, now time.Time) error {
+	stamp := metav1.NewTime(now)
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Repository{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: repo.Namespace, Name: repo.Name}, fresh); err != nil {
+			return err
+		}
+		fresh.Status.LastIssueScan = &stamp
+		return r.Status().Update(ctx, fresh)
+	})
+	if err != nil {
+		return err
+	}
+	repo.Status.LastIssueScan = &stamp
+	return nil
+}
+
+// stampScan records the per-activity Last*Scan and persists status, using
+// `now` - the CALLER's own reconcile evaluation time - rather than reading
+// the wall clock itself (review Finding 1: for issueScan this value IS
+// reposDueForScan's dueBase fallback, and a fresh post-sweep read can step
+// over the fire of any never-stamped repo whose slot fell inside the pass;
+// see stampRepoScan's doc for the full argument, which applies identically
+// here since both write the same base). RetryOnConflict handles racing
+// reconcile updates so the stamp always lands. Returns non-nil on persistent
+// failure so the caller can log+metric the event.
 //
 // On success it also sets obs.SweepLastSuccessTimestamp{activity} - the same
 // heartbeat gauge sweep.go's B.4 pass sets for sweep/nightlySweep, extended
@@ -539,8 +590,8 @@ func (r *ProjectReconciler) reposDueForScan(proj *tatarav1alpha1.Project, activi
 // persisted Status.Last* stamps at the top of every reconcile (fix #386) -
 // this stamp-on-success path is what advances it between rehydrates, not
 // the only way it ever gets set.
-func (r *ProjectReconciler) stampScan(ctx context.Context, proj *tatarav1alpha1.Project, activity string) error {
-	now := metav1.Now()
+func (r *ProjectReconciler) stampScan(ctx context.Context, proj *tatarav1alpha1.Project, activity string, now time.Time) error {
+	stamp := metav1.NewTime(now)
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.Project{}
 		if err := r.Get(ctx, types.NamespacedName{Namespace: proj.Namespace, Name: proj.Name}, fresh); err != nil {
@@ -548,21 +599,21 @@ func (r *ProjectReconciler) stampScan(ctx context.Context, proj *tatarav1alpha1.
 		}
 		switch activity {
 		case "issueScan":
-			fresh.Status.LastIssueScan = &now
-			proj.Status.LastIssueScan = &now
+			fresh.Status.LastIssueScan = &stamp
+			proj.Status.LastIssueScan = &stamp
 		case "brainstorm":
-			fresh.Status.LastBrainstorm = &now
-			proj.Status.LastBrainstorm = &now
+			fresh.Status.LastBrainstorm = &stamp
+			proj.Status.LastBrainstorm = &stamp
 		case "documentation":
-			fresh.Status.LastDocumentation = &now
-			proj.Status.LastDocumentation = &now
+			fresh.Status.LastDocumentation = &stamp
+			proj.Status.LastDocumentation = &stamp
 		}
 		return r.Status().Update(ctx, fresh)
 	})
 	if err != nil {
 		return err
 	}
-	obs.SweepLastSuccessTimestamp.WithLabelValues(proj.Name, activity).Set(float64(now.Unix()))
+	obs.SweepLastSuccessTimestamp.WithLabelValues(proj.Name, activity).Set(float64(stamp.Unix()))
 	return nil
 }
 
@@ -1225,6 +1276,25 @@ func (r *ProjectReconciler) createUpgradeTask(ctx context.Context, proj *tatarav
 	return created, nil
 }
 
+// isAdoptedUpgradeTask reports whether an upgrade Task was born from an EXISTING
+// third-party merge request rather than from the cron.
+//
+// TWO TESTS, AND THE SECOND IS THE UPGRADE PATH. The label is the explicit
+// marker MintAdoptedUpgradeTask stamps from now on. The Source shape is the
+// structural fallback for every adopted Task minted BEFORE this label existed:
+// on a live cluster several are in flight at upgrade time, and without the
+// fallback the cron would be suppressed by them for their whole remaining
+// lifetime - the exact D2 failure the label exists to prevent, arriving through
+// the one door a label cannot cover. It is exact rather than heuristic:
+// createUpgradeTask sets NO Source at all, and every adopted mint sets one with
+// IsPR true and a merge request number.
+func isAdoptedUpgradeTask(t *tatarav1alpha1.Task) bool {
+	if t.Labels[tatarav1alpha1.LabelUpgradeOrigin] == tatarav1alpha1.UpgradeOriginAdopted {
+		return true
+	}
+	return t.Spec.Source != nil && t.Spec.Source.IsPR && t.Spec.Source.Number > 0
+}
+
 // openUpgradeLaneCount counts the upgrade lanes the project currently owes,
 // against which maxOpenUpgrades is checked. A lane is held by a live Task OR by
 // a QueuedEvent that has been enqueued but not yet minted into one.
@@ -1240,6 +1310,13 @@ func (r *ProjectReconciler) createUpgradeTask(ctx context.Context, proj *tatarav
 // `declined` - the correct and common answer for a scheduled kind that finds
 // nothing worth taking - parks. Counting a park as live would stop the cron for
 // the whole park retention after the first quiet cycle.
+//
+// IT COUNTS THE CRON'S OWN WORK ONLY (design D2). maxOpenUpgrades governs the
+// CRON - the agent that proactively hunts for dependency bumps - and nothing
+// else. Adopted third-party merge requests are ordinary queue citizens bounded
+// by QueueCapacity and MaxLivePods, and counting them here would make a draining
+// Renovate backlog read as "lanes full": the cron would fall silent for as long
+// as the backlog lasted, with no error, no log and no counter.
 func (r *ProjectReconciler) openUpgradeLaneCount(ctx context.Context, proj *tatarav1alpha1.Project) (int, error) {
 	var list tatarav1alpha1.TaskList
 	if err := r.List(ctx, &list, client.InNamespace(proj.Namespace)); err != nil {
@@ -1250,6 +1327,9 @@ func (r *ProjectReconciler) openUpgradeLaneCount(ctx context.Context, proj *tata
 		t := &list.Items[i]
 		if t.Spec.ProjectRef != proj.Name || t.Spec.Kind != "upgrade" {
 			continue
+		}
+		if isAdoptedUpgradeTask(t) {
+			continue // adopted work is bounded by the general pool (design D2)
 		}
 		if !tatarav1alpha1.TaskDone(t) && !tatarav1alpha1.Parked(t) {
 			n++
@@ -1263,6 +1343,9 @@ func (r *ProjectReconciler) openUpgradeLaneCount(ctx context.Context, proj *tata
 		q := &qes.Items[i]
 		if q.Spec.ProjectRef != proj.Name || q.Spec.Kind != "upgrade" {
 			continue
+		}
+		if queue.IsAdoptedUpgradeMint(q) {
+			continue // the not-yet-minted half of the same exclusion
 		}
 		// An admission TICKET spawns the next pod stage of a Task that already
 		// exists and is already counted above; counting it too would double-book
@@ -1341,8 +1424,9 @@ func earliestIssueScanFire(proj *tatarav1alpha1.Project, schedule string, repos 
 	period := cronPeriod(sched, base)
 	var earliest time.Time
 	for i := range repos {
+		repoBase := repoIssueScanBase(&repos[i], base)
 		off := scanOffset(proj.Name, repos[i].Name, "issueScan", period)
-		if fire := repoNextFire(sched, off, base); earliest.IsZero() || fire.Before(earliest) {
+		if fire := repoNextFire(sched, off, repoBase); earliest.IsZero() || fire.Before(earliest) {
 			earliest = fire
 		}
 	}
@@ -1621,11 +1705,51 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 					// immediately and the next pass MINTS - which stamps, and the
 					// sweep is back on its cron cadence. A pass can only defer the
 					// stamp while it is making that progress.
+					//
+					// The per-repo stamps below share this exact contract: they anchor
+					// reposDueForScan's per-repo base (repoIssueScanBase) the same way
+					// the project stamp anchors dueBase, so skipping one and not the
+					// other would re-open the same hole for whichever repo's tombstone
+					// mint is owed. Both stamps are skipped together, or neither is.
 					consider(now.Add(sweepRequeue))
-				} else if serr := r.stampScan(ctx, proj, "issueScan"); serr != nil {
-					l.Error(serr, "scan: persist sweep stamp failed",
-						"action", "scan_stamp_error", "resource_id", proj.Name, "activity", SweepActivity)
-					obs.SweepErrorsTotal.WithLabelValues(proj.Name, "issueScan", "stamp_failed").Inc()
+				} else {
+					// Both stamps below take `now` - the evaluation time
+					// reposDueForScan was just called with above, NOT a fresh
+					// wall-clock read. SweepProject can take real seconds against
+					// the forge; a fresh read taken here would already be past the
+					// fire of any repo whose slot fell inside that window. `now`
+					// cannot step over an unfired slot (see stampRepoScan's doc for
+					// the proof), so a never-swept repo's project-base fallback
+					// stays exactly where it was, whether or not this pass ever
+					// gives it its own stamp.
+					if serr := r.stampScan(ctx, proj, "issueScan", now); serr != nil {
+						l.Error(serr, "scan: persist sweep stamp failed",
+							"action", "scan_stamp_error", "resource_id", proj.Name, "activity", SweepActivity)
+						obs.SweepErrorsTotal.WithLabelValues(proj.Name, "issueScan", "stamp_failed").Inc()
+					}
+					// Per-repo stamps (defect 2 fix): each dueRepos member is stamped
+					// independently of the project-wide write above, so ONE repo's
+					// conflict/failure never blocks another's.
+					for i := range dueRepos {
+						if rerr := r.stampRepoScan(ctx, &dueRepos[i], now); rerr != nil {
+							l.Error(rerr, "scan: persist per-repo sweep stamp failed",
+								"action", "scan_stamp_error", "resource_id", proj.Name,
+								"activity", SweepActivity, "repo", dueRepos[i].Name)
+							obs.SweepErrorsTotal.WithLabelValues(proj.Name, "issueScan", "stamp_failed").Inc()
+							continue
+						}
+						// dueRepos[i] is a COPY of the matching entry in `repos`
+						// (reposDueForScan appends repos[i] by value) - write the
+						// fresh stamp back by name so the deferred
+						// publishNextExpected -> earliestIssueScanFire sees it
+						// instead of the pre-pass value (review Finding 2).
+						for j := range repos {
+							if repos[j].Name == dueRepos[i].Name {
+								repos[j].Status.LastIssueScan = dueRepos[i].Status.LastIssueScan
+								break
+							}
+						}
+					}
 				}
 				if _, next2, ok2 := r.reposDueForScan(proj, "issueScan", repos, now); ok2 {
 					consider(next2)
@@ -1767,7 +1891,7 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 					l.Error(derr, "scan: nightly doc batch failed",
 						"action", "scan_doc_batch_error", "resource_id", proj.Name, "activity", "documentation")
 				}
-				if serr := r.stampScan(ctx, proj, "documentation"); serr != nil {
+				if serr := r.stampScan(ctx, proj, "documentation", now); serr != nil {
 					l.Error(serr, "scan: persist documentation stamp failed",
 						"action", "scan_stamp_error", "resource_id", proj.Name, "activity", "documentation")
 					obs.SweepErrorsTotal.WithLabelValues(proj.Name, "documentation", "stamp_failed").Inc()

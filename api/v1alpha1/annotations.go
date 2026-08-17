@@ -5,64 +5,6 @@ package v1alpha1
 // reads this to decide whether to launch an ingest Job.
 const ReingestRequestedAnnotation = "tatara.dev/reingest-requested"
 
-// SweepRequestedAnnotation is the RFC3339 instant at which a webhook asked for
-// this Repository's issueScan sweep slot to be PULLED FORWARD. reposDueForScan
-// treats a repo whose request is newer than the project's last scan as due now,
-// regardless of its deterministic phase-shifted slot.
-//
-// IT EXISTS BECAUSE SOME WORK CANNOT BE MINTED FROM AN HTTP GOROUTINE. A
-// dependency-upgrade merge request is adopted under the project-wide
-// maxOpenUpgrades cap, and the webhook server runs on EVERY replica
-// (HandlerRunnable.NeedLeaderElection() is false) behind a load-balancing
-// Service - so a check-then-mint in the handler is a distributed race that no
-// in-process lock can close, and three replicas can each independently pass the
-// same cap check. The leader's sweep is serialized per project
-// (MaxConcurrentReconciles: 1) and already enforces the cap correctly, so the
-// webhook's job is reduced to telling it to run NOW. Same idiom as
-// ReingestRequestedAnnotation above: a marker write from the HTTP goroutine,
-// consumed by a leader-only reconcile (the #353 / F6-1 boundary).
-//
-// IT IS COMPARED, NEVER CLEARED. Deleting it after a pass would need a
-// compare-and-delete against a webhook that may stamp between the list and the
-// clear; comparing the instant against the SAME dueBase every other repo slot is
-// anchored on costs no write at all, and stampScan advancing LastIssueScan
-// retires every request older than the pass that served it. That also makes a
-// burst self-debouncing: five deliveries write five instants onto ONE key, and
-// one pass serves them all.
-const SweepRequestedAnnotation = "tatara.dev/sweep-requested"
-
-// UpgradeDeferredAnnotation records that the most recent sweep pass over this
-// Repository found an adoptable dependency-upgrade merge request and could NOT
-// take it because the project-wide maxOpenUpgrades was already spent
-// (SweepSkipUpgradeHeadroom). Its value is that pass's RFC3339 instant; its
-// PRESENCE is what anything reads.
-//
-// IT IS THE ADDRESS OF A WAIT. SweepRequestedAnnotation above closes the ARRIVAL
-// half of the adoption latency - a delivery says "look at THIS repo now". The
-// RELEASE half is the mirror image and has no address of its own: an upgrade
-// Task frees a lane that is PROJECT-WIDE, and the merge request that lane
-// unblocks may sit in any enrolled repository, not the one the finished Task was
-// bound to. The two available shortcuts are both wrong. Marking only the
-// finished Task's own repository is cheap and silently misses every cross-repo
-// deferral. Marking every enrolled repository buys a full forge listing of the
-// whole project for every finished Task, which at the observed rate is a
-// standing listing load in exchange for information the operator already has.
-//
-// The pass that DEFERRED is the only actor that knows which repository is
-// waiting and why, so it writes it down here, and the freed lane marks exactly
-// those. On a project with nothing deferred the release is a cached List and
-// zero writes.
-//
-// IT IS CLEARED, unlike SweepRequestedAnnotation, and by exactly one writer: the
-// same sweep arm, on the first pass over this repository that defers nothing.
-// That is what bounds the mechanism. A record that outlived its backlog would
-// let every subsequent freed lane re-request a sweep of a repository with
-// nothing left to adopt, which is the forge-listing loop the whole marker idiom
-// is built to avoid. Clearing needs no compare-and-delete race window: this key
-// has ONE writer, the leader's serialized sweep, whereas the request marker is
-// written by every webhook replica.
-const UpgradeDeferredAnnotation = "tatara.dev/upgrade-deferred"
-
 // Turn-loop annotation keys, shared by the controller (agent-run state) and the
 // webhook (reactivation must clear them so a fresh run starts clean).
 const (
@@ -124,31 +66,6 @@ const (
 	// individually preserved by every writer to promise that. Nothing ever removes
 	// this annotation.
 	AnnRetiredParkMigrated = "tatara.dev/retired-park-migrated"
-	// AnnUpgradeLaneReleased is the ONCE-ONLY LATCH for the lane-release sweep
-	// request. Its VALUE is the RFC3339 instant the release ran; its PRESENCE -
-	// not its value - is the guard. Nothing ever removes it.
-	//
-	// IT IS WHAT MAKES THE TRIGGER AN EDGE. A terminal Task is not reconciled
-	// once: every informer resync, every event on an object it owns, and every
-	// reaper write re-delivers it, and the terminal early return in
-	// reconcileStage is reached each time. Without the latch, each of those
-	// re-stamps SweepRequestedAnnotation with a fresh instant, which makes the
-	// repository due again on the next 30s project reconcile, which lists the
-	// forge again - a 30s listing loop driven by Tasks that finished hours ago
-	// and are only waiting for the reaper. The freed lane is an EVENT and must be
-	// spent exactly once.
-	//
-	// On metadata rather than status, for the same reason AnnRetiredParkMigrated
-	// is: it has to survive everything a status write does to a Task, including
-	// an objbudget spill.
-	//
-	// ONE RELEASE PER TASK IS A DELIBERATE UNDER-COUNT. A Task that parks,
-	// unparks (retaking its lane) and parks again frees a lane twice and asks for
-	// a sweep once. Re-arming on unpark would need a second writer on the unpark
-	// path and would re-open the loop this latch closes, for a shape that is rare
-	// and costs only latency: the ordinary four-hourly slot and the webhook
-	// fast path both still reach that repository.
-	AnnUpgradeLaneReleased = "tatara.dev/upgrade-lane-released"
 )
 
 // AnnAutoReentries / AnnAutoReentryExhausted are the C.3 automatic-pickup
@@ -172,6 +89,61 @@ const (
 	AnnAutoReentries        = "tatara.dev/auto-reentries"
 	AnnAutoReentryExhausted = "tatara.dev/auto-reentry-exhausted"
 )
+
+// THE CI-RECOVERY ANNOTATIONS. Four keys, two pairs, and they exist because a
+// decline means one of two incompatible things: a verdict on the CHANGE ("this
+// bump is wrong / superseded"), which must stay permanent, or a verdict on the
+// INFRASTRUCTURE ("I could not submit, CI was red"), which must be re-driven
+// when the blocker clears. parked(implement-declined) cannot tell them apart
+// after the fact and the free-text decline reason must not be parsed, so the
+// discriminating evidence is captured AT DECLINE TIME.
+//
+// THEY ARE ANNOTATIONS, NOT STATUS FIELDS, for the reason
+// AnnRetiredParkMigrated is: they are LATCHES and EVIDENCE about a park, read
+// by a driver that lives outside stage.Unpark, and metadata survives every
+// status write - a re-park, an un-park, a transition, a spill - without every
+// status writer having to individually preserve them. It also keeps the CRD
+// schema unchanged.
+const (
+	// AnnDeclineCI is what CI said at the moment the agent declined: one of
+	// CIEvidenceRed / CIEvidenceGreen / CIEvidenceUnknown, aggregated over the
+	// merge requests the Task owned (CIDeclineEvidence). ABSENT means the Task
+	// owned nothing tatara may act on, which is the ordinary decline and is
+	// never re-driven.
+	AnnDeclineCI = "tatara.dev/decline-ci"
+	// AnnDeclineHeads is the head fingerprint the decline was made against, from
+	// the same CIDeclineEvidence call. It is OPAQUE: compared for equality,
+	// never parsed. Requiring it to still match is what makes the recovery a
+	// re-read of the EXACT code the agent declined at, rather than a re-drive
+	// against whatever has been pushed since.
+	AnnDeclineHeads = "tatara.dev/decline-heads"
+	// AnnCIRecoveryUnparks is the decimal count of CI recoveries this Task has
+	// SPENT. It is the ABSOLUTE ceiling (MaxCIRecoveryUnparks), and it is what
+	// stops a Task that keeps declining from ping-ponging one fresh head at a
+	// time forever.
+	AnnCIRecoveryUnparks = "tatara.dev/ci-recovery-unparks"
+	// AnnCIRecoveryHeads is the head fingerprint the driver last fired on, and
+	// it is the AT-MOST-ONCE-PER-HEAD latch: the same head is never re-driven
+	// twice, so a pipeline flapping green -> red -> green at one commit cannot
+	// re-open the same decline repeatedly. A fresh push is a genuinely new
+	// situation and gets its own lap, charged against the ceiling above.
+	//
+	// Both are stamped BEFORE the un-park, in one metadata write: a crash
+	// between the two leaves a Task that stays parked and is never retried -
+	// visible, inert, fixable by hand - which is the same fail-closed ordering
+	// driveRetiredUnparks uses and for the same reason.
+	AnnCIRecoveryHeads = "tatara.dev/ci-recovery-heads"
+)
+
+// AnnMergeStageParked latches the ONE notice posted when an issue's Task parks
+// for a MERGE-STAGE reason (stage.IsMergeStagePark) and the automatic driver
+// therefore refuses to re-enter it at all. Same shape as
+// AnnAutoReentryExhausted - RFC3339 value, PRESENCE is the guard - and
+// deliberately NOT that annotation: the two notices say different things (a
+// spent budget versus a budget that was never charged), and reusing the marker
+// would let a merge-stage stop swallow a later exhaustion notice on the same
+// issue, or the reverse.
+const AnnMergeStageParked = "tatara.dev/merge-stage-parked"
 
 // AnnBrainstormSources is the annotation key carrying the comma-separated
 // brainstorm source list stamped on brainstorm Tasks by projectscan and read by
@@ -203,6 +175,24 @@ const (
 	LabelSourceKind = "tatara.io/source-kind"
 	// LabelActivity is the scan activity name.
 	LabelActivity = "tatara.io/activity"
+)
+
+// LabelUpgradeOrigin discriminates the two producers of an `upgrade` Task, and
+// it exists so a draining dependency-engine backlog does not silence the upgrade
+// CRON. maxOpenUpgrades bounds the cron ALONE (design D2); adopted merge requests
+// are bounded by the general pool. Without a discriminator openUpgradeLaneCount
+// would read a Renovate batch as "lanes full" and the cron would stop proposing
+// bumps for as long as the batch lasted, invisibly.
+//
+// The prefix is tatara.dev/, NOT the tatara.io/ its neighbours above use. That
+// split predates this label (every annotation in this file is tatara.dev/, both
+// scan labels are tatara.io/); do not "fix" one to match the other, it would
+// orphan every live object carrying the old key.
+const (
+	LabelUpgradeOrigin = "tatara.dev/upgrade-origin"
+	// UpgradeOriginAdopted marks work born from an EXISTING third-party merge
+	// request. The cron's own mints carry no upgrade-origin label at all.
+	UpgradeOriginAdopted = "adopted"
 )
 
 const (

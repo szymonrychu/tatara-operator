@@ -149,6 +149,23 @@ const (
 	// required check routes the Task back to implementing so the agent can fix
 	// it, and the FOURTH lap is refused at failed(ci-blocked).
 	MaxCIRedReentries = 3
+	// MaxMergeConflictReentries bounds the conflict self-heal: a tatara-owned
+	// merge request the forge reports DIRTY routes the Task back to implementing
+	// so the agent can reconcile the branch with its base, and the FOURTH lap is
+	// refused at parked(merge-blocked). The bound is not optional - main keeps
+	// moving, so conflict -> implement -> push -> conflict is a genuine loop and
+	// an unbounded one would spawn a pod per lap forever.
+	MaxMergeConflictReentries = 3
+	// MaxCIRecoveryUnparks is the ABSOLUTE ceiling on
+	// controller.driveCIRecoveryUnparks: how many times ONE Task may be released
+	// from parked(implement-declined) because the CI that blocked its submission
+	// has since gone green. The per-head latch (AnnCIRecoveryHeads) already makes
+	// each head at most one lap; this bounds the number of DISTINCT heads, so a
+	// Task that keeps pushing and keeps declining stops instead of ping-ponging.
+	// Three, matching every other re-entry bound in this block. When it is spent
+	// the Task simply stays parked and ages out at ParkRetention, exactly as it
+	// did before the driver existed.
+	MaxCIRecoveryUnparks = 3
 	// MaxHumanReviewRounds bounds the reviewing<->parked(awaiting-human) cycle
 	// on kind=review Tasks (fix V7-9). NOT bounded by AgentSpec.MaxReviewRounds
 	// - that counter only moves on request_changes.

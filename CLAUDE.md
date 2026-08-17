@@ -1,43 +1,55 @@
-# CLAUDE.md - tatara
-
-This file briefs any Claude session working on the `tatara` repo or any
-of its component child repos (`tatara-memory`, `tatara-cli`, etc.). Every
-child repo carries a copy of this file at its own root. Treat it as the
-canonical contract.
+# CLAUDE.md - tatara-operator
 
 ## What this repo is
 
-`tatara` is the docs and architecture index for the tatara platform. The
-platform is split into seven independent GitHub repositories under
-`szymonrychu/`. See `README.md` for the full list and `ARCHITECTURE.md`
-for how they fit together. The previous monolithic implementation lives
-at `~/Documents/tatara-old` as a reference.
+The tatara control plane: a controller-runtime operator owning the
+`tatara.dev/v1alpha1` CRDs (`Project`, `Repository`, `Task`, `Issue`,
+`MergeRequest`, `QueuedEvent`). It ingests repos into `tatara-memory`, takes
+GitHub/GitLab webhooks, spawns `tatara-claude-code-wrapper` pods with
+`tatara-cli` as their MCP server, and lands the result back in the forge - including the merge, which nothing else in
+the platform is allowed to do.
+
+It subsumes the retired `tatara-tasks` (the CRDs are the task store),
+`tatara-gitlab-bridge` (webhooks are built in) and the orchestration role of
+`tatara-argo-workflows`.
 
 ## What this repo is NOT
 
-- Not a monorepo. Each component is its own git repo with its own CI,
-  helm chart, Dockerfile, MEMORY.md and ROADMAP.md.
-- Not an umbrella helmfile. There is no top-level `helmfile.yaml.gotmpl`
-  composing the platform; each component deploys itself.
-- Not a place for code. Code belongs in the component repo it serves.
+- Not an agent. It spawns them and reads their outcomes; it never writes code.
+- Not the deploy. Its chart is published here and applied from
+  `tatara-helmfile`.
 
-## On-disk layout
+<!-- BEGIN tatara-shared-contract (generated from tatara-agent-skills/template/CLAUDE-shared.md - do not edit below this line) -->
+## The tatara platform
 
-```
-~/Documents/tatara/                   # this repo
-├── tatara-memory/                    # child repo (gitignored)
-├── tatara-cli/                       # child repo (gitignored)
-├── tatara-memory-repo-ingester/      # child repo (gitignored)
-├── tatara-claude-code-wrapper/       # child repo (gitignored)
-├── tatara-argo-workflows/            # child repo (gitignored)
-├── tatara-operator/                  # child repo (gitignored)
-└── tatara-chat/                      # child repo (gitignored)
-```
+`tatara` is not a repo. It is nine independent GitHub repositories under
+`szymonrychu/`, enrolled as `Repository` CRs by the `tatara` Project
+(`tatara-helmfile/values/project-tatara/common.yaml`):
 
-Each child clones from `github.com/szymonrychu/<name>` into the matching
-subdirectory. The parent `.gitignore` keeps them out of this repo.
+| repo | owns |
+|---|---|
+| `tatara-operator` | the control plane: Project/Repository/Task CRs, the agent lifecycle, forge write-back, merge |
+| `tatara-memory` | the memory and code-graph service |
+| `tatara-memory-repo-ingester` | the ingester that feeds `tatara-memory` from git |
+| `tatara-cli` | the `tatara` CLI and the MCP server every agent pod talks to |
+| `tatara-claude-code-wrapper` | the agent pod image and its bootstrap |
+| `tatara-agent-skills` | the skills plugin every agent pod loads, and this contract |
+| `tatara-helmfile` | the helm releases and the platform enrollment CRs |
+| `tatara-observability` | Grafana alert rules as terraform |
+| `tatara-documentation` | the docs site and the design-doc archive |
 
-## Hard rules (copied to every component repo's CLAUDE.md)
+There is no umbrella repo and no monorepo: each repo carries its own CI,
+`Dockerfile` and chart where it ships one, `MEMORY.md` and `ROADMAP.md`, and
+each deploys itself. Read the repo's own `README.md` for what it does; there is
+no cross-repo architecture file.
+
+## On-disk layout in an agent pod
+
+Every repo a Task needs is cloned to `/workspace/<owner>/<repo>` on the task
+branch before the agent's first turn. They are siblings: there is no parent
+directory containing the others, and no gitignored nesting.
+
+## Hard rules
 
 1. **Newest stable Go** for any Go service. Pin the Go directive to the
    exact minor in `go.mod`.
@@ -63,8 +75,12 @@ subdirectory. The parent `.gitignore` keeps them out of this repo.
    **and agents never post a review either**: the operator writes the
    SCM review from the accepted verdict. The operator merges each repo
    in `Task.spec.mergeOrder` sequentially, on green CI, against the
-   exact reviewed head SHA. Never hand-edit a deploy pin; never re-run a
-   green release job (tag mode is not idempotent).
+   exact reviewed head SHA. It applies the `semver:<level>` label itself,
+   as a one-way projection of `MergeRequest.status.significance`, BEFORE
+   the merge - CI cuts the tag from the label at the merge commit, so a
+   merge that lands before the label is a release that never gets tagged.
+   Never hand-edit a deploy pin; never re-run a green release job (tag
+   mode is not idempotent).
 
    **In-cluster carve-out (L.10):** **in-cluster agent pods** may not
    use `gh`/`glab` and may not merge. This is enforced structurally, not
@@ -96,18 +112,37 @@ subdirectory. The parent `.gitignore` keeps them out of this repo.
     nothing about the cluster it runs on: no baked `imagePullSecrets`,
     node affinity, ingress host/class, storage class, or replicated-
     secret names in `values.yaml`. All cluster-specific customization
-    comes from the `~/Documents/infra/helmfile` project (per-bucket
-    `values/common.yaml` + per-release `values/<name>/{common,<env>}.yaml`
-    + sops `<env>.secrets.yaml`). Tatara releases live in that repo's
-    `helmfiles/tatara/` bucket.
+    comes from the `tatara-helmfile` repo (per-bucket `values/common.yaml`
+    + per-release `values/<name>/{common,<env>}.yaml` + sops
+    `<env>.secrets.yaml`).
 15. **Sonnet for implementation. Opus for merges.** Implementation
     subagents are sonnet (`claude-sonnet-4-6` or current stable). The
     merge subagent that integrates parallel work is opus. Plan and
-    review work runs in opus. (This was rule 7 until the task-centric
-    redesign; 7 is now the semver push-CD contract. The numbering of
-    rules 1-14 is load-bearing - `values.yaml` cites "rule 6" and
-    "rule 14" by number - so this moved to the end rather than
-    renumbering.)
+    review work runs in opus.
+16. **Never `kubectl set image`, `kubectl edit`, or `kubectl patch`
+    spec fields on a helm-managed resource.** Bump chart appVersion
+    and `helm upgrade` instead. Direct kubectl mutations leave orphan
+    field-managers (kubectl-edit, kubectl-set, before-first-apply)
+    that block helm 4 server-side apply on the next sync. Reason:
+    burned us in the v0.1.1 -> v0.1.2 tatara-memory upgrade.
+
+### Citing a rule
+
+Rules 1-6 and 8-13 have never moved and are safe to cite by number. Four
+numbers were reconciled when this block became one artifact, because the
+per-repo copies had drifted into two incompatible numberings:
+
+| rule | meaning | was |
+|---|---|---|
+| 7 | semver push-CD | 7 in the operator; unnumbered `## CD` prose in the other six |
+| 14 | charts are cluster-agnostic | 14 in operator/helmfile/observability; absent from cli, memory, ingester, wrapper |
+| 15 | sonnet implements, opus merges | 7 in the six non-operator copies, 15 in the operator |
+| 16 | no kubectl mutation of helm-managed resources | 14 in cli and memory; absent elsewhere |
+
+Anything written before this block existed may cite the old number. Design
+docs under `tatara-documentation/docs/appendix/design-docs/` are an archive and
+are NOT swept: read a rule citation there as the rule's text at the time, not
+as a pointer into this list.
 
 ## Writing rules
 
@@ -148,16 +183,31 @@ installed in the agent container and on PATH.
 
 ## CD (semver push-CD)
 
-See **hard rule 7**. It is the single source of truth and this section
-carries no separate copy on purpose: the previous copy here said "the
-pipeline merges (bot-authored PRs auto-merge on green required checks)",
-which directly contradicts rule 7's "merge is an OPERATOR action,
-auto-merge is never armed". A contradiction left alive in a second
-section is the exact failure mode the redesign's contract review kept
-finding: an implementer reads ONE section.
+See **hard rule 7**. It is the single source of truth and this section carries
+no separate copy on purpose: the copy that used to live here said "the pipeline
+merges bot-authored PRs on green required checks", which directly contradicts
+rule 7's "merge is an OPERATOR action, auto-merge is never armed". A
+contradiction left alive in a second section is the exact failure mode the
+redesign's contract review kept finding: an implementer reads ONE section.
 
-The operator applies the `semver:<level>` label itself, as a one-way
-projection of `MergeRequest.status.significance` (which `submit_outcome`
-stamps), and it applies it BEFORE the merge - CI cuts the tag from the
-label at the merge commit, so a merge that lands before the label is a
-release that never gets tagged.
+## This block is generated
+
+Everything between the BEGIN and END markers is owned by
+`tatara-agent-skills/template/CLAUDE-shared.md` and is byte-identical in every
+tatara repo. Editing it in place is pointless - the next skills release
+overwrites it. Change it with a PR against that file; the skills release
+workflow fans it out. Content ABOVE the BEGIN marker and BELOW the END marker
+is local to this repo and is never touched by the sync, which is where a repo
+records how these rules apply to it.
+<!-- END tatara-shared-contract -->
+
+## Local notes
+
+- The operator is the only component that merges. Rule 7 is not advice here, it
+  is this repo's behavior: `Task.spec.mergeOrder`, sequential, green CI, the
+  exact reviewed head SHA, `semver:<level>` label applied BEFORE the merge.
+- Agent pods get no forge token and a merge-free MCP profile
+  (`internal/agent/pod.go`). Keep it structural. Do not "helpfully" widen a
+  profile to unblock an agent.
+- CRD changes are API changes: `change_significance: major` unless the field is
+  additive and optional.

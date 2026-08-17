@@ -6,6 +6,7 @@ import (
 	"time"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
@@ -50,6 +51,42 @@ func TestTTLStop_ClearsTheLastTurnStateItJustSpent(t *testing.T) {
 	}
 	if len(got.Status.LastTurnPushedRepos) != 0 {
 		t.Errorf("lastTurnPushedRepos = %v after a TTL stop, want cleared", got.Status.LastTurnPushedRepos)
+	}
+}
+
+// THE TURN ID MUST SURVIVE EXACTLY WHERE THE REPO LISTS SURVIVE.
+//
+// The failed-repos note dedupes on a body that names its turn, so the id is what
+// separates a replay (respawnLostPod re-presenting one payload) from a
+// recurrence (the same repos failing again later). If respawn cleared the id but
+// kept the list, the replayed note would render turn-less, no longer match the
+// note already in the journal, and be written twice - and every later recurrence
+// would then match THAT turn-less body and be swallowed, which is the round-3
+// defect back through the other door.
+func TestRespawnLostPod_KeepsTheTurnIDAlongsideTheReposItNames(t *testing.T) {
+	proj, task, r, _ := newConversingExitFixture(t)
+	task.Status.State = tatarav1alpha1.StateUnderImplementation
+	task.Status.AgentKind = stage.AgentKindFor(tatarav1alpha1.StateUnderImplementation, "implement")
+	task.Status.LastTurnFailedRepos = []string{"tatara-cli"}
+	task.Status.LastTurnReposTurnID = "turn-12"
+	if err := r.Status().Update(context.Background(), task); err != nil {
+		t.Fatalf("seed last-turn state: %v", err)
+	}
+
+	if _, err := r.respawnLostPod(context.Background(), proj, task,
+		obs.RecreationReasonPodGone, time.Now()); err != nil {
+		t.Fatalf("respawnLostPod: %v", err)
+	}
+
+	got := mdGetTask(t, r.Client, task.Name)
+	if len(got.Status.LastTurnFailedRepos) == 0 {
+		t.Fatalf("lastTurnFailedRepos cleared by a respawn: that path writes no note, " +
+			"so the status is the only surviving trace of the loss")
+	}
+	if got.Status.LastTurnReposTurnID != "turn-12" {
+		t.Errorf("lastTurnReposTurnId = %q alongside a surviving failed list, want turn-12: "+
+			"a list without its turn renders a body that matches neither its own replay nor a later recurrence",
+			got.Status.LastTurnReposTurnID)
 	}
 }
 

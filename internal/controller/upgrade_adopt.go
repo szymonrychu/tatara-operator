@@ -17,11 +17,15 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/upgrade"
 )
 
-// adoptedUpgradeKind is the Task kind an adopted third-party dependency merge
+// AdoptedUpgradeKind is the Task kind an adopted third-party dependency merge
 // request mints. It is `upgrade`, NOT `takeover`: the Task must get the upgrade
 // tool profile (so it has submit_outcome at all), the upgrade skill profile, the
 // upgrade outcome schema, and it must count against maxOpenUpgrades.
-const adoptedUpgradeKind = "upgrade"
+//
+// EXPORTED because the webhook is the OTHER producer of an adoption payload and
+// was carrying its own "upgrade" literal for the same field. Two spellings of
+// one contract, in two packages, with nothing holding them together.
+const AdoptedUpgradeKind = "upgrade"
 
 // AdoptedSignificanceFloor is the change significance an adopted merge request's
 // mirror is seeded with at mint.
@@ -67,15 +71,22 @@ const AdoptedSignificanceFloor = "patch"
 // authors as the bot (AdoptUpgradeMR requires it, or an allowlisted engine login
 // that ownershipForAuthor accepts through the SAME predicate), so
 // ownershipForAuthor classifies it `tatara` on its own and there is nothing to
-// flip. Ownership has exactly ONE writer, ReconcileOwnership, and it stays that
-// way.
+// flip.
+//
+// What that buys is that ADOPTION stamps no ownership. It is NOT that the field
+// has a single writer - restapi's takeover endpoint writes
+// Status.Ownership=tatara on the gated hand-over, and ReconcileOwnership's own
+// doc block concedes it ("that is the gated takeover REST endpoint's job"). The
+// stronger claim stood here until #604's round 7; do not restore it, and do not
+// replace it with a list of who else writes the field, because nothing this
+// file decides depends on the answer.
 
 // AdoptedUpgradeTaskName is the deterministic name of the upgrade Task adopted
 // onto (repo, number). Being a pure function of the merge request's identity is
 // what makes the mint idempotent, and idempotence is the WHOLE dedup mechanism
 // for adoption: one Task per merge request, no matter how many sweeps run.
 func AdoptedUpgradeTaskName(proj, repo string, number int) string {
-	return tatarav1alpha1.IntakeTaskName(proj, adoptedUpgradeKind, repo, number)
+	return tatarav1alpha1.IntakeTaskName(proj, AdoptedUpgradeKind, repo, number)
 }
 
 // MintAdoptedUpgradeTask mints an upgrade Task bound to an EXISTING
@@ -86,8 +97,7 @@ func AdoptedUpgradeTaskName(proj, repo string, number int) string {
 // that function hardcodes kind, initial state, goal, name derivation and an
 // ownership-lost unpark, and all five differ here.
 //
-// IT DOES EXACTLY TWO THINGS A PLAIN TASK MINT DOES NOT, and the list is short
-// on purpose - an earlier draft had a third:
+// IT DOES EXACTLY THREE THINGS A PLAIN TASK MINT DOES NOT:
 //
 //  1. Binds the MergeRequest CR as the Task's, via bindMRToTask - which also
 //     CREATES it. ensureMergeRequestCR is reachable only through
@@ -97,17 +107,32 @@ func AdoptedUpgradeTaskName(proj, repo string, number int) string {
 //     bind, ownedMergeRequests returns empty, mrForRepo returns nil, and the
 //     merge corridor parks operator-error.
 //  2. Stamps AnnTakeoverHeadBranch (below).
+//  3. Stamps LabelUpgradeOrigin=adopted, so openUpgradeLaneCount can exclude
+//     this Task from the CRON's maxOpenUpgrades budget (design D2). Adopted
+//     work is bounded by the general pool; the cron's knob counts only its own.
 //
-// THE THIRD THING IS GONE: no ownership flip, no ownership reason, no
-// LastBotHeadSHA seed. AdoptUpgradeMR requires the merge request to be authored
-// by an identity adoptableAuthor accepts, and ownershipForAuthor asks the same
-// predicate, so the mirror classifies `tatara` on the first ReconcileOwnership
-// pass - which happens LATER IN THIS SAME SWEEP PASS, with a live head from
-// GetPRHead. That backfill also seeds LastBotHeadSHA in the same write, and an
-// absent seed cannot cause a flip anyway (ownership.go seeds and returns rather
-// than flipping when the baseline is empty). Stamping any of it here would make
-// this a SECOND writer of Status.Ownership, which ReconcileOwnership's own doc
-// block asks callers not to be.
+// NO OWNERSHIP FLIP, NO OWNERSHIP REASON, NO LASTBOTHEADSHA SEED. An earlier
+// draft stamped ownership here; this one does not. AdoptUpgradeMR requires the
+// merge request to be authored by an identity adoptableAuthor accepts, and
+// ownershipForAuthor asks the same predicate, so the mirror classifies
+// `tatara` on the next ReconcileOwnership pass over it. (NOT "later in this
+// same sweep pass", which this said until #604's round 7: since #612 the mint
+// runs from the queue dispatcher's admission, not from the sweep, so there is
+// no shared pass to be later in. And NOT "with a live head from GetPRHead",
+// retired in round 8 - name no head source here at all, because the
+// classification does not read one: ownershipForAuthor decides on
+// Status.Author, and liveHead reaches only the LastBotHeadSHA seed inside the
+// same branch. The waking pass is the bind's own status WRITE, not its create:
+// ReconcileOwnership returns at once on a status-less mirror.) That seed lands
+// in the same write, and an absent one cannot cause a flip anyway (ownership.go
+// seeds and returns rather than flipping when the baseline is empty). Stamping
+// any of it here would be REDUNDANT rather than early: the classification
+// derives the same value from the same predicate AdoptUpgradeMR's own
+// precondition already applied. NOT "a second write on Status.Ownership",
+// retired with the head claim - the backfill is guarded on Ownership == "", so
+// a stamp here would make it a no-op rather than a second write, and counting
+// writers of that field is what the ownership note at the top of this file
+// refuses.
 //
 // It does NOT stamp the head branch as a work branch on its own: that is
 // AnnTakeoverHeadBranch, read kind-agnostically by branchEnvValues, which is
@@ -118,9 +143,15 @@ func AdoptedUpgradeTaskName(proj, repo string, number int) string {
 // annotation the review pod would fall through to TaskBranch(task) - a
 // tatara/chore-<n>-<slug> branch that does not exist on the forge - and review
 // the wrong tree.
+//
+// `stamp` is the minting QueuedEvent's label set (queue.MintStamp) and may be
+// nil. It is TAKEN, not derived, because this mint builds its Task by hand
+// rather than through BuildTaskFromQueuedEvent - and without it the event that
+// admitted this Task is never reaped: reconcileDone finds the Task by
+// LabelQueuedEvent and mintedTask resolves idempotency by LabelMintedBy.
 func (m *Minter) MintAdoptedUpgradeTask(ctx context.Context, proj *tatarav1alpha1.Project,
 	repo *tatarav1alpha1.Repository, pr scm.PRRef,
-	sp objbudget.Spiller) (*tatarav1alpha1.Task, MintOutcome, error) {
+	sp objbudget.Spiller, stamp map[string]string) (*tatarav1alpha1.Task, MintOutcome, error) {
 
 	name := AdoptedUpgradeTaskName(proj.Name, repo.Name, pr.Number)
 
@@ -153,6 +184,7 @@ func (m *Minter) MintAdoptedUpgradeTask(ctx context.Context, proj *tatarav1alpha
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: proj.Namespace,
+			Labels:    adoptedTaskLabels(stamp),
 			Annotations: map[string]string{
 				// Kind-agnostic in branchEnvValues: the pod's TASK_BRANCH becomes
 				// this branch, so the REVIEW pod reviews the right tree and the
@@ -164,7 +196,7 @@ func (m *Minter) MintAdoptedUpgradeTask(ctx context.Context, proj *tatarav1alpha
 		Spec: tatarav1alpha1.TaskSpec{
 			ProjectRef:    proj.Name,
 			RepositoryRef: repo.Name,
-			Kind:          adoptedUpgradeKind,
+			Kind:          AdoptedUpgradeKind,
 			Goal: upgrade.GoalAdopted(slug, pr.HeadBranch, pr.Title,
 				pr.Number, proj.Spec.UpgradePolicy),
 			// `new`, so REVIEW GOES FIRST. Not under-implementation (which is
@@ -174,12 +206,18 @@ func (m *Minter) MintAdoptedUpgradeTask(ctx context.Context, proj *tatarav1alpha
 			// turn decides, and a request_changes is what hands it to the upgrade
 			// agent.
 			//
-			// Not `refined` either: refined's only exit into under-implementation
-			// is submit_outcome(action=approved), which routes through
+			// Not `refined` either, and since #604 it is not even admissible:
+			// refined's only exit into under-implementation is
+			// submit_outcome(action=approved), which routes through
 			// verifyApprovalScope and is refused with no-live-issue for a Task
-			// owning zero Issue CRs - which a merge-request-born Task always
-			// does. And awaiting-review is not mintable at all: InitialState's
-			// CRD enum is new;refined;under-implementation.
+			// owning zero Issue CRs - which a merge-request-born Task always is.
+			// #604 deleted the (create) -> refined edge and narrowed the enum in
+			// lockstep, so this paragraph now explains why the value is GONE
+			// rather than why it is not chosen. awaiting-review was never
+			// mintable. Read the live set off TaskSpec.InitialState's kubebuilder
+			// Enum marker rather than a copy of it here: copies of it drifted
+			// twice during #604's own review, which is what
+			// TestNoProseRestatesTheRetiredInitialStateEnum now fails on.
 			//
 			// `new` costs nothing: AgentKindFor(new, *) is "", so no pod runs
 			// there, and reconcileTriaging walks the Task to awaiting-review on
@@ -253,9 +291,9 @@ func (m *Minter) MintAdoptedUpgradeTask(ctx context.Context, proj *tatarav1alpha
 	// AND THAT IS THE WHOLE MINT. No ownership write of any kind: the merge
 	// request is authored by an identity adoptableAuthor accepts, by
 	// AdoptUpgradeMR's own precondition, so ReconcileOwnership classifies it
-	// `tatara` and seeds LastBotHeadSHA later in this same sweep pass. Adding an
-	// ownership stamp here would make this a second writer of a field with one
-	// owner.
+	// `tatara` and seeds LastBotHeadSHA on its next pass over the mirror. Adding
+	// an ownership stamp here would put a second write on that field - see the
+	// ownership note at the top of this file.
 	return task, MintCreated, nil
 }
 
@@ -310,4 +348,76 @@ func (m *Minter) seedAdoptedSemverFloor(ctx context.Context, proj *tatarav1alpha
 		return fmt.Errorf("adopt: seed the semver floor on %s: %w", mrName, err)
 	}
 	return nil
+}
+
+// adoptedTaskLabels merges the caller's mint stamp with the adoption origin
+// marker. The origin is stamped LAST and unconditionally: it is this repo's own
+// invariant, not the caller's to override.
+func adoptedTaskLabels(stamp map[string]string) map[string]string {
+	labels := make(map[string]string, len(stamp)+1)
+	for k, v := range stamp {
+		labels[k] = v
+	}
+	labels[tatarav1alpha1.LabelUpgradeOrigin] = tatarav1alpha1.UpgradeOriginAdopted
+	return labels
+}
+
+// ClampAdoptedUpgradeBody cuts a merge-request description to the byte budget
+// AdoptedUpgradeRef.Body's kubebuilder marker enforces (issue #495's class: a
+// bounded CRD field fed from an unbounded upstream one).
+//
+// UNCLAMPED, AN OVERSIZED BODY TAKES THE WEBHOOK DARK FOR THAT PROJECT. The
+// Create 422s, enqueueAdoption's failure policy is a 500 so the forge
+// redelivers, and it 500s again on every redelivery - and GitLab counts
+// consecutive delivery failures toward auto-disabling the project hook. The
+// sweep backstop fails enqueue_adopt_upgrade on every pass for as long as the
+// merge request is open, and refreshQueuedAdoption's Update is rejected the
+// same way, which is design D4's freshness guarantee silently ending for
+// exactly the merge requests whose changelogs are largest.
+//
+// MergeRequestBodyMaxBytes, not GoalMaxBytes: this string never becomes a Task
+// goal. It is copied onto MergeRequest.status.body (mrSnapshot ->
+// bindMRToTask -> SyncMergeRequest), whose own cap is this one, so anything
+// smaller would truncate the adopted mirror below what every other mirror path
+// stores for the same merge request.
+func ClampAdoptedUpgradeBody(body string) string {
+	return tatarav1alpha1.TruncateUTF8(body, tatarav1alpha1.MergeRequestBodyMaxBytes)
+}
+
+// AdoptedUpgradeRefFromPR snapshots a listing/delivery PRRef into the CRD shape
+// a QueuedEvent carries. Everything AdoptUpgradeMR and MintAdoptedUpgradeTask
+// read is copied, HeadRepo included - the fork guard fails CLOSED on an empty
+// one, so a lossy copy silently disarms adoption rather than breaking it loudly.
+//
+// IT IS ALSO THE ONE TRUNCATION FUNNEL for the snapshot, deliberately: both
+// producers (the webhook's enqueueAdoption and the sweep's PRAdoptUpgrade arm)
+// build their snapshot here and nowhere else, so a clamp on this line is a
+// clamp on both without either having to remember. Only Body is clamped -
+// neither AdoptedUpgradeRef.Title nor MergeRequest.status.title carries a
+// MaxLength marker, so clamping the title would be inventing a limit no
+// consumer imposes.
+func AdoptedUpgradeRefFromPR(pr scm.PRRef) *tatarav1alpha1.AdoptedUpgradeRef {
+	return &tatarav1alpha1.AdoptedUpgradeRef{
+		Number: pr.Number, Title: pr.Title, Author: pr.Author,
+		HeadSHA: pr.HeadSHA, HeadBranch: pr.HeadBranch,
+		Body:   ClampAdoptedUpgradeBody(pr.Body),
+		Labels: pr.Labels, Repo: pr.Repo, HeadRepo: pr.HeadRepo,
+	}
+}
+
+// PRRefFromAdopted is AdoptedUpgradeRefFromPR's inverse, used at admit time.
+// Exported for the same reason its inverse is: the webhook's own tests assert
+// that the snapshot they enqueue survives AdoptUpgradeMR, and they must ask that
+// question through the EXACT conversion admission uses. A hand-copied twin in a
+// test would answer a question about itself the moment this drifts.
+// UpdatedAt is deliberately left zero: nothing on the adoption path reads it.
+func PRRefFromAdopted(a *tatarav1alpha1.AdoptedUpgradeRef) scm.PRRef {
+	if a == nil {
+		return scm.PRRef{}
+	}
+	return scm.PRRef{
+		Number: a.Number, Title: a.Title, Author: a.Author,
+		HeadSHA: a.HeadSHA, HeadBranch: a.HeadBranch, Body: a.Body,
+		Labels: a.Labels, Repo: a.Repo, HeadRepo: a.HeadRepo,
+	}
 }

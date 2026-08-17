@@ -40,8 +40,11 @@ type ghWorkItem struct {
 	Labels  []ghLabel `json:"labels"`
 	HTMLURL string    `json:"html_url"`
 	Head    struct {
-		SHA string `json:"sha"`
-		Ref string `json:"ref"`
+		SHA  string `json:"sha"`
+		Ref  string `json:"ref"`
+		Repo struct {
+			FullName string `json:"full_name"`
+		} `json:"repo"`
 	} `json:"head"`
 	Merged      bool `json:"merged"` // pull_request.merged: true when a PR-close delivery is a merge
 	PullRequest *struct {
@@ -255,6 +258,7 @@ func ghWorkItemEvent(kind string, isPR bool, p ghPayload, wi *ghWorkItem) Webhoo
 		IsPR:         isPR,
 		HeadSHA:      wi.Head.SHA,
 		HeadBranch:   wi.Head.Ref,
+		HeadRepo:     wi.Head.Repo.FullName,
 		ChangedLabel: p.Label.Name,
 		Merged:       wi.Merged,
 	}
@@ -1231,6 +1235,34 @@ func (c *GitHub) ClosePR(ctx context.Context, repoURL, token string, number int,
 		return nil
 	}
 	return c.Comment(ctx, token, fmt.Sprintf("%s/%s#%d", owner, repo, number), body)
+}
+
+// EditPR updates a PR with only the non-nil fields in req (PATCH semantics),
+// via the PULLS endpoint rather than the issues one: /issues/{n} accepts a title
+// on a PR but not a body, so routing this through EditIssue would drop half of
+// what submit_outcome sends. A 404 (PR gone) is benign, as in EditIssue.
+func (c *GitHub) EditPR(ctx context.Context, repoURL, token string, number int, req EditPRReq) error {
+	owner, repo, err := ghOwnerRepo(repoURL)
+	if err != nil {
+		return err
+	}
+	body := map[string]any{}
+	if req.Title != nil {
+		body["title"] = *req.Title
+	}
+	if req.Body != nil {
+		body["body"] = *req.Body
+	}
+	if len(body) == 0 {
+		return nil
+	}
+	path := fmt.Sprintf("/repos/%s/%s/pulls/%d", owner, repo, number)
+	err = ghDo(ctx, c.base(), http.MethodPatch, path, token, body, nil)
+	var he *HTTPError
+	if errors.As(err, &he) && he.Status == http.StatusNotFound {
+		return nil
+	}
+	return err
 }
 
 // ghRefGoneBody is what GitHub's delete-ref endpoint says when the ref is not

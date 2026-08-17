@@ -95,6 +95,74 @@ func TestRunScans_TombstoneRequeueReSweepsTheOwedRepo(t *testing.T) {
 	}
 }
 
+// TestRunScans_TombstoneRequeueLeavesPerRepoStampUntouched is the per-repo
+// half of the sweepRequeue>0 contract (defect 2 fix): the skipped stamp is
+// not just the project-wide Status.LastIssueScan, the per-repo one must stay
+// untouched too, or the 30s wake's re-evaluation would anchor the owed repo
+// on a fresh per-repo stamp instead of leaving it due.
+func TestRunScans_TombstoneRequeueLeavesPerRepoStampUntouched(t *testing.T) {
+	ctx := context.Background()
+	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *"}}
+	proj, repo := seedScanProject(t, "remint-repo-stamp", cron)
+	past := metav1.NewTime(time.Now().Add(-3 * time.Hour))
+	proj.Status.LastIssueScan = &past
+	if err := k8sClient.Status().Update(ctx, proj); err != nil {
+		t.Fatalf("seed LastIssueScan: %v", err)
+	}
+
+	seedDeadIntakeTwin(t, proj, repo, 42)
+	reader := &fakeReader{issues: []scm.IssueRef{{Number: 42, State: "open", Author: "szymonrychu"}}}
+	r := newScanReconciler(reader)
+
+	if _, _, _, _, err := r.runScans(ctx, proj); err != nil {
+		t.Fatalf("runScans pass 1: %v", err)
+	}
+	var got tatarav1alpha1.Repository
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: repo.Name}, &got); err != nil {
+		t.Fatalf("get repo: %v", err)
+	}
+	if got.Status.LastIssueScan != nil {
+		t.Fatalf("pass 1 stamped the repo's own LastIssueScan to %v even though the mint is still owed; "+
+			"the 30s wake will now anchor on a fresh stamp instead of leaving the repo due",
+			got.Status.LastIssueScan)
+	}
+}
+
+// TestRunScans_SuccessfulSweepStampsPerRepo is the positive-path wiring
+// check: a pass that sweeps a due repo and returns no requeue must stamp that
+// repo's OWN Status.LastIssueScan, not just the project-wide one - this is
+// the write that makes repoIssueScanBase's per-repo anchoring possible.
+func TestRunScans_SuccessfulSweepStampsPerRepo(t *testing.T) {
+	ctx := context.Background()
+	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *"}}
+	proj, repo := seedScanProject(t, "successful-sweep-stamp", cron)
+	past := metav1.NewTime(time.Now().Add(-3 * time.Hour))
+	proj.Status.LastIssueScan = &past
+	if err := k8sClient.Status().Update(ctx, proj); err != nil {
+		t.Fatalf("seed LastIssueScan: %v", err)
+	}
+
+	reader := &fakeReader{issues: []scm.IssueRef{{Number: 99, State: "open", Author: "szymonrychu"}}}
+	r := newScanReconciler(reader)
+
+	before := time.Now()
+	if _, _, _, _, err := r.runScans(ctx, proj); err != nil {
+		t.Fatalf("runScans: %v", err)
+	}
+	var got tatarav1alpha1.Repository
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: repo.Name}, &got); err != nil {
+		t.Fatalf("get repo: %v", err)
+	}
+	if got.Status.LastIssueScan == nil {
+		t.Fatal("a successful sweep of a due repo must stamp the repo's own LastIssueScan")
+	}
+	// metav1.Time truncates to second precision, so compare against the
+	// second-truncated start to avoid a false failure on the same-second race.
+	if got.Status.LastIssueScan.Time.Before(before.Truncate(time.Second)) {
+		t.Fatalf("repo LastIssueScan %v is before the pass started %v", got.Status.LastIssueScan.Time, before)
+	}
+}
+
 // TestRunScans_StampsAgainOnceTheOwedMintLands bounds the fix. The skipped
 // stamp is not a permanent state: the pass that actually mints advances
 // Status.LastIssueScan, so the sweep returns to its cron cadence and cannot

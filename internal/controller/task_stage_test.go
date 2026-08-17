@@ -16,8 +16,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
@@ -747,7 +745,6 @@ func TestTriageNeverRoutesPastTheApprovalGate(t *testing.T) {
 		"implement":  tatarav1alpha1.StateRefined,
 		"incident":   tatarav1alpha1.StateRefined,
 		"refine":     tatarav1alpha1.StateRefined,
-		"takeover":   tatarav1alpha1.StateRefined,
 		"review":     tatarav1alpha1.StateAwaitingReview,
 	}
 	for kind, wantStage := range want {
@@ -762,6 +759,17 @@ func TestTriageNeverRoutesPastTheApprovalGate(t *testing.T) {
 			tatarav1alpha1.StateNew, wantStage) {
 			t.Fatalf("triaging -> %s is not a legal edge for kind %q", wantStage, kind)
 		}
+	}
+
+	// #604: `takeover` is NOT in the map above, and its absence is the
+	// assertion. Landing a takeover in FRONT of the gate is landing it somewhere
+	// it can never leave - it owns zero Issue CRs, so verifyApprovalScope
+	// refuses no-live-issue forever. It is minted straight into
+	// under-implementation instead, and a takeover that somehow reaches triage
+	// must park triage-stalled rather than acquire a row back to `refined`.
+	if got, ok := triageTarget(tsTask("t", "takeover", tatarav1alpha1.StateNew, time.Now())); ok {
+		t.Fatalf("triageTarget(\"takeover\") = %q,true; want no row: a takeover routed to the gate "+
+			"strands there, and this is the SECOND enforcement site that has to agree with the mint", got)
 	}
 }
 
@@ -1689,22 +1697,6 @@ func turnSubmitCount(t *testing.T, reg *prometheus.Registry, kind, result string
 // TICKET CLASS BY STAGE, NOT BY TASK KIND (production bug).
 // ---------------------------------------------------------------------------
 
-// ticketMirrorClient is newMirrorClient's twin, but with QueuedEvent's status
-// subresource enabled too: EnqueueEvent does a Create then a Status().Update
-// to stamp state=Queued, which a client that does not know QueuedEvent has a
-// status subresource 404s on. newMirrorClient omits it because none of its
-// (many) other callers ever enqueue a ticket through it.
-func ticketMirrorClient(t *testing.T, objs ...client.Object) client.Client {
-	t.Helper()
-	return fake.NewClientBuilder().
-		WithScheme(mirrorScheme(t)).
-		WithObjects(objs...).
-		WithStatusSubresource(&tatarav1alpha1.Issue{}, &tatarav1alpha1.MergeRequest{},
-			&tatarav1alpha1.Task{}, &tatarav1alpha1.QueuedEvent{}).
-		WithIndex(&tatarav1alpha1.QueuedEvent{}, queue.TaskRefIndex, queue.TaskRefIndexer).
-		Build()
-}
-
 // TestEnsureTicketClassByStageAgentKind covers the production symptom: an
 // incident Task's DOWNSTREAM stages (clarify, implement, ...) were classed
 // QueueClassAlert just because task.Spec.Kind == "incident", starving them
@@ -1739,7 +1731,7 @@ func TestEnsureTicketClassByStageAgentKind(t *testing.T) {
 			ctx := context.Background()
 			task := tsTask("t-"+tc.stg, tc.specKind, tc.stg, time.Now())
 			proj := tsProject(3)
-			c := ticketMirrorClient(t, proj, mdSecret(), task)
+			c := newMirrorClient(t, proj, mdSecret(), task)
 			r := tsReconciler(c)
 			r.Seq = &queue.SeqSource{Client: c, Namespace: mdNS}
 
@@ -1780,7 +1772,7 @@ func TestEnsureTicket_IncidentKindGetsPriorityZero(t *testing.T) {
 
 	incidentTask := tsTask("t-incident", "incident", tatarav1alpha1.StateRefined, time.Now())
 	proj := tsProject(3)
-	c := ticketMirrorClient(t, proj, mdSecret(), incidentTask)
+	c := newMirrorClient(t, proj, mdSecret(), incidentTask)
 	r := tsReconciler(c)
 	r.Seq = &queue.SeqSource{Client: c, Namespace: mdNS}
 
@@ -1800,7 +1792,7 @@ func TestEnsureTicket_IncidentKindGetsPriorityZero(t *testing.T) {
 	}
 
 	normalTask := tsTask("t-normal", "implement", tatarav1alpha1.StateRefined, time.Now())
-	c2 := ticketMirrorClient(t, proj, mdSecret(), normalTask)
+	c2 := newMirrorClient(t, proj, mdSecret(), normalTask)
 	r2 := tsReconciler(c2)
 	r2.Seq = &queue.SeqSource{Client: c2, Namespace: mdNS}
 

@@ -59,6 +59,7 @@ type recordingForge struct {
 	issueStates    map[int]scm.IssueState
 	nextNumber     int
 	comments       []recordedComment  // every Comment call, in order
+	editPRs        []recordedEditPR   // every EditPR call, in order
 	subIssueCalls  []recordedSubIssue // every AddSubIssue call, in order
 	addSubIssueErr error              // returned by AddSubIssue when set (e.g. scm.ErrSubIssuesUnsupported)
 	commentErr     error              // returned by Comment when set (e.g. cross-repo 403 on the parent)
@@ -157,6 +158,16 @@ func (f *recordingForge) GetIssueState(_ context.Context, _, _ string, number in
 func (f *recordingForge) Comment(_ context.Context, _, issueRef, body string) error {
 	f.comments = append(f.comments, recordedComment{Ref: issueRef, Body: body})
 	return f.commentErr
+}
+
+// EditPR is the ONE forge write the implement-submitted path makes: the agent's
+// title and body onto its own merge requests. Recorded rather than panicking, so
+// a test can assert what was sent.
+func (f *recordingForge) EditPR(_ context.Context, repoURL, _ string, number int, req scm.EditPRReq) error {
+	f.editPRs = append(f.editPRs, recordedEditPR{
+		RepoURL: repoURL, Number: number, Title: deref(req.Title), Body: deref(req.Body),
+	})
+	return nil
 }
 
 func (f *recordingForge) AddSubIssue(_ context.Context, _, parentRef string, childNumber int) error {

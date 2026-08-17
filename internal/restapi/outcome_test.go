@@ -37,18 +37,49 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
-// reviewPanicForge answers the ONE read /outcome is allowed to make
-// (GetPRHead) and PANICS on PostReview. THE /outcome HANDLER MAKES NO FORGE
-// WRITE: for kind=review it does exactly two things - one read, then it
+// reviewPanicForge answers the reads /outcome is allowed to make (GetPRHead,
+// and the B1 readiness pair) plus the ONE write it makes (EditPR), and PANICS
+// on PostReview and Merge. THE /outcome HANDLER POSTS NO REVIEW AND MERGES
+// NOTHING: for kind=review it does exactly two things - one read, then it
 // persists the intent (mr.status.pendingReview). The MergeRequest RECONCILER
-// posts it (Task 13). If this panics, /outcome posted a review and the whole
-// crash-safety story (C.5.3) is void.
+// posts it (Task 13). If PostReview panics, /outcome posted a review and the
+// whole crash-safety story (C.5.3) is void.
 type reviewPanicForge struct {
 	scm.SCMWriter
 	heads map[int]string
 	// The B1 readiness surface, defaulting to ready. See recordingForge.
 	ciStatuses  map[int]string
 	mergeStates map[int]scm.MergeState
+	// editPRs records every EditPR call in order; editPRErr fails them all, which
+	// is how the best-effort contract is tested (a forge refusal must not turn an
+	// accepted submit into a 500).
+	editPRs   []recordedEditPR
+	editPRErr error
+}
+
+// recordedEditPR is one EditPR call. The submitted path always sends both
+// fields (submit_outcome requires both), so this flattens them; the PATCH
+// semantic - that a nil field is not sent at all - is pinned in internal/scm,
+// where the request is actually serialised.
+type recordedEditPR struct {
+	RepoURL string
+	Number  int
+	Title   string
+	Body    string
+}
+
+func (f *reviewPanicForge) EditPR(_ context.Context, repoURL, _ string, number int, req scm.EditPRReq) error {
+	f.editPRs = append(f.editPRs, recordedEditPR{
+		RepoURL: repoURL, Number: number, Title: deref(req.Title), Body: deref(req.Body),
+	})
+	return f.editPRErr
+}
+
+func deref(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
 }
 
 func (f *reviewPanicForge) GetPRState(_ context.Context, _, _ string, number int) (scm.PRState, error) {
@@ -271,6 +302,128 @@ func TestOutcome_Implement_RecordsLiveBotHeadSHA(t *testing.T) {
 	mr := e.mr(t, tatarav1alpha1.MergeRequestName("tatara-operator", 295))
 	require.Equal(t, "live-head-999", mr.Status.LastBotHeadSHA,
 		"lastBotHeadSHA must be the live head fetched from SCM, not an agent-reported sha")
+}
+
+// THE SUBMITTED TITLE AND BODY ARE THE MERGE REQUEST'S. They used to reach
+// nothing but an internal Task note, so a reviewer asking an agent to correct a
+// stale version in the MR title was asking for something no agent could do:
+// mr_write exposes open/comment/reply only, and submit_outcome(title=, body=)
+// was documented as the carrier while writing neither. This is that write.
+func TestOutcome_Implement_SubmittedEditsTheMergeRequestOnTheForge(t *testing.T) {
+	f := &reviewPanicForge{heads: map[int]string{295: "live-head"}}
+	e := buildV2(t, v2Opts{writer: f}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
+		mrV2("tatara-operator", 295, "t1"))
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"implement","payload":{"action":"submitted","title":"chore(deps): bump terraform 42.99.0 to 43.4.4","body":"the corrected description","changeSignificance":"patch"}}`)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	require.Len(t, f.editPRs, 1, "the one open owned merge request must be edited exactly once")
+	require.Equal(t, "https://github.com/acme/tatara-operator", f.editPRs[0].RepoURL)
+	require.Equal(t, 295, f.editPRs[0].Number)
+	require.Equal(t, "chore(deps): bump terraform 42.99.0 to 43.4.4", f.editPRs[0].Title)
+	require.Equal(t, "the corrected description", f.editPRs[0].Body)
+
+	// The mirror is refreshed from the value just written, not left stale until
+	// the next sweep: the next agent turn and the review pod read the mirror.
+	mr := e.mr(t, tatarav1alpha1.MergeRequestName("tatara-operator", 295))
+	require.Equal(t, "chore(deps): bump terraform 42.99.0 to 43.4.4", mr.Status.Title)
+	require.Equal(t, "the corrected description", mr.Status.Body)
+}
+
+// AN EXTERNAL MERGE REQUEST IS A HUMAN'S AND ITS TITLE IS THEIRS. The platform
+// may review it but never pushes to it, so it never rewrites its title either -
+// while a tatara-owned sibling in the same submit still gets the edit.
+func TestOutcome_Implement_SubmittedSkipsAnExternallyOwnedMergeRequest(t *testing.T) {
+	f := &reviewPanicForge{heads: map[int]string{295: "h1", 80: "h2"}}
+	e := buildV2(t, v2Opts{writer: f}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"), repoV2("tatara-cli", "tatara"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
+		mrV2("tatara-operator", 295, "t1", func(m *tatarav1alpha1.MergeRequest) {
+			m.Status.Ownership = tatarav1alpha1.OwnershipExternal
+		}),
+		mrV2("tatara-cli", 80, "t1", func(m *tatarav1alpha1.MergeRequest) {
+			m.Status.Ownership = tatarav1alpha1.OwnershipTatara
+		}))
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"implement","payload":{"action":"submitted","title":"T","body":"B","changeSignificance":"minor","mergeOrder":["tatara-cli","tatara-operator"]}}`)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	require.Len(t, f.editPRs, 1, "only the tatara-owned merge request may be edited")
+	require.Equal(t, 80, f.editPRs[0].Number)
+
+	ext := e.mr(t, tatarav1alpha1.MergeRequestName("tatara-operator", 295))
+	require.Equal(t, "an MR", ext.Status.Title, "an external merge request's mirrored title is not rewritten either")
+}
+
+// BEST-EFFORT, EXACTLY LIKE THE record_bot_head STAMP. The stage transition has
+// already committed by the time the edit runs, so a forge refusal must leave the
+// accepted outcome accepted - one clean 200 - rather than turning it into a 500
+// the agent would retry against a Task that has already moved on.
+func TestOutcome_Implement_ForgeEditFailureDoesNotFailTheSubmit(t *testing.T) {
+	f := &reviewPanicForge{heads: map[int]string{295: "live-head"}, editPRErr: fmt.Errorf("forge said 403")}
+	e := buildV2(t, v2Opts{writer: f}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
+		mrV2("tatara-operator", 295, "t1"))
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"implement","payload":{"action":"submitted","title":"T","body":"B","changeSignificance":"minor"}}`)
+	require.Equal(t, http.StatusOK, w.Code, "a failed title edit must not fail the submit")
+
+	var dto map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &dto),
+		"the response body must be exactly ONE valid JSON object; the edit must never touch o.w")
+
+	require.Equal(t, tatarav1alpha1.StateAwaitingReview, e.task(t, "t1").Status.State,
+		"the stage transition committed before the edit and stays committed")
+	mr := e.mr(t, tatarav1alpha1.MergeRequestName("tatara-operator", 295))
+	require.Equal(t, "an MR", mr.Status.Title,
+		"the mirror follows the forge: a refused edit leaves it as it was")
+}
+
+// A merge request title has the same forge length cap an issue title does
+// (GitLab's 255-char Issuable validation applies to both), and an over-long one
+// is a 400 that would discard the edit. Clamp before the write, as every other
+// forge title site does.
+func TestOutcome_Implement_OverLongTitleIsClampedBeforeTheForge(t *testing.T) {
+	f := &reviewPanicForge{heads: map[int]string{295: "live-head"}}
+	e := buildV2(t, v2Opts{writer: f}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
+		mrV2("tatara-operator", 295, "t1"))
+
+	long := strings.Repeat("x", tatarav1alpha1.IssueTitleMaxChars+50)
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		fmt.Sprintf(`{"kind":"implement","payload":{"action":"submitted","title":%q,"body":"B","changeSignificance":"minor"}}`, long))
+	require.Equal(t, http.StatusOK, w.Code)
+
+	require.Len(t, f.editPRs, 1)
+	require.LessOrEqual(t, utf8.RuneCountInString(f.editPRs[0].Title), tatarav1alpha1.IssueTitleMaxChars,
+		"the title handed to the forge must be clamped, not the raw agent string")
+	require.Equal(t, tatarav1alpha1.ClampIssueTitle(long), f.editPRs[0].Title)
+	require.Equal(t, f.editPRs[0].Title, e.mr(t, tatarav1alpha1.MergeRequestName("tatara-operator", 295)).Status.Title,
+		"the mirror records what the forge was actually sent")
+}
+
+// NO TITLE, NO BODY, NO FORGE CALL. `submitted` requires both fields, so a
+// payload missing one is refused in the read-only validation phase - before the
+// claim - and the forge is never reached. This is what keeps every 4xx this
+// endpoint produces a pure no-write rejection.
+func TestOutcome_Implement_SubmittedWithoutTitleIs400AndMakesNoForgeEdit(t *testing.T) {
+	f := &reviewPanicForge{heads: map[int]string{295: "live-head"}}
+	e := buildV2(t, v2Opts{writer: f}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
+		mrV2("tatara-operator", 295, "t1"))
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"implement","payload":{"action":"submitted","title":"","body":"","changeSignificance":"minor"}}`)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	require.Empty(t, f.editPRs, "a rejected outcome must not edit anything on the forge")
 }
 
 // THE HEAD-RECORD BLOCK MUST NEVER TOUCH o.w. projectSCMWriterAndToken does a

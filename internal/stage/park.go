@@ -102,6 +102,7 @@ var unparkClasses = map[string]UnparkClass{
 	ReasonHeadMoving:             UnparkNever,
 	ReasonCIRed:                  UnparkNever,
 	ReasonCIBlocked:              UnparkNever,
+	ReasonMergeConflict:          UnparkNever,
 	ReasonOwnershipLost:          UnparkNever,
 	ReasonTriageStalled:          UnparkNever,
 	ReasonOperatorError:          UnparkNever,
@@ -112,6 +113,61 @@ var unparkClasses = map[string]UnparkClass{
 	ReasonMergeAuthRefused:       UnparkNever,
 	ReasonFoldAdoptionUnverified: UnparkNever,
 }
+
+// mergeStageParks is the SECOND axis park reasons divide on, and it is
+// ORTHOGONAL to UnparkClass: not who un-parks, but WHERE IN THE LIFECYCLE the
+// park was written.
+//
+// A member can only be written once the implementation has been ACCEPTED and
+// the work is at or past the merge. What blocks it is therefore OUTSIDE the
+// code - a credential, a protected branch, a sibling repo that already landed,
+// somebody else pushing to the branch - so a fresh implementation Task cannot
+// clear the obstacle, and minting one CLOSES the reviewed merge request that
+// holds the only copy of the finished work. Measured twice on 2026-08-10:
+// ansible!16 and terraform!215, both approved and conflict-free, closed unmerged
+// by the automatic re-entry lap with their blocker untouched.
+//
+// PER MEMBER, the writer that makes it merge-stage:
+//
+//	merge-timeout        the merged-state stage deadline, after review
+//	merge-blocked        repark of merge-timeout at MaxMergeReentries
+//	merge-auth-refused   the forge refused the merge CREDENTIAL (merge.go)
+//	merge-order-missing  ReconcileMerging entered with an empty mergeOrder
+//	head-moving          MaxHeadMoveReentries: somebody else owns the branch
+//	ci-red               CIRed's anyMerged arm ONLY: part of mergeOrder LANDED
+//	merge-conflict       MergeConflict's anyMerged arm ONLY: same, for a DIRTY
+//	                     merge request instead of a red check
+//	deploy-timeout       the deployed-state stage deadline, post-merge
+//	deploy-blocked       repark of deploy-timeout at MaxDeployReentries
+//
+// ci-blocked IS THE BOUNDARY CASE AND IS DELIBERATELY OUT. stage.CIRed reaches
+// it only when NOTHING in mergeOrder has merged, and red CI on an unmerged
+// branch is fixed by a new commit and nothing else - so re-implementing is the
+// remedy there, not a way of destroying one. merge-conflict does NOT follow
+// ci-blocked out, and the asymmetry is in the reasons, not an oversight: the
+// exhaustion terminal of the conflict cycle is merge-blocked (already a member),
+// and merge-conflict is written ONLY on the anyMerged refusal, where something
+// HAS landed - the ci-red half of the pair, not the ci-blocked half. Every other park reason is written
+// at or before review, about the attempt itself, and keeps its existing
+// treatment; ownership-lost is doubly out, because the merge request is a
+// HUMAN's and ourMR already refuses to touch it.
+var mergeStageParks = map[string]bool{
+	ReasonMergeTimeout:      true,
+	ReasonMergeBlocked:      true,
+	ReasonMergeAuthRefused:  true,
+	ReasonMergeOrderMissing: true,
+	ReasonHeadMoving:        true,
+	ReasonCIRed:             true,
+	ReasonMergeConflict:     true,
+	ReasonDeployTimeout:     true,
+	ReasonDeployBlocked:     true,
+}
+
+// IsMergeStagePark reports whether reason was written at or after the merge, on
+// work that was already implemented and reviewed. Callers use it to refuse the
+// two things that destroy such work: an automatic re-implementation, and the
+// close of the merge request it would replace.
+func IsMergeStagePark(reason string) bool { return mergeStageParks[reason] }
 
 // UnparkClassFor reports who un-parks a park reason. ok is false for a reason
 // that is not a park reason at all.
@@ -203,6 +259,167 @@ func repark(t *v1alpha1.Task, reason string, now time.Time) {
 	// Park validates the reason; both call sites pass a compile-time constant
 	// that is a member of ParkReasons, so the error is unreachable.
 	_ = Park(t, reason, now)
+}
+
+// UpgradeDeclineToOwnershipLost swaps a TAKEOVER Task's implement-declined park
+// for ownership-lost, and refuses every other (kind, reason) pair. It is the
+// #604 review's fix for the ordinary stand-down, and it exists because the two
+// halves of that change disagreed about what a human push means:
+//
+//   - the takeover job text calls a human push "normal and not a failure";
+//   - tatara-implement-takeover, the skill that turn is now REQUIRED to invoke,
+//     tells the pod to submit_outcome(action="declined") on exactly that signal
+//     (an ls-remote mismatch, or a non-fast-forward push rejection).
+//
+// Both of the agent's signals are LOCAL git calls, so it reaches that verdict
+// ahead of the operator's own flip, which waits on webhook -> mirror headSHA ->
+// ReconcileOwnership. The agent-first order parks implement-declined, which is
+// UnparkNever, which nothing resumes: the re-take is refused, DrainStandDownMerge
+// cannot re-drive an approved external head, and a merge request a human simply
+// took back is stuck until ParkRetention.
+//
+// THE RULE IS "A HUMAN PUSH SUPERSEDES A DECLINED TAKEOVER", NOT "A DIVERGENCE
+// DECLINE IS TOLD APART FROM A DELIBERATE ONE". The first draft of this claimed
+// the second, and it is FALSE: the job text requires the agent to comment on the
+// merge request explaining itself before it declines, so the expected human
+// response to a DELIBERATE decline is to read that comment and push a fix - and
+// that push flips ownership exactly like a divergence does. There is no signal
+// that separates the two. The agent's decline_reason is free text and cannot be
+// trusted with the question, and a trustworthy one would be a new outcome field,
+// i.e. an API change and its own design call.
+//
+// So the discriminator is not intent, it is the merge request: a takeover Task
+// is refused resumption for as long as the branch is still tatara's, and stops
+// being refused the moment it is the human's again. That is the right rule
+// anyway, and it is the one the rest of the machine already follows - it is what
+// UnparkTakeover's targets, DrainStandDownMerge and the whole stand-down path
+// are keyed on. The alternative, refusing a takeover forever on a merge request
+// its author has since moved on, is #604's own failure shape with a different
+// label on it.
+//
+// So a DELIBERATE decline is terminal until the human pushes, and resumable
+// after. That is a behaviour change on the decline, stated plainly rather than
+// smuggled in under an invariant that does not hold, and it includes
+// DrainStandDownMerge being able to merge - on an approved review of the HUMAN's
+// head - a merge request an earlier turn declined.
+//
+// "The branch is the human's again" is an OBSERVATION the caller makes, and it
+// is imperfect: the operator's only signal is liveHead != LastBotHeadSHA, so a
+// stale baseline reads tatara's own push as a hand-back. That is this package's
+// caller's problem, not this function's - it is argued, with the remedies that do
+// not work, at controller/ownership.go's parkOwnerTask.
+//
+// NARROW ON BOTH AXES ANYWAY, because both narrowings still are load-bearing:
+//
+//   - kind=takeover only. Only a takeover's Task is CONTINGENT on tatara owning
+//     somebody else's merge request; on any other kind the branch is tatara's
+//     own, so a human pushing to it is not "taking it back" and must not reopen
+//     a refusal the agent stands behind.
+//
+//   - implement-declined only, because THE UPGRADE RECONCILES TWO NAMES FOR ONE
+//     EVENT. On a takeover, implement-declined is the AGENT's local-git name for
+//     the very push the flip is here to record: the skill declines on an
+//     ls-remote mismatch or a non-fast-forward rejection, both local calls, so
+//     the agent's verdict routinely lands before the operator's webhook ->
+//     mirror -> here chain. Two observers, one event, two names; renaming is all
+//     this does. No other park reason has that property: each is written about
+//     something other than the push this flip is reacting to.
+//
+//     DO NOT justify it with "a human push must not launder a verdict", which
+//     stood here as "every other UnparkNever park is a genuine terminal (an
+//     exhaustion cap, an operator error, a contract mismatch) reached without
+//     any judgement about the merge request at all". That is FALSE, and ci-red
+//     alone retires it: enterCIRed writes it off the merge request's own
+//     pipeline verdict. Do not answer that with a corrected LIST of which
+//     reasons are merge-request-derived - #604's review tried twice and got two
+//     different wrong lists; one counterexample is what a universal claim costs,
+//     and a list is a second thing to keep true.
+//
+//     ci-blocked AND head-moving ARE OPEN QUESTIONS, not settled by the
+//     principle above. A human push can turn red CI green or land the head the
+//     corridor was waiting for, and afterwards the merge request is still
+//     mergeable on an approved review - a real case for upgrading them too. What
+//     defends excluding them is only that the operator classified no OWNERSHIP
+//     change when it wrote either park, so upgrading would assert a hand-back it
+//     never measured. A conservative default, not a derived result; the price is
+//     ParkRetention. An earlier draft claimed head-moving was structurally
+//     distinguishable because the flip always preempts it - FALSE, and not to be
+//     reinstated: DrainStandDownMerge runs a LIVE takeover Task against an
+//     external-owned merge request, and the flip branch gates on
+//     Ownership == tatara, so it cannot fire there at all.
+//
+// It is NOT repark, and the reason is narrow: this is ONE park's reason being
+// corrected, not a second park. repark clears and re-Parks, so Park's park-event
+// bookkeeping - fold this state's elapsed residency into StageElapsedCarrySeconds,
+// re-arm StateEnteredAt, restamp ParkedFromState - would run a second time for a
+// Task that only ever parked once. Only the reason and the park stamp move here.
+// The stamp DOES move, so the maintainer gets a full ParkRetention window from
+// the moment the branch actually came back, exactly as a fresh park would have.
+//
+// THE JUSTIFICATION THAT USED TO BE HERE WAS FALSE; do not reinstate it. It
+// said a repark would charge the resumed Task for the days it sat parked and so
+// blow ResidencyExceeded on its first pass back. It cannot: every way out of
+// parked(ownership-lost) THAT LEAVES THE TASK ALIVE writes a state entry in the
+// same pass, and stampEnter zeroes StageElapsedCarrySeconds and nils
+// StateWorkStartedAt, on which ResidencyExceeded returns false outright. The two
+// that resume the work - MintOrUnparkTakeoverTask and DrainStandDownMerge - go
+// through UnparkTakeover; UnparkForMRTerminal is a THIRD exit and does NOT (it
+// guards on the target state and the state reason, never on the park reason),
+// but it clears the park into a terminal via Enter, so stampEnter runs there
+// too. The qualifier is load-bearing, and NOT because the exits can be counted:
+// there are also ways out that write no state entry at all, because they DELETE
+// the Task rather than resume it (the reaper on ParkRetention, driveStrandedParks
+// and resumeNoReentryParks on a Task that owns Issues). A carry those leave
+// behind is moot, not carried. reArm is the mutation that PRESERVES the carry;
+// what matters here is only that no reArm caller admits ownership-lost - Unpark
+// and UnparkRetiredPark refuse it by class, reenterParkedOnReview by an explicit
+// switch over the reasons it accepts.
+//
+// NO DECISION reads the carry while the Task is parked (task_stage.go checks
+// residency only on an UN-parked Task), but a READER does, so do not restate
+// that as an absolute either: project_controller.go's updateTaskStageGauges
+// calls StateElapsedSeconds for every Task with StateEnteredAt set, with no
+// Parked filter, and Park leaves StateEnteredAt set. A re-fold is nonetheless
+// INVISIBLE there, and the arithmetic is the point: Park folds
+// now.Sub(StateEnteredAt) into the carry and re-stamps StateEnteredAt to the
+// same instant, so StateElapsedSeconds - now.Sub(StateEnteredAt) + carry -
+// moves the identical quantity from the first term to the second and reads the
+// same before and after (that continuity is what operator_task_state_age_seconds
+// is carry-adjusted FOR). The only thing a second fold would move is the raw
+// Status.StageElapsedCarrySeconds field - and "nothing exposes or decides on
+// that" is the third overstatement this paragraph has carried, so do not write
+// it either. It is a CRD status field (task_types.go), and ArmedClock DECIDES on
+// it: `reentered && carry > 0` at merged/deployed is the timeout-re-entry
+// discriminator, and ArmedClock's own comment calls that read exact - the
+// merge-timeout round trip, where Unpark's reArm deliberately PRESERVES the
+// carry, is that decision working as designed. The scope that survives is only
+// WHILE THE TASK IS PARKED: ArmedClock takes the park branch whenever ParkReason
+// is set and so never reaches the discriminator. That is enough here, because
+// this function neither un-parks nor transitions. So the gauge is neither a
+// reason to repark nor a reason not to; the reason is the one given above, that
+// a Task which parked once must not be booked two park events.
+//
+// changed is false, with no error, when the Task is ALREADY parked
+// ownership-lost. That is a converged state, not a misuse: every caller is a
+// converge-by-retry path (resumeFlipToExternal exists to re-drive an interrupted
+// flip, and its Get reads a CACHE that can still say implement-declined after
+// the write landed), so erroring there would block the very retry the caller is
+// making and would double-count the upgrade.
+func UpgradeDeclineToOwnershipLost(t *v1alpha1.Task, now time.Time) (bool, error) {
+	if t.Spec.Kind != kindTakeover {
+		return false, fmt.Errorf("decline upgrade is takeover-only, got kind %q", t.Spec.Kind)
+	}
+	if t.Status.ParkReason == ReasonOwnershipLost {
+		return false, nil // already converged
+	}
+	if t.Status.ParkReason != ReasonImplementDeclined {
+		return false, fmt.Errorf("decline upgrade requires parkReason=%s, got %q",
+			ReasonImplementDeclined, t.Status.ParkReason)
+	}
+	stamp := metav1.NewTime(now)
+	t.Status.ParkReason = ReasonOwnershipLost
+	t.Status.ParkedAt = &stamp
+	return true, nil
 }
 
 // takeoverTargets is UnparkTakeover's OWN allow-list, and it is deliberately
@@ -322,6 +539,52 @@ func UnparkForMRTerminal(t *v1alpha1.Task, to, reason string) error {
 // reason change, and StageElapsedCarrySeconds PRESERVED - so the 24h residency
 // dead-man switch stays cumulative across the migration and a Task that had
 // already burned 20 hours does not buy a fresh day by being un-parked.
+// UnparkCIRecovered releases a parked(implement-declined) Task whose decline was
+// a verdict on the INFRASTRUCTURE rather than on the change: the agent could not
+// hand the work on because the operator's own submission gate answered 409
+// ci-red, the blocker has since cleared, and the merge request tatara owns end
+// to end is green at the very head the agent gave up at.
+//
+// IT IS A DRIVER'S PRIMITIVE, NOT A RE-ENTRY RULE, and the distinction is the
+// whole safety argument. implement-declined stays UnparkNever: stage.Unpark has
+// no arm for it and must not grow one, because the reaper's unparkFires probe
+// calls Unpark to decide whether a park is somebody's to re-enter, and an arm
+// here would hold EVERY declined Task alive past ParkRetention - including the
+// overwhelming majority whose decline was a genuine verdict on the change.
+// Reclassifying it as UnparkTimer is refused for the reason unparkClasses gives:
+// a timer class requires a bounding counter and there is no CRD field to hold
+// one. The bound this recovery does have lives on ANNOTATIONS, read by
+// controller.driveCIRecoveryUnparks, exactly as driveRetiredUnparks' latch does.
+//
+// TAKEOVER IS EXCLUDED, and not defensively. On kind=takeover, implement-declined
+// is the agent's LOCAL-GIT name for a human push - the takeover skill declines on
+// an ls-remote mismatch or a non-fast-forward rejection, both local calls that
+// land before the operator's ownership flip - and UpgradeDeclineToOwnershipLost
+// already owns that reason there. Re-driving it would put an agent back on a
+// branch whose author has taken it back, in exactly the window before the flip
+// is recorded.
+//
+// reArm, not stampEnter: no state change, no reason change, and
+// StageElapsedCarrySeconds PRESERVED, so the residency dead-man switch stays
+// cumulative across the recovery. The Task lands back in the state it parked in -
+// under-implementation - where the reconciler mints a fresh implement pod, the
+// agent finds its own pushed work and a green pipeline, and the submission that
+// was refused goes through.
+func UnparkCIRecovered(t *v1alpha1.Task, now time.Time) error {
+	if t.Status.ParkReason != ReasonImplementDeclined {
+		return fmt.Errorf("ci-recovery un-park requires parkReason=%s, got %q",
+			ReasonImplementDeclined, t.Status.ParkReason)
+	}
+	if t.Spec.Kind == kindTakeover {
+		return fmt.Errorf("ci-recovery un-park is never for a takeover: implement-declined there names a human push")
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	reArm(t, now)
+	return nil
+}
+
 func UnparkRetiredPark(t *v1alpha1.Task, now time.Time) error {
 	class, ok := UnparkClassFor(t.Status.ParkReason)
 	if !ok || class != UnparkRetired {

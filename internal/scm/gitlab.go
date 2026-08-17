@@ -47,6 +47,18 @@ type glPayload struct {
 		LastCommit struct {
 			ID string `json:"id"`
 		} `json:"last_commit"`
+		// Source is the MR's source project, present only on Merge Request Hook
+		// deliveries. PathWithNamespace differs from Project.PathWithNamespace
+		// exactly when the MR is opened from a fork.
+		//
+		// glPayload is ONE struct shared by every GitLab event kind, and this key
+		// is not one of them: on a Merge Request Hook object_attributes.source is
+		// this object, but on a Pipeline Hook it is a STRING naming what triggered
+		// the pipeline (e.g. "merge_request_event"). A plain struct field failed
+		// json.Unmarshal for every pipeline delivery, and GitLab halts a webhook
+		// after enough consecutive verification failures - see MEMORY.md.
+		// glSourceProject tolerates both shapes without a second parse pass.
+		Source glSourceProject `json:"source"`
 	} `json:"object_attributes"`
 	Issue struct {
 		IID int `json:"iid"`
@@ -62,6 +74,27 @@ type glPayload struct {
 		} `json:"labels"`
 	} `json:"changes"`
 	Labels []glLabel `json:"labels"`
+}
+
+// glSourceProject decodes object_attributes.source. On a Merge Request Hook
+// it is an object (the MR's source project); on a Pipeline Hook it is a
+// string (what triggered the pipeline). Only the object form carries a
+// PathWithNamespace worth reading, so the string form (or anything else
+// that is not an object) is silently ignored rather than treated as an
+// error - the field simply does not apply to that event kind.
+type glSourceProject struct {
+	PathWithNamespace string `json:"-"`
+}
+
+func (s *glSourceProject) UnmarshalJSON(b []byte) error {
+	var obj struct {
+		PathWithNamespace string `json:"path_with_namespace"`
+	}
+	if err := json.Unmarshal(b, &obj); err != nil {
+		return nil
+	}
+	s.PathWithNamespace = obj.PathWithNamespace
+	return nil
 }
 
 // DetectAndVerify verifies the X-Gitlab-Token and parses the payload.
@@ -173,6 +206,7 @@ func glWorkItemEvent(kind string, isPR bool, p glPayload) WebhookEvent {
 		IsPR:         isPR,
 		HeadSHA:      p.ObjectAttributes.LastCommit.ID,
 		HeadBranch:   p.ObjectAttributes.SourceBranch,
+		HeadRepo:     p.ObjectAttributes.Source.PathWithNamespace,
 		ChangedLabel: changed,
 		Merged:       action == "merged",
 	}
@@ -498,9 +532,80 @@ func (c *GitLab) RemoveLabel(ctx context.Context, token, issueRef, label string)
 	return glDo(ctx, c.base(), http.MethodPut, path, token, map[string]string{"remove_labels": label}, nil)
 }
 
+// glHeadPipeline is an MR's head_pipeline object. Both CI derivations - the
+// merge gate's GetPRState and the agent-facing PRChecks - decode it into this
+// one shape and hand it to headCIStatus, so there is exactly one place where
+// "what is this MR's CI" is answered.
+type glHeadPipeline struct {
+	ID     int64  `json:"id"`
+	SHA    string `json:"sha"`
+	Status string `json:"status"`
+}
+
+// glCIDerivation is headCIStatus's answer: the status, plus what a caller
+// needs in order to show rows that actually explain it.
+type glCIDerivation struct {
+	// Status is the MIRROR vocabulary: none|pending|running|green|red.
+	Status string
+	// CommitStatuses are the statuses Status was folded from, and are non-empty
+	// ONLY on the head==nil arm. PRChecks turns them into checks[] rows so the
+	// status it reports is explained by at least one row; GetPRState, which has
+	// nowhere to put them, discards them. Returning them beats re-fetching:
+	// there is one derivation and one round-trip.
+	CommitStatuses []glCommitStatus
+	// StaleHead is true when a head pipeline exists but belongs to a PREVIOUS
+	// commit. Its jobs are not this head's checks, so PRChecks emits no rows on
+	// that arm: a row that explains a different commit explains nothing, and
+	// four completed/success rows under a pending status read as "CI passed".
+	// The flag lives here so the staleness predicate is derived once, in the
+	// same place as the status it produces.
+	StaleHead bool
+}
+
+// headCIStatus is THE GitLab CI derivation, in the MIRROR vocabulary. It
+// answers from the pipeline object's OWN aggregate status, which GitLab
+// computes across bridges (child pipelines), retries, allow_failure and manual
+// gates.
+//
+// Do not re-derive this by folding a job list. /pipelines/{id}/jobs excludes
+// bridge jobs, so on any repo that generates its real gating into a child
+// pipeline (containers, charts, helmfile via .parse.py's trigger:template) a
+// job fold sees four green jobs and answers green while the pipeline itself is
+// failed. That was #609.
+//
+// sha is the MR's current head; head may be nil.
+func (c *GitLab) headCIStatus(ctx context.Context, proj, sha, token string, head *glHeadPipeline) (glCIDerivation, error) {
+	switch {
+	case head == nil:
+		// No pipeline attached yet; fall back to commit statuses so external CI
+		// reporters (commit-status-only) are visible. Use the per-call token, not
+		// c.token: the writer client from ByProvider has an empty c.token, so
+		// GetCommitCIStatus (which reads c.token) would issue an unauthenticated
+		// read and 401 on private projects.
+		statuses, err := c.commitStatuses(ctx, proj, sha, token)
+		if err != nil {
+			return glCIDerivation{}, err
+		}
+		// foldCommitStatuses folds EVERY status on the commit before it answers,
+		// so its success is an aggregate claim and MirrorCIStatus's contract holds.
+		return glCIDerivation{
+			Status:         MirrorCIStatus(foldCommitStatuses(statuses)),
+			CommitStatuses: statuses,
+		}, nil
+	case head.SHA != "" && head.SHA != sha:
+		// Pipeline is present but belongs to a previous commit (lag window after
+		// a push). Treat as pending so nobody acts on a stale success.
+		return glCIDerivation{Status: CIMirrorPending, StaleHead: true}, nil
+	default:
+		// Pipeline is for the current SHA (or SHA field not reported by the API).
+		return glCIDerivation{Status: glPipelineCIStatus(head.Status)}, nil
+	}
+}
+
 // GetPRState reads an MR and its head pipeline status.
-// When head_pipeline is null (pipeline not yet attached) or its SHA does not
-// match the MR's current SHA (stale pipeline), the status falls back to the
+// CI comes from headCIStatus, narrowed to the gate vocabulary: when
+// head_pipeline is null (pipeline not yet attached) or its SHA does not match
+// the MR's current SHA (stale pipeline), the status falls back to the
 // commit-statuses endpoint so external CI reporters are visible and the merge
 // gate does not act on a stale success.
 func (c *GitLab) GetPRState(ctx context.Context, repoURL, token string, number int) (PRState, error) {
@@ -512,46 +617,26 @@ func (c *GitLab) GetPRState(ctx context.Context, repoURL, token string, number i
 		Author struct {
 			Username string `json:"username"`
 		} `json:"author"`
-		SHA          string `json:"sha"`
-		SourceBranch string `json:"source_branch"`
-		State        string `json:"state"`
-		HeadPipeline *struct {
-			SHA    string `json:"sha"`
-			Status string `json:"status"`
-		} `json:"head_pipeline"`
+		SHA          string          `json:"sha"`
+		SourceBranch string          `json:"source_branch"`
+		State        string          `json:"state"`
+		HeadPipeline *glHeadPipeline `json:"head_pipeline"`
 	}
 	path := "/projects/" + url.PathEscape(proj) + "/merge_requests/" + strconv.Itoa(number)
 	if err := glDo(ctx, c.base(), http.MethodGet, path, token, nil, &mr); err != nil {
 		return PRState{}, err
 	}
 
-	ciStatus := ""
-	switch {
-	case mr.HeadPipeline == nil:
-		// No pipeline attached yet; fall back to commit statuses so external CI
-		// reporters (commit-status-only) are visible through the merge gate. Use
-		// the per-call token, not c.token: the writer client from ByProvider has
-		// an empty c.token, so GetCommitCIStatus (which reads c.token) would issue
-		// an unauthenticated read and 401 on private projects.
-		ciStatus, err = c.commitCIStatus(ctx, proj, mr.SHA, token)
-		if err != nil {
-			return PRState{}, err
-		}
-	case mr.HeadPipeline.SHA != "" && mr.HeadPipeline.SHA != mr.SHA:
-		// Pipeline is present but belongs to a previous commit (lag window after
-		// a push). Treat as pending so the merge gate waits for the new pipeline
-		// rather than acting on a stale success.
-		ciStatus = "pending"
-	default:
-		// Pipeline is for the current SHA (or SHA field not reported by the API).
-		ciStatus = glCIStatus(mr.HeadPipeline.Status)
+	ci, err := c.headCIStatus(ctx, proj, mr.SHA, token, mr.HeadPipeline)
+	if err != nil {
+		return PRState{}, err
 	}
 
 	return PRState{
 		Author:     mr.Author.Username,
 		HeadSHA:    mr.SHA,
 		HeadBranch: mr.SourceBranch,
-		CIStatus:   ciStatus,
+		CIStatus:   gateCIStatus(ci.Status),
 		Merged:     mr.State == "merged",
 		Closed:     mr.State == "closed",
 	}, nil
@@ -788,6 +873,35 @@ func (c *GitLab) ClosePR(ctx context.Context, repoURL, token string, number int,
 	return c.mrNote(ctx, c.base(), proj, number, token, body)
 }
 
+// EditPR updates an MR with only the non-nil fields in req. The body is sent as
+// `description`, which is GitLab's name for it - a PUT carrying `body` is
+// accepted and silently edits nothing. The project comes from glProjectPath (the
+// repo URL), not from an owner/repo pair, matching every other MR write here.
+// A 404 (MR gone) is benign, as in EditIssue.
+func (c *GitLab) EditPR(ctx context.Context, repoURL, token string, number int, req EditPRReq) error {
+	proj, err := glProjectPath(repoURL)
+	if err != nil {
+		return err
+	}
+	body := map[string]any{}
+	if req.Title != nil {
+		body["title"] = *req.Title
+	}
+	if req.Body != nil {
+		body["description"] = *req.Body
+	}
+	if len(body) == 0 {
+		return nil
+	}
+	path := "/projects/" + url.PathEscape(proj) + "/merge_requests/" + strconv.Itoa(number)
+	err = glDo(ctx, c.base(), http.MethodPut, path, token, body, nil)
+	var he *HTTPError
+	if errors.As(err, &he) && he.Status == http.StatusNotFound {
+		return nil
+	}
+	return err
+}
+
 // DeleteBranch deletes a head branch. It is the GitLab half of the B.6 reaper's
 // branch delete (issue #443); the reaper only ever calls it for a branch its own
 // terminal Task pushed. GitLab answers 404 for a branch that is already gone, so
@@ -926,32 +1040,65 @@ func (c *GitLab) setBoardLabel(ctx context.Context, token, itemURL, column strin
 // "pending" | "success" | "failure".
 // All pages are fetched (per_page=100) so a failing status beyond the
 // default 20-item first page is not missed.
+//
+// This is the reader path and it uses c.token. The writer path reaches the
+// same statuses through headCIStatus, which takes a per-call token: the writer
+// client from ByProvider has an empty c.token, so routing it here instead would
+// issue an unauthenticated read and 401 on private projects.
 func (c *GitLab) GetCommitCIStatus(ctx context.Context, owner, _ /*repo*/, sha string) (string, error) {
-	return c.commitCIStatus(ctx, owner, sha, c.token)
-}
-
-// commitCIStatus is the token-explicit core of GetCommitCIStatus, shared by
-// GetCommitCIStatus (reader path, token=c.token) and GetPRState (writer path,
-// per-call token). Keeping the token explicit prevents the empty-c.token writer
-// client (from ByProvider) issuing an unauthenticated statuses read - which
-// would 401 on private projects and break the merge gate when an MR has no head
-// pipeline yet.
-func (c *GitLab) commitCIStatus(ctx context.Context, owner, sha, token string) (string, error) {
-	type statusItem struct {
-		Status string `json:"status"`
-	}
-	path := "/projects/" + url.PathEscape(owner) + "/repository/commits/" + url.PathEscape(sha) + "/statuses?per_page=100"
-	statuses, err := glDoPaged[statusItem](ctx, c.base(), path, token)
+	statuses, err := c.commitStatuses(ctx, owner, sha, c.token)
 	if err != nil {
 		return "", err
 	}
+	return foldCommitStatuses(statuses), nil
+}
+
+// glCommitStatus is one row of /repository/commits/{sha}/statuses. name and
+// target_url are decoded so the same fetch that answers "what is the CI" can
+// also populate checks[]; nothing folds on them.
+type glCommitStatus struct {
+	Name      string `json:"name"`
+	Status    string `json:"status"`
+	TargetURL string `json:"target_url"`
+}
+
+// commitStatuses lists every commit status on sha. All pages are fetched
+// (per_page=100) so a failing status beyond the default 20-item first page is
+// not missed.
+func (c *GitLab) commitStatuses(ctx context.Context, owner, sha, token string) ([]glCommitStatus, error) {
+	path := "/projects/" + url.PathEscape(owner) + "/repository/commits/" + url.PathEscape(sha) + "/statuses?per_page=100"
+	return glDoPaged[glCommitStatus](ctx, c.base(), path, token)
+}
+
+// foldCommitStatuses reduces commit statuses to the gate vocabulary through
+// the shared failure > pending > success > "" reducer. No statuses means no
+// observation, which is "" and not success.
+func foldCommitStatuses(statuses []glCommitStatus) string {
 	if len(statuses) == 0 {
-		return "", nil
+		return ""
 	}
-	// Aggregate through the shared failure > pending > success > "" reducer.
 	mapped := make([]string, len(statuses))
 	for i, s := range statuses {
 		mapped[i] = glCIStatus(s.Status)
 	}
-	return foldCIStatuses(mapped...), nil
+	return foldCIStatuses(mapped...)
+}
+
+// glPipelineJob is one row of /pipelines/{id}/jobs.
+type glPipelineJob struct {
+	ID     int64  `json:"id"`
+	Name   string `json:"name"`
+	Status string `json:"status"`
+	WebURL string `json:"web_url"`
+}
+
+// glPipelineBridge is one row of /pipelines/{id}/bridges: a trigger job, and
+// the unit that carries a child pipeline's result. /jobs does not return these.
+type glPipelineBridge struct {
+	Name               string `json:"name"`
+	Status             string `json:"status"`
+	WebURL             string `json:"web_url"`
+	DownstreamPipeline *struct {
+		WebURL string `json:"web_url"`
+	} `json:"downstream_pipeline"`
 }

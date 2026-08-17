@@ -271,6 +271,60 @@ var MintOutcomeTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Help: "Intake mint attempts by task kind and typed outcome (contract B.4).",
 }, []string{"kind", "outcome"})
 
+// AdoptionEnqueuedTotal counts dependency-upgrade merge requests turned into a
+// QUEUED adoption, by project and by which producer saw it first. The webhook is
+// the fast path and the sweep is the backstop, so a healthy project's `sweep`
+// rate is near zero: a sustained `sweep` rate means webhook deliveries are being
+// lost, which is invisible on the mint counters (the sweep enqueues them either
+// way, just up to a full issueScan period later).
+var AdoptionEnqueuedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "operator_adoption_enqueued_total",
+	Help: "Dependency-upgrade merge requests enqueued for adoption, by project and producer activity (sweep|webhook).",
+}, []string{"project", "activity"})
+
+// adoptionActivities is AdoptionEnqueuedTotal's closed {activity} set: the two
+// producers of a queued adoption - the webhook (issue #495's original path)
+// and the sweep, which enqueues under the same dedup key as a pure backstop
+// since Task 8. Both are seeded, not just the one a given pass happens to hit,
+// because the pair is the whole point of the label - a `sweep` series that
+// only appears once the backstop fires cannot be compared against `webhook`
+// on the first lost delivery after a pod roll.
+var adoptionActivities = []string{"sweep", WebhookActivity}
+
+// AdoptionEventDroppedTotal counts QUEUED dependency-upgrade adoptions that never
+// became a Task, by reason. A queued snapshot is a POINTER to a live forge
+// object, and the dispatcher re-asks the adoption question at admit time rather
+// than trusting the snapshot - so a non-zero rate is the mechanism WORKING: it is
+// the count of agent pods not burned on merge requests that stopped being
+// adoptable while they waited.
+var AdoptionEventDroppedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "operator_adoption_event_dropped_total",
+	Help: "Queued dependency-upgrade adoptions dropped before minting, by project and reason.",
+}, []string{"project", "reason"})
+
+// adoptionDropReasons is AdoptionEventDroppedTotal's closed reason set, seeded
+// for the same reason every counter here is: a CounterVec with no
+// WithLabelValues call has NO series, so increase(...[1h]) is blind to the first
+// increment after every pod roll. Kept in sync with BOTH producers - the
+// dispatcher's drop(...) call sites and the webhook's pre-enqueue refusal - by
+// TestAdoptionDropReasonsMatchTheirProducers, which scans them out of the source;
+// sweepSkipReasons carried the prose version of that instruction and drifted from
+// four call sites anyway (issue #495).
+//
+// repo_slug_unknown is the webhook's alone and it is a CONFIGURATION fault, not a
+// freshness one: a Repository URL its provider cannot turn into a forge slug
+// refuses every adoption for that repository forever, because AdoptUpgradeMR's
+// fork clause fails closed on the empty value. Unlike the dispatcher's reasons,
+// a sustained rate here is never the mechanism working.
+//
+// merged and closed are the FRESHNESS handlers' own reasons
+// (internal/webhook/mirror_refresh.go's dropQueuedAdoption, driven by
+// handleMRClosed): a still-queued adoption whose merge request merged or closed
+// out from under it while it waited behind a full pool. Kept as two series, not
+// one, so a dashboard can tell a happy-path merge racing the queue apart from a
+// human or the engine withdrawing the proposal.
+var adoptionDropReasons = []string{"not_adoptable", "repository_gone", "repo_slug_unknown", "merged", "closed"}
+
 // sweepSkipReasons is the closed skip-reason set. Keep in sync with sweep.go's
 // SweepSkip* constants - enforced by TestSweepSkipReasonsMatchSweepConstants,
 // which scans them out of the source, because the identical prose instruction
@@ -284,7 +338,6 @@ var sweepSkipReasons = []string{
 	"already_minted",
 	"tombstone_deleted",
 	"mint_not_owed",
-	"upgrade_headroom_bound",
 }
 
 // mintOutcomeKinds x mintOutcomes is MintOutcomeTotal's closed label set, seeded
@@ -305,10 +358,25 @@ var mintOutcomes = []string{"not_owed", "created", "existing_live", "tombstone_d
 // live forge delivery is not a sweep pass and must not read as one.
 var sweepActivities = []string{"sweep", WebhookActivity}
 
+// ownerActivities is the closed {activity} set for the two OWNER-resolution
+// counters, and it is sweepActivities plus the dispatcher. resolveLiveMROwner
+// now also runs at ADMIT time (the queued-adoption re-check), and a stale-owner
+// ref it repairs there is not a sweep pass and must not read as one - the exact
+// mislabelling issue #521 fixed for the webhook half. SweepSkippedTotal is
+// deliberately NOT seeded for it: the dispatcher records its refusals on
+// AdoptionEventDroppedTotal and emits no sweep skip at all, so seeding one would
+// add permanently dead series.
+var ownerActivities = []string{"sweep", WebhookActivity, QueueActivity}
+
 // WebhookActivity mirrors controller.WebhookActivity. Literal here for the same
 // no-reverse-import reason as sweepSeedReasons; the two are pinned together by
 // TestWebhookActivityMatchesTheControllerConstant.
 const WebhookActivity = "webhook"
+
+// QueueActivity mirrors controller.QueueActivity: mint-adjacent work the
+// leader-elected DISPATCHER does at admission. Pinned by
+// TestQueueActivityMatchesTheControllerConstant.
+const QueueActivity = "queue"
 
 // sweepSeedReasons is the closed fail(reason, ...) set for sweep.go's B.4 pass
 // (SweepActivity), plus list_tasks. Literal here (not imported from
@@ -329,17 +397,15 @@ var sweepSeedReasons = []string{
 	"get_owning_task", "get_mr_cr", "adopt_pr", "mint_review_task",
 	"reopen_retained_proposal", "get_mr_cr_post_classify", "list_pr_comments",
 	"reconcile_ownership", "resolve_live_owner",
-	// The adoption arm (a dependency-upgrade merge request minting its own
-	// upgrade Task): the mint itself, and the lane count that decides how many
-	// this pass may take. An uncountable lane budget adopts NOTHING, so its
-	// failure is invisible in the mint counters and only shows up here.
-	"adopt_upgrade_mr", "count_upgrade_lanes",
-	// The deferral record a freed lane reads to know WHICH repository is
-	// waiting. Its failure is silent by construction - the pass still logs and
-	// counts every upgrade_headroom_bound skip, and the merge request is still
-	// adopted on the ordinary four-hourly slot - so this counter is the only
-	// place a repository that can no longer be woken early becomes visible.
-	"record_upgrade_deferral",
+	// The adoption arm no longer mints and no longer counts lanes - it ENQUEUES,
+	// and the dispatcher mints under the general pool (queue_controller.go,
+	// outside this scan: this list is sweep.go's fail(reason, ...) sites only).
+	// enqueue_adopt_upgrade is the sweep's enqueue failing, which is the one way
+	// a merge request the operator CAN see still ends a pass with no queue
+	// entry. adopt_upgrade_mr left with the mint it named - the dispatcher's own
+	// admit-time failure is a plain error return, not a fail(reason, ...) call,
+	// so it is not part of this seeded set.
+	"enqueue_adopt_upgrade",
 }
 
 // cronReasons/refineReasons are the closed reason sets for projectscan.go's
@@ -359,6 +425,19 @@ var refineReasons = []string{"invalid_cron", "stamp_failed", "refine_inflight_ch
 // tick reads the live upgrade-Task count before minting, and a failed read is a
 // tick that silently minted nothing.
 var upgradeReasons = []string{"invalid_cron", "stamp_failed", "upgrade_count_failed"}
+
+// queueSeedReasons is the closed SweepErrorsTotal{activity="queue"} reason set
+// for the dispatcher's own admission work (queue_controller.go), as opposed to
+// sweepSeedReasons (sweep.go's B.4 pass). admit_adopted_upgrade is
+// admitAdoptedUpgrade's one reason for every genuine machinery failure on the
+// re-check-then-mint path - a Get, resolveLiveMROwner, MintAdoptedUpgradeTask,
+// or drop's own Delete - which AdoptionEventDroppedTotal does not cover
+// (that counter's contract is "a non-zero rate is the mechanism WORKING", the
+// opposite of a transient API error). Kept in sync with
+// controller.adoptAdmitErrorReason by TestQueueAdmitErrorReasonIsSeeded, which
+// scans queue_controller.go the same way TestSweepSeedReasonsCoverEveryFailSite
+// scans sweep.go.
+var queueSeedReasons = []string{"admit_adopted_upgrade"}
 
 // SeedSweepErrorsForProject pre-seeds the closed (activity x reason) label set of
 // SweepErrorsTotal for ONE project, so a healthy sweep with zero errors still
@@ -386,17 +465,46 @@ func SeedSweepErrorsForProject(project string) {
 	seedLabels(seed, []string{project}, []string{"documentation", "issueScan"}, cronReasons)
 	seedLabels(seed, []string{project}, []string{"refine"}, refineReasons)
 	seedLabels(seed, []string{project}, []string{"upgrade"}, upgradeReasons)
+	seedLabels(seed, []string{project}, []string{QueueActivity}, queueSeedReasons)
 	skip := func(l ...string) { SweepSkippedTotal.WithLabelValues(l...) }
 	seedLabels(skip, []string{project}, sweepActivities, sweepSkipReasons)
-	for _, activity := range sweepActivities {
+	for _, activity := range ownerActivities {
 		SweepStaleOwnerRepairedTotal.WithLabelValues(project, activity)
 		SweepTerminalOwnerReleasedTotal.WithLabelValues(project, activity)
 	}
+	SeedAdoptionForProject(project)
 	// MintOutcomeTotal carries NO project label, so this is process-global and
 	// idempotent - seeded here rather than in init() only because this is where
 	// its neighbours are, and its absence was the gap the #521 review found.
 	mint := func(l ...string) { MintOutcomeTotal.WithLabelValues(l...) }
 	seedLabels(mint, mintOutcomeKinds, mintOutcomes)
+}
+
+// SeedAdoptionForProject pre-seeds the closed label sets of the two adoption
+// counters for ONE project.
+//
+// IT IS SPLIT OUT OF SeedSweepErrorsForProject BECAUSE ITS PRODUCERS ARE NOT
+// LEADER-ELECTED AND ITS ONLY SEEDER WAS. SeedSweepErrorsForProject runs from
+// ProjectReconciler, which is leader-only; the webhook's enqueueAdoption
+// (activity="webhook", reason="repo_slug_unknown") and its freshness handlers
+// (reason="merged"/"closed") run on ALL replicas, and merged/closed have no
+// non-webhook producer at all. On the two non-leader replicas those series
+// therefore did not exist until their first increment, and a counter born at 1
+// is invisible to increase(...[1h]) - so the FIRST adoption event after every
+// pod roll was unobservable on two pods out of three, for the series this
+// operator's adoption path leans on hardest.
+//
+// Called from BOTH: the leader's Project reconcile (via
+// SeedSweepErrorsForProject, so a Project enrolled after start is covered) and
+// every replica's webhook-server start (cmd/manager/wire.go), which is the only
+// hook that precedes any delivery. Idempotent - WithLabelValues returns the
+// existing child - so calling it from two places costs map lookups and nothing
+// else.
+func SeedAdoptionForProject(project string) {
+	enq := func(l ...string) { AdoptionEnqueuedTotal.WithLabelValues(l...) }
+	seedLabels(enq, []string{project}, adoptionActivities)
+	drop := func(l ...string) { AdoptionEventDroppedTotal.WithLabelValues(l...) }
+	seedLabels(drop, []string{project}, adoptionDropReasons)
 }
 
 func init() {
@@ -410,6 +518,8 @@ func init() {
 		SweepStaleOwnerRepairedTotal,
 		SweepTerminalOwnerReleasedTotal,
 		MintOutcomeTotal,
+		AdoptionEnqueuedTotal,
+		AdoptionEventDroppedTotal,
 		SweepOrphanStrandedSeconds,
 	)
 }

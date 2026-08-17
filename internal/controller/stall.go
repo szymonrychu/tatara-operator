@@ -416,6 +416,11 @@ func (r *TaskReconciler) agentAskedToBeStopped(task *tatarav1alpha1.Task) bool {
 // already written it, unprompted, so every step of that sequence would spend a
 // real turn's worth of tokens and wall time re-asking a question that has been
 // answered.
+//
+// ONE step of it is still owed, and it is the one the agent structurally cannot
+// perform: the failed-repos note. See AppendFailedReposNote. This is also the
+// path it is needed on MOST - it fires whenever an agent ends its work
+// properly, where the TTL path fires only when a clock came round first.
 func (r *TaskReconciler) stopAfterAgentHandoff(ctx context.Context, proj *tatarav1alpha1.Project,
 	task *tatarav1alpha1.Task, agentKind string, now time.Time) (ctrl.Result, error) {
 
@@ -432,6 +437,19 @@ func (r *TaskReconciler) stopAfterAgentHandoff(ctx context.Context, proj *tatara
 	if err := clearTurnAnnotations(ctx, r.Client, task); err != nil {
 		return ctrl.Result{}, fmt.Errorf("agent-requested stop clear %s: %w", task.Name, err)
 	}
+	// BEFORE the clear below, and not covered by the agent's note: the agent had
+	// no way to know a push failed at turn end (the wrapper reports it to pod
+	// stdout only), so this is the one fact its handoff cannot carry.
+	// Best-effort, and ordered ahead of the patch because the report is worth more
+	// than the tidy state: if the patch then fails, respawnLostPod picks the Task
+	// up with the payload deliberately un-retired, and the note is already
+	// written. AppendFailedReposNote is idempotent on the body, so that second
+	// pass does not double it - and the body names its turn, so a LATER turn
+	// losing the same repos is still recorded rather than swallowed by the older
+	// note that this unconditional clearLastTurn is about to make unrecoverable.
+	agent.AppendFailedReposNote(ctx,
+		&agent.FitNoteAppender{Client: r.Client, Spiller: r.spiller(proj), Namespace: task.Namespace},
+		task, task.Status.LastTurnFailedRepos, task.Status.LastTurnReposTurnID, now)
 	if err := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 		fresh.Status.PodStartedAt = nil
 		fresh.Status.StateWorkStartedAt = nil
@@ -446,6 +464,5 @@ func (r *TaskReconciler) stopAfterAgentHandoff(ctx context.Context, proj *tatara
 	l.Info("agent asked to be stopped (handoff note, no turn in flight); pod stopped",
 		"action", "agent_requested_stop", "resource_id", task.Name,
 		"state", task.Status.State, "agent_kind", agentKind)
-	_ = now
 	return ctrl.Result{RequeueAfter: agentBootRequeue}, nil
 }

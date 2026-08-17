@@ -330,6 +330,19 @@ func (m *OperatorMetrics) UnparkDeclined(stageReason, kind string) {
 // the same rule internal/controller's UnparkDecline vocabulary follows.
 const UnparkClassRetired = "retired"
 
+// UnparkClassCIRecovered is the `class` label value for the CI-recovery driver
+// (controller.driveCIRecoveryUnparks): a decline the operator's own submission
+// gate forced with a 409 ci-red, released because the pipeline it named has
+// since gone green at the same head. Declared here, not aliased, for the reason
+// above.
+//
+// Unlike class=retired this is NOT a one-shot migration and is expected to tick
+// at a low rate forever. What it must NOT do is climb: each Task is bounded by
+// MaxCIRecoveryUnparks and by an at-most-once-per-head latch, so a rate that
+// keeps rising means a Task is ping-ponging and one of those two bounds is not
+// sticking.
+const UnparkClassCIRecovered = "ci-recovered"
+
 // TaskUnparked increments operator_task_unparked_total for one released park.
 // Nil-safe: a reconciler wired without metrics is a test, not an outage.
 func (m *OperatorMetrics) TaskUnparked(parkReason, class string) {

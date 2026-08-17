@@ -23,8 +23,25 @@ var OwnershipFlipTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Help: "MergeRequest ownership flips by direction (to-tatara|to-external) and reason (takeover|external-push).",
 }, []string{"direction", "reason"})
 
+// OwnershipDeclineUpgradedTotal counts the ONE park upgrade the flip performs:
+// a kind=takeover Task found already parked implement-declined when its merge
+// request went back to the human, re-stamped ownership-lost so the re-take and
+// DrainStandDownMerge can still reach it (#604 review, see
+// stage.UpgradeDeclineToOwnershipLost).
+//
+// It is the ordinary stand-down arriving AGENT-FIRST: the pod's divergence
+// signal is a local git call, the operator's flip waits on a webhook. This rate
+// is the observable answer to "how often does that race land the wrong way
+// round", which is otherwise invisible - both orders converge on the same final
+// state by design, and only this counter distinguishes them. A counter with no
+// labels needs no pre-seed: registering it exposes the zero baseline.
+var OwnershipDeclineUpgradedTotal = prometheus.NewCounter(prometheus.CounterOpts{
+	Name: "operator_mr_ownership_decline_upgraded_total",
+	Help: "Takeover Tasks whose implement-declined park was upgraded to ownership-lost by a flip to external.",
+})
+
 func init() {
-	ctrlmetrics.Registry.MustRegister(OwnershipFlipTotal)
+	ctrlmetrics.Registry.MustRegister(OwnershipFlipTotal, OwnershipDeclineUpgradedTotal)
 	// Pre-seed the two real flip label sets so a healthy operator exposes a zero
 	// baseline from startup (metric-wiring audit convention, issue #370).
 	OwnershipFlipTotal.WithLabelValues("to-tatara", "takeover")

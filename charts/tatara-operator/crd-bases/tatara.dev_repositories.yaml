@@ -187,6 +187,16 @@ spec:
                 type: string
               lastIngestedCommit:
                 type: string
+              lastIssueScan:
+                description: |-
+                  LastIssueScan is the last time the issueScan/sweep pass covered THIS
+                  repository. It exists because Project.Status.LastIssueScan is project-wide:
+                  a pass that swept some repos advanced the shared base past the fire time of
+                  the repos it did not sweep, deferring them a full cron period - every
+                  period, deterministically, to whichever repo's offset lost the race with
+                  reconcile jitter.
+                format: date-time
+                type: string
               lastScheduledReingest:
                 description: |-
                   LastScheduledReingest is the last time the cron schedule stamped a

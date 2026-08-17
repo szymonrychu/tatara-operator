@@ -53,7 +53,15 @@ type QueuedEventPayload struct {
 	// submit_outcome(action=approved) and the upgrade outcome schema has no such
 	// action. Without this the Task would sit at refined re-submitting against a
 	// transition that does not exist.
-	// +kubebuilder:validation:Enum=new;refined;under-implementation
+	//
+	// THIS ENUM MUST TRACK TaskSpec.InitialState's, because enqueue.go copies
+	// this field onto it VERBATIM. #604 removed `refined` from both. A payload
+	// that still admitted it would build a Task the Task CRD now REJECTS, so the
+	// queue controller would fail to mint on every reconcile pass forever -
+	// trading the stranded Task #604 fixed for a stranded QueuedEvent, one
+	// enforcement site later. The only writer is projectscan's upgrade tick
+	// (under-implementation).
+	// +kubebuilder:validation:Enum=new;under-implementation
 	// +optional
 	InitialState string `json:"initialState,omitempty"`
 	// AlertRule is carried from the incident webhook onto the built Task's
@@ -85,6 +93,13 @@ type QueuedEventPayload struct {
 	// NewTask is the blueprint for a Task that does not exist yet (a mint).
 	// +optional
 	NewTask *QueuedTaskBlueprint `json:"newTask,omitempty"`
+
+	// AdoptedUpgrade marks the ADOPTION payload shape: a dependency-upgrade
+	// merge request that already exists on the forge, queued until the pool has
+	// room. Mutually exclusive with the admission-ticket shape
+	// (AgentKind+TaskRef) and with NewTask - see ValidateQueuedEventSpec.
+	// +optional
+	AdoptedUpgrade *AdoptedUpgradeRef `json:"adoptedUpgrade,omitempty"`
 }
 
 // QueuedTaskBlueprint is the mint blueprint for a Task that does not exist
@@ -107,6 +122,64 @@ type QueuedTaskBlueprint struct {
 	AlertRules  []string          `json:"alertRules,omitempty"`
 	Labels      map[string]string `json:"labels,omitempty"`
 	Annotations map[string]string `json:"annotations,omitempty"`
+}
+
+// AdoptedUpgradeRef is the merge-request snapshot a QUEUED ADOPTION carries.
+//
+// IT EXISTS BECAUSE NEITHER EXISTING MINT SHAPE CAN CARRY IT. QueuedTaskBlueprint
+// has no Source, no InitialState and no merge-request fields at all; the flat
+// legacy payload's TaskSource carries Number/HeadSHA/Title but not HeadBranch,
+// Body, Labels, Repo or HeadRepo. MintAdoptedUpgradeTask needs every one of
+// those: HeadBranch becomes AnnTakeoverHeadBranch (which is what points both the
+// review pod and the upgrade pod at the engine's branch), Title and Body feed
+// the mirror snapshot, and Repo/HeadRepo are AdoptUpgradeMR's fork guard.
+//
+// IT IS A SNAPSHOT OF A LIVE FORGE OBJECT, which is exactly the objection that
+// once ruled queued adoption out (MEMORY.md 2026-08-16). The webhook keeps it
+// fresh: `synchronize` refreshes headSHA/title/body on a still-Queued event and
+// `closed`/`merged` deletes one outright, and the mint re-runs the adoption
+// predicates before it creates anything.
+type AdoptedUpgradeRef struct {
+	// Number is the merge request number/iid. Required.
+	Number int `json:"number"`
+	// +optional
+	Title string `json:"title,omitempty"`
+	// Author is the forge login that opened the merge request - the identity
+	// adoptableAuthor rules on. Never a git commit author.
+	Author string `json:"author"`
+	// +optional
+	HeadSHA string `json:"headSHA,omitempty"`
+	// +optional
+	HeadBranch string `json:"headBranch,omitempty"`
+	// Body carries the changelog the review agent reads. It is capped at
+	// MergeRequestBodyMaxBytes (limits.go), NOT at GoalMaxBytes as it was until
+	// the whole-branch review: this string's DESTINATION is
+	// MergeRequest.status.body (mrSnapshot -> bindMRToTask -> SyncMergeRequest),
+	// whose own marker is 65536, so the smaller cap made the adopted mirror's
+	// body strictly shorter than the same merge request's body mirrored by any
+	// other path, for a field that never reaches a Task goal at all.
+	//
+	// NOTHING TRUNCATED IT AT ALL BEFORE THAT REVIEW, which is the real defect
+	// the cap value only frames: a grouped Renovate bump with per-dependency
+	// release notes routinely runs past any of these numbers, the QueuedEvent
+	// Create 422s, the webhook answers 500 on EVERY delivery for that merge
+	// request (GitLab counts consecutive failures toward auto-disabling the
+	// project hook), and the sweep fails enqueue_adopt_upgrade every pass
+	// forever. ClampAdoptedUpgradeBody (internal/controller/upgrade_adopt.go) is
+	// the one clamp; it runs inside AdoptedUpgradeRefFromPR so both producers
+	// inherit it, and again on the D4 refresh write.
+	// Go-side twin: MergeRequestBodyMaxBytes (limits.go).
+	// +kubebuilder:validation:MaxLength=65536
+	// +optional
+	Body string `json:"body,omitempty"`
+	// +optional
+	Labels []string `json:"labels,omitempty"`
+	// Repo and HeadRepo are AdoptUpgradeMR clause (d)'s fork guard, in the
+	// forge's own slug namespace. An EMPTY HeadRepo fails the guard CLOSED.
+	// +optional
+	Repo string `json:"repo,omitempty"`
+	// +optional
+	HeadRepo string `json:"headRepo,omitempty"`
 }
 
 // validAgentKinds are the 7 AGENT kinds a QueuedEventPayload.AgentKind may name
@@ -224,6 +297,20 @@ func ValidateQueuedEventSpec(spec QueuedEventSpec) error {
 		}
 		if hasNewTask && len(spec.Payload.NewTask.Goal) > 16384 {
 			return fmt.Errorf("queuedevent: payload.newTask.goal exceeds max length 16384")
+		}
+	}
+	if a := spec.Payload.AdoptedUpgrade; a != nil {
+		// The adoption payload MINTS. A ticket admits an existing Task's pod and
+		// mints nothing, and a blueprint describes a different Task entirely, so a
+		// payload claiming both leaves the dispatcher guessing which work it is.
+		if spec.Payload.AgentKind != "" || spec.Payload.TaskRef != "" || spec.Payload.NewTask != nil {
+			return fmt.Errorf("queuedevent: payload.adoptedUpgrade is exclusive with agentKind/taskRef/newTask")
+		}
+		if a.Number <= 0 {
+			return fmt.Errorf("queuedevent: payload.adoptedUpgrade.number must be positive")
+		}
+		if spec.RepositoryRef == "" {
+			return fmt.Errorf("queuedevent: payload.adoptedUpgrade requires repositoryRef")
 		}
 	}
 	return nil

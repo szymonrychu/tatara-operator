@@ -101,10 +101,34 @@ func TestEveryParkReasonHasAnUnparkClass(t *testing.T) {
 		_, ok := stage.UnparkClassFor(r)
 		require.True(t, ok, "park reason %q has no UnparkClass; the axis must be total", r)
 	}
-	require.Len(t, stage.ParkReasons, 28)
+	require.Len(t, stage.ParkReasons, 29)
 	require.Len(t, stage.RejectReasons, 6)
 	require.Len(t, stage.DoneReasons, 2)
-	require.Len(t, stage.Reasons, 36, "the three sets must partition Reasons with no remainder")
+	require.Len(t, stage.Reasons, 37, "the three sets must partition Reasons with no remainder")
+}
+
+// TestMergeStageParksAreParkReasonsAndExcludeTheImplementationOnes pins the
+// SECOND axis. Every member must be a real park reason (a typo here would
+// silently classify nothing), and the boundary case is ci-blocked: it is the one
+// reason in the same neighbourhood that a re-implementation is the correct
+// answer to, because stage.CIRed reaches it only when NOTHING has merged yet.
+func TestMergeStageParksAreParkReasonsAndExcludeTheImplementationOnes(t *testing.T) {
+	merge := []string{
+		stage.ReasonMergeTimeout, stage.ReasonMergeBlocked, stage.ReasonMergeAuthRefused,
+		stage.ReasonMergeOrderMissing, stage.ReasonHeadMoving, stage.ReasonCIRed,
+		stage.ReasonMergeConflict, stage.ReasonDeployTimeout, stage.ReasonDeployBlocked,
+	}
+	for _, r := range merge {
+		require.True(t, stage.IsParkReason(r), "%q must be a park reason", r)
+		require.True(t, stage.IsMergeStagePark(r), "%q is written at or after the merge", r)
+	}
+	for _, r := range []string{
+		stage.ReasonCIBlocked, stage.ReasonStageDeadline, stage.ReasonImplementDeclined,
+		stage.ReasonReviewPostRefused, stage.ReasonOwnershipLost, stage.ReasonOperatorError,
+		stage.ReasonBacklogSweep, stage.ReasonAwaitingHuman,
+	} {
+		require.False(t, stage.IsMergeStagePark(r), "%q is not a merge-stage park", r)
+	}
 }
 
 func TestTheThreeReasonSetsPartitionReasonsWithNoOverlap(t *testing.T) {
@@ -205,4 +229,78 @@ func TestUnparkForMRTerminalIsNarrow(t *testing.T) {
 	if err := stage.UnparkForMRTerminal(unparked, v1alpha1.StateDone, stage.ReasonMRMergedExternally); err != nil {
 		t.Fatalf("an unparked task must be a no-op success, got %v", err)
 	}
+}
+
+// UpgradeDeclineToOwnershipLost is the ONE park reason the ownership flip is
+// allowed to rewrite (#604 review). Both of its guards are load-bearing, so both
+// are pinned: widening either one turns a genuine terminal into a Task a human
+// push can resurrect.
+func TestUpgradeDeclineToOwnershipLost(t *testing.T) {
+	later := now.Add(72 * time.Hour)
+
+	t.Run("upgrades a declined takeover", func(t *testing.T) {
+		tk := taskOfKind(v1alpha1.StateUnderImplementation, "takeover")
+		require.NoError(t, stage.Park(tk, stage.ReasonImplementDeclined, now))
+		carry, entered := tk.Status.StageElapsedCarrySeconds, tk.Status.StateEnteredAt.Time
+
+		changed, err := stage.UpgradeDeclineToOwnershipLost(tk, later)
+		require.NoError(t, err)
+		require.True(t, changed)
+		require.Equal(t, stage.ReasonOwnershipLost, tk.Status.ParkReason)
+		require.Equal(t, v1alpha1.StateUnderImplementation, tk.Status.State,
+			"the upgrade must not move State")
+		require.Equal(t, later, tk.Status.ParkedAt.Time,
+			"the retention window restarts from the flip, so the maintainer gets a full ParkRetention "+
+				"from when the branch actually came back")
+		// The reason repark is wrong here: this is ONE park's reason being
+		// corrected, so Park's park-event bookkeeping - the residency fold and
+		// the StateEnteredAt re-arm - must not run a second time. NOT because a
+		// re-fold would blow ResidencyExceeded: it could not, since every exit
+		// from parked(ownership-lost) runs UnparkTakeover -> stampEnter, which
+		// zeroes the carry anyway. See UpgradeDeclineToOwnershipLost.
+		require.Equal(t, carry, tk.Status.StageElapsedCarrySeconds,
+			"the upgrade must not fold the parked interval into the residency carry")
+		require.Equal(t, entered, tk.Status.StateEnteredAt.Time,
+			"the upgrade must not re-arm the state clock")
+	})
+
+	t.Run("refuses another kind", func(t *testing.T) {
+		tk := taskOfKind(v1alpha1.StateUnderImplementation, "implement")
+		require.NoError(t, stage.Park(tk, stage.ReasonImplementDeclined, now))
+		_, err := stage.UpgradeDeclineToOwnershipLost(tk, later)
+		require.Error(t, err,
+			"on a non-takeover kind the branch is tatara's own, so a human push is not a hand-back")
+		require.Equal(t, stage.ReasonImplementDeclined, tk.Status.ParkReason)
+	})
+
+	t.Run("refuses another park reason", func(t *testing.T) {
+		tk := taskOfKind(v1alpha1.StateUnderImplementation, "takeover")
+		require.NoError(t, stage.Park(tk, stage.ReasonStageDeadline, now))
+		_, err := stage.UpgradeDeclineToOwnershipLost(tk, later)
+		require.Error(t, err,
+			"every other unresumable park on a takeover is a genuine terminal")
+		require.Equal(t, stage.ReasonStageDeadline, tk.Status.ParkReason)
+	})
+
+	t.Run("refuses an unparked task", func(t *testing.T) {
+		_, err := stage.UpgradeDeclineToOwnershipLost(
+			taskOfKind(v1alpha1.StateUnderImplementation, "takeover"), later)
+		require.Error(t, err)
+	})
+
+	// CONVERGED, NOT MISUSED. Every caller is a converge-by-retry path -
+	// resumeFlipToExternal re-drives an interrupted flip off a CACHED read that
+	// can still say implement-declined after the write landed - so erroring here
+	// would block the retry and double-count the upgrade.
+	t.Run("is a no-op success when already ownership-lost", func(t *testing.T) {
+		tk := taskOfKind(v1alpha1.StateUnderImplementation, "takeover")
+		require.NoError(t, stage.Park(tk, stage.ReasonOwnershipLost, now))
+		stamped := tk.Status.ParkedAt.Time
+
+		changed, err := stage.UpgradeDeclineToOwnershipLost(tk, later)
+		require.NoError(t, err)
+		require.False(t, changed, "a converged Task must not re-count as an upgrade")
+		require.Equal(t, stamped, tk.Status.ParkedAt.Time,
+			"a no-op must not restart the retention window either")
+	})
 }
