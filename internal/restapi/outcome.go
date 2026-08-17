@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -1192,8 +1193,90 @@ func (o *outcomeCtx) implement(p implementPayload) {
 			"action", "record_bot_head_skip", "reason", "scm_resolution", "task", o.task.Name)
 	}
 
+	s.editSubmittedMRs(ctx, o, open, p.Title, p.Body)
+
 	o.ok("submitted", "merge_order", strings.Join(p.MergeOrder, ","),
 		"change_significance", p.ChangeSignificance, "ci_hold", ciHold)
+}
+
+// editSubmittedMRs writes the submitted title and body onto the Task's own merge
+// requests on the forge, and refreshes the mirror from what was actually sent.
+//
+// Until this existed those two fields reached nothing but an internal Task note,
+// while tatara-cli's tool schema documented them as "MR title" / "MR body". That
+// gap made a whole class of review finding unfixable: `mr_write` exposes
+// open/comment/reply and no edit, so an agent asked to correct a stale version
+// in a merge request title had no carrier for it at all and could only decline.
+//
+// EXTERNAL MERGE REQUESTS ARE SKIPPED. An external MR is somebody else's - the
+// platform reviews it but never pushes to it - and its title is theirs to write.
+// Empty ownership is NOT external: it means "not yet classified", which at
+// implement-submit is the ordinary shape of an MR the agent opened this same
+// turn (mint leaves the field empty until ReconcileOwnership backfills it), and
+// the two paths that hand the platform somebody else's MR - takeover and upgrade
+// adoption - both stamp `tatara` explicitly. So `external` is the only value
+// that ever means "not ours".
+//
+// BEST-EFFORT, ON THE SAME CONTRACT AS THE record_bot_head STAMP ABOVE: the
+// stage transition has ALREADY committed, so nothing here may touch o.w (hence
+// the discardWriter) and no failure here may turn an accepted outcome into a
+// 500. A refused edit leaves the forge and the mirror as they were, logged at
+// WARN, and the next turn's submit sends the same title again.
+func (s *Server) editSubmittedMRs(ctx context.Context, o *outcomeCtx, open []tatarav1alpha1.MergeRequest, rawTitle, body string) {
+	// Clamped for the same reason every other forge title write is: a forge caps
+	// a merge request title (GitLab at 255 chars, the same Issuable validation an
+	// issue gets) and answers 400 on an over-long one, which here would discard
+	// the edit silently.
+	title := s.clampTitleForForge(ctx, o.r, obs.TitleSiteMREdit, o.task.Name, rawTitle)
+	writer, token, ok := s.projectSCMWriterAndToken(&discardWriter{}, o.r, o.proj)
+	if !ok {
+		s.log.WarnContext(ctx, "restapi: mr_edit skipped: scm writer/token resolution failed",
+			"action", "mr_edit_skip", "reason", "scm_resolution", "task", o.task.Name)
+		return
+	}
+	for i := range open {
+		mr := &open[i]
+		if mr.Status.Ownership == tatarav1alpha1.OwnershipExternal {
+			s.log.InfoContext(ctx, "restapi: mr_edit skipped: the merge request is externally owned",
+				"action", "mr_edit_skip", "reason", "external", "task", o.task.Name, "mr", mr.Name)
+			continue
+		}
+		repo, err := s.repoCR(ctx, o.proj.Name, mr.Spec.RepositoryRef)
+		if err != nil {
+			s.log.WarnContext(ctx, "restapi: mr_edit skipped: repository lookup failed",
+				"action", "mr_edit_skip", "reason", "repo_lookup", "task", o.task.Name, "mr", mr.Name, "error", err)
+			continue
+		}
+		// Both fields are always sent: `submitted` REJECTS a payload missing
+		// either, so there is no reachable title-only or body-only submit. The
+		// pointer shape is EditPRReq's contract for callers that do have one.
+		editErr := writer.EditPR(ctx, repo.Spec.URL, token, mr.Spec.Number,
+			scm.EditPRReq{Title: &title, Body: &body})
+		controller.RecordSCM(s.metrics, providerOf(o.proj), "edit_pr", editErr)
+		if editErr != nil {
+			s.log.WarnContext(ctx, "restapi: mr_edit skipped: forge edit failed",
+				"action", "mr_edit_skip", "reason", "edit_pr", "task", o.task.Name, "mr", mr.Name, "error", editErr)
+			continue
+		}
+		// The mirror follows the forge write, and only it. Leaving it stale would
+		// keep the OLD title in front of every reader that uses the mirror rather
+		// than the forge - the prompt bundle the next turn is built from, and the
+		// review pod - which is the same wrong title the reviewer asked to have
+		// corrected, still on screen after the fix landed.
+		key := types.NamespacedName{Namespace: s.ns, Name: mr.Name}
+		if err := objbudget.FitMergeRequest(ctx, s.c, s.spillerForOrNil(o.proj), key, func(m *tatarav1alpha1.MergeRequest) {
+			m.Status.Title = title
+			m.Status.Body = truncateValidUTF8(body, tatarav1alpha1.MergeRequestBodyMaxBytes)
+		}); err != nil {
+			obs.MirrorWriteDroppedTotal.WithLabelValues(o.proj.Name, "MergeRequest", "mr_edit").Inc()
+			s.log.WarnContext(ctx, "restapi: mr_edit mirror refresh failed",
+				"action", "mr_edit_skip", "reason", "fit_conflict", "task", o.task.Name, "mr", mr.Name, "error", err)
+			continue
+		}
+		s.log.InfoContext(ctx, "restapi: merge request title and body written to the forge",
+			"action", "mr_edit", "task", o.task.Name, "mr", mr.Name, "number", mr.Spec.Number,
+			"title_chars", utf8.RuneCountInString(title), "body_bytes", len(body))
+	}
 }
 
 // ownedMRRepos is the DEDUPED repo list of the MRs still open, in stable order.

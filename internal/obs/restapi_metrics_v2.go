@@ -113,6 +113,10 @@ const (
 	TitleSiteBrainstormPropose = "brainstorm_propose"
 	TitleSiteIssueCreate       = "issue_create"
 	TitleSiteIssueEdit         = "issue_edit"
+	// TitleSiteMREdit is the submit_outcome title on its way to the merge
+	// request. It is the one non-issue site: a forge caps a merge request title
+	// at the same length it caps an issue title, so the same clamp applies.
+	TitleSiteMREdit = "mr_edit"
 )
 
 func init() {
@@ -137,4 +141,5 @@ func init() {
 	RestTitleClampedTotal.WithLabelValues(TitleSiteBrainstormPropose)
 	RestTitleClampedTotal.WithLabelValues(TitleSiteIssueCreate)
 	RestTitleClampedTotal.WithLabelValues(TitleSiteIssueEdit)
+	RestTitleClampedTotal.WithLabelValues(TitleSiteMREdit)
 }

@@ -253,6 +253,19 @@ const ownYourPRRule = "### 3. You own the PR until it is clean\n\n" +
 	"Submitting on a RED one is not - the operator refuses that outcome, your turn does not end, and " +
 	"you are told which of CI, conflict or review findings is the problem.\n\n"
 
+// submittedTitleBodyRule tells the agent what `title` and `body` on a submitted
+// outcome actually DO, because for a long time they did nothing: they landed in
+// an internal Task note and the merge request kept whatever mr_write(open) gave
+// it. A reviewer asking for a corrected title was then asking for something no
+// agent had a tool for - `mr_write` exposes open/comment/reply only - and the
+// honest answer was to decline. The operator now writes both onto the merge
+// request itself (restapi's editSubmittedMRs), so this says so: a capability an
+// agent is not told about is a capability it does not have.
+const submittedTitleBodyRule = "`title` and `body` REPLACE the merge request's own title and description on " +
+	"the forge - they are not a note to the operator. That is also how you FIX either of them: " +
+	"re-submit with the corrected text. It is the only writer for those two fields, so a reviewer " +
+	"asking you to correct a title is asking for exactly this.\n\n"
+
 // inheritedWorkspaceRule is what the REVIEW agent must be told when its pod
 // mounts the Task's persistent workspace volume. Empty when it does not, because
 // then the paragraph would simply be false - the review pod gets a fresh clone.
@@ -427,6 +440,7 @@ func agentJob(agentKind string, task *tatarav1alpha1.Task, proj *tatarav1alpha1.
 			"you changed more than one repo: it is the DEPENDENCY order the repos merge in, and there " +
 			"is no default - getting it backwards ships a dependent repo against a parent that never " +
 			"published.\n\n" +
+			submittedTitleBodyRule +
 			"If you will not do the work, `submit_outcome(kind=implement, action=declined, " +
 			"decline_reason=...)`. There is no partial delivery: implement the whole scope or decline " +
 			"it." +
@@ -469,6 +483,11 @@ func agentJob(agentKind string, task *tatarav1alpha1.Task, proj *tatarav1alpha1.
 			"`submit_outcome(kind=implement, action=submitted, title=..., body=..., " +
 			"change_significance=major|minor|patch)` once the merge request is clean by the three " +
 			"tests above. It then goes to review exactly like any other change.\n\n" +
+			submittedTitleBodyRule +
+			"ON A TAKEOVER THAT CUTS BOTH WAYS: the title and description you send REPLACE the " +
+			"author's, and both fields are required, so send THEIR text back unchanged unless it has " +
+			"become wrong (a stale version, a scope that moved). Rewriting a correct title in your own " +
+			"words is the hijack section 1 warns about, in the one field a human is certain to read.\n\n" +
 			"If you will not finish it, `submit_outcome(kind=implement, action=declined, " +
 			"decline_reason=...)`. **A DECLINE IS TERMINAL FOR AS LONG AS THE BRANCH IS STILL " +
 			"TATARA'S.** It parks the Task: nothing un-parks it, and a second \"take over\" comment " +
@@ -561,6 +580,7 @@ func agentJob(agentKind string, task *tatarav1alpha1.Task, proj *tatarav1alpha1.
 			"you changed more than one repo: it is the DEPENDENCY order the repos merge in, and there " +
 			"is no default - getting it backwards ships a chart against an image tag that never " +
 			"published.\n\n" +
+			submittedTitleBodyRule +
 			"If no unit is worth taking this cycle, or the one you picked turns out to be unsafe, " +
 			"`submit_outcome(action=declined, decline_reason=...)`. `declined` is a correct and " +
 			"common answer, and there is no partial delivery." +

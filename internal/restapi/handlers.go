@@ -283,13 +283,14 @@ func titleLogFields(raw, sent string) []any {
 	}
 }
 
-// clampTitleForForge clamps an agent-supplied ISSUE title on its way to a forge
-// write, and when the clamp actually changed something it says so - counter plus
-// one INFO line - instead of rewriting what the agent wrote in silence.
+// clampTitleForForge clamps an agent-supplied title on its way to a forge write,
+// and when the clamp actually changed something it says so - counter plus one
+// INFO line - instead of rewriting what the agent wrote in silence.
 //
-// It is how all four issue-title writes in this package clamp: the three
-// CreateIssue sites and the deferred edit intent. MR titles do not go through it
-// and are a documented gap - see ClampIssueTitle.
+// It is how every title write in this package clamps: the three CreateIssue
+// sites, the deferred issue edit intent, and submit_outcome's merge request
+// title (editSubmittedMRs). A forge caps a merge request title exactly as it
+// caps an issue title, so there is one cap and one clamp - see ClampIssueTitle.
 //
 // The clamp exists to make an over-long title a NON-event, so it is expected to
 // engage on ordinary traffic. That is the argument for the signal, not against
