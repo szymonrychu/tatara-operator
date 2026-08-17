@@ -107,6 +107,30 @@ func TestEveryParkReasonHasAnUnparkClass(t *testing.T) {
 	require.Len(t, stage.Reasons, 36, "the three sets must partition Reasons with no remainder")
 }
 
+// TestMergeStageParksAreParkReasonsAndExcludeTheImplementationOnes pins the
+// SECOND axis. Every member must be a real park reason (a typo here would
+// silently classify nothing), and the boundary case is ci-blocked: it is the one
+// reason in the same neighbourhood that a re-implementation is the correct
+// answer to, because stage.CIRed reaches it only when NOTHING has merged yet.
+func TestMergeStageParksAreParkReasonsAndExcludeTheImplementationOnes(t *testing.T) {
+	merge := []string{
+		stage.ReasonMergeTimeout, stage.ReasonMergeBlocked, stage.ReasonMergeAuthRefused,
+		stage.ReasonMergeOrderMissing, stage.ReasonHeadMoving, stage.ReasonCIRed,
+		stage.ReasonDeployTimeout, stage.ReasonDeployBlocked,
+	}
+	for _, r := range merge {
+		require.True(t, stage.IsParkReason(r), "%q must be a park reason", r)
+		require.True(t, stage.IsMergeStagePark(r), "%q is written at or after the merge", r)
+	}
+	for _, r := range []string{
+		stage.ReasonCIBlocked, stage.ReasonStageDeadline, stage.ReasonImplementDeclined,
+		stage.ReasonReviewPostRefused, stage.ReasonOwnershipLost, stage.ReasonOperatorError,
+		stage.ReasonBacklogSweep, stage.ReasonAwaitingHuman,
+	} {
+		require.False(t, stage.IsMergeStagePark(r), "%q is not a merge-stage park", r)
+	}
+}
+
 func TestTheThreeReasonSetsPartitionReasonsWithNoOverlap(t *testing.T) {
 	seen := map[string]int{}
 	for _, set := range [][]string{stage.ParkReasons, stage.RejectReasons, stage.DoneReasons} {

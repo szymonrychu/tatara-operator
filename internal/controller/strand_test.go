@@ -67,6 +67,11 @@ func r2Metrics() *obs.OperatorMetrics { return obs.NewOperatorMetrics(prometheus
 // strandedFixture is a Task parked under an UnparkNever reason with NO human
 // reply waiting, owning one OPEN Issue - the exact population C.3 exists for,
 // and the exact population resumeNoReentryParks structurally cannot serve.
+//
+// The reason is stage-deadline, an IMPLEMENTATION-PHASE failure. It used to be
+// ci-red, which is now a stage.IsMergeStagePark member and so takes the
+// non-reentrant arm: the automatic-pickup tests below are about the ordinary
+// arm, and a fixture that silently switched arms would have tested nothing.
 func strandedFixture(t *testing.T, parkedAgo time.Duration) (
 	*tatarav1alpha1.Project, *tatarav1alpha1.Repository, *tatarav1alpha1.Task,
 	*tatarav1alpha1.Issue, string, string) {
@@ -78,7 +83,7 @@ func strandedFixture(t *testing.T, parkedAgo time.Duration) (
 	issName := tatarav1alpha1.IssueName("tatara-operator", 1)
 
 	task := reapTask("resume", taskName, SweepIssueKind, tatarav1alpha1.StateUnderImplementation,
-		stage.ReasonCIRed, time.Now().Add(-parkedAgo))
+		stage.ReasonStageDeadline, time.Now().Add(-parkedAgo))
 	parked := metav1.NewTime(time.Now().Add(-parkedAgo))
 	task.Status.ParkedAt = &parked
 	task.Status.IssueRefs = []string{issName}
@@ -216,7 +221,7 @@ func TestStrandedPark_DefersToAHumanReply(t *testing.T) {
 	require.Empty(t, mustGetIssue(t, c, issName).Annotations[tatarav1alpha1.AnnAutoReentries])
 }
 
-// TestStrandedPark_ReentryReasonUntouched: ci-blocked is UnparkNever, but
+// TestStrandedPark_ReentryReasonUntouched: stage-deadline is UnparkNever, but
 // awaiting-human is UnparkHuman and merge-timeout is UnparkTimer - both already
 // have an owner (driveUnparks) and must not be double-driven from here. So must
 // backlog-sweep, which never RAN and has no failure to recover from.
@@ -279,6 +284,84 @@ func TestStrandedPark_IsBoundedAndLandsInARealDeadEnd(t *testing.T) {
 	before := len(w.comments)
 	require.NoError(t, r.driveStrandedParks(ctx, proj, time.Now()))
 	require.Equal(t, before, len(w.comments), "the dead-end notice is once-only")
+}
+
+// TestStrandedPark_MergeStageParkStopsWithoutReentryOrClosingItsMR IS THE BUG.
+//
+// Measured 2026-08-10: ansible!16 and terraform!215, both fully reviewed and
+// conflict-free, were CLOSED UNMERGED by the automatic re-entry lap - "Closing:
+// tatara is restarting this issue (auto-reentry) after the previous attempt
+// ended in `merge-blocked`" - and replaced by a Task that then sat
+// parked(backlog-sweep) for a week. The work was finished; only the MERGE was
+// blocked, and a re-implementation cannot unblock a merge.
+//
+// So a merge-stage park lands as a human-visible STOP: notice, tatara-parked
+// label, no lap charged, and the reviewed merge request left OPEN.
+func TestStrandedPark_MergeStageParkStopsWithoutReentryOrClosingItsMR(t *testing.T) {
+	for _, reason := range []string{stage.ReasonMergeBlocked, stage.ReasonMergeAuthRefused} {
+		t.Run(reason, func(t *testing.T) {
+			ctx := context.Background()
+			proj, repo, task, iss, taskName, issName := strandedFixture(t, 2*time.Hour)
+			task.Status.ParkReason = reason
+			mrName := tatarav1alpha1.MergeRequestName("tatara-operator", 16)
+			task.Status.MRRefs = []string{mrName}
+			mr := botMR(mrName, taskName, "tatara-operator", 16)
+
+			c := newMirrorClient(t, proj, repo, reapSecret(), task, iss, mr)
+			w := newStrandWriter()
+			r := reapReconciler(c, w)
+
+			require.NoError(t, r.driveStrandedParks(ctx, proj, time.Now()))
+
+			still, ok := mustGetTask(t, c, taskName)
+			require.True(t, ok, "a merge-stage park must not be re-minted")
+			require.Equal(t, task.UID, still.UID, "the same task, not a fresh one")
+			require.Empty(t, w.closed, "the REVIEWED merge request must survive")
+
+			fresh := mustGetIssue(t, c, issName)
+			require.Empty(t, fresh.Annotations[tatarav1alpha1.AnnAutoReentries],
+				"no lap is spent on a park that will never re-enter")
+			require.NotEmpty(t, fresh.Annotations[tatarav1alpha1.AnnMergeStageParked],
+				"the notice is latched so it is posted exactly once")
+
+			issueRef := "szymonrychu/tatara-operator#1"
+			require.True(t, w.labelled(issueRef, TataraParkedLabel),
+				"the stop is VISIBLE in the backlog, not a silent vanish")
+			require.True(t, w.commentedWith(reason), "the notice names the blocker")
+			require.True(t, w.commentedWith("merge request"),
+				"and says the merge request was left open, which is the whole point")
+
+			before := len(w.comments)
+			require.NoError(t, r.driveStrandedParks(ctx, proj, time.Now()))
+			require.Equal(t, before, len(w.comments), "the notice is once-only")
+			require.Empty(t, w.closed, "and no later pass closes the merge request either")
+		})
+	}
+}
+
+// TestStrandedPark_OrdinaryParkStillReentersAndClosesItsMR is the regression
+// guard on the other side of the split: an IMPLEMENTATION-phase park is exactly
+// what automatic re-entry is for, and its half-finished bot PR is still closed
+// before the fresh Task opens its own.
+func TestStrandedPark_OrdinaryParkStillReentersAndClosesItsMR(t *testing.T) {
+	ctx := context.Background()
+	proj, repo, task, iss, taskName, issName := strandedFixture(t, 2*time.Hour)
+	mrName := tatarav1alpha1.MergeRequestName("tatara-operator", 16)
+	task.Status.MRRefs = []string{mrName}
+	mr := botMR(mrName, taskName, "tatara-operator", 16)
+
+	c := newMirrorClient(t, proj, repo, reapSecret(), task, iss, mr)
+	w := newStrandWriter()
+	r := reapReconciler(c, w)
+
+	require.NoError(t, r.driveStrandedParks(ctx, proj, time.Now()))
+
+	fresh, ok := mustGetTask(t, c, taskName)
+	require.True(t, ok)
+	require.NotEqual(t, task.UID, fresh.UID, "an ordinary park still re-mints")
+	require.Contains(t, w.closed, 16, "and still closes the old task's own bot PR")
+	require.Equal(t, "1", mustGetIssue(t, c, issName).Annotations[tatarav1alpha1.AnnAutoReentries],
+		"and still spends its lap")
 }
 
 // TestStrandedPark_SpendsTheBudgetBeforeTheReentry pins the crash ordering. A

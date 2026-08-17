@@ -90,6 +90,16 @@ const (
 	AnnAutoReentryExhausted = "tatara.dev/auto-reentry-exhausted"
 )
 
+// AnnMergeStageParked latches the ONE notice posted when an issue's Task parks
+// for a MERGE-STAGE reason (stage.IsMergeStagePark) and the automatic driver
+// therefore refuses to re-enter it at all. Same shape as
+// AnnAutoReentryExhausted - RFC3339 value, PRESENCE is the guard - and
+// deliberately NOT that annotation: the two notices say different things (a
+// spent budget versus a budget that was never charged), and reusing the marker
+// would let a merge-stage stop swallow a later exhaustion notice on the same
+// issue, or the reverse.
+const AnnMergeStageParked = "tatara.dev/merge-stage-parked"
+
 // AnnBrainstormSources is the annotation key carrying the comma-separated
 // brainstorm source list stamped on brainstorm Tasks by projectscan and read by
 // agent.BuildPod to gate the egress network label. Centralised here so the two

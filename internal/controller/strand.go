@@ -150,12 +150,13 @@ func (r *ProjectReconciler) strandedCandidate(proj *tatarav1alpha1.Project,
 	return now.After(parkedAt(t).Add(strandedParkGrace))
 }
 
-// driveOneStrandedPark picks ONE of three dispositions for ONE parked Task:
+// driveOneStrandedPark picks ONE of four dispositions for ONE parked Task:
 // COLLECT it (every owned issue is already closed - a corpse, no mint, no
-// budget), RE-ENTER it (budget left), or land it in the DEAD END (budget spent).
-// Between them they are total over the candidate population, which is the
-// property the previous version lacked: its closed-issue arm returned nil and
-// deferred to a driver that could not reach the case.
+// budget), STOP it outright (a MERGE-STAGE park, which re-entry cannot help and
+// would actively harm), RE-ENTER it (budget left), or land it in the DEAD END
+// (budget spent). Between them they are total over the candidate population,
+// which is the property the previous version lacked: its closed-issue arm
+// returned nil and deferred to a driver that could not reach the case.
 //
 // EVERY open owned Issue must have budget left, not merely one of them. resumeOne
 // severs and re-mints all of them together, so a Task holding one issue with
@@ -215,6 +216,17 @@ func (r *ProjectReconciler) driveOneStrandedPark(ctx context.Context, proj *tata
 			"action", "stranded_park_collect", "resource_id", t.Name,
 			"park_reason", t.Status.ParkReason, "kind", t.Spec.Kind, "issues", len(issues))
 		return r.resumeOne(ctx, proj, t, live, resumeTriggerAutoCollect)
+	}
+
+	// A MERGE-STAGE PARK IS NOT A FAILED ATTEMPT. The implementation succeeded
+	// and was reviewed; what is stuck is the merge, on something outside the code
+	// (see stage.IsMergeStagePark). Re-entering re-implements work that is already
+	// finished, CLOSES the reviewed merge request to make room for the copy, and
+	// leaves the blocker exactly where it was - so the lap is not merely wasted,
+	// it is destructive. It is checked BEFORE the budget so no lap is charged for
+	// a re-entry that will never happen.
+	if stage.IsMergeStagePark(t.Status.ParkReason) {
+		return r.landMergeStagePark(ctx, proj, t, open, now)
 	}
 
 	for _, iss := range open {
@@ -277,6 +289,67 @@ func (r *ProjectReconciler) landStrandedDeadEnd(ctx context.Context, proj *tatar
 			"max_reentries", tatarav1alpha1.MaxAutoReentries)
 	}
 	return nil
+}
+
+// landMergeStagePark is where a park written AT OR AFTER THE MERGE stops, and
+// it is landStrandedDeadEnd's mechanism with landStrandedDeadEnd's two
+// budget-shaped parts removed: no lap is charged (none was ever spendable here)
+// and the notice says the merge is blocked rather than that three attempts
+// failed. Everything else is identical and deliberately so - the once-only
+// comment, the tatara-parked label that keeps the sweep from re-minting the
+// issue ACTIVE, no early collection, ageing out at ParkRetention.
+//
+// It is a SIBLING and not a parameter on landStrandedDeadEnd: the two share a
+// helper (commentAndParkIssue) and differ in the notice, the latch and the
+// metric, which is three of the four things that function does. Two short clear
+// callers beat one with a mode flag.
+func (r *ProjectReconciler) landMergeStagePark(ctx context.Context, proj *tatarav1alpha1.Project,
+	t *tatarav1alpha1.Task, open []*tatarav1alpha1.Issue, now time.Time) error {
+
+	writer, token, err := r.scanWriter(ctx, proj)
+	if err != nil {
+		return fmt.Errorf("strand: scm writer: %w", err)
+	}
+	for _, iss := range open {
+		if iss.Annotations[tatarav1alpha1.AnnMergeStageParked] != "" {
+			continue
+		}
+		repo, err := r.repositoryFor(ctx, proj.Namespace, iss.Spec.RepositoryRef)
+		if err != nil {
+			return err
+		}
+		if err := commentAndParkIssue(ctx, r.Client, r.Metrics, proj, writer, token, iss, repo, parkNotice{
+			Marker:      tatarav1alpha1.AnnMergeStageParked,
+			MarkerValue: now.UTC().Format(time.RFC3339),
+			Body:        mergeStageParkComment(t),
+			LogFields: []any{"resource_id", iss.Name, "task", t.Name,
+				"park_reason", t.Status.ParkReason},
+		}); err != nil {
+			return err
+		}
+		obs.StrandedParkTotal.WithLabelValues(proj.Name, t.Status.ParkReason, obs.StrandedParkMergeStage).Inc()
+		log.FromContext(ctx).Info("a stranded park is blocked at the merge, not in the implementation; refusing to re-enter it",
+			"action", "stranded_park_merge_stage", "resource_id", iss.Name, "task", t.Name,
+			"park_reason", t.Status.ParkReason, "kind", t.Spec.Kind)
+	}
+	return nil
+}
+
+// mergeStageParkComment tells the human the two things that separate this stop
+// from every other one: the work is FINISHED, and the merge request is still
+// there. It also states what a reply will and will not do, because a reply
+// re-runs the implementation from scratch - useful when the blocker is gone,
+// wasteful when a maintainer could simply merge.
+func mergeStageParkComment(t *tatarav1alpha1.Task) string {
+	return fmt.Sprintf(
+		"tatara has stopped working this issue by itself: the implementation finished and was reviewed, "+
+			"and the task then stopped at the MERGE with `%s` (task `%s`).\n\n"+
+			"Restarting the implementation cannot clear a merge-stage blocker, so the merge request is "+
+			"left OPEN rather than closed and rebuilt. Clear the blocker and merge it, or comment here to "+
+			"have tatara implement the issue again from scratch.\n\n"+
+			"The issue stays open and is labelled `%s`, so the platform will not spend another agent on it "+
+			"on its own.",
+		t.Status.ParkReason, t.Name, TataraParkedLabel)
 }
 
 // strandedDeadEndComment is the ONE signal a human gets that the platform has

@@ -22,11 +22,13 @@ import (
 type resumeWriter struct {
 	scm.SCMWriter
 	closed  []int
+	bodies  []string
 	removed []string
 }
 
-func (w *resumeWriter) ClosePR(_ context.Context, _, _ string, number int, _ string) error {
+func (w *resumeWriter) ClosePR(_ context.Context, _, _ string, number int, body string) error {
 	w.closed = append(w.closed, number)
+	w.bodies = append(w.bodies, body)
 	return nil
 }
 
@@ -442,6 +444,83 @@ func TestNoReentryPark_MintCreatedLogsAsResumed(t *testing.T) {
 
 	require.True(t, containsLine(*lines, "resumed a no-re-entry park from a human reply"),
 		"MintCreated is the ONE outcome allowed to log as a resume")
+}
+
+// --- the merge-stage guard --------------------------------------------------
+
+// closeMRFixture is a parked Task owning ONE open bot PR, for the guard tests
+// that call closeTaskBotMRs directly: this is the function that issues the
+// irreversible forge write, so it is the layer the guard is asserted at.
+func closeMRFixture(reason string) (*tatarav1alpha1.Project, *tatarav1alpha1.Repository,
+	*tatarav1alpha1.Task, *tatarav1alpha1.MergeRequest) {
+
+	proj := reapProject("resume")
+	repo := reapRepo("resume", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
+	task := reapTask("resume", "close-task", SweepIssueKind, tatarav1alpha1.StateMerged,
+		reason, time.Now().Add(-time.Hour))
+	mrName := tatarav1alpha1.MergeRequestName("tatara-operator", 16)
+	task.Status.MRRefs = []string{mrName}
+	return proj, repo, task, botMR(mrName, "close-task", "tatara-operator", 16)
+}
+
+// TestCloseTaskBotMRs_RefusesAMergeStageParkedTask is the DEFENCE IN DEPTH
+// behind the strand driver's routing: whatever future caller reaches this
+// function with a re-mint trigger, a merge-stage park's merge request is
+// finished, reviewed work whose blocker is outside the code, and closing it
+// destroys the work while leaving the blocker exactly where it was.
+//
+// It covers the HUMAN-REPLY trigger too, and must: the dead-end notice invites
+// the maintainer to comment, and resumeNoReentryParks reaches this function on
+// that comment. Refusing only the automatic trigger would leave our own notice
+// baiting the human into the same destruction.
+func TestCloseTaskBotMRs_RefusesAMergeStageParkedTask(t *testing.T) {
+	for _, reason := range []string{stage.ReasonMergeBlocked, stage.ReasonMergeAuthRefused} {
+		for _, trigger := range []string{resumeTriggerAutoReentry, resumeTriggerHumanReply} {
+			t.Run(reason+"/"+trigger, func(t *testing.T) {
+				ctx := context.Background()
+				proj, repo, task, mr := closeMRFixture(reason)
+				c := newMirrorClient(t, proj, repo, reapSecret(), task, mr)
+				w := &resumeWriter{}
+				r := reapReconciler(c, w)
+
+				require.NoError(t, r.closeTaskBotMRs(ctx, proj, task, trigger))
+				require.Empty(t, w.closed, "a merge-stage park's reviewed merge request is never closed to re-implement it")
+			})
+		}
+	}
+}
+
+// TestCloseTaskBotMRs_ClosesAnImplementationParksMR is the control: the guard is
+// keyed on the park reason, and an implementation-phase park's half-finished PR
+// is still closed before the fresh Task opens its own.
+func TestCloseTaskBotMRs_ClosesAnImplementationParksMR(t *testing.T) {
+	ctx := context.Background()
+	proj, repo, task, mr := closeMRFixture(stage.ReasonStageDeadline)
+	c := newMirrorClient(t, proj, repo, reapSecret(), task, mr)
+	w := &resumeWriter{}
+	r := reapReconciler(c, w)
+
+	require.NoError(t, r.closeTaskBotMRs(ctx, proj, task, resumeTriggerAutoReentry))
+	require.Contains(t, w.closed, 16)
+	require.Contains(t, w.bodies[0], "restarting this issue", "the re-mint wording is unchanged")
+}
+
+// TestCloseTaskBotMRs_AutoCollectStillClosesWithItsOwnWording: the collect path
+// is EXEMPT from the guard and stays exempt. It re-mints nothing and every owned
+// issue is already closed, so the PR is being cleaned up rather than superseded -
+// and leaving it open there would strand an open forge PR whose mirror cascades
+// away with the Task the collect is about to delete.
+func TestCloseTaskBotMRs_AutoCollectStillClosesWithItsOwnWording(t *testing.T) {
+	ctx := context.Background()
+	proj, repo, task, mr := closeMRFixture(stage.ReasonMergeBlocked)
+	c := newMirrorClient(t, proj, repo, reapSecret(), task, mr)
+	w := &resumeWriter{}
+	r := reapReconciler(c, w)
+
+	require.NoError(t, r.closeTaskBotMRs(ctx, proj, task, resumeTriggerAutoCollect))
+	require.Contains(t, w.closed, 16, "the collect path is unchanged")
+	require.Contains(t, w.bodies[0], "the issue this PR was opened for is closed",
+		"and keeps its own distinct wording")
 }
 
 // --- pacing -----------------------------------------------------------------
