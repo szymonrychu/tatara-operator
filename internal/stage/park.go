@@ -102,6 +102,7 @@ var unparkClasses = map[string]UnparkClass{
 	ReasonHeadMoving:             UnparkNever,
 	ReasonCIRed:                  UnparkNever,
 	ReasonCIBlocked:              UnparkNever,
+	ReasonMergeConflict:          UnparkNever,
 	ReasonOwnershipLost:          UnparkNever,
 	ReasonTriageStalled:          UnparkNever,
 	ReasonOperatorError:          UnparkNever,
@@ -134,13 +135,19 @@ var unparkClasses = map[string]UnparkClass{
 //	merge-order-missing  ReconcileMerging entered with an empty mergeOrder
 //	head-moving          MaxHeadMoveReentries: somebody else owns the branch
 //	ci-red               CIRed's anyMerged arm ONLY: part of mergeOrder LANDED
+//	merge-conflict       MergeConflict's anyMerged arm ONLY: same, for a DIRTY
+//	                     merge request instead of a red check
 //	deploy-timeout       the deployed-state stage deadline, post-merge
 //	deploy-blocked       repark of deploy-timeout at MaxDeployReentries
 //
 // ci-blocked IS THE BOUNDARY CASE AND IS DELIBERATELY OUT. stage.CIRed reaches
 // it only when NOTHING in mergeOrder has merged, and red CI on an unmerged
 // branch is fixed by a new commit and nothing else - so re-implementing is the
-// remedy there, not a way of destroying one. Every other park reason is written
+// remedy there, not a way of destroying one. merge-conflict does NOT follow
+// ci-blocked out, and the asymmetry is in the reasons, not an oversight: the
+// exhaustion terminal of the conflict cycle is merge-blocked (already a member),
+// and merge-conflict is written ONLY on the anyMerged refusal, where something
+// HAS landed - the ci-red half of the pair, not the ci-blocked half. Every other park reason is written
 // at or before review, about the attempt itself, and keeps its existing
 // treatment; ownership-lost is doubly out, because the merge request is a
 // HUMAN's and ourMR already refuses to touch it.
@@ -151,6 +158,7 @@ var mergeStageParks = map[string]bool{
 	ReasonMergeOrderMissing: true,
 	ReasonHeadMoving:        true,
 	ReasonCIRed:             true,
+	ReasonMergeConflict:     true,
 	ReasonDeployTimeout:     true,
 	ReasonDeployBlocked:     true,
 }

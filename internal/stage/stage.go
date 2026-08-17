@@ -137,9 +137,10 @@ const (
 	ReasonMRTakenOver            = "mr-taken-over"
 	ReasonCIRed                  = "ci-red"
 	ReasonCIBlocked              = "ci-blocked"
+	ReasonMergeConflict          = "merge-conflict"
 )
 
-// ParkReasons is the 28-member vocabulary of status.parkReason. It is the CRD
+// ParkReasons is the 29-member vocabulary of status.parkReason. It is the CRD
 // enum on that field, verbatim.
 var ParkReasons = []string{
 	ReasonBacklogSweep,
@@ -170,6 +171,7 @@ var ParkReasons = []string{
 	ReasonMergeAuthRefused,
 	ReasonCIRed,
 	ReasonCIBlocked,
+	ReasonMergeConflict,
 }
 
 // RejectReasons is the 6-member vocabulary of status.stateReason on `rejected`.
@@ -1125,7 +1127,7 @@ func ReenterOnReviewChangesRequested(t *v1alpha1.Task, mrs []v1alpha1.MergeReque
 
 // enterFreshImplementing applies the awaiting-review|merged ->
 // under-implementation edge for a maintainer-driven fresh implementation, and on
-// success zeroes the merge, head-move and red-CI budgets (F3): a fresh
+// success zeroes the merge, head-move, red-CI and conflict budgets (F3): a fresh
 // implementation deserves a fresh merge budget, and this reset is human-gated
 // (one maintainer changes_requested per reset), so it is NOT the automatic
 // HeadMoved bounce and cannot spin a head-move loop on its own.
@@ -1136,6 +1138,7 @@ func enterFreshImplementing(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, now t
 	t.Status.HeadMoveReentries = 0
 	t.Status.MergeReentries = 0
 	t.Status.CIRedReentries = 0
+	t.Status.MergeConflictReentries = 0
 	return true
 }
 
@@ -1166,6 +1169,7 @@ func reenterParkedOnReview(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, now ti
 		t.Status.HeadMoveReentries = 0
 		t.Status.MergeReentries = 0
 		t.Status.CIRedReentries = 0
+		t.Status.MergeConflictReentries = 0
 		return true
 	default:
 		return false
@@ -1226,6 +1230,53 @@ func CIRed(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, maxCIRedReentries int)
 	}
 	t.Status.CIRedReentries++
 	return Edge{To: v1alpha1.StateUnderImplementation, Reason: ReasonCIRed}, true
+}
+
+// MergeConflict is the CONFLICT SELF-HEAL exit, and it is CYCLE 6. It is taken
+// from merged when the forge reports the merge request DIRTY - a textual
+// conflict with the base branch - and ONLY for a merge request TATARA OWNS.
+//
+// A conflict is deterministic in exactly the way a red required check is: the
+// merge corridor is pod-less, so nothing in there can reconcile a branch, and
+// re-reading the same "not mergeable" every 60s until the 4h budget parks it
+// buys nothing. It is worse than that for the case it was written for. An
+// ADOPTED upgrade merge request whose bot has frozen itself out - Renovate
+// refuses to rebase a branch an agent has committed to, deliberately - has NO
+// other actor at all, so the stall is permanent. The Task therefore goes back to
+// under-implementation, where an agent reconciles the branch BY COMMITTING TO
+// IT, which is also what keeps that freeze on.
+//
+// DIRTY ONLY. blocked is policy (a missing approval, a protected branch, a
+// required check) that no commit an agent writes can clear, and behind is not a
+// conflict at all - the forge merges a behind branch itself. Both keep stalling.
+//
+// It INCREMENTS status.mergeConflictReentries and caps at
+// maxMergeConflictReentries -> park(merge-blocked). The cap is load-bearing
+// rather than defensive: main keeps moving, so every lap can re-conflict, and
+// merge-blocked is EXACTLY where the old stall-and-time-out path landed such a
+// Task, so exhaustion degrades to the previous behaviour instead of inventing a
+// worse one.
+//
+// TWO refusals sit in front of the re-implement, mirroring CIRed:
+//
+//   - kind=review: a human's merge request; GUARD 1 refuses under-implementation
+//     for it from anywhere, and returning an edge Enter would then reject would
+//     wedge the corridor. It parks awaiting-human.
+//   - anyMerged(mrs): part of spec.mergeOrder has already landed, so
+//     re-implementing would re-propose merged code and recreate deleted
+//     branches. It parks merge-conflict, which has no re-entry: a human decides.
+func MergeConflict(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, maxMergeConflictReentries int) (Edge, bool) {
+	if t.Spec.Kind == kindReview {
+		return Edge{To: ParkTarget, Reason: ReasonAwaitingHuman}, true
+	}
+	if anyMerged(mrs) {
+		return Edge{To: ParkTarget, Reason: ReasonMergeConflict}, true
+	}
+	if t.Status.MergeConflictReentries >= maxMergeConflictReentries {
+		return Edge{To: ParkTarget, Reason: ReasonMergeBlocked}, true
+	}
+	t.Status.MergeConflictReentries++
+	return Edge{To: v1alpha1.StateUnderImplementation, Reason: ReasonMergeConflict}, true
 }
 
 // UnparkInput is everything the un-park rules read.
