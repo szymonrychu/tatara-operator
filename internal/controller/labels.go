@@ -117,8 +117,18 @@ func RecordSCM(m *obs.OperatorMetrics, provider, verb string, err error) {
 // It deliberately does NOT also call SCMWrite the way RecordSCM does:
 // obs.SCMVerbKind classifies an unknown verb as "write", so counting read
 // traffic there would dilute the very write-failure-ratio alert #268 fixed.
+//
+// It records ONLY an *scm.HTTPError, because its callers hand it the error from
+// a whole mirror sync and that wraps three unrelated failures: the forge read,
+// scm.OwnerRepo's URL parse, and the objbudget APISERVER write. scm.ErrorStatus
+// maps every non-HTTPError to "network", so recording unconditionally would put
+// etcd conflicts and byte-budget spill failures on an SCM-request panel under a
+// label claiming the forge was unreachable. A genuine transport failure is
+// indistinguishable from those at this layer and is therefore also skipped;
+// operator_mirror_sync_total{result="error"} still counts it.
 func recordSCMReadError(m *obs.OperatorMetrics, provider, verb string, err error) {
-	if m == nil || err == nil {
+	var he *scm.HTTPError
+	if m == nil || !errors.As(err, &he) {
 		return
 	}
 	m.SCMRequestErrorByStatus(provider, verb, scm.ErrorStatus(err))

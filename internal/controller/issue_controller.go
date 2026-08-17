@@ -179,9 +179,24 @@ func (r *IssueReconciler) doReconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// The deferred issue_write intents (C.2.12): the agent's tool call persisted
 	// one, and this is what performs it on the forge.
+	//
+	// The terminal guard is the same one the MergeRequest reconciler has carried
+	// around its drain steps since #436, and this side needs it for the same
+	// reason: every arm of the drain re-reads the thread (listThreadComments) to
+	// dedup its own marker, so on a permanently-gone issue the drain 404s exactly
+	// where the mirror sync above did. Without it #621's loop survives the fix for
+	// any Issue carrying a pending intent - it merely moves twenty lines down and
+	// costs an extra forge call per pass. The intent is NOT dropped: an agent's
+	// durable intent is not something a failed forge read is entitled to discard,
+	// so it is retried at the next cadence and stays visible in status.
 	if r.Driver != nil {
 		if err := r.Driver.DrainPendingComments(ctx, &iss); err != nil {
-			return ctrl.Result{}, err
+			if !isPermanentTargetGone(err) {
+				return ctrl.Result{}, err
+			}
+			log.FromContext(ctx).Info("issue: upstream permanently gone; stopped draining pending intents this pass",
+				"action", "issue_gone_drain", "resource_id", iss.Name,
+				"status", scm.ErrorStatus(err))
 		}
 	}
 

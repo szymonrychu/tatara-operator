@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -70,6 +71,38 @@ func TestReconcile_MirrorRead404IsVisibleInPrometheus(t *testing.T) {
 	}
 }
 
+// TestReconcile_MirrorRead5xxIsVisibleInPrometheus: telling a PERMANENT 404 from
+// a RETRYABLE 504 is the whole point of the counter, so the retryable arm has to
+// record too - recording only inside the gone branch would leave the metric
+// unable to make the one distinction it exists for.
+func TestReconcile_MirrorRead5xxIsVisibleInPrometheus(t *testing.T) {
+	rd := &mirrorReader{prCommentsErr: &scm.HTTPError{Status: 504, Path: "/x", Body: "gateway timeout"}}
+	_, r, mr := mrGoneFixture(t, rd)
+	m := obs.NewOperatorMetrics(prometheus.NewRegistry())
+	r.Driver = &StageDriver{Client: r.Client, Metrics: m}
+
+	if _, err := r.Reconcile(context.Background(), reqFor(mr)); err == nil {
+		t.Fatal("a 504 must still propagate")
+	}
+	if got := testutil.ToFloat64(m.SCMRequestErrorByStatusCounter("github", "list_pr_comments", "504")); got != 1 {
+		t.Fatalf("504 series = %v, want 1", got)
+	}
+}
+
+// TestRecordSCMReadError_IgnoresNonForgeFailures: the reconcilers hand this the
+// error from a whole mirror sync, which also wraps scm.OwnerRepo parse failures
+// and objbudget APISERVER writes. scm.ErrorStatus calls every non-HTTPError
+// "network", so recording unconditionally would report an etcd conflict as an
+// unreachable forge on the SCM-request panel.
+func TestRecordSCMReadError_IgnoresNonForgeFailures(t *testing.T) {
+	m := obs.NewOperatorMetrics(prometheus.NewRegistry())
+	recordSCMReadError(m, "github", "list_pr_comments", errors.New("etcd: conflict on status update"))
+	if got := testutil.ToFloat64(m.SCMRequestErrorByStatusCounter("github", "list_pr_comments", "network")); got != 0 {
+		t.Fatalf("a non-forge failure was recorded as an SCM request error: %v", got)
+	}
+	recordSCMReadError(nil, "github", "list_pr_comments", &scm.HTTPError{Status: 404})
+}
+
 // mrGoneFixture builds the MergeRequest reconciler with the CADENCE MIRROR SYNC
 // ON (mdMRReconciler deliberately leaves ReaderFor nil) and no Driver, so the
 // only forge call a reconcile can make is the thread read under test.
@@ -115,14 +148,66 @@ func TestReconcile_MirrorReadPermanent404MarksClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a permanent 404 on the mirror READ must not requeue as an error, got: %v", err)
 	}
-	if res.RequeueAfter <= 0 {
-		t.Fatalf("want a normal cadence requeue, got %+v", res)
+	if res.RequeueAfter != CIRefreshCadenceActive {
+		t.Fatalf("RequeueAfter = %v, want min(cadence, ciCadence) = %v", res.RequeueAfter, CIRefreshCadenceActive)
 	}
 	if rd.headSHACalls != 1 {
 		t.Fatalf("repo-readable probe calls = %d, want exactly 1", rd.headSHACalls)
 	}
-	if got := mdGetMR(t, c, mr.Name); got.Status.State != "closed" {
+	// The probe must address the REPO the mirror belongs to. A probe handed the
+	// wrong (or an empty) slug answers for something else entirely.
+	if rd.headSHAArgs != "szymonrychu|tatara-operator" {
+		t.Fatalf("probe addressed %q, want szymonrychu|tatara-operator", rd.headSHAArgs)
+	}
+	got := mdGetMR(t, c, mr.Name)
+	if got.Status.State != "closed" {
 		t.Fatalf("want mirror marked closed, got state=%q", got.Status.State)
+	}
+	// Without the stamp mirrorSyncDue never goes false, so every later reconcile
+	// re-reads the thread it has just proven gone and re-probes the repo - at the
+	// 5-minute CI tick that is a HIGHER forge rate than the backoff being removed,
+	// with the drains starved on every pass.
+	if got.Status.LastSyncedAt == nil {
+		t.Fatal("LastSyncedAt was not stamped: the gone thread will be re-read on every reconcile")
+	}
+}
+
+// TestReconcile_MirrorReadGoneStopsRereadingUntilTheNextCadence is the other half
+// of that stamp: the SECOND reconcile must make no forge call at all and must
+// fall through to the CI backstop and the drains instead of taking the gone
+// branch again.
+func TestReconcile_MirrorReadGoneStopsRereadingUntilTheNextCadence(t *testing.T) {
+	rd := &mirrorReader{prCommentsErr: &scm.HTTPError{Status: 404, Path: "/x", Body: "gone"}}
+	_, r, mr := mrGoneFixture(t, rd)
+
+	if _, err := r.Reconcile(context.Background(), reqFor(mr)); err != nil {
+		t.Fatalf("first reconcile: %v", err)
+	}
+	if _, err := r.Reconcile(context.Background(), reqFor(mr)); err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+	if rd.prCalls != 1 || rd.headSHACalls != 1 {
+		t.Fatalf("second reconcile re-read the gone thread: prCalls=%d headSHACalls=%d, want 1 and 1",
+			rd.prCalls, rd.headSHACalls)
+	}
+}
+
+// TestReconcile_MirrorRead410DoesNotCloseTheMirror pins the MergeRequest side to
+// the NARROW predicate. status.state="closed" makes stage.MRTerminal true, which
+// finalizes the OWNER TASK as rejected(mr-closed-externally) and posts a terminal
+// comment on the driving issue - so this disposition may not rest on a status
+// GitHub also returns repo-wide for a repository with Issues disabled, which the
+// /repos probe cannot see. The Issue side keeps 404/410 because its disposition
+// is a skipped read and nothing else.
+func TestReconcile_MirrorRead410DoesNotCloseTheMirror(t *testing.T) {
+	rd := &mirrorReader{prCommentsErr: &scm.HTTPError{Status: 410, Path: "/x", Body: `{"message":"Gone"}`}}
+	c, r, mr := mrGoneFixture(t, rd)
+
+	if _, err := r.Reconcile(context.Background(), reqFor(mr)); err == nil {
+		t.Fatal("a 410 on the MR read must propagate, not terminate the owner Task")
+	}
+	if got := mdGetMR(t, c, mr.Name); got.Status.State != "open" {
+		t.Fatalf("want state left open on a 410, got %q", got.Status.State)
 	}
 }
 

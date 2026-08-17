@@ -98,6 +98,7 @@ type mirrorReader struct {
 	prCommentsErr error
 	headSHAErr    error
 	headSHACalls  int
+	headSHAArgs   string
 }
 
 func (m *mirrorReader) ListIssueComments(context.Context, string, string, int) ([]scm.IssueComment, error) {
@@ -116,8 +117,9 @@ func (m *mirrorReader) ListPRComments(context.Context, string, string, int) ([]s
 	return m.prComments, nil
 }
 
-func (m *mirrorReader) GetDefaultBranchHeadSHA(context.Context, string, string) (string, error) {
+func (m *mirrorReader) GetDefaultBranchHeadSHA(_ context.Context, owner, repo string) (string, error) {
 	m.headSHACalls++
+	m.headSHAArgs = owner + "|" + repo
 	if m.headSHAErr != nil {
 		return "", m.headSHAErr
 	}

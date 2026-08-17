@@ -123,10 +123,28 @@ func (r *MergeRequestReconciler) doReconcile(ctx context.Context, req ctrl.Reque
 			recordSCMReadError(r.metrics(), provider, "list_pr_comments", err)
 			// tatara-operator#621: the #436 terminal-404 guard below only covers the
 			// forge WRITES. A permanently-gone upstream MR discovered by this READ
-			// returned raw from here and requeued forever, never reaching it. Same
-			// disposition, same terminal state a real forge close leaves.
-			if upstreamThreadGone(ctx, reader, &repo, provider, err) {
-				if serr := markMergeRequestGone(ctx, r.Client, r.spiller(&proj), &mr); serr != nil {
+			// returned raw from here and requeued forever, never reaching it.
+			//
+			// scm.IsNotFound (404 ONLY), not isPermanentTargetGone (404/410), even
+			// though upstreamThreadGone accepts both: the disposition here is NOT
+			// local to the mirror. status.state="closed" makes stage.MRTerminal true,
+			// which is what externalTerminalEdge finalizes the OWNER TASK on
+			// (rejected/mr-closed-externally, plus its terminal comment on the driving
+			// issue). A predicate that terminates somebody's Task must be the narrow
+			// one, and 404 is what a deleted PR actually answered throughout the
+			// incident. 410 is GitHub's answer for a deleted ISSUE and is also what it
+			// returns for a repo with Issues DISABLED - repo-wide, and invisible to the
+			// repo-readable probe, which reads /repos and not /issues. The Issue side
+			// keeps 404/410 because its disposition is a skipped read and nothing else.
+			if scm.IsNotFound(err) && upstreamThreadGone(ctx, reader, &repo, provider, err) {
+				// The stamp is not cosmetic. markMergeRequestGone writes state only, so
+				// mirrorSyncDue stays true forever and this branch re-reads the gone
+				// thread AND re-probes the repo on every CI tick - 5 minutes for an
+				// actively-worked MR, i.e. a HIGHER forge rate than the exponential
+				// backoff being removed, with the drains starved on every pass. Stamped,
+				// the gone thread costs 2 calls per MIRROR cadence and the drains run on
+				// every pass in between.
+				if serr := markMergeRequestThreadGone(ctx, r.Client, r.spiller(&proj), &mr, r.now()); serr != nil {
 					return ctrl.Result{}, serr
 				}
 				log.FromContext(ctx).Info("mergerequest: upstream thread permanently gone; marked closed, skipped mirror sync",
@@ -288,6 +306,33 @@ func markMergeRequestGone(ctx context.Context, c client.Client, sp objbudget.Spi
 	return objbudget.FitMergeRequest(ctx, c, sp, key, func(m *tatarav1alpha1.MergeRequest) {
 		m.Status.State = "closed"
 	})
+}
+
+// markMergeRequestThreadGone is markMergeRequestGone for the MIRROR READ path
+// (#621): it stamps the terminal state AND the cadence stamp the sync never got
+// to write, in ONE status update.
+//
+// Both facts belong to the same write. Without the stamp mirrorSyncDue never
+// goes false and the caller re-reads a thread it has already proven gone on
+// every reconcile; with it, the gone thread is re-probed once per mirror cadence
+// and every pass in between runs the CI backstop and the drains normally.
+// LastSyncedAt is unconditional here, unlike the state, because a second 404 an
+// hour later is a fresh confirmation and must re-arm the interval.
+func markMergeRequestThreadGone(ctx context.Context, c client.Client, sp objbudget.Spiller,
+	mr *tatarav1alpha1.MergeRequest, now time.Time) error {
+
+	stamp := metav1.NewTime(now)
+	key := client.ObjectKeyFromObject(mr)
+	if err := objbudget.FitMergeRequest(ctx, c, sp, key, func(m *tatarav1alpha1.MergeRequest) {
+		m.Status.State = "closed"
+		m.Status.LastSyncedAt = &stamp
+	}); err != nil {
+		return err
+	}
+	// Fold onto the in-memory copy the rest of this reconcile still reads.
+	mr.Status.State = "closed"
+	mr.Status.LastSyncedAt = &stamp
+	return nil
 }
 
 // SetupWithManager registers the MergeRequest reconciler.

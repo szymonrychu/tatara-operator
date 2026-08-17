@@ -5,8 +5,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
+	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -363,19 +367,28 @@ func TestMergeRequestControllerReconciles(t *testing.T) {
 func TestIssueReconcile_MirrorReadPermanent404SkipsSyncAndContinues(t *testing.T) {
 	proj, repo := mirrorProject("tatara-bot"), mirrorRepo()
 	task := taskAtStage(tatarav1alpha1.StateRefined, "")
+	// status=approved so the label projection has real work to do: it is the LAST
+	// step of doReconcile, and a label write is the only OBSERVABLE proof that the
+	// reconcile continued instead of returning early with a cadence requeue - the
+	// requeue value alone cannot tell the two apart.
 	iss := ownedIssue(tatarav1alpha1.IssueName(repo.Name, 62), 62, task,
-		tatarav1alpha1.IssueStatus{State: "open"})
+		tatarav1alpha1.IssueStatus{State: "open", Status: "approved"})
 	c := newMirrorClient(t, proj, repo, task, iss, scmSecret())
 	rd := &mirrorReader{commentsErr: &scm.HTTPError{
 		Status: 410, Path: "/repos/szymonrychu/tatara-operator/issues/62/comments", Body: `{"message":"Gone"}`,
 	}}
+	w := &mirrorWriter{}
 
-	res := reconcileIssue(t, newIssueReconciler(c, &mirrorWriter{}, rd), iss.Name)
+	res := reconcileIssue(t, newIssueReconciler(c, w, rd), iss.Name)
 
-	// Only the bottom of doReconcile returns the mirror cadence, so reaching it
-	// proves the reconcile continued past the failed read instead of returning.
 	if res.RequeueAfter != MirrorCadence(task) {
 		t.Fatalf("RequeueAfter = %v, want the mirror cadence %v", res.RequeueAfter, MirrorCadence(task))
+	}
+	if len(w.added) == 0 {
+		t.Fatal("the reconcile stopped at the failed read: the label projection never ran")
+	}
+	if rd.headSHAArgs != "szymonrychu|tatara-operator" {
+		t.Fatalf("probe addressed %q, want szymonrychu|tatara-operator", rd.headSHAArgs)
 	}
 	if rd.headSHACalls != 1 {
 		t.Fatalf("repo-readable probe calls = %d, want exactly 1", rd.headSHACalls)
@@ -400,6 +413,8 @@ func TestIssueReconcile_MirrorRead5xxPropagates(t *testing.T) {
 	c := newMirrorClient(t, proj, repo, task, iss, scmSecret())
 	rd := &mirrorReader{commentsErr: &scm.HTTPError{Status: 500, Path: "/x", Body: "boom"}}
 	r := newIssueReconciler(c, &mirrorWriter{}, rd)
+	m := obs.NewOperatorMetrics(prometheus.NewRegistry())
+	r.Driver = &StageDriver{Client: c, Metrics: m}
 
 	_, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Namespace: testNS, Name: iss.Name},
@@ -409,5 +424,39 @@ func TestIssueReconcile_MirrorRead5xxPropagates(t *testing.T) {
 	}
 	if rd.headSHACalls != 0 {
 		t.Fatalf("the repo probe must run ONLY on the 404/410 path, got %d calls", rd.headSHACalls)
+	}
+	if got := testutil.ToFloat64(m.SCMRequestErrorByStatusCounter("github", "list_issue_comments", "500")); got != 1 {
+		t.Fatalf("the Issue read path recorded no status series: %v, want 1", got)
+	}
+}
+
+// TestIssueReconcile_GoneThreadDoesNotWedgeThePendingDrain: every arm of
+// DrainPendingComments re-reads the thread to dedup its own marker, so on a
+// permanently-gone issue the drain 404s exactly where the mirror sync did.
+// Without a guard there, #621's loop survives the fix for any Issue carrying a
+// pending intent - it just moves twenty lines down and costs an extra call.
+func TestIssueReconcile_GoneThreadDoesNotWedgeThePendingDrain(t *testing.T) {
+	proj, repo := mirrorProject("tatara-bot"), mirrorRepo()
+	task := taskAtStage(tatarav1alpha1.StateRefined, "")
+	iss := ownedIssue(tatarav1alpha1.IssueName(repo.Name, 62), 62, task,
+		tatarav1alpha1.IssueStatus{
+			State:           "open",
+			PendingComments: []tatarav1alpha1.PendingComment{{RequestID: "req-1", Body: "hello"}},
+		})
+	c := newMirrorClient(t, proj, repo, task, iss, scmSecret())
+	gone := &scm.HTTPError{Status: 404, Path: "/x", Body: `{"message":"Not Found"}`}
+	rd := &mirrorReader{commentsErr: gone}
+	r := newIssueReconciler(c, &mirrorWriter{}, rd)
+	r.Driver = mdNewDriverWithReader(t, newFakeForge(t), c, rd)
+
+	res := reconcileIssue(t, r, iss.Name)
+
+	if res.RequeueAfter != MirrorCadence(task) {
+		t.Fatalf("RequeueAfter = %v, want the mirror cadence %v", res.RequeueAfter, MirrorCadence(task))
+	}
+	// The intent is retried, never discarded: a failed forge READ is not entitled
+	// to throw away an agent's durable intent.
+	if got := getIssueCR(t, c, iss.Name); len(got.Status.PendingComments) != 1 {
+		t.Fatalf("pending intents = %d, want the intent retained for the next cadence", len(got.Status.PendingComments))
 	}
 }
