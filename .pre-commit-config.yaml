@@ -43,6 +43,12 @@ repos:
         pass_filenames: false
         always_run: true
         stages: [pre-push]
+      - id: cd-release-jobs
+        name: cd-release job scripts (verify-pin, fanout-alarm)
+        entry: make test-cd-jobs
+        language: system
+        pass_filenames: false
+        files: '(\.github/workflows/release\.yml|hack/test-cd-release-jobs\.sh)$'
       - id: rbac-drift
         name: rbac drift guard
         entry: make rbac-check

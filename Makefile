@@ -27,7 +27,7 @@ else
 HELM_BIN := helm
 endif
 
-.PHONY: all generate manifests test lint build image fmt tidy chart-lint clean ci rbac rbac-check
+.PHONY: all generate manifests test lint build image fmt tidy chart-lint clean ci rbac rbac-check test-cd-jobs
 
 all: generate manifests lint test build
 
@@ -138,7 +138,11 @@ rbac:
 rbac-check:
 	HELM_BIN="$(HELM_BIN)" CONTROLLER_GEN="$(CONTROLLER_GEN)" RBAC_GEN_DIR="$(RBAC_GEN_DIR)" bash hack/check-rbac-drift.sh
 
-ci: generate manifests lint test rbac-check chart-lint
+# release.yml's verify-pin/fanout-alarm scripts, run against a stubbed forge.
+test-cd-jobs:
+	bash hack/test-cd-release-jobs.sh
+
+ci: generate manifests lint test rbac-check chart-lint test-cd-jobs
 
 clean:
 	rm -rf bin dist
