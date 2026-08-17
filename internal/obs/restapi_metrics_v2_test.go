@@ -22,8 +22,8 @@ func TestRestTitleClampedTotal_PreseededZeroBaseline(t *testing.T) {
 	// interesting question about the title clamp is a RATE ("is the platform
 	// rewriting agent titles, and is that changing?"), and a rate needs a series
 	// that exists before the first clamp.
-	if got := testutil.CollectAndCount(RestTitleClampedTotal); got != 4 {
-		t.Fatalf("operator_rest_title_clamped_total has %d series, want 4 (one per call site, pre-seeded)", got)
+	if got := testutil.CollectAndCount(RestTitleClampedTotal); got != 5 {
+		t.Fatalf("operator_rest_title_clamped_total has %d series, want 5 (one per call site, pre-seeded)", got)
 	}
 }
 

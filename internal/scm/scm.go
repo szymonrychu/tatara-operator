@@ -136,6 +136,20 @@ type EditIssueReq struct {
 	Labels *[]string
 }
 
+// EditPRReq is a PATCH on a pull/merge request: only non-nil fields are sent.
+//
+// It has NO Labels field, unlike EditIssueReq, and that omission is deliberate.
+// A merge request's labels already have two writers - the semver projection
+// (MergeRequest.status.significance -> semver:<level>, applied by the operator
+// immediately before the merge) and the trigger-label logic - and CI cuts the
+// release tag from that label. A third writer reaching the same field through
+// this request would be a race over what version ships. Label writes go through
+// AddLabel/RemoveLabel, which are per-label and do not clobber the set.
+type EditPRReq struct {
+	Title *string
+	Body  *string
+}
+
 // BoardItem is one project-board item listed for cron issue-triage.
 type BoardItem struct {
 	Repo      string    `json:"repo"`
@@ -262,6 +276,14 @@ type SCMWriter interface {
 	// never had auto-merge armed returns an error callers treat as non-fatal.
 	DisableAutoMerge(ctx context.Context, repoURL, token, prURL string) error
 	ClosePR(ctx context.Context, repoURL, token string, number int, body string) error
+	// EditPR updates a pull/merge request with only the non-nil fields in req,
+	// so a title-only edit never blanks the body. A 404 (the PR/MR is gone) is
+	// benign and returns nil, as in EditIssue.
+	//
+	// It is what makes a reviewer's "correct the title" finding actionable: the
+	// title and body an agent submits on submit_outcome reach the forge through
+	// here, and there is no other writer for either field.
+	EditPR(ctx context.Context, repoURL, token string, number int, req EditPRReq) error
 	AddBoardItem(ctx context.Context, token string, board BoardRef, itemURL string) error
 	SetBoardColumn(ctx context.Context, token string, board BoardRef, itemURL, column string) error
 	CloseIssue(ctx context.Context, token, repo string, number int, comment string) error

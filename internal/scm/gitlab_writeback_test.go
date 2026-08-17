@@ -222,6 +222,54 @@ func TestGitLabEditIssue_404Benign(t *testing.T) {
 	require.NoError(t, c.EditIssue(context.Background(), "t", "g/p", 7, EditIssueReq{Body: &body}))
 }
 
+// The GitLab half of EditPR. Two provider differences are load-bearing and are
+// what this pins: the project is the URL-escaped path derived from the repo URL
+// (never an owner/repo pair), and the body field is called `description`.
+func TestGitLabEditPR_PUTsOnlyProvided(t *testing.T) {
+	var gotBody map[string]any
+	c := newGitLab(t, func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodPut, r.Method)
+		require.Equal(t, "/projects/g%2Fp/merge_requests/7", glTestPath(r))
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"iid":7}`))
+	})
+	title := "chore(deps): bump terraform 42.99.0 to 43.4.4"
+	require.NoError(t, c.EditPR(context.Background(), "https://gitlab.com/g/p.git", "t", 7, EditPRReq{Title: &title}))
+	require.Equal(t, "chore(deps): bump terraform 42.99.0 to 43.4.4", gotBody["title"])
+	_, descPresent := gotBody["description"]
+	require.False(t, descPresent, "description must NOT be sent when Body is nil")
+}
+
+func TestGitLabEditPR_BodyOnlySendsDescription(t *testing.T) {
+	var gotBody map[string]any
+	c := newGitLab(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusOK)
+	})
+	body := "the corrected description"
+	require.NoError(t, c.EditPR(context.Background(), "https://gitlab.com/g/p.git", "t", 7, EditPRReq{Body: &body}))
+	require.Equal(t, "the corrected description", gotBody["description"],
+		"GitLab calls the merge request body `description`; sending `body` silently edits nothing")
+	_, titlePresent := gotBody["title"]
+	require.False(t, titlePresent, "title must NOT be sent when Title is nil")
+}
+
+func TestGitLabEditPR_EmptyReqMakesNoCall(t *testing.T) {
+	c := newGitLab(t, func(_ http.ResponseWriter, _ *http.Request) {
+		t.Fatal("EditPR called the forge with no non-nil field")
+	})
+	require.NoError(t, c.EditPR(context.Background(), "https://gitlab.com/g/p.git", "t", 7, EditPRReq{}))
+}
+
+func TestGitLabEditPR_404Benign(t *testing.T) {
+	c := newGitLab(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	})
+	title := "x"
+	require.NoError(t, c.EditPR(context.Background(), "https://gitlab.com/g/p.git", "t", 7, EditPRReq{Title: &title}))
+}
+
 func TestGitLabEnableAutoMerge(t *testing.T) {
 	var gotPath, gotBody string
 	c := newGitLab(t, func(w http.ResponseWriter, r *http.Request) {

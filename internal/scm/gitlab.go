@@ -873,6 +873,35 @@ func (c *GitLab) ClosePR(ctx context.Context, repoURL, token string, number int,
 	return c.mrNote(ctx, c.base(), proj, number, token, body)
 }
 
+// EditPR updates an MR with only the non-nil fields in req. The body is sent as
+// `description`, which is GitLab's name for it - a PUT carrying `body` is
+// accepted and silently edits nothing. The project comes from glProjectPath (the
+// repo URL), not from an owner/repo pair, matching every other MR write here.
+// A 404 (MR gone) is benign, as in EditIssue.
+func (c *GitLab) EditPR(ctx context.Context, repoURL, token string, number int, req EditPRReq) error {
+	proj, err := glProjectPath(repoURL)
+	if err != nil {
+		return err
+	}
+	body := map[string]any{}
+	if req.Title != nil {
+		body["title"] = *req.Title
+	}
+	if req.Body != nil {
+		body["description"] = *req.Body
+	}
+	if len(body) == 0 {
+		return nil
+	}
+	path := "/projects/" + url.PathEscape(proj) + "/merge_requests/" + strconv.Itoa(number)
+	err = glDo(ctx, c.base(), http.MethodPut, path, token, body, nil)
+	var he *HTTPError
+	if errors.As(err, &he) && he.Status == http.StatusNotFound {
+		return nil
+	}
+	return err
+}
+
 // DeleteBranch deletes a head branch. It is the GitLab half of the B.6 reaper's
 // branch delete (issue #443); the reaper only ever calls it for a branch its own
 // terminal Task pushed. GitLab answers 404 for a branch that is already gone, so

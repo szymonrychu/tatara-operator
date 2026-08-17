@@ -151,13 +151,14 @@ func TruncateRunes(s string, maxRunes int) string {
 // 400 on an over-long title discards the whole outcome the agent had just
 // submitted.
 //
-// MR titles are a KNOWN GAP and are deliberately not routed through here yet.
-// GitLab applies the same 255-character Issuable validation to a merge request,
-// so mrOpen can take the same 400 - but it maps a forge 4xx (status and body)
-// straight back to the caller, so the agent is told what happened and loses
-// nothing. That is the whole difference: the issue paths swallow the rejection
-// into a 502 after the outcome is already spent, the MR path does not. Widening
-// the clamp to MR titles is worth doing; it is not what closes #529.
+// ONE MR TITLE PATH ROUTES THROUGH HERE TOO, and the name is now narrower than
+// the function: submit_outcome's merge request title (restapi's
+// editSubmittedMRs). GitLab applies the same 255-character Issuable validation
+// to a merge request, and that write is best-effort AFTER the stage transition
+// committed, so an unclamped 400 there is swallowed exactly the way the issue
+// paths swallow theirs. mrOpen still does not clamp and does not need to: it
+// maps a forge 4xx (status and body) straight back to the caller, so the agent
+// is told what happened and loses nothing.
 func ClampIssueTitle(title string) string {
 	// Flattened FIRST, so both the trim and the cut below see one line. A title
 	// is a single line everywhere it is used and an interior line break is never
