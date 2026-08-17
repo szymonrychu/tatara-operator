@@ -102,7 +102,7 @@ func newWebhookMux() *chi.Mux {
 //
 // Webhook routes (/operator/webhooks/...) are unauthenticated - HMAC
 // verification happens inside the handler. REST routes are OIDC-gated.
-func addWebhookServer(ctx context.Context, mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMetrics, seq *queue.SeqSource) error {
+func addWebhookServer(ctx context.Context, mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMetrics, seq *queue.SeqSource, memoryToken func(ctx context.Context) (string, error)) error {
 	httpMux := newWebhookMux()
 
 	// M2 webhook routes - unauthenticated, HMAC-verified inside the handler.
@@ -115,7 +115,7 @@ func addWebhookServer(ctx context.Context, mgr ctrl.Manager, cfg config.Config, 
 		Namespace:                       cfg.Namespace,
 		Metrics:                         metrics,
 		Seq:                             seq,
-		SpillerFor:                      newSpillerFor(mgr, cfg),
+		SpillerFor:                      newSpillerFor(memoryToken),
 		IncidentRefireCommentCooldown:   cfg.IncidentRefireCommentCooldown,
 		IncidentCorrelationLabels:       cfg.IncidentCorrelationLabels,
 		IncidentEscalateRefireThreshold: cfg.IncidentEscalateRefireThreshold,
@@ -170,8 +170,8 @@ func addWebhookServer(ctx context.Context, mgr ctrl.Manager, cfg config.Config, 
 		// rehydrate what the webhook/reconciler side had already spilled
 		// (fault 3). Both resolvers are per-project - SAME reasoning as
 		// newSpillerFor - because tatara-memory is deployed once per Project.
-		SpillerFor: newSpillerFor(mgr, cfg),
-		MemoryFor:  newMemoryFor(mgr, cfg),
+		SpillerFor: newSpillerFor(memoryToken),
+		MemoryFor:  newMemoryFor(memoryToken),
 		Logger:     slog.Default(),
 		Metrics:    metrics,
 		// IncidentInvestigationCommentCooldown is Fix 7's (#400) comment_issue
@@ -190,7 +190,7 @@ func addWebhookServer(ctx context.Context, mgr ctrl.Manager, cfg config.Config, 
 		// above).
 		Minter: &controller.Minter{
 			Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(),
-			Metrics: metrics, SpillerFor: newSpillerFor(mgr, cfg),
+			Metrics: metrics, SpillerFor: newSpillerFor(memoryToken),
 		},
 	}).Mount(httpMux, auth.Middleware(verifier, metrics))
 
@@ -274,13 +274,12 @@ func (a adoptionSeedRunnable) NeedLeaderElection() bool { return false }
 // distinction is the whole point: a Project mid-provision also has an empty
 // endpoint, and it must keep blocking so nothing is destroyed a minute before
 // the stack it could have spilled to comes up.
-func newSpillerFor(mgr ctrl.Manager, cfg config.Config) func(*tataradevv1alpha1.Project) objbudget.Spiller {
-	memoryTokens := auth.NewTokenSource(auth.TokenSourceConfig{
-		TokenURL:     cfg.OIDCIssuer + "/protocol/openid-connect/token",
-		ClientID:     cfg.OperatorOIDCClientID,
-		ClientSecret: cfg.OperatorOIDCClientSecret,
-		Audience:     "tatara-memory",
-	})
+//
+// memoryToken is passed IN, not minted here: every resolver, the reconciler
+// mirror path and the retrieval probe share ONE tatara-memory client-credentials
+// source (newMemoryTokenSource, built once in main), so they share one cached
+// token instead of hammering Keycloak with six independent grants.
+func newSpillerFor(memoryToken func(ctx context.Context) (string, error)) func(*tataradevv1alpha1.Project) objbudget.Spiller {
 	return func(proj *tataradevv1alpha1.Project) objbudget.Spiller {
 		if tataradevv1alpha1.MemoryDisabled(proj) {
 			return objbudget.Discarding
@@ -289,8 +288,20 @@ func newSpillerFor(mgr ctrl.Manager, cfg config.Config) func(*tataradevv1alpha1.
 		if endpoint == "" {
 			return nil
 		}
-		return memclient.New(endpoint, memoryTokens.Token, nil)
+		return memclient.New(endpoint, memoryToken, nil)
 	}
+}
+
+// newMemoryTokenSource is THE tatara-memory client-credentials source. One per
+// process: it caches the token internally, so a second source is duplicate
+// grant traffic against Keycloak and nothing else.
+func newMemoryTokenSource(cfg config.Config) *auth.TokenSource {
+	return auth.NewTokenSource(auth.TokenSourceConfig{
+		TokenURL:     cfg.OIDCIssuer + "/protocol/openid-connect/token",
+		ClientID:     cfg.OperatorOIDCClientID,
+		ClientSecret: cfg.OperatorOIDCClientSecret,
+		Audience:     "tatara-memory",
+	})
 }
 
 // memoryEndpointOf is the nil-safe read of a Project's tatara-memory endpoint.
@@ -315,14 +326,8 @@ func memoryEndpointOf(proj *tataradevv1alpha1.Project) string {
 // construction; kept as its own small function (rather than reusing
 // newSpillerFor's return value) because objbudget.Spiller and
 // restapi.NoteFetcher are distinct interfaces and Go does not convert
-// between them implicitly.
-func newMemoryFor(mgr ctrl.Manager, cfg config.Config) func(*tataradevv1alpha1.Project) restapi.NoteFetcher {
-	memoryTokens := auth.NewTokenSource(auth.TokenSourceConfig{
-		TokenURL:     cfg.OIDCIssuer + "/protocol/openid-connect/token",
-		ClientID:     cfg.OperatorOIDCClientID,
-		ClientSecret: cfg.OperatorOIDCClientSecret,
-		Audience:     "tatara-memory",
-	})
+// between them implicitly. Shares newSpillerFor's one token source.
+func newMemoryFor(memoryToken func(ctx context.Context) (string, error)) func(*tataradevv1alpha1.Project) restapi.NoteFetcher {
 	return func(proj *tataradevv1alpha1.Project) restapi.NoteFetcher {
 		if tataradevv1alpha1.MemoryDisabled(proj) {
 			return nil
@@ -331,7 +336,7 @@ func newMemoryFor(mgr ctrl.Manager, cfg config.Config) func(*tataradevv1alpha1.P
 		if endpoint == "" {
 			return nil
 		}
-		return memclient.New(endpoint, memoryTokens.Token, nil)
+		return memclient.New(endpoint, memoryToken, nil)
 	}
 }
 
@@ -445,7 +450,7 @@ func usageBundleAccessors(reader client.Reader, writer client.Client, namespace,
 // addReconcilers constructs and registers all reconcilers with mgr, and adds
 // the turn-complete callback server as a manager Runnable. It returns the
 // shared SeqSource so callers can pass it to addWebhookServer.
-func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMetrics, pushReceiver *pushmetrics.Receiver) (*queue.SeqSource, error) {
+func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMetrics, pushReceiver *pushmetrics.Receiver, memoryToken func(ctx context.Context) (string, error)) (*queue.SeqSource, error) {
 	// Fail fast at startup if any wrapper-pod resource quantity is malformed,
 	// rather than silently dropping it on every reconcile.
 	if err := agent.ValidatePodResourceQuantities(podConfigFromConfig(cfg)); err != nil {
@@ -463,17 +468,6 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 	// no leader dependency and no in-memory state.
 	seq := &queue.SeqSource{Client: mgr.GetClient(), Namespace: cfg.Namespace}
 
-	// Memory-audience token source for the operator's authenticated retrieval
-	// probe (updateMemoryRetrievalProbe). Mints via the same shared OIDC client as
-	// the wrapper token below, for the "tatara-memory" audience; the source caches
-	// across the per-cycle probes.
-	memoryTokens := auth.NewTokenSource(auth.TokenSourceConfig{
-		TokenURL:     cfg.OIDCIssuer + "/protocol/openid-connect/token",
-		ClientID:     cfg.OperatorOIDCClientID,
-		ClientSecret: cfg.OperatorOIDCClientSecret,
-		Audience:     "tatara-memory",
-	})
-
 	// The A.7 byte-budget spiller, per-project (its status.memory.endpoint), used
 	// by every reconciler that writes an Issue/MergeRequest/Task mirror -
 	// ProjectReconciler's own sweep-driven mint + OP12 ReconcileOwnership included.
@@ -486,7 +480,7 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 	// with memory disabled resolved to a client aimed at "", so the reconciler
 	// mirror path had the same latent FitIssue/FitMergeRequest wedge the REST
 	// note path already had.
-	spillerFor := newSpillerFor(mgr, cfg)
+	spillerFor := newSpillerFor(memoryToken)
 
 	// Built here, ahead of ProjectReconciler, so ProjectReconciler.Tasks below
 	// can point at the SAME *TaskReconciler instance the manager registers
@@ -526,7 +520,7 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		Metrics:             metrics,
 		ExternalWebhookBase: cfg.ExternalWebhookBase,
 		MemoryConfig:        memoryConfigFromConfig(cfg),
-		MemoryToken:         memoryTokens.Token,
+		MemoryToken:         memoryToken,
 		OperatorURL:         cfg.OperatorURL,
 		GrafanaConfig:       grafanaConfigFromConfig(cfg),
 		ReaderFor: func(provider, token string) (scm.SCMReader, error) {

@@ -275,3 +275,51 @@ func TestFitIssue_EvictionIsByIdentityNotTimestamp(t *testing.T) {
 			len(got.Status.Comments)+got.Status.SpilledComments)
 	}
 }
+
+// TestFitIssue_AnEmptyExternalIDIsNotAnIdentity guards the invariant identity
+// exclusion rests on. mergeComments (internal/controller/mirror.go) keys its
+// dedupe on `ok && c.ExternalID != ""`, so it DELIBERATELY lets several
+// empty-id comments coexist. If one of them is evicted, "" lands in the
+// exclusion set and every retained empty-id comment goes with it - dropped
+// from the object, never spilled, and without even the surplus WARN the note
+// path gives. Unreachable today (every producer stamps a forge id) and this is
+// what keeps it that way.
+func TestFitIssue_AnEmptyExternalIDIsNotAnIdentity(t *testing.T) {
+	ctx := context.Background()
+	at := time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
+	comments := make([]tatarav1alpha1.Comment, 0, 120)
+	for i := 0; i < 120; i++ {
+		// The OLDEST (evicted) and the NEWEST (retained) share the empty id.
+		id := "c" + strconv.Itoa(i)
+		if i == 0 || i == 119 {
+			id = ""
+		}
+		comments = append(comments, tatarav1alpha1.Comment{
+			ExternalID: id, Author: "someone",
+			Body: strings.Repeat("x", 8000), CreatedAt: metav1.NewTime(at.Add(time.Duration(i) * time.Second)),
+		})
+	}
+	issue := &tatarav1alpha1.Issue{
+		ObjectMeta: metav1.ObjectMeta{Name: "iss-repo-emptyid", Namespace: "tatara"},
+		Spec:       tatarav1alpha1.IssueSpec{RepositoryRef: "repo", Number: 1, URL: "https://example.invalid/1"},
+		Status:     tatarav1alpha1.IssueStatus{Comments: comments, CommentCount: 120},
+	}
+	s := newTestScheme(t)
+	c := newFakeClient(t, s, issue)
+	sp := &fakeSpiller{}
+	key := types.NamespacedName{Name: issue.Name, Namespace: "tatara"}
+
+	if err := FitIssue(ctx, c, sp, key, func(*tatarav1alpha1.Issue) {}); err != nil {
+		t.Fatalf("FitIssue: %v", err)
+	}
+
+	got := &tatarav1alpha1.Issue{}
+	if err := c.Get(ctx, key, got); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	newest := got.Status.Comments[len(got.Status.Comments)-1]
+	if !newest.CreatedAt.Time.Equal(at.Add(119 * time.Second)) {
+		t.Fatalf("newest retained comment is at %v, want the empty-id one at +119s: an evicted empty id took a retained one with it",
+			newest.CreatedAt.Time)
+	}
+}

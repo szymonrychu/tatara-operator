@@ -261,31 +261,61 @@ func spillEvicted(ctx context.Context, sp Spiller, kind, name string, batch any,
 	return trackID, true, nil
 }
 
-// excludeComments drops every comment whose ExternalID is in evicted.
+// commentKey identifies a comment for exclusion.
+//
+// ExternalID ALONE IS NOT AN IDENTITY. mergeComments
+// (internal/controller/mirror.go) dedupes on `ok && c.ExternalID != ""`, so it
+// deliberately lets several empty-id comments coexist; keying on the id alone
+// would let ONE evicted empty-id comment exclude every retained one - dropped
+// from the object and never spilled. The whole value is the key instead.
+// CreatedAt collapses to Unix seconds because that is the granularity
+// metav1.Time round-trips at, and comparing time.Time directly would compare
+// monotonic readings and locations that do not survive a round trip.
+type commentKey struct {
+	id, author, body string
+	at               int64
+}
+
+func keyOfComment(c tatarav1alpha1.Comment) commentKey {
+	return commentKey{id: c.ExternalID, author: c.Author, body: c.Body, at: c.CreatedAt.Unix()}
+}
+
+// evictedComments is excludeComments' key MULTISET: it COUNTS occurrences, so
+// N indistinguishable comments evicted exclude exactly N retained ones and no
+// more.
+func evictedComments(evicted []tatarav1alpha1.Comment) map[commentKey]int {
+	counts := make(map[commentKey]int, len(evicted))
+	for _, c := range evicted {
+		counts[keyOfComment(c)]++
+	}
+	return counts
+}
+
+// excludeComments drops the comments in evicted, by identity and by count.
 //
 // It replaces a "retain CreatedAt >= retainFrom" filter, which was wrong on a
 // TIE: metav1.Time round-trips at second granularity, so a comment sharing its
 // second with the oldest survivor was both evicted AND retained. The object
 // then never came under budget, and every later write re-spilled the same
 // batch and appended another track_id. Identity has no ties.
-func excludeComments(comments []tatarav1alpha1.Comment, evicted map[string]struct{}) []tatarav1alpha1.Comment {
+//
+// The tally is a COPY: this runs inside RetryOnConflict, so consuming the
+// caller's map would leave the second attempt with nothing left to exclude.
+func excludeComments(comments []tatarav1alpha1.Comment, evicted map[commentKey]int) []tatarav1alpha1.Comment {
+	remaining := make(map[commentKey]int, len(evicted))
+	for k, n := range evicted {
+		remaining[k] = n
+	}
 	out := make([]tatarav1alpha1.Comment, 0, len(comments))
 	for _, c := range comments {
-		if _, gone := evicted[c.ExternalID]; gone {
+		k := keyOfComment(c)
+		if remaining[k] > 0 {
+			remaining[k]--
 			continue
 		}
 		out = append(out, c)
 	}
 	return out
-}
-
-// evictedCommentIDs is excludeComments' key set.
-func evictedCommentIDs(evicted []tatarav1alpha1.Comment) map[string]struct{} {
-	ids := make(map[string]struct{}, len(evicted))
-	for _, c := range evicted {
-		ids[c.ExternalID] = struct{}{}
-	}
-	return ids
 }
 
 // FitIssue applies mutate to the Issue at key, evicting the oldest comments
@@ -333,7 +363,7 @@ func FitIssue(ctx context.Context, c client.Client, sp Spiller, key types.Namesp
 			retainFrom = &t
 		}
 	}
-	goneIDs := evictedCommentIDs(evicted)
+	goneComments := evictedComments(evicted)
 
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.Issue{}
@@ -343,7 +373,7 @@ func FitIssue(ctx context.Context, c client.Client, sp Spiller, key types.Namesp
 		mutate(fresh)
 		if retainFrom != nil {
 			was := len(fresh.Status.Comments)
-			fresh.Status.Comments = excludeComments(fresh.Status.Comments, goneIDs)
+			fresh.Status.Comments = excludeComments(fresh.Status.Comments, goneComments)
 			// CommentsRetainedFrom no longer drives the exclusion, but it is
 			// still the A.1 re-ingest watermark: without it the mirror re-fetches
 			// and re-appends everything this call just evicted.
@@ -407,7 +437,7 @@ func FitMergeRequest(ctx context.Context, c client.Client, sp Spiller, key types
 			retainFrom = &t
 		}
 	}
-	goneIDs := evictedCommentIDs(evicted)
+	goneComments := evictedComments(evicted)
 
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.MergeRequest{}
@@ -417,7 +447,7 @@ func FitMergeRequest(ctx context.Context, c client.Client, sp Spiller, key types
 		mutate(fresh)
 		if retainFrom != nil {
 			was := len(fresh.Status.Comments)
-			fresh.Status.Comments = excludeComments(fresh.Status.Comments, goneIDs)
+			fresh.Status.Comments = excludeComments(fresh.Status.Comments, goneComments)
 			fresh.Status.CommentsRetainedFrom = retainFrom
 			fresh.Status.SpilledComments += was - len(fresh.Status.Comments)
 			if stored {

@@ -303,15 +303,15 @@ func TestMemoryConfigFromConfig(t *testing.T) {
 // TestNewMemoryFor_ReturnsPerProjectNoteFetcher covers issue #345 fault (3):
 // restapi.Config.MemoryFor must resolve a fresh tatara-memory client per
 // Project (mirroring newSpillerFor), not one flat instance shared across
-// every project's rehydrate call. mgr is unused by the resolver body (same
-// as newSpillerFor), so nil is safe here.
+// every project's rehydrate call. The token source IS shared - one per
+// process - which is why it is passed in rather than minted per resolver.
 func TestNewMemoryFor_ReturnsPerProjectNoteFetcher(t *testing.T) {
 	cfg := config.Config{
 		OIDCIssuer:               "https://kc/realms/tatara",
 		OperatorOIDCClientID:     "tatara-operator",
 		OperatorOIDCClientSecret: "secret",
 	}
-	memoryFor := newMemoryFor(nil, cfg)
+	memoryFor := newMemoryFor(newMemoryTokenSource(cfg).Token)
 
 	projA := &tataradevv1alpha1.Project{
 		ObjectMeta: metav1.ObjectMeta{Name: "alpha"},
@@ -419,8 +419,9 @@ func TestNewSpillerFor_ResolvesThreeStates(t *testing.T) {
 		OperatorOIDCClientID:     "tatara-operator",
 		OperatorOIDCClientSecret: "secret",
 	}
-	spillerFor := newSpillerFor(nil, cfg)
-	memoryFor := newMemoryFor(nil, cfg)
+	tokens := newMemoryTokenSource(cfg).Token
+	spillerFor := newSpillerFor(tokens)
+	memoryFor := newMemoryFor(tokens)
 
 	disabled := &tataradevv1alpha1.Project{
 		ObjectMeta: metav1.ObjectMeta{Name: "tatara"},

@@ -768,6 +768,20 @@ func (o *outcomeCtx) commit(mutate func(*tatarav1alpha1.Task) error) bool {
 			append(reqLogFields(o.r), "task", o.task.Name, "error", mutErr)...)
 		return false
 	}
+	if errors.Is(err, objbudget.ErrSpillFailed) || errors.Is(err, objbudget.ErrSpillerUnconfigured) {
+		// SAME ANSWER postNote GIVES, because it is the same condition on the
+		// same journal: WithNoteCap made these two reachable here (#616), and
+		// both are transient - a tatara-memory outage, or an endpoint the
+		// Project has not published yet. writeClientErr would map them to 500
+		// "internal error" with no Retry-After, which tells the agent to give
+		// up on something that clears by itself, and disagrees with what
+		// postNote answers for the very same Task. A memory-free-BY-CONFIG
+		// Project never reaches here: it resolves to objbudget.Discarding.
+		s.log.ErrorContext(ctx, "restapi: spilling oldest notes failed",
+			append(reqLogFields(o.r), "task", o.task.Name, "kind", o.kind, "error", err)...)
+		writeRetryAfter(o.w, "note spill is unavailable; retry")
+		return false
+	}
 	if errors.Is(err, objbudget.ErrObjectTooLarge) {
 		obs.RestOutcomeRejectedTotal.WithLabelValues(o.kind, stage.ReasonObjectTooLarge).Inc()
 		if perr := objbudget.MinimalFailPatch(ctx, s.c, o.task, stage.ReasonObjectTooLarge); perr != nil {
