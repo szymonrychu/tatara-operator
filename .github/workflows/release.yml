@@ -277,7 +277,10 @@ jobs:
 
           red=""
           if [ -n "$head_sha" ]; then
-            red="$(api "repos/${PARENT}/commits/${head_sha}/check-runs" \
+            # per_page=100: check-runs pages at 30 by default, and a red run on
+            # page 2 would read as "green, in flight" - the exact false-negative
+            # this verdict exists to remove.
+            red="$(api "repos/${PARENT}/commits/${head_sha}/check-runs?per_page=100" \
               | jq -r '[.check_runs[]
                         | select(.conclusion == "failure" or .conclusion == "timed_out"
                                  or .conclusion == "cancelled" or .conclusion == "action_required")
