@@ -149,6 +149,16 @@ const (
 	// required check routes the Task back to implementing so the agent can fix
 	// it, and the FOURTH lap is refused at failed(ci-blocked).
 	MaxCIRedReentries = 3
+	// MaxCIRecoveryUnparks is the ABSOLUTE ceiling on
+	// controller.driveCIRecoveryUnparks: how many times ONE Task may be released
+	// from parked(implement-declined) because the CI that blocked its submission
+	// has since gone green. The per-head latch (AnnCIRecoveryHeads) already makes
+	// each head at most one lap; this bounds the number of DISTINCT heads, so a
+	// Task that keeps pushing and keeps declining stops instead of ping-ponging.
+	// Three, matching every other re-entry bound in this block. When it is spent
+	// the Task simply stays parked and ages out at ParkRetention, exactly as it
+	// did before the driver existed.
+	MaxCIRecoveryUnparks = 3
 	// MaxHumanReviewRounds bounds the reviewing<->parked(awaiting-human) cycle
 	// on kind=review Tasks (fix V7-9). NOT bounded by AgentSpec.MaxReviewRounds
 	// - that counter only moves on request_changes.

@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -339,6 +340,12 @@ func (r *ProjectReconciler) driveUnparksPaced(ctx context.Context, proj *tatarav
 	if err := r.driveRetiredUnparks(ctx, proj, now); err != nil {
 		return 0, err
 	}
+	// The CI recovery rides the SAME pacing for the SAME reason: it is another
+	// full-namespace sweep over parked Tasks, and #368 is about exactly that
+	// running at Reconcile()'s cadence.
+	if err := r.driveCIRecoveryUnparks(ctx, proj, now); err != nil {
+		return 0, err
+	}
 	if r.lastDriveUnparks == nil {
 		r.lastDriveUnparks = map[string]time.Time{}
 	}
@@ -471,6 +478,188 @@ func (r *ProjectReconciler) applyRetiredUnpark(ctx context.Context, t *tatarav1a
 			return nil // raced past this park; the latch is stamped, so never retried
 		}
 		if err := stage.UnparkRetiredPark(fresh, now); err != nil {
+			return err
+		}
+		if err := r.Status().Update(ctx, fresh); err != nil {
+			return err
+		}
+		*t = *fresh
+		return nil
+	})
+}
+
+// driveCIRecoveryUnparks re-drives a Task whose decline the INFRASTRUCTURE
+// caused, once the infrastructure has recovered.
+//
+// THE MEASURED CASE (containers!1281, !1283). Both were Renovate merge requests
+// tatara ADOPTED into upgrade Tasks and OWNS end to end. The agent verified the
+// bump, could not submit - the operator's own readiness gate answered 409 ci-red
+// at head 4c11cad, because the gitlab.com account was unverified and GitLab
+// refused to create child pipelines at all - and declined. That writes
+// implement-declined, which is UnparkNever, and nothing re-examines it. The
+// account block was then lifted, the pipelines went green, and the operator's own
+// mirror came to read ciStatus=green headSHA=4c11cad2 ownership=tatara: it held
+// the proof its own decline was void, in its own mirror, and nothing read it.
+// For a merge request tatara owns end to end that is a dead end BY CONSTRUCTION -
+// driveStrandedParks cannot help either, because it re-mints from an ISSUE and
+// an adopted upgrade Task owns none.
+//
+// IT IS A DRIVER OUTSIDE stage.Unpark, following driveRetiredUnparks exactly.
+// implement-declined stays UnparkNever, so the reaper's unparkFires probe still
+// answers "nothing will re-enter this" and every Task this driver does not fire
+// for ages out at ParkRetention precisely as before. See UnparkCIRecovered for
+// why an arm inside Unpark, or an UnparkTimer reclassification, are both wrong.
+//
+// THE DISTINCTION IT MUST PRESERVE. A decline is a verdict on the CHANGE ("this
+// bump is wrong, superseded, unwanted") or on the INFRASTRUCTURE ("I could not
+// submit"). The first must stay permanent - helmfile!1407 was declined because
+// main had already moved past it and the merge request carried zero net change,
+// and re-driving that would re-open a settled decision. Nothing about the park
+// separates them afterwards and the free-text decline reason must not be parsed,
+// so the discriminator is captured at decline time (AnnDeclineCI) and only
+// CIEvidenceRed - the one value the submission gate actually refuses on - counts.
+//
+// FIVE CONDITIONS, ALL REQUIRED, and each one closes a way of getting this
+// wrong: the park is implement-declined on a non-takeover Task; the decline-time
+// evidence says CI was RED; the merge requests tatara may act on are green NOW;
+// their heads still fingerprint to what the decline was made against (so the
+// green is about THE SAME CODE, and a merge request that has since closed,
+// merged or flipped to `external` drops out of the set and can never match); and
+// the bound has room.
+func (r *ProjectReconciler) driveCIRecoveryUnparks(ctx context.Context, proj *tatarav1alpha1.Project, now time.Time) error {
+	var tl tatarav1alpha1.TaskList
+	if err := r.List(ctx, &tl, client.InNamespace(proj.Namespace)); err != nil {
+		return fmt.Errorf("unpark: list tasks for the ci recovery: %w", err)
+	}
+	l := log.FromContext(ctx)
+	var firstErr error
+	for i := range tl.Items {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		t := &tl.Items[i]
+		if t.Spec.ProjectRef != proj.Name || !tatarav1alpha1.Parked(t) {
+			continue
+		}
+		if t.Status.ParkReason != stage.ReasonImplementDeclined || t.Spec.Kind == stage.KindTakeover {
+			continue
+		}
+		declineCI := t.Annotations[tatarav1alpha1.AnnDeclineCI]
+		declineHeads := t.Annotations[tatarav1alpha1.AnnDeclineHeads]
+		if declineCI != tatarav1alpha1.CIEvidenceRed || declineHeads == "" {
+			continue
+		}
+		mrs, err := LoadTaskMRsFor(ctx, r.Client, t)
+		if err != nil {
+			l.Error(err, "unpark: load merge requests for the ci recovery",
+				"action", "ci_recovery_error", "resource_id", t.Name)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		// The SAME aggregation the decline stamped, re-derived from the live
+		// mirrors. Green-now and same-head-as-then are one comparison each, and
+		// every ownership/state filter is inside CIDeclineEvidence, so the two
+		// sides cannot drift into disagreeing about which merge requests count.
+		ci, heads := tatarav1alpha1.CIDeclineEvidence(mrs)
+		if ci != tatarav1alpha1.CIEvidenceGreen || heads != declineHeads {
+			continue
+		}
+		if t.Annotations[tatarav1alpha1.AnnCIRecoveryHeads] == heads {
+			continue // this head has had its one lap
+		}
+		spent := ciRecoveryUnparks(t)
+		if spent >= tatarav1alpha1.MaxCIRecoveryUnparks {
+			// LAST, deliberately: reaching this line means every other condition
+			// held, so the log names a Task that WOULD have been re-driven. It
+			// cannot become spam - a Task only gets here once per distinct head,
+			// and the head latch refuses the repeats.
+			l.Info("ci recovery refused: the absolute bound is spent; the task ages out at ParkRetention",
+				"action", "ci_recovery_exhausted", "resource_id", t.Name,
+				"unparks", spent, "max_unparks", tatarav1alpha1.MaxCIRecoveryUnparks)
+			continue
+		}
+		// SPEND FIRST, then un-park - the driveRetiredUnparks ordering, for the
+		// same reason. A crash between the two leaves a Task that stays parked
+		// and is never retried: visible, inert, fixable by hand. The other order
+		// would re-drive on every pass forever, which is the token-burning loop
+		// these annotations exist to prevent.
+		if err := r.stampCIRecoveryLatch(ctx, t, heads, spent+1); err != nil {
+			l.Error(err, "unpark: stamp the ci-recovery bound",
+				"action", "ci_recovery_error", "resource_id", t.Name)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if err := r.applyCIRecoveryUnpark(ctx, t, now); err != nil {
+			l.Error(err, "unpark: release a ci-blocked decline",
+				"action", "ci_recovery_error", "resource_id", t.Name)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		l.Info("released a decline the infrastructure caused: ci is green again at the head it was declined at",
+			"action", "ci_recovery_unparked", "resource_id", t.Name, "state", t.Status.State,
+			"kind", t.Spec.Kind, "heads", heads, "unparks", spent+1, "project", proj.Name)
+		r.Metrics.TaskUnparked(stage.ReasonImplementDeclined, obs.UnparkClassCIRecovered)
+	}
+	return firstErr
+}
+
+// ciRecoveryUnparks reads the spent-lap count. An unparsable value reads as the
+// ceiling, not as zero: a counter nobody can read must fail towards refusing,
+// which is the direction that cannot loop.
+func ciRecoveryUnparks(t *tatarav1alpha1.Task) int {
+	raw, ok := t.Annotations[tatarav1alpha1.AnnCIRecoveryUnparks]
+	if !ok {
+		return 0
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return tatarav1alpha1.MaxCIRecoveryUnparks
+	}
+	return n
+}
+
+// stampCIRecoveryLatch writes the bound's two halves - the spent count and the
+// head this lap is being charged for - in ONE metadata patch, so the ceiling can
+// never advance without the head latch moving with it. Metadata, not status, for
+// the reason stampRetiredParkMigrated gives: the subresources are independent, so
+// the un-park's status write cannot lose it.
+func (r *ProjectReconciler) stampCIRecoveryLatch(ctx context.Context, t *tatarav1alpha1.Task, heads string, spent int) error {
+	patch := client.MergeFrom(t.DeepCopy())
+	if t.Annotations == nil {
+		t.Annotations = map[string]string{}
+	}
+	t.Annotations[tatarav1alpha1.AnnCIRecoveryUnparks] = strconv.Itoa(spent)
+	t.Annotations[tatarav1alpha1.AnnCIRecoveryHeads] = heads
+	if err := r.Patch(ctx, t, patch); err != nil {
+		return fmt.Errorf("unpark: stamp the ci-recovery bound on %s: %w", t.Name, err)
+	}
+	return nil
+}
+
+// applyCIRecoveryUnpark persists stage.UnparkCIRecovered under optimistic
+// concurrency, re-reading through the UNCACHED APIReader and re-checking the park
+// under the retry, exactly as applyRetiredUnpark does and for the same reasons.
+func (r *ProjectReconciler) applyCIRecoveryUnpark(ctx context.Context, t *tatarav1alpha1.Task, now time.Time) error {
+	getter := client.Reader(r.APIReader)
+	if getter == nil {
+		getter = r.Client
+	}
+	key := client.ObjectKeyFromObject(t)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := getter.Get(ctx, key, fresh); err != nil {
+			return err
+		}
+		if !tatarav1alpha1.Parked(fresh) || fresh.Status.ParkReason != stage.ReasonImplementDeclined {
+			return nil // raced past this park; the bound is stamped, so never retried
+		}
+		if err := stage.UnparkCIRecovered(fresh, now); err != nil {
 			return err
 		}
 		if err := r.Status().Update(ctx, fresh); err != nil {

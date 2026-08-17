@@ -90,6 +90,51 @@ const (
 	AnnAutoReentryExhausted = "tatara.dev/auto-reentry-exhausted"
 )
 
+// THE CI-RECOVERY ANNOTATIONS. Four keys, two pairs, and they exist because a
+// decline means one of two incompatible things: a verdict on the CHANGE ("this
+// bump is wrong / superseded"), which must stay permanent, or a verdict on the
+// INFRASTRUCTURE ("I could not submit, CI was red"), which must be re-driven
+// when the blocker clears. parked(implement-declined) cannot tell them apart
+// after the fact and the free-text decline reason must not be parsed, so the
+// discriminating evidence is captured AT DECLINE TIME.
+//
+// THEY ARE ANNOTATIONS, NOT STATUS FIELDS, for the reason
+// AnnRetiredParkMigrated is: they are LATCHES and EVIDENCE about a park, read
+// by a driver that lives outside stage.Unpark, and metadata survives every
+// status write - a re-park, an un-park, a transition, a spill - without every
+// status writer having to individually preserve them. It also keeps the CRD
+// schema unchanged.
+const (
+	// AnnDeclineCI is what CI said at the moment the agent declined: one of
+	// CIEvidenceRed / CIEvidenceGreen / CIEvidenceUnknown, aggregated over the
+	// merge requests the Task owned (CIDeclineEvidence). ABSENT means the Task
+	// owned nothing tatara may act on, which is the ordinary decline and is
+	// never re-driven.
+	AnnDeclineCI = "tatara.dev/decline-ci"
+	// AnnDeclineHeads is the head fingerprint the decline was made against, from
+	// the same CIDeclineEvidence call. It is OPAQUE: compared for equality,
+	// never parsed. Requiring it to still match is what makes the recovery a
+	// re-read of the EXACT code the agent declined at, rather than a re-drive
+	// against whatever has been pushed since.
+	AnnDeclineHeads = "tatara.dev/decline-heads"
+	// AnnCIRecoveryUnparks is the decimal count of CI recoveries this Task has
+	// SPENT. It is the ABSOLUTE ceiling (MaxCIRecoveryUnparks), and it is what
+	// stops a Task that keeps declining from ping-ponging one fresh head at a
+	// time forever.
+	AnnCIRecoveryUnparks = "tatara.dev/ci-recovery-unparks"
+	// AnnCIRecoveryHeads is the head fingerprint the driver last fired on, and
+	// it is the AT-MOST-ONCE-PER-HEAD latch: the same head is never re-driven
+	// twice, so a pipeline flapping green -> red -> green at one commit cannot
+	// re-open the same decline repeatedly. A fresh push is a genuinely new
+	// situation and gets its own lap, charged against the ceiling above.
+	//
+	// Both are stamped BEFORE the un-park, in one metadata write: a crash
+	// between the two leaves a Task that stays parked and is never retried -
+	// visible, inert, fixable by hand - which is the same fail-closed ordering
+	// driveRetiredUnparks uses and for the same reason.
+	AnnCIRecoveryHeads = "tatara.dev/ci-recovery-heads"
+)
+
 // AnnMergeStageParked latches the ONE notice posted when an issue's Task parks
 // for a MERGE-STAGE reason (stage.IsMergeStagePark) and the automatic driver
 // therefore refuses to re-enter it at all. Same shape as

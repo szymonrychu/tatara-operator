@@ -1022,6 +1022,9 @@ func (o *outcomeCtx) implement(p implementPayload) {
 				return
 			}
 		}
+		if !docDecline {
+			s.stampDeclineCIEvidence(ctx, o.r, o.task, mrs)
+		}
 		o.ok("declined")
 		return
 	}
@@ -1232,6 +1235,64 @@ func (s *Server) stampDocumentedBy(ctx context.Context, proj *tatarav1alpha1.Pro
 		}
 	}
 	return nil
+}
+
+// stampDeclineCIEvidence records WHAT CI SAID at the instant the agent gave up,
+// and WHICH CODE it said it about.
+//
+// A decline is one of two incompatible things: a verdict on the CHANGE ("this
+// bump is wrong, superseded, unwanted"), which must stay permanent, or a verdict
+// on the INFRASTRUCTURE ("I could not submit, this endpoint answered 409 ci-red
+// and will on every further attempt"), which must be re-driven when the blocker
+// clears. Once the Task is parked(implement-declined) nothing separates them:
+// the park reason is identical and the decline reason is free text nothing may
+// parse. So the discriminator has to be captured HERE, at decline time, and
+// controller.driveCIRecoveryUnparks is what later reads it.
+//
+// AFTER commit, NEVER BEFORE. Stamping first would attach a description of a
+// decline to a Task whose park did not land (an illegal-transition conflict is
+// reachable: the stage can move between the gate's read and commit's Get), and
+// evidence about a decline that never happened is exactly the false red that
+// re-opens a settled decision. Stamping second fails the other way - no
+// evidence, so the Task is never re-driven and behaves precisely as it did
+// before this existed - which is the direction to fail in.
+//
+// BEST-EFFORT, and it never touches o.w: the park has already committed and the
+// response must carry exactly the one answer o.ok is about to write. A failure
+// costs the recovery, not the outcome.
+//
+// The write REMOVES both keys when no merge request qualifies. A Task can
+// decline twice, and the previous decline's red must not survive into a world
+// where it is no longer true - a stale red left behind is a licence the driver
+// would honour.
+//
+// It rides updateTaskSpec because that helper is a plain (non-status) Update
+// with conflict retry, which is what a metadata write needs; nothing about the
+// spec is touched.
+func (s *Server) stampDeclineCIEvidence(ctx context.Context, r *http.Request,
+	task *tatarav1alpha1.Task, mrs []tatarav1alpha1.MergeRequest) {
+
+	ci, heads := tatarav1alpha1.CIDeclineEvidence(mrs)
+	err := s.updateTaskSpec(ctx, task.Name, func(t *tatarav1alpha1.Task) {
+		if ci == "" {
+			delete(t.Annotations, tatarav1alpha1.AnnDeclineCI)
+			delete(t.Annotations, tatarav1alpha1.AnnDeclineHeads)
+			return
+		}
+		if t.Annotations == nil {
+			t.Annotations = map[string]string{}
+		}
+		t.Annotations[tatarav1alpha1.AnnDeclineCI] = ci
+		t.Annotations[tatarav1alpha1.AnnDeclineHeads] = heads
+	})
+	if err != nil {
+		s.log.WarnContext(ctx, "restapi: decline ci evidence not recorded; this decline can never be re-driven",
+			append(reqLogFields(r), "action", "decline_ci_evidence_skip", "task", task.Name, "error", err)...)
+		return
+	}
+	s.log.InfoContext(ctx, "restapi: recorded what ci said at decline time",
+		append(reqLogFields(r), "action", "decline_ci_evidence", "task", task.Name,
+			"decline_ci", ci, "decline_heads", heads)...)
 }
 
 // --- review ---------------------------------------------------------------
