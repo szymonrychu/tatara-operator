@@ -340,16 +340,20 @@ func markMergeRequestGone(ctx context.Context, c client.Client, sp objbudget.Spi
 // to write, in ONE status update.
 //
 // Both facts belong to the same write. Without the stamp mirrorSyncDue never
-// goes false and the caller re-reads a thread it has already proven gone on
-// every reconcile; with it, the gone thread is re-probed once per mirror cadence
-// and every pass in between runs the CI backstop and the drains normally.
-// LastSyncedAt is unconditional here, unlike the state, because a second 404 an
-// hour later is a fresh confirmation and must re-arm the interval.
+// goes false, and the first cut of this fix silenced the loop by making it
+// FASTER: the early return re-read the thread it had just proven gone and
+// re-probed the repo on every requeue - min(cadence, ciCadence) = 5 minutes for
+// an actively-worked MR, against the ~3.6 calls/h the exponential backoff had
+// settled at, with refreshCI and all six drains starved on every pass.
 //
-// It refuses a recorded merge for the reason mrMergeIsRecorded gives. The
-// caller's terminal exclusion at :116 already stops that being reachable on the
-// cadence path; the refusal lives here because the invariant belongs to the
-// write, not to one of its call sites.
+// The caller's terminal exclusion at :116 now skips the whole block once the
+// state lands, so the stamp no longer carries that on its own. Keep it anyway:
+// it is the honest record of when this thread was last checked, and it is the
+// only thing standing between a future caller without that exclusion and the
+// same regression.
+//
+// It refuses a recorded merge for the reason mrMergeIsRecorded gives - here
+// rather than at the call site, because the invariant belongs to the write.
 func markMergeRequestThreadGone(ctx context.Context, c client.Client, sp objbudget.Spiller,
 	mr *tatarav1alpha1.MergeRequest, now time.Time) error {
 
