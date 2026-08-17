@@ -611,6 +611,48 @@ func syncMergeRequestThread(ctx context.Context, c client.Client, sp objbudget.S
 	return nil
 }
 
+// upstreamThreadGone reports whether err from a mirror THREAD READ means THAT
+// issue/PR is permanently gone upstream, so the caller must stop returning the
+// error instead of requeueing it forever (tatara-operator#621).
+//
+// #436 already fixed exactly this for the forge WRITES, but its guard sits below
+// the mirror read in the same Reconcile, so a read 404 short-circuited the whole
+// guarded region. Three deleted mtg-decks PRs produced 53 ERROR lines in an hour
+// and were still doubling toward the 1000s backoff cap.
+//
+// TWO CLAUSES, both load-bearing:
+//
+//   - isPermanentTargetGone, not scm.IsNotFound: 404 OR 410, because a deleted
+//     GitHub issue answers 410. It keys on the STATUS, never on the call site -
+//     the same object and the same ListPRComments call answered 504 once during
+//     the incident, and a gateway timeout must stay retryable.
+//   - ONE confirming repo-level read. A 404 on one thread proves that PR is gone;
+//     it does NOT prove the repo is. A deleted repo or a revoked token 404s EVERY
+//     thread in that repo, and silently closing every mirror in it on that signal
+//     is destructive - so an unreadable repo answers false and the error stays
+//     loud, which is the correct disposition for a credential/enrolment fault.
+//
+// The probe runs ONLY on the 404/410 path, so steady-state forge load is
+// unchanged. ciOwnerRepo, not scm.OwnerRepo, because GitLab wants the full
+// project path as the single owner argument.
+func upstreamThreadGone(ctx context.Context, reader scm.SCMReader,
+	repo *tatarav1alpha1.Repository, provider string, err error) bool {
+
+	if !isPermanentTargetGone(err) {
+		return false
+	}
+	owner, name, perr := ciOwnerRepo(repo.Spec.URL, provider)
+	if perr != nil {
+		return false
+	}
+	if _, rerr := reader.GetDefaultBranchHeadSHA(ctx, owner, name); rerr != nil {
+		log.FromContext(ctx).Info("mirror: thread 404 but repo unreadable; NOT treating the thread as gone",
+			"action", "mirror_gone_probe", "repo", repo.Name, "err", rerr.Error())
+		return false
+	}
+	return true
+}
+
 // SyncIssueOnDemand re-reads ONE issue's thread NOW - one forge read, off
 // cadence. It is NOT an optimisation, and it survived the deletion of the
 // re-verify-on-unpark path that used to call it (owner decision D2): its caller

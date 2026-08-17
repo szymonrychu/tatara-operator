@@ -353,3 +353,61 @@ func TestMergeRequestControllerReconciles(t *testing.T) {
 		t.Fatalf("the reconciler wrote status.status = %q; only an ACCEPTED review outcome writes it", got.Status.Status)
 	}
 }
+
+// TestIssueReconcile_MirrorReadPermanent404SkipsSyncAndContinues is the Issue
+// half of tatara-operator#621. The MergeRequest side closes the mirror; this
+// side deliberately does NOT, because Issue.Status.State="closed" drives
+// handleIssueClosed and the WS3-I3 stop edge - a failed READ is not entitled to
+// make a Task-lifecycle decision. It logs the read as terminal, skips the sync
+// and lets the rest of the reconcile run.
+func TestIssueReconcile_MirrorReadPermanent404SkipsSyncAndContinues(t *testing.T) {
+	proj, repo := mirrorProject("tatara-bot"), mirrorRepo()
+	task := taskAtStage(tatarav1alpha1.StateRefined, "")
+	iss := ownedIssue(tatarav1alpha1.IssueName(repo.Name, 62), 62, task,
+		tatarav1alpha1.IssueStatus{State: "open"})
+	c := newMirrorClient(t, proj, repo, task, iss, scmSecret())
+	rd := &mirrorReader{commentsErr: &scm.HTTPError{
+		Status: 410, Path: "/repos/szymonrychu/tatara-operator/issues/62/comments", Body: `{"message":"Gone"}`,
+	}}
+
+	res := reconcileIssue(t, newIssueReconciler(c, &mirrorWriter{}, rd), iss.Name)
+
+	// Only the bottom of doReconcile returns the mirror cadence, so reaching it
+	// proves the reconcile continued past the failed read instead of returning.
+	if res.RequeueAfter != MirrorCadence(task) {
+		t.Fatalf("RequeueAfter = %v, want the mirror cadence %v", res.RequeueAfter, MirrorCadence(task))
+	}
+	if rd.headSHACalls != 1 {
+		t.Fatalf("repo-readable probe calls = %d, want exactly 1", rd.headSHACalls)
+	}
+	got := getIssueCR(t, c, iss.Name)
+	if got.Status.State != "open" {
+		t.Fatalf("a failed READ must not move Issue.Status.State, got %q", got.Status.State)
+	}
+	// Not stamping LastSyncedAt is what keeps the read retried once per cadence
+	// rather than abandoned.
+	if got.Status.LastSyncedAt != nil {
+		t.Fatalf("LastSyncedAt was stamped on a sync that never happened: %v", got.Status.LastSyncedAt)
+	}
+}
+
+// TestIssueReconcile_MirrorRead5xxPropagates: same call site, retryable status.
+func TestIssueReconcile_MirrorRead5xxPropagates(t *testing.T) {
+	proj, repo := mirrorProject("tatara-bot"), mirrorRepo()
+	task := taskAtStage(tatarav1alpha1.StateRefined, "")
+	iss := ownedIssue(tatarav1alpha1.IssueName(repo.Name, 62), 62, task,
+		tatarav1alpha1.IssueStatus{State: "open"})
+	c := newMirrorClient(t, proj, repo, task, iss, scmSecret())
+	rd := &mirrorReader{commentsErr: &scm.HTTPError{Status: 500, Path: "/x", Body: "boom"}}
+	r := newIssueReconciler(c, &mirrorWriter{}, rd)
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: testNS, Name: iss.Name},
+	})
+	if err == nil {
+		t.Fatal("a 500 on the mirror read must propagate as a retryable error")
+	}
+	if rd.headSHACalls != 0 {
+		t.Fatalf("the repo probe must run ONLY on the 404/410 path, got %d calls", rd.headSHACalls)
+	}
+}

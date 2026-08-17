@@ -124,7 +124,22 @@ func (r *IssueReconciler) doReconcile(ctx context.Context, req ctrl.Request) (ct
 			return ctrl.Result{}, err
 		}
 		if err := syncIssueThread(ctx, r.Client, r.spiller(&proj), reader, &proj, &repo, &iss); err != nil {
-			return ctrl.Result{}, err
+			provider := providerOf(&proj)
+			recordSCMReadError(r.metrics(), provider, "list_issue_comments", err)
+			// tatara-operator#621's latent Issue half. The MergeRequest side reaches
+			// markMergeRequestGone here; this side deliberately does NOT mark the
+			// mirror closed, because Issue.Status.State="closed" drives
+			// handleIssueClosed and the WS3-I3 stop edge, which stops the owner Task.
+			// A failed READ is not entitled to make a Task-lifecycle decision. Skip
+			// the sync and fall through: the label projection and the closed branch
+			// still owe this CR work. LastSyncedAt is deliberately not stamped, so the
+			// read is retried once per cadence rather than abandoned.
+			if !upstreamThreadGone(ctx, reader, &repo, provider, err) {
+				return ctrl.Result{}, err
+			}
+			log.FromContext(ctx).Info("issue: upstream thread permanently gone; skipped mirror sync, mirror left open",
+				"action", "issue_gone_mirror_read", "resource_id", iss.Name,
+				"status", scm.ErrorStatus(err))
 		}
 	}
 

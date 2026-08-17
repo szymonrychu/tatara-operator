@@ -106,6 +106,24 @@ func RecordSCM(m *obs.OperatorMetrics, provider, verb string, err error) {
 	m.SCMRequestErrorByStatus(provider, verb, scm.ErrorStatus(err))
 }
 
+// recordSCMReadError records ONE failed SCM READ on
+// operator_scm_request_errors_by_status_total. m may be nil in tests.
+//
+// The mirror read path had no counter at all: the 53 GitHub 404s of #621
+// produced no series on this metric, so the only Prometheus evidence of a
+// forever-looping mirror was operator_mirror_sync_total{result="error"}, which
+// carries no status and cannot tell a 404 from a 504.
+//
+// It deliberately does NOT also call SCMWrite the way RecordSCM does:
+// obs.SCMVerbKind classifies an unknown verb as "write", so counting read
+// traffic there would dilute the very write-failure-ratio alert #268 fixed.
+func recordSCMReadError(m *obs.OperatorMetrics, provider, verb string, err error) {
+	if m == nil || err == nil {
+		return
+	}
+	m.SCMRequestErrorByStatus(provider, verb, scm.ErrorStatus(err))
+}
+
 // lifecycleLabels returns the four managed phase labels (brainstorming/approved/
 // implementation/declined), applying defaults when a field is empty.
 func lifecycleLabels(s *tatarav1alpha1.ScmSpec) (brainstorming, approved, implementation, declined string) {

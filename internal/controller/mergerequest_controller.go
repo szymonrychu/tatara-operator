@@ -7,6 +7,7 @@ import (
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
+	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/own"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -59,6 +60,15 @@ func (r *MergeRequestReconciler) spiller(proj *tatarav1alpha1.Project) objbudget
 	return r.SpillerFor(proj)
 }
 
+// metrics returns the shared OperatorMetrics off Driver, or nil when the
+// reconciler was built without one. Twin of IssueReconciler.metrics.
+func (r *MergeRequestReconciler) metrics() *obs.OperatorMetrics {
+	if r.Driver == nil {
+		return nil
+	}
+	return r.Driver.Metrics
+}
+
 // +kubebuilder:rbac:groups=tatara.dev,resources=mergerequests,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=tatara.dev,resources=mergerequests/status,verbs=get;update;patch
 
@@ -109,6 +119,21 @@ func (r *MergeRequestReconciler) doReconcile(ctx context.Context, req ctrl.Reque
 			return ctrl.Result{}, err
 		}
 		if err := syncMergeRequestThread(ctx, r.Client, r.spiller(&proj), reader, &proj, &repo, &mr); err != nil {
+			provider := providerOf(&proj)
+			recordSCMReadError(r.metrics(), provider, "list_pr_comments", err)
+			// tatara-operator#621: the #436 terminal-404 guard below only covers the
+			// forge WRITES. A permanently-gone upstream MR discovered by this READ
+			// returned raw from here and requeued forever, never reaching it. Same
+			// disposition, same terminal state a real forge close leaves.
+			if upstreamThreadGone(ctx, reader, &repo, provider, err) {
+				if serr := markMergeRequestGone(ctx, r.Client, r.spiller(&proj), &mr); serr != nil {
+					return ctrl.Result{}, serr
+				}
+				log.FromContext(ctx).Info("mergerequest: upstream thread permanently gone; marked closed, skipped mirror sync",
+					"action", "mr_gone_mirror_read", "resource_id", mr.Name,
+					"status", scm.ErrorStatus(err))
+				return ctrl.Result{RequeueAfter: min(cadence, ciCadence)}, nil
+			}
 			return ctrl.Result{}, err
 		}
 	}
