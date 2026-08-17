@@ -86,6 +86,20 @@ var CIRedExitTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Help: "Tasks routed off a red required check at the reviewed head, by repo, source stage and target stage (issue #476).",
 }, []string{"repo", "from", "to"})
 
+// MergeConflictExitTotal counts conflict self-heal exits from the merge
+// corridor, by the repo whose merge request went DIRTY and the stage the Task
+// left for. There is no `from` label because there is only one site: the merge
+// gate, at merged.
+//
+// `to` separates the outcomes that matter operationally:
+// under-implementation is an agent being put on the branch, and (park) is the
+// bound being spent - a sustained non-zero rate on the latter means main is
+// moving faster than the agent can reconcile, which is a human's problem.
+var MergeConflictExitTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "operator_merge_conflict_exit_total",
+	Help: "Tasks routed off a DIRTY tatara-owned merge request at the merge gate, by repo and target stage.",
+}, []string{"repo", "to"})
+
 // ClearMergeCursorStalled deletes every MergeCursorStalledSeconds series for a
 // Task. Called when the Task leaves merging, for any reason.
 func ClearMergeCursorStalled(task string) {
@@ -94,5 +108,5 @@ func ClearMergeCursorStalled(task string) {
 
 func init() {
 	ctrlmetrics.Registry.MustRegister(UnexpectedMergeTotal, MergeCursorStalledSeconds,
-		ReviewPostTotal, reviewFindingDegradedTotal, CIRedExitTotal)
+		ReviewPostTotal, reviewFindingDegradedTotal, CIRedExitTotal, MergeConflictExitTotal)
 }
