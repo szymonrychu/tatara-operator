@@ -271,8 +271,14 @@ type SCMWriter interface {
 	// EnsureLabel ensures a label exists on the repo with the given hex color
 	// (6 hex digits, no '#'), creating it or updating its color. Idempotent.
 	EnsureLabel(ctx context.Context, repoURL, token, name, color string) error
-	// GetMergeState returns the provider-neutral mergeability of the PR/MR,
-	// used by the conflict self-heal (merge gate + stranded-DIRTY-PR sweep).
+	// GetMergeState returns the provider-neutral mergeability of the PR/MR. It has
+	// exactly ONE caller, the merge gate (controller/merge.go), which splits its
+	// answer three ways: dirty on a tatara-owned merge request routes the Task
+	// back to an agent that can reconcile the branch, dirty on an external one and
+	// blocked stall, and everything else attempts the merge. The comment here used
+	// to promise a "stranded-DIRTY-PR sweep" as well; no such sweep was ever
+	// written, and a comment describing a mechanism that does not exist is how the
+	// next reader concludes the case is already handled.
 	GetMergeState(ctx context.Context, repoURL, token string, number int) (MergeState, error)
 	// AddSubIssue makes childNumber a sub-issue of parentRef (owner/repo#parent).
 	// GitHub keys the sub-issues API on the child's numeric id (NOT its number),

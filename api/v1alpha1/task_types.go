@@ -521,7 +521,7 @@ type TaskStatus struct {
 	// stage.Enter asserts ParkReason == "" on every non-park edge and refuses
 	// otherwise, and stage.Unpark is the ONE function that clears it. Nothing
 	// else in the codebase may assign to this field.
-	// +kubebuilder:validation:Enum=backlog-sweep;triage-stalled;name-too-long;stage-deadline;awaiting-human;identity-unverified;implement-declined;review-loop-exhausted;review-post-refused;merge-timeout;merge-blocked;merge-order-missing;deploy-timeout;deploy-blocked;no-outcome;turn-budget-exhausted;pod-recreation-exhausted;object-too-large;fold-adoption-unverified;admission-starved;agent-contract-mismatch;operator-error;head-moving;handoff-stalled;ownership-lost;merge-auth-refused;ci-red;ci-blocked
+	// +kubebuilder:validation:Enum=backlog-sweep;triage-stalled;name-too-long;stage-deadline;awaiting-human;identity-unverified;implement-declined;review-loop-exhausted;review-post-refused;merge-timeout;merge-blocked;merge-order-missing;deploy-timeout;deploy-blocked;no-outcome;turn-budget-exhausted;pod-recreation-exhausted;object-too-large;fold-adoption-unverified;admission-starved;agent-contract-mismatch;operator-error;head-moving;handoff-stalled;ownership-lost;merge-auth-refused;ci-red;ci-blocked;merge-conflict
 	// +optional
 	ParkReason string `json:"parkReason,omitempty"`
 	// +optional
@@ -716,6 +716,18 @@ type TaskStatus struct {
 	// Cap 3 -> failed(ci-blocked).
 	// +optional
 	CIRedReentries int `json:"ciRedReentries,omitempty"`
+	// MergeConflictReentries bounds the SIXTH cycle: the conflict self-heal.
+	// A TATARA-OWNED merge request the forge reports DIRTY is a textual conflict
+	// with the base, and the merge corridor is pod-less, so polling it until the
+	// 4h budget parks it is a permanent dead end - nobody else is coming for the
+	// branch, and an adopted upgrade merge request its bot will not touch again
+	// (Renovate freezes on a branch an agent has committed to) is stuck forever.
+	// The Task therefore goes back to implementing, where an agent can reconcile
+	// and push. Like every other bounce it spawns pods, so it gets a counter.
+	// Cap 3 -> parked(merge-blocked), which is exactly where the stall-and-time-out
+	// path landed it before this cycle existed.
+	// +optional
+	MergeConflictReentries int `json:"mergeConflictReentries,omitempty"`
 	// CIWaitSince is THE CI HOLD (PR B): the implement outcome was ACCEPTED, the
 	// code is pushed, and the advance to awaiting-review is HELD because CI at
 	// the pushed head is still pending/running. It is the timestamp of the accept

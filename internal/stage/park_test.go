@@ -101,10 +101,10 @@ func TestEveryParkReasonHasAnUnparkClass(t *testing.T) {
 		_, ok := stage.UnparkClassFor(r)
 		require.True(t, ok, "park reason %q has no UnparkClass; the axis must be total", r)
 	}
-	require.Len(t, stage.ParkReasons, 28)
+	require.Len(t, stage.ParkReasons, 29)
 	require.Len(t, stage.RejectReasons, 6)
 	require.Len(t, stage.DoneReasons, 2)
-	require.Len(t, stage.Reasons, 36, "the three sets must partition Reasons with no remainder")
+	require.Len(t, stage.Reasons, 37, "the three sets must partition Reasons with no remainder")
 }
 
 // TestMergeStageParksAreParkReasonsAndExcludeTheImplementationOnes pins the
@@ -116,7 +116,7 @@ func TestMergeStageParksAreParkReasonsAndExcludeTheImplementationOnes(t *testing
 	merge := []string{
 		stage.ReasonMergeTimeout, stage.ReasonMergeBlocked, stage.ReasonMergeAuthRefused,
 		stage.ReasonMergeOrderMissing, stage.ReasonHeadMoving, stage.ReasonCIRed,
-		stage.ReasonDeployTimeout, stage.ReasonDeployBlocked,
+		stage.ReasonMergeConflict, stage.ReasonDeployTimeout, stage.ReasonDeployBlocked,
 	}
 	for _, r := range merge {
 		require.True(t, stage.IsParkReason(r), "%q must be a park reason", r)

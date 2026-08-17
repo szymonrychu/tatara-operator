@@ -431,7 +431,7 @@ func TestPodNotReadyIsNotAReason(t *testing.T) {
 }
 
 func TestReasonsIsTheClosedSetAndTheThreeVocabulariesAreDisjoint(t *testing.T) {
-	require.Len(t, stage.Reasons, 36)
+	require.Len(t, stage.Reasons, 37)
 	for _, r := range stage.RejectReasons {
 		require.False(t, stage.IsParkReason(r), "%q cannot be both a reject and a park reason", r)
 		require.False(t, stage.IsDoneReason(r))
@@ -1045,10 +1045,12 @@ func TestReenterOnReviewChangesRequested(t *testing.T) {
 func TestReenterOnReviewChangesRequested_ResetsMergeAndHeadBudgets(t *testing.T) {
 	tk := task(v1alpha1.StateMerged)
 	tk.Status.MergeReentries, tk.Status.HeadMoveReentries, tk.Status.CIRedReentries = 2, 2, 2
+	tk.Status.MergeConflictReentries = 2
 	require.True(t, stage.ReenterOnReviewChangesRequested(tk, []v1alpha1.MergeRequest{{}}, now))
 	require.Zero(t, tk.Status.MergeReentries)
 	require.Zero(t, tk.Status.HeadMoveReentries)
 	require.Zero(t, tk.Status.CIRedReentries)
+	require.Zero(t, tk.Status.MergeConflictReentries)
 }
 
 func TestReenterOnReviewChangesRequested_MergeTimeoutAccounting(t *testing.T) {

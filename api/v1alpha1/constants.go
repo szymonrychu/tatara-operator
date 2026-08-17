@@ -149,6 +149,13 @@ const (
 	// required check routes the Task back to implementing so the agent can fix
 	// it, and the FOURTH lap is refused at failed(ci-blocked).
 	MaxCIRedReentries = 3
+	// MaxMergeConflictReentries bounds the conflict self-heal: a tatara-owned
+	// merge request the forge reports DIRTY routes the Task back to implementing
+	// so the agent can reconcile the branch with its base, and the FOURTH lap is
+	// refused at parked(merge-blocked). The bound is not optional - main keeps
+	// moving, so conflict -> implement -> push -> conflict is a genuine loop and
+	// an unbounded one would spawn a pod per lap forever.
+	MaxMergeConflictReentries = 3
 	// MaxCIRecoveryUnparks is the ABSOLUTE ceiling on
 	// controller.driveCIRecoveryUnparks: how many times ONE Task may be released
 	// from parked(implement-declined) because the CI that blocked its submission

@@ -355,6 +355,17 @@ func (d *StageDriver) ReconcileMerging(ctx context.Context, proj *tatarav1alpha1
 		}
 		ms, err := writer.GetMergeState(ctx, repo.Spec.URL, token, mr.Spec.Number)
 		RecordSCM(d.Metrics, provider, "get_merge_state", err)
+		// DIRTY AND BLOCKED ARE OPPOSITES and used to be lumped together here.
+		// dirty is a TEXTUAL conflict with the base, which an agent resolves by
+		// committing to the branch; blocked is POLICY - a missing approval, a
+		// protected branch, a required check - which no commit an agent writes can
+		// clear. Only the first is self-healable, and only on a branch tatara owns:
+		// an external merge request is a human's, and the raw ownership is the test
+		// rather than mergeAllowedForOwnership, because a stood-down merge request
+		// is merge-ELIGIBLE and still not ours to push to.
+		if err == nil && ms == scm.MergeStateDirty && mr.Status.Ownership == tatarav1alpha1.OwnershipTatara {
+			return ctrl.Result{}, d.mergeConflict(ctx, proj, task, mrs, mr, repo.Spec.DefaultBranch, cursor)
+		}
 		if err == nil && (ms == scm.MergeStateDirty || ms == scm.MergeStateBlocked) {
 			return d.stallMerge(ctx, proj, task, repoRef, cursor, "not-mergeable")
 		}
@@ -454,6 +465,77 @@ func (d *StageDriver) headMoved(ctx context.Context, proj *tatarav1alpha1.Projec
 		return err
 	}
 	return d.enterStageWithCursor(ctx, proj, task, tatarav1alpha1.StateAwaitingReview, "", fresh, cursor)
+}
+
+// mergeConflict is CYCLE 6, the conflict self-heal: merging -> implementing on a
+// DIRTY merge request tatara owns, bounded by maxMergeConflictReentries.
+//
+// The caller has already established the two things that make this safe - the
+// forge says dirty, and status.ownership says tatara - so everything left is
+// bookkeeping. The counter is persisted in the SAME write as the stage, via
+// enterStageWithCursor's mutate: a bound written by a second call is a bound a
+// crash between the two can lose.
+//
+// The MERGE CURSOR IS CARRIED. It records which repos of spec.mergeOrder already
+// merged, and the whole point of the sequential order is that those are not
+// re-merged when the Task comes back.
+//
+// THE MERGE REQUEST IS NOT RESET to unreviewed, unlike the head-moved bounce.
+// There is nothing to re-review yet: the agent has not pushed. Its push moves the
+// head, and the ordinary implement -> awaiting-review -> merged flow re-reviews
+// that head and returns here on its own.
+func (d *StageDriver) mergeConflict(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task,
+	mrs []tatarav1alpha1.MergeRequest, mr *tatarav1alpha1.MergeRequest, baseBranch string, cursor int) error {
+	l := log.FromContext(ctx)
+	obs.ClearMergeCursorStalled(task.Name)
+
+	edge, _ := stage.MergeConflict(task, mrs, tatarav1alpha1.MaxMergeConflictReentries)
+	reentries := task.Status.MergeConflictReentries
+	// The note goes on BEFORE the write, for the same reason the red-CI bounce
+	// puts one there: the bundle an implement pod renders says nothing at all
+	// about mergeability, so without it the agent boots into a fresh
+	// implementation turn with no idea that its only job is a conflict.
+	if err := appendOperatorNoteTo(ctx, d.Client, d.spiller(proj), task,
+		mergeConflictNote(mr, baseBranch, reentries), d.now()); err != nil {
+		return err
+	}
+	if edge.To == stage.ParkTarget {
+		l.Error(nil, "merge: the conflict self-heal is spent; parking the Task",
+			"action", "merge_conflict_park", "resource_id", task.Name,
+			"repo", mr.Spec.RepositoryRef, "pr", mr.Spec.Number, "reason", edge.Reason,
+			"merge_conflict_reentries", reentries)
+		if err := d.parkTask(ctx, proj, task, edge.Reason); err != nil {
+			return err
+		}
+	} else if err := d.enterStageWithCursor(ctx, proj, task, edge.To, edge.Reason, mrs, cursor); err != nil {
+		return err
+	}
+	obs.MergeConflictExitTotal.WithLabelValues(mr.Spec.RepositoryRef, edge.To).Inc()
+	l.Info("merge: the merge request conflicts with its base; handing the branch back to an agent",
+		"action", "merge_conflict_exit", "resource_id", task.Name, "to", edge.To,
+		"reason", edge.Reason, "repo", mr.Spec.RepositoryRef, "pr", mr.Spec.Number,
+		"base_branch", baseBranch, "merge_conflict_reentries", reentries)
+	return nil
+}
+
+// mergeConflictNote is what the next implement pod actually reads. It names the
+// repo, the merge request, the base it conflicts with and the lap, because the
+// bundle carries no mergeability field at all.
+//
+// IT FORBIDS REGENERATING THE BRANCH, and that is not style advice. The case this
+// whole cycle exists for is an ADOPTED upgrade merge request whose bot has frozen
+// itself out on purpose - Renovate's isBranchModified stops it rebasing a branch
+// an agent has committed to - and a force-pushed regeneration would throw away
+// the very commits that hold the freeze on, plus any review already given.
+func mergeConflictNote(mr *tatarav1alpha1.MergeRequest, baseBranch string, lap int) string {
+	return fmt.Sprintf(
+		"%s!%d CONFLICTS with %s and cannot merge (attempt %d of %d). This turn is a conflict "+
+			"resolution, not a fresh implementation: the change was already reviewed. Merge %s into "+
+			"the merge request's branch, resolve the conflicts, keep the change's intent intact, and "+
+			"push. Do NOT force-push, rebase or regenerate the branch - the existing commits are what "+
+			"the merge request is, and re-creating it would discard them.",
+		mr.Spec.RepositoryRef, mr.Spec.Number, baseBranch, lap, tatarav1alpha1.MaxMergeConflictReentries,
+		baseBranch)
 }
 
 // stallMerge parks the pass on a poll: the cursor stays put and
@@ -559,10 +641,12 @@ func (d *StageDriver) enterStageWithCursor(ctx context.Context, proj *tatarav1al
 	to, reason string, mrs []tatarav1alpha1.MergeRequest, cursor int) error {
 	now := d.now()
 	reentries := task.Status.HeadMoveReentries
+	conflicts := task.Status.MergeConflictReentries
 	// Absolute assignments only: the closure is re-run to size the write and again
 	// on every conflict retry.
 	mutate := func(t *tatarav1alpha1.Task) {
 		t.Status.HeadMoveReentries = reentries
+		t.Status.MergeConflictReentries = conflicts
 		if cursor >= 0 {
 			t.Status.MergeCursor = cursor
 		}

@@ -505,6 +505,19 @@ spec:
                   way, so a clamped id still matches the turn that wrote it.
                 maxLength: 256
                 type: string
+              mergeConflictReentries:
+                description: |-
+                  MergeConflictReentries bounds the SIXTH cycle: the conflict self-heal.
+                  A TATARA-OWNED merge request the forge reports DIRTY is a textual conflict
+                  with the base, and the merge corridor is pod-less, so polling it until the
+                  4h budget parks it is a permanent dead end - nobody else is coming for the
+                  branch, and an adopted upgrade merge request its bot will not touch again
+                  (Renovate freezes on a branch an agent has committed to) is stuck forever.
+                  The Task therefore goes back to implementing, where an agent can reconcile
+                  and push. Like every other bounce it spawns pods, so it gets a counter.
+                  Cap 3 -> parked(merge-blocked), which is exactly where the stall-and-time-out
+                  path landed it before this cycle existed.
+                type: integer
               mergeCursor:
                 description: |-
                   MergeCursor is the index into Spec.MergeOrder the sequential merge reached.
@@ -633,6 +646,7 @@ spec:
                 - merge-auth-refused
                 - ci-red
                 - ci-blocked
+                - merge-conflict
                 type: string
               parkedAt:
                 format: date-time
