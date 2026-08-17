@@ -7,6 +7,7 @@ import (
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
+	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/own"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -59,6 +60,15 @@ func (r *MergeRequestReconciler) spiller(proj *tatarav1alpha1.Project) objbudget
 	return r.SpillerFor(proj)
 }
 
+// metrics returns the shared OperatorMetrics off Driver, or nil when the
+// reconciler was built without one. Twin of IssueReconciler.metrics.
+func (r *MergeRequestReconciler) metrics() *obs.OperatorMetrics {
+	if r.Driver == nil {
+		return nil
+	}
+	return r.Driver.Metrics
+}
+
 // +kubebuilder:rbac:groups=tatara.dev,resources=mergerequests,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=tatara.dev,resources=mergerequests/status,verbs=get;update;patch
 
@@ -103,12 +113,56 @@ func (r *MergeRequestReconciler) doReconcile(ctx context.Context, req ctrl.Reque
 	cadence := MirrorCadence(owner)
 	ciCadence := CIRefreshCadence(owner)
 
-	if r.ReaderFor != nil && mirrorSyncDue(mr.Status.LastSyncedAt, cadence, r.now()) {
+	// THE TERMINAL EXCLUSION, same one refreshCI makes at :239. A merged or closed
+	// mirror's thread can no longer gate anything, so re-reading it on cadence
+	// forever is pure forge load - and it is the ONLY route by which a 404 could
+	// reach the gone branch below and rewrite a MERGE that already happened.
+	// mr.Status.State is not mirror-local: "merged" -> "closed" leaves
+	// stage.AllMRsTerminal true while AllMRsMerged goes false, which is exactly
+	// what terminalMREdge/ownMRsShippedEdge finalize the owner Task
+	// rejected(mr-closed-externally) on, with a public terminal comment on the
+	// driving issue. syncMergeRequestThread itself stays unguarded: it is shared
+	// with SyncMergeRequestOnDemand, the deliberate off-cadence path.
+	terminalMirror := mr.Status.State == "merged" || mr.Status.State == "closed"
+	if r.ReaderFor != nil && !terminalMirror && mirrorSyncDue(mr.Status.LastSyncedAt, cadence, r.now()) {
 		reader, err := mirrorReaderFor(ctx, r.Client, r.ReaderFor, &proj)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
 		if err := syncMergeRequestThread(ctx, r.Client, r.spiller(&proj), reader, &proj, &repo, &mr); err != nil {
+			provider := providerOf(&proj)
+			recordSCMReadError(r.metrics(), provider, "list_pr_comments", err)
+			// tatara-operator#621: the #436 terminal-404 guard below only covers the
+			// forge WRITES. A permanently-gone upstream MR discovered by this READ
+			// returned raw from here and requeued forever, never reaching it.
+			//
+			// scm.IsNotFound (404 ONLY), not isPermanentTargetGone (404/410), even
+			// though upstreamThreadGone accepts both: the disposition here is NOT
+			// local to the mirror. status.state="closed" makes stage.MRTerminal true,
+			// which is what externalTerminalEdge finalizes the OWNER TASK on
+			// (rejected/mr-closed-externally, plus its terminal comment on the driving
+			// issue). A predicate that terminates somebody's Task must be the narrow
+			// one, and 404 is what a deleted PR actually answered throughout the
+			// incident. 410 is GitHub's answer for a deleted ISSUE and is also what it
+			// returns for a repo with Issues DISABLED - repo-wide, and invisible to the
+			// repo-readable probe, which reads /repos and not /issues. The Issue side
+			// keeps 404/410 because its disposition is a skipped read and nothing else.
+			if scm.IsNotFound(err) && upstreamThreadGone(ctx, reader, &repo, provider, err) {
+				// The stamp is not cosmetic. markMergeRequestGone writes state only, so
+				// mirrorSyncDue stays true forever and this branch re-reads the gone
+				// thread AND re-probes the repo on every CI tick - 5 minutes for an
+				// actively-worked MR, i.e. a HIGHER forge rate than the exponential
+				// backoff being removed, with the drains starved on every pass. Stamped,
+				// the gone thread costs 2 calls per MIRROR cadence and the drains run on
+				// every pass in between.
+				if serr := markMergeRequestThreadGone(ctx, r.Client, r.spiller(&proj), &mr, r.now()); serr != nil {
+					return ctrl.Result{}, serr
+				}
+				log.FromContext(ctx).Info("mergerequest: upstream thread permanently gone; marked closed, skipped mirror sync",
+					"action", "mr_gone_mirror_read", "resource_id", mr.Name,
+					"status", scm.ErrorStatus(err))
+				return ctrl.Result{RequeueAfter: min(cadence, ciCadence)}, nil
+			}
 			return ctrl.Result{}, err
 		}
 	}
@@ -252,16 +306,64 @@ func ciOwnerRepo(repoURL, provider string) (string, string, error) {
 	return owner, name, nil
 }
 
+// mrMergeIsRecorded reports whether this mirror already records a completed
+// merge, which no forge 404 may overwrite.
+//
+// "closed" is a strictly weaker claim than "merged" and rewriting one into the
+// other is not a mirror-local edit: stage.AllMRsTerminal stays true while
+// AllMRsMerged goes false, so terminalMREdge/ownMRsShippedEdge finalize the
+// owner Task rejected(mr-closed-externally) - and WithTerminalIssueRelease posts
+// that verdict publicly on the driving issue - instead of done. A 404 proves the
+// forge will not answer for this number; it does not disprove a merge the
+// operator itself performed and stamped. MergedAt is checked too because it is
+// the merge path's own receipt (stampMerged, merge.go) and is the field
+// review_apply.go and stage.go already treat as the durable one.
+func mrMergeIsRecorded(mr *tatarav1alpha1.MergeRequest) bool {
+	return mr.Status.State == "merged" || mr.Status.MergedAt != nil
+}
+
 // markMergeRequestGone stamps a permanently-404ing MergeRequest's mirror as
 // closed, the same terminal state a real forge close leaves. Idempotent: a
 // second 404 on an already-closed mirror is a no-op write.
 func markMergeRequestGone(ctx context.Context, c client.Client, sp objbudget.Spiller, mr *tatarav1alpha1.MergeRequest) error {
-	if mr.Status.State == "closed" {
+	if mr.Status.State == "closed" || mrMergeIsRecorded(mr) {
 		return nil
 	}
 	key := client.ObjectKeyFromObject(mr)
 	return objbudget.FitMergeRequest(ctx, c, sp, key, func(m *tatarav1alpha1.MergeRequest) {
 		m.Status.State = "closed"
+	})
+}
+
+// markMergeRequestThreadGone is markMergeRequestGone for the MIRROR READ path
+// (#621): it stamps the terminal state AND the cadence stamp the sync never got
+// to write, in ONE status update.
+//
+// Both facts belong to the same write. Without the stamp mirrorSyncDue never
+// goes false, and the first cut of this fix silenced the loop by making it
+// FASTER: the early return re-read the thread it had just proven gone and
+// re-probed the repo on every requeue - min(cadence, ciCadence) = 5 minutes for
+// an actively-worked MR, against the ~3.6 calls/h the exponential backoff had
+// settled at, with refreshCI and all six drains starved on every pass.
+//
+// The caller's terminal exclusion at :116 now skips the whole block once the
+// state lands, so the stamp no longer carries that on its own. Keep it anyway:
+// it is the honest record of when this thread was last checked, and it is the
+// only thing standing between a future caller without that exclusion and the
+// same regression.
+//
+// It refuses a recorded merge for the reason mrMergeIsRecorded gives - here
+// rather than at the call site, because the invariant belongs to the write.
+func markMergeRequestThreadGone(ctx context.Context, c client.Client, sp objbudget.Spiller,
+	mr *tatarav1alpha1.MergeRequest, now time.Time) error {
+
+	if mrMergeIsRecorded(mr) {
+		return nil
+	}
+	stamp := metav1.NewTime(now)
+	return objbudget.FitMergeRequest(ctx, c, sp, client.ObjectKeyFromObject(mr), func(m *tatarav1alpha1.MergeRequest) {
+		m.Status.State = "closed"
+		m.Status.LastSyncedAt = &stamp
 	})
 }
 
