@@ -92,16 +92,38 @@ type mirrorReader struct {
 	prComments []scm.IssueComment
 	calls      int
 	prCalls    int
+	// commentsErr/prCommentsErr fail the THREAD read; headSHAErr fails the
+	// repo-level confirming probe upstreamThreadGone makes on a 404/410 (#621).
+	commentsErr   error
+	prCommentsErr error
+	headSHAErr    error
+	headSHACalls  int
+	headSHAArgs   string
 }
 
 func (m *mirrorReader) ListIssueComments(context.Context, string, string, int) ([]scm.IssueComment, error) {
 	m.calls++
+	if m.commentsErr != nil {
+		return nil, m.commentsErr
+	}
 	return m.comments, nil
 }
 
 func (m *mirrorReader) ListPRComments(context.Context, string, string, int) ([]scm.IssueComment, error) {
 	m.prCalls++
+	if m.prCommentsErr != nil {
+		return nil, m.prCommentsErr
+	}
 	return m.prComments, nil
+}
+
+func (m *mirrorReader) GetDefaultBranchHeadSHA(_ context.Context, owner, repo string) (string, error) {
+	m.headSHACalls++
+	m.headSHAArgs = owner + "|" + repo
+	if m.headSHAErr != nil {
+		return "", m.headSHAErr
+	}
+	return "sha-main", nil
 }
 
 func mirrorProject(botLogin string) *tatarav1alpha1.Project {
