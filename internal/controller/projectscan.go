@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"hash/fnv"
+	"math/bits"
 	"sort"
 	"strconv"
 	"strings"
@@ -102,7 +103,14 @@ func scanOffset(project, repo, activity string, period time.Duration) time.Durat
 	}
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(project + "\x00" + repo + "\x00" + activity))
-	return time.Duration(uint64(h.Sum32()) % uint64(period))
+	// hash * period / 2^32 via exact 128-bit multiplication, not `hash %
+	// period`: period is a time.Duration in NANOSECONDS (1.44e13 for a 4h
+	// cron), while h.Sum32() maxes at 2^32-1 (4.29e9) - a plain modulo is a
+	// no-op against anything past a ~4.3s period, and every offset collapsed
+	// into [0, 4.3s) regardless of the configured period (the production
+	// regression this replaces).
+	hi, lo := bits.Mul64(uint64(h.Sum32()), uint64(period))
+	return time.Duration(hi<<32 | lo>>32)
 }
 
 // cronPeriod returns the nominal interval between two consecutive fires of a
@@ -117,6 +125,27 @@ func cronPeriod(sched cron.Schedule, base time.Time) time.Duration {
 // given the base cron schedule and the repo's deterministic offset.
 func repoNextFire(sched cron.Schedule, offset time.Duration, after time.Time) time.Time {
 	return sched.Next(after.Add(-offset)).Add(offset)
+}
+
+// repoIssueScanBase resolves the base time a repo's phase-shifted issueScan
+// fire anchors on: its own Status.LastIssueScan stamp when it has one, else
+// the project-wide projectBase. Without this, EVERY repo shared one
+// project-wide stamp - a pass that swept some repos advanced that shared base
+// past the fire of the repos it did not sweep (reconcile jitter losing to a
+// pass that takes several seconds against offsets spread by mere seconds
+// under the old collapsed scanOffset, or simply an unlucky small offset even
+// with scanOffset fixed), deferring them a FULL cron period, every period,
+// deterministically. Anchoring per-repo breaks that: once a repo is actually
+// swept it owns its own schedule and stops drifting with every other repo's
+// pass duration. The fallback is what makes the upgrade land cleanly - on the
+// first pass after rollout every never-stamped repo computes a fire that is
+// already in the past (dueBase's own creationTimestamp/never-run contract)
+// and is swept immediately.
+func repoIssueScanBase(repo *tatarav1alpha1.Repository, projectBase time.Time) time.Time {
+	if repo.Status.LastIssueScan != nil {
+		return repo.Status.LastIssueScan.Time
+	}
+	return projectBase
 }
 
 // label key aliases for readability within this package.
@@ -479,8 +508,12 @@ func (r *ProjectReconciler) reposDueForScan(proj *tatarav1alpha1.Project, activi
 	var due []tatarav1alpha1.Repository
 	var soonest time.Time
 	for i := range repos {
+		repoBase := base
+		if activity == "issueScan" {
+			repoBase = repoIssueScanBase(&repos[i], base)
+		}
 		off := scanOffset(proj.Name, repos[i].Name, activity, period)
-		if fire := repoNextFire(sched, off, base); !now.Before(fire) {
+		if fire := repoNextFire(sched, off, repoBase); !now.Before(fire) {
 			due = append(due, repos[i])
 		}
 		if nf := repoNextFire(sched, off, now); soonest.IsZero() || nf.Before(soonest) {
@@ -493,6 +526,27 @@ func (r *ProjectReconciler) reposDueForScan(proj *tatarav1alpha1.Project, activi
 		soonest = sched.Next(now)
 	}
 	return due, soonest, true
+}
+
+// stampRepoScan records Status.LastIssueScan on ONE repo the pass just swept.
+// Copies stampScan's RetryOnConflict pattern (three replicas race this same
+// write). This is the per-repo half of the scan-fairness fix: without it,
+// every repo would keep falling back to the project-wide stamp
+// (repoIssueScanBase), which is exactly the shared-base starvation this field
+// exists to break. A stamp failure is logged and metered like stampScan's
+// stamp_failed path by the caller, not fatal - a repo that misses its stamp
+// this pass simply falls back to the project-wide base on the next
+// evaluation instead of being lost.
+func (r *ProjectReconciler) stampRepoScan(ctx context.Context, repo *tatarav1alpha1.Repository) error {
+	now := metav1.Now()
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Repository{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: repo.Namespace, Name: repo.Name}, fresh); err != nil {
+			return err
+		}
+		fresh.Status.LastIssueScan = &now
+		return r.Status().Update(ctx, fresh)
+	})
 }
 
 // stampScan records the per-activity Last*Scan and persists status.
@@ -1345,8 +1399,9 @@ func earliestIssueScanFire(proj *tatarav1alpha1.Project, schedule string, repos 
 	period := cronPeriod(sched, base)
 	var earliest time.Time
 	for i := range repos {
+		repoBase := repoIssueScanBase(&repos[i], base)
 		off := scanOffset(proj.Name, repos[i].Name, "issueScan", period)
-		if fire := repoNextFire(sched, off, base); earliest.IsZero() || fire.Before(earliest) {
+		if fire := repoNextFire(sched, off, repoBase); earliest.IsZero() || fire.Before(earliest) {
 			earliest = fire
 		}
 	}
@@ -1625,11 +1680,32 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 					// immediately and the next pass MINTS - which stamps, and the
 					// sweep is back on its cron cadence. A pass can only defer the
 					// stamp while it is making that progress.
+					//
+					// The per-repo stamps below share this exact contract: they anchor
+					// reposDueForScan's per-repo base (repoIssueScanBase) the same way
+					// the project stamp anchors dueBase, so skipping one and not the
+					// other would re-open the same hole for whichever repo's tombstone
+					// mint is owed. Both stamps are skipped together, or neither is.
 					consider(now.Add(sweepRequeue))
-				} else if serr := r.stampScan(ctx, proj, "issueScan"); serr != nil {
-					l.Error(serr, "scan: persist sweep stamp failed",
-						"action", "scan_stamp_error", "resource_id", proj.Name, "activity", SweepActivity)
-					obs.SweepErrorsTotal.WithLabelValues(proj.Name, "issueScan", "stamp_failed").Inc()
+				} else {
+					if serr := r.stampScan(ctx, proj, "issueScan"); serr != nil {
+						l.Error(serr, "scan: persist sweep stamp failed",
+							"action", "scan_stamp_error", "resource_id", proj.Name, "activity", SweepActivity)
+						obs.SweepErrorsTotal.WithLabelValues(proj.Name, "issueScan", "stamp_failed").Inc()
+					}
+					// Per-repo stamps (defect 2 fix): each dueRepos member is stamped
+					// independently of the project-wide write above, so ONE repo's
+					// conflict/failure never blocks another's - repoIssueScanBase falls
+					// back to the project-wide base for any repo whose stamp misses
+					// this pass, same as a repo that has never been stamped.
+					for i := range dueRepos {
+						if rerr := r.stampRepoScan(ctx, &dueRepos[i]); rerr != nil {
+							l.Error(rerr, "scan: persist per-repo sweep stamp failed",
+								"action", "scan_stamp_error", "resource_id", proj.Name,
+								"activity", SweepActivity, "repo", dueRepos[i].Name)
+							obs.SweepErrorsTotal.WithLabelValues(proj.Name, "issueScan", "stamp_failed").Inc()
+						}
+					}
 				}
 				if _, next2, ok2 := r.reposDueForScan(proj, "issueScan", repos, now); ok2 {
 					consider(next2)
