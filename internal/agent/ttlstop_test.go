@@ -2,6 +2,7 @@ package agent_test
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -19,6 +20,7 @@ import (
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
+	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 )
 
 const ttlNS = "tatara"
@@ -586,4 +588,73 @@ func TestTTLStop_NonOOMTerminationKeepsTheOrdinarySyntheticNote(t *testing.T) {
 	body := h.notes(t)[0].Body
 	require.NotContains(t, body, agent.OOMKilledNoteMarker)
 	require.Contains(t, body, "wired the reconciler, tests still red")
+}
+
+// TestFitNoteAppender_NotesCapEvictsOldest_WithNoteCap: when notes hit MaxNotes,
+// WithNoteCap evicts the oldest down to MaxNotes as well as applying the byte
+// budget. The evicted batch goes to the Spiller; objbudget.Discarding drops it
+// and records no entry in Status.Stats.NotesSpilledRefs while still advancing
+// NotesSpilled (#616).
+func TestFitNoteAppender_NotesCapEvictsOldest_WithNoteCap(t *testing.T) {
+	now := time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
+	task := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "task-notecap", Namespace: ttlNS, UID: "uid-notes"},
+		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "demo", Kind: "implement"},
+		Status: tatarav1alpha1.TaskStatus{
+			State:     tatarav1alpha1.StateUnderImplementation,
+			AgentKind: "implement",
+		},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(ttlScheme(t)).
+		WithStatusSubresource(&tatarav1alpha1.Task{}).
+		WithObjects(task.DeepCopy()).
+		Build()
+
+	// Seed with exactly MaxNotes=50 notes, spaced by 1 second.
+	fresh := &tatarav1alpha1.Task{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Namespace: ttlNS, Name: "task-notecap"}, fresh))
+	for i := 0; i < tatarav1alpha1.MaxNotes; i++ {
+		at := metav1.NewTime(now.Add(time.Duration(i) * time.Second))
+		fresh.Status.Notes = append(fresh.Status.Notes, tatarav1alpha1.Note{
+			At: at, Agent: "operator", Kind: "note", Body: fmt.Sprintf("seeded note %d", i),
+		})
+	}
+	require.NoError(t, c.Status().Update(context.Background(), fresh))
+
+	// Append one more note through FitNoteAppender with Discarding spiller.
+	appender := &agent.FitNoteAppender{
+		Client:    c,
+		Spiller:   objbudget.Discarding,
+		Namespace: ttlNS,
+	}
+
+	newNote := tatarav1alpha1.Note{
+		At:    metav1.NewTime(now.Add(time.Duration(tatarav1alpha1.MaxNotes) * time.Second)),
+		Agent: "operator", Kind: "note", Body: "appended note",
+	}
+	require.NoError(t, appender.AppendNote(context.Background(), "task-notecap", newNote))
+
+	// Read the final state.
+	final := &tatarav1alpha1.Task{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Namespace: ttlNS, Name: "task-notecap"}, final))
+
+	// Journal did not grow to 51.
+	require.Len(t, final.Status.Notes, tatarav1alpha1.MaxNotes,
+		"FitTask with WithNoteCap must evict the oldest note to stay at MaxNotes, not grow to 51")
+
+	// Newest note is present.
+	require.Equal(t, "appended note", final.Status.Notes[len(final.Status.Notes)-1].Body,
+		"the newly appended note must be at the end")
+
+	// Oldest seeded note is gone (evicted).
+	for _, n := range final.Status.Notes {
+		require.NotEqual(t, "seeded note 0", n.Body,
+			"the oldest seeded note must be evicted when the cap is hit")
+	}
+
+	// NotesSpilledRefs is empty (Discarding doesn't record refs).
+	require.Empty(t, final.Status.Stats.NotesSpilledRefs,
+		"Discarding spiller must not record any spilledRefs in Status.Stats.NotesSpilledRefs")
 }

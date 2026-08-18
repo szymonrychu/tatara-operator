@@ -23,6 +23,17 @@
 // every conflict; committing the trimmed object before the spill succeeds
 // loses the evicted comments/notes if the spill then fails. The ordering
 // here is SPILL FIRST, DROP ONLY ON SPILL SUCCESS.
+//
+// THAT ORDERING HAS EXACTLY ONE INVERSION, and it is deliberate: Discarding.
+// SPILL FIRST protects evicted items from a REPAIRABLE outage. A Project with
+// spec.memory.enabled=false has no memory stack, will never have one, and
+// nothing is being repaired - so "block until the spill succeeds" is not a
+// policy there, it is a permanent refusal (#616). Discarding therefore reports
+// success with an EMPTY track_id, which every Fit* reads as "evicted, not
+// stored": the items are dropped, no ref is recorded, and the outcome lands on
+// operator_objbudget_evicted_dropped_total instead of
+// operator_comment_spill_total. Recording a ref for a batch nothing stored is
+// worse than recording none - task_context would rehydrate it and get a 404.
 package objbudget
 
 import (
@@ -53,6 +64,13 @@ var ErrObjectTooLarge = errors.New("object exceeds byte budget with nothing left
 // this path dereferenced a nil interface and panicked. See SpillBlocked.
 var ErrSpillerUnconfigured = errors.New("no tatara-memory spiller configured")
 
+// ErrSpillFailed means the Spiller was configured and reachable-looking but
+// the spill call returned an error. It exists so a caller can tell a
+// TRANSIENT spill fault (answer 503 + Retry-After: tatara-memory is down and
+// will come back) from every other Fit* failure, without string-matching the
+// wrapped error.
+var ErrSpillFailed = errors.New("tatara-memory spill failed")
+
 // The reasons SpillBlocked distinguishes. They are the label values of
 // operator_objbudget_spill_blocked_total, so an alert can tell an outage
 // (spill_error, self-healing once tatara-memory is back) from a wiring bug
@@ -65,9 +83,42 @@ const (
 // Spiller sends one eviction batch to tatara-memory and returns the durable
 // track_id the caller records. A concrete implementation lives over
 // internal/memory; tests inject a fake.
+//
+// AN EMPTY track_id WITH A NIL ERROR MEANS DISCARDED, NOT STORED: the batch
+// is gone and the caller must NOT record a ref for it. See Discarding and the
+// package doc's inversion note.
 type Spiller interface {
 	Spill(ctx context.Context, kind, name string, payload any) (trackID string, err error)
 }
+
+// Discarding is the Spiller for a Project whose memory stack is switched off
+// by configuration. It accepts every batch and stores nothing.
+//
+// It is a VALUE, not nil: nil means "no spiller was wired", which is a bug
+// and blocks the write. Discarding means "there is deliberately nowhere to
+// spill to", which permits it.
+var Discarding Spiller = discardingSpiller{}
+
+type discardingSpiller struct{}
+
+func (discardingSpiller) Spill(context.Context, string, string, any) (string, error) {
+	return "", nil
+}
+
+// FitOption tunes one Fit* call. The only one today is WithNoteCap.
+type FitOption func(*fitOptions)
+
+type fitOptions struct{ noteCap bool }
+
+// WithNoteCap makes FitTask evict on COUNT as well as on bytes, down to
+// tatarav1alpha1.MaxNotes.
+//
+// It is OPT-IN, and that is the whole design. Only the four note APPENDERS
+// pass it; the dozen other FitTask callers (stage transitions, the merge
+// cursor, CI gating) write status fields that have nothing to do with the
+// journal, and making them evict on count would let a tatara-memory blip
+// block a transition - a worse failure than the one the cap prevents.
+func WithNoteCap() FitOption { return func(o *fitOptions) { o.noteCap = true } }
 
 // Metrics is the recorder Fit* functions call on every guarded write. It
 // defaults to a no-op; call SetMetrics once at startup (see
@@ -81,6 +132,11 @@ type Metrics interface {
 	IncObjectTooLarge(kind, name string)
 	// IncCommentSpill records one eviction batch spilled to tatara-memory.
 	IncCommentSpill(kind string)
+	// IncEvictedDropped records one eviction batch DISCARDED rather than
+	// spilled, because the owning Project has no memory stack by
+	// configuration. It is the counterpart of IncCommentSpill, not of
+	// IncSpillBlocked: nothing was refused, the items are simply gone.
+	IncEvictedDropped(kind string)
 	// IncSpillBlocked records a write REFUSED because its eviction batch could
 	// not be spilled, by kind and by one of the SpillBlockedReason* values.
 	IncSpillBlocked(kind, reason string)
@@ -91,6 +147,7 @@ type noopMetrics struct{}
 func (noopMetrics) ObserveObjectSize(string, int)    {}
 func (noopMetrics) IncObjectTooLarge(string, string) {}
 func (noopMetrics) IncCommentSpill(string)           {}
+func (noopMetrics) IncEvictedDropped(string)         {}
 func (noopMetrics) IncSpillBlocked(string, string)   {}
 
 var metricsRecorder Metrics = noopMetrics{}
@@ -177,26 +234,90 @@ func evictOldest[T any](items []T, setAndSize func([]T) (int, error)) (survivors
 	}
 }
 
-// filterCommentsFrom keeps only comments whose CreatedAt is at or after
-// retainFrom - the PURE, idempotent half of the trim, safe to re-run on
-// every RetryOnConflict attempt.
-func filterCommentsFrom(comments []tatarav1alpha1.Comment, retainFrom metav1.Time) []tatarav1alpha1.Comment {
-	out := make([]tatarav1alpha1.Comment, 0, len(comments))
-	for _, c := range comments {
-		if !c.CreatedAt.Time.Before(retainFrom.Time) {
-			out = append(out, c)
-		}
+// spillEvicted sends ONE eviction batch and reports whether tatara-memory
+// stored it. It is the single place the three Fit* functions decide what an
+// unspillable batch means, so the unconfigured/failed/discarded split cannot
+// drift between them.
+//
+// stored=false with err=nil is the deliberate-discard case (see Discarding):
+// the caller drops the items and records NO ref.
+func spillEvicted(ctx context.Context, sp Spiller, kind, name string, batch any, items int) (trackID string, stored bool, err error) {
+	if sp == nil {
+		SpillBlocked(ctx, kind, name, SpillBlockedReasonUnconfigured, items)
+		return "", false, ErrSpillerUnconfigured
 	}
-	return out
+	trackID, err = sp.Spill(ctx, kind, name, batch)
+	if err != nil {
+		SpillBlocked(ctx, kind, name, SpillBlockedReasonError, items)
+		return "", false, fmt.Errorf("%w: %w", ErrSpillFailed, err)
+	}
+	if trackID == "" {
+		metricsRecorder.IncEvictedDropped(kind)
+		slog.WarnContext(ctx, "objbudget: evicted items discarded rather than spilled; the owning project has no memory stack by configuration",
+			"action", "objbudget_evicted_dropped", "kind", kind, "resource_id", name, "items", items)
+		return "", false, nil
+	}
+	metricsRecorder.IncCommentSpill(kind)
+	return trackID, true, nil
 }
 
-// filterNotesFrom is the Note counterpart of filterCommentsFrom.
-func filterNotesFrom(notes []tatarav1alpha1.Note, retainFrom metav1.Time) []tatarav1alpha1.Note {
-	out := make([]tatarav1alpha1.Note, 0, len(notes))
-	for _, n := range notes {
-		if !n.At.Time.Before(retainFrom.Time) {
-			out = append(out, n)
+// commentKey identifies a comment for exclusion. It is ExternalID and NOTHING
+// ELSE, because ExternalID is the only field of a mirrored comment that cannot
+// change under the guard: mergeComments/mergeOneComment
+// (internal/controller/mirror.go) take body, author and CreatedAt from the
+// forge listing and UPSERT them, so a body edited on the forge between the
+// Phase-1 read that chose the eviction batch and the Phase-2 read that applies
+// it would move any key that included them - and a key that no longer matches
+// spills a comment AND retains it, which is the exact tie this exclusion
+// replaced a timestamp filter to avoid.
+//
+// ExternalID alone is only safe BECAUSE the exclusion is a multiset (see
+// evictedComments). mergeComments dedupes on `ok && c.ExternalID != ""`, so it
+// deliberately lets several empty-id comments coexist; as a SET, "" would let
+// one evicted empty-id comment exclude every retained one. As a counted
+// multiset it excludes exactly as many as were evicted, and since both lists
+// are ordered oldest-first and eviction takes from the front, those are the
+// right ones.
+type commentKey struct{ id string }
+
+func keyOfComment(c tatarav1alpha1.Comment) commentKey {
+	return commentKey{id: c.ExternalID}
+}
+
+// evictedComments is excludeComments' key MULTISET: it COUNTS occurrences, so
+// N indistinguishable comments evicted exclude exactly N retained ones and no
+// more.
+func evictedComments(evicted []tatarav1alpha1.Comment) map[commentKey]int {
+	counts := make(map[commentKey]int, len(evicted))
+	for _, c := range evicted {
+		counts[keyOfComment(c)]++
+	}
+	return counts
+}
+
+// excludeComments drops the comments in evicted, by identity and by count.
+//
+// It replaces a "retain CreatedAt >= retainFrom" filter, which was wrong on a
+// TIE: metav1.Time round-trips at second granularity, so a comment sharing its
+// second with the oldest survivor was both evicted AND retained. The object
+// then never came under budget, and every later write re-spilled the same
+// batch and appended another track_id. Identity has no ties.
+//
+// The tally is a COPY: this runs inside RetryOnConflict, so consuming the
+// caller's map would leave the second attempt with nothing left to exclude.
+func excludeComments(comments []tatarav1alpha1.Comment, evicted map[commentKey]int) []tatarav1alpha1.Comment {
+	remaining := make(map[commentKey]int, len(evicted))
+	for k, n := range evicted {
+		remaining[k] = n
+	}
+	out := make([]tatarav1alpha1.Comment, 0, len(comments))
+	for _, c := range comments {
+		k := keyOfComment(c)
+		if remaining[k] > 0 {
+			remaining[k]--
+			continue
 		}
+		out = append(out, c)
 	}
 	return out
 }
@@ -231,18 +352,13 @@ func FitIssue(ctx context.Context, c client.Client, sp Spiller, key types.Namesp
 
 	var retainFrom *metav1.Time
 	var trackID string
+	var stored bool
 	evictedN := len(evicted)
 	if evictedN > 0 {
-		if sp == nil {
-			SpillBlocked(ctx, kind, key.Name, SpillBlockedReasonUnconfigured, evictedN)
-			return fmt.Errorf("objbudget: spill %d comments for issue %s: %w", evictedN, key.Name, ErrSpillerUnconfigured)
-		}
-		trackID, err = sp.Spill(ctx, kind, key.Name, evicted)
+		trackID, stored, err = spillEvicted(ctx, sp, kind, key.Name, evicted, evictedN)
 		if err != nil {
-			SpillBlocked(ctx, kind, key.Name, SpillBlockedReasonError, evictedN)
 			return fmt.Errorf("objbudget: spill %d comments for issue %s: %w", evictedN, key.Name, err)
 		}
-		metricsRecorder.IncCommentSpill(kind)
 		if len(survivors) > 0 {
 			t := survivors[0].CreatedAt
 			retainFrom = &t
@@ -251,6 +367,7 @@ func FitIssue(ctx context.Context, c client.Client, sp Spiller, key types.Namesp
 			retainFrom = &t
 		}
 	}
+	goneComments := evictedComments(evicted)
 
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.Issue{}
@@ -259,10 +376,16 @@ func FitIssue(ctx context.Context, c client.Client, sp Spiller, key types.Namesp
 		}
 		mutate(fresh)
 		if retainFrom != nil {
-			fresh.Status.Comments = filterCommentsFrom(fresh.Status.Comments, *retainFrom)
+			was := len(fresh.Status.Comments)
+			fresh.Status.Comments = excludeComments(fresh.Status.Comments, goneComments)
+			// CommentsRetainedFrom no longer drives the exclusion, but it is
+			// still the A.1 re-ingest watermark: without it the mirror re-fetches
+			// and re-appends everything this call just evicted.
 			fresh.Status.CommentsRetainedFrom = retainFrom
-			fresh.Status.SpilledComments += evictedN
-			fresh.Status.SpilledCommentsRefs = append(fresh.Status.SpilledCommentsRefs, trackID)
+			fresh.Status.SpilledComments += was - len(fresh.Status.Comments)
+			if stored {
+				fresh.Status.SpilledCommentsRefs = append(fresh.Status.SpilledCommentsRefs, trackID)
+			}
 		}
 		fresh.Status.CommentCount = len(fresh.Status.Comments) + fresh.Status.SpilledComments
 		sz, err := sizeOf(fresh)
@@ -303,18 +426,13 @@ func FitMergeRequest(ctx context.Context, c client.Client, sp Spiller, key types
 
 	var retainFrom *metav1.Time
 	var trackID string
+	var stored bool
 	evictedN := len(evicted)
 	if evictedN > 0 {
-		if sp == nil {
-			SpillBlocked(ctx, kind, key.Name, SpillBlockedReasonUnconfigured, evictedN)
-			return fmt.Errorf("objbudget: spill %d comments for mergerequest %s: %w", evictedN, key.Name, ErrSpillerUnconfigured)
-		}
-		trackID, err = sp.Spill(ctx, kind, key.Name, evicted)
+		trackID, stored, err = spillEvicted(ctx, sp, kind, key.Name, evicted, evictedN)
 		if err != nil {
-			SpillBlocked(ctx, kind, key.Name, SpillBlockedReasonError, evictedN)
 			return fmt.Errorf("objbudget: spill %d comments for mergerequest %s: %w", evictedN, key.Name, err)
 		}
-		metricsRecorder.IncCommentSpill(kind)
 		if len(survivors) > 0 {
 			t := survivors[0].CreatedAt
 			retainFrom = &t
@@ -323,6 +441,7 @@ func FitMergeRequest(ctx context.Context, c client.Client, sp Spiller, key types
 			retainFrom = &t
 		}
 	}
+	goneComments := evictedComments(evicted)
 
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.MergeRequest{}
@@ -331,10 +450,13 @@ func FitMergeRequest(ctx context.Context, c client.Client, sp Spiller, key types
 		}
 		mutate(fresh)
 		if retainFrom != nil {
-			fresh.Status.Comments = filterCommentsFrom(fresh.Status.Comments, *retainFrom)
+			was := len(fresh.Status.Comments)
+			fresh.Status.Comments = excludeComments(fresh.Status.Comments, goneComments)
 			fresh.Status.CommentsRetainedFrom = retainFrom
-			fresh.Status.SpilledComments += evictedN
-			fresh.Status.SpilledCommentsRefs = append(fresh.Status.SpilledCommentsRefs, trackID)
+			fresh.Status.SpilledComments += was - len(fresh.Status.Comments)
+			if stored {
+				fresh.Status.SpilledCommentsRefs = append(fresh.Status.SpilledCommentsRefs, trackID)
+			}
 		}
 		fresh.Status.CommentCount = len(fresh.Status.Comments) + fresh.Status.SpilledComments
 		sz, err := sizeOf(fresh)
@@ -354,8 +476,13 @@ func FitMergeRequest(ctx context.Context, c client.Client, sp Spiller, key types
 // NotesSpilledRefs). Notes carry no re-ingest watermark field - unlike
 // Issue/MergeRequest comments, notes are never re-synced from an external
 // source, so there is no re-fetch/re-evict loop to guard against.
-func FitTask(ctx context.Context, c client.Client, sp Spiller, key types.NamespacedName, mutate func(*tatarav1alpha1.Task)) error {
+func FitTask(ctx context.Context, c client.Client, sp Spiller, key types.NamespacedName, mutate func(*tatarav1alpha1.Task), opts ...FitOption) error {
 	const kind = "Task"
+
+	var o fitOptions
+	for _, apply := range opts {
+		apply(&o)
+	}
 
 	cur := &tatarav1alpha1.Task{}
 	if err := getWaitingOutCreateLag(ctx, c, key, cur); err != nil {
@@ -364,7 +491,18 @@ func FitTask(ctx context.Context, c client.Client, sp Spiller, key types.Namespa
 	candidate := cur.DeepCopy()
 	mutate(candidate)
 
-	survivors, evicted, finalSize, err := evictOldest(candidate.Status.Notes, func(items []tatarav1alpha1.Note) (int, error) {
+	// The COUNT cap runs first and unconditionally; the byte guard then runs on
+	// what is left. Doing it the other way round would let a journal of 500
+	// small notes pass the byte check and never reach the cap.
+	notes := candidate.Status.Notes
+	var capEvicted []tatarav1alpha1.Note
+	if o.noteCap && len(notes) > tatarav1alpha1.MaxNotes {
+		n := len(notes) - tatarav1alpha1.MaxNotes
+		capEvicted = notes[:n:n]
+		notes = notes[n:]
+	}
+
+	_, evicted, finalSize, err := evictOldest(notes, func(items []tatarav1alpha1.Note) (int, error) {
 		candidate.Status.Notes = items
 		return sizeOf(candidate)
 	})
@@ -375,27 +513,15 @@ func FitTask(ctx context.Context, c client.Client, sp Spiller, key types.Namespa
 		metricsRecorder.IncObjectTooLarge(kind, key.Name)
 		return ErrObjectTooLarge
 	}
+	evicted = append(capEvicted, evicted...)
 
-	var retainFrom *metav1.Time
 	var trackID string
+	var stored bool
 	evictedN := len(evicted)
 	if evictedN > 0 {
-		if sp == nil {
-			SpillBlocked(ctx, kind, key.Name, SpillBlockedReasonUnconfigured, evictedN)
-			return fmt.Errorf("objbudget: spill %d notes for task %s: %w", evictedN, key.Name, ErrSpillerUnconfigured)
-		}
-		trackID, err = sp.Spill(ctx, kind, key.Name, evicted)
+		trackID, stored, err = spillEvicted(ctx, sp, kind, key.Name, evicted, evictedN)
 		if err != nil {
-			SpillBlocked(ctx, kind, key.Name, SpillBlockedReasonError, evictedN)
 			return fmt.Errorf("objbudget: spill %d notes for task %s: %w", evictedN, key.Name, err)
-		}
-		metricsRecorder.IncCommentSpill(kind)
-		if len(survivors) > 0 {
-			t := survivors[0].At
-			retainFrom = &t
-		} else {
-			t := evicted[evictedN-1].At
-			retainFrom = &t
 		}
 	}
 
@@ -405,10 +531,35 @@ func FitTask(ctx context.Context, c client.Client, sp Spiller, key types.Namespa
 			return err
 		}
 		mutate(fresh)
-		if retainFrom != nil {
-			fresh.Status.Notes = filterNotesFrom(fresh.Status.Notes, *retainFrom)
-			fresh.Status.Stats.NotesSpilled += evictedN
-			fresh.Status.Stats.NotesSpilledRefs = append(fresh.Status.Stats.NotesSpilledRefs, trackID)
+		if evictedN > 0 {
+			// POSITIONAL, not "retain At >= retainFrom". Notes are appended
+			// oldest-first and metav1.Time round-trips at second granularity, so
+			// a timestamp filter both evicted and retained a note that shared its
+			// second with the oldest survivor: the cap was never reached and every
+			// later write re-spilled the same batch. Index arithmetic has no ties.
+			//
+			// The cap is re-applied against fresh, not just replayed at evictedN,
+			// because an uncapped FitTask caller may have appended between the two
+			// reads; without it the cap silently stops converging.
+			drop := evictedN
+			if o.noteCap {
+				drop = max(drop, len(fresh.Status.Notes)-tatarav1alpha1.MaxNotes)
+			}
+			drop = min(drop, len(fresh.Status.Notes))
+			if drop > evictedN {
+				// The surplus is dropped WITHOUT having been spilled: the batch
+				// went to tatara-memory before this re-read existed. Rare (it needs
+				// an uncapped appender to land inside the two Gets) and bounded by
+				// that race, but it is real loss, so it is never silent.
+				slog.WarnContext(ctx, "objbudget: note journal grew between the eviction decision and the write; the surplus is dropped unspilled",
+					"action", "objbudget_surplus_dropped", "kind", kind, "resource_id", key.Name,
+					"spilled", evictedN, "dropped", drop)
+			}
+			fresh.Status.Notes = fresh.Status.Notes[drop:]
+			fresh.Status.Stats.NotesSpilled += drop
+			if stored {
+				fresh.Status.Stats.NotesSpilledRefs = append(fresh.Status.Stats.NotesSpilledRefs, trackID)
+			}
 		}
 		sz, err := sizeOf(fresh)
 		if err != nil {

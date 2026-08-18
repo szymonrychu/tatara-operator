@@ -154,11 +154,16 @@ func run(ctx context.Context, gate *obs.ShutdownGate) error {
 	// series and re-exposes them on the operator's own /metrics registry.
 	pushReceiver := pushmetrics.New(cfg.PushMetricsTTL, cfg.PushMetricsAllowedPrefixes)
 	ctrlmetrics.Registry.MustRegister(pushReceiver)
-	seqAlloc, err := addReconcilers(mgr, cfg, operatorMetrics, pushReceiver)
+	// ONE tatara-memory client-credentials source for the whole process. Both
+	// wiring halves mint against the same Keycloak client for the same audience
+	// and the source caches, so a source per call site (six of them, before this)
+	// is nothing but duplicate grant traffic and six caches expiring apart.
+	memoryTokens := newMemoryTokenSource(cfg)
+	seqAlloc, err := addReconcilers(mgr, cfg, operatorMetrics, pushReceiver, memoryTokens.Token)
 	if err != nil {
 		return err
 	}
-	if err := addWebhookServer(ctx, mgr, cfg, operatorMetrics, seqAlloc); err != nil {
+	if err := addWebhookServer(ctx, mgr, cfg, operatorMetrics, seqAlloc, memoryTokens.Token); err != nil {
 		return err
 	}
 	// NO MIGRATION RUNS HERE, and that is a RULING, not an omission. #521 removed

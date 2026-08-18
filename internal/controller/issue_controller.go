@@ -124,7 +124,33 @@ func (r *IssueReconciler) doReconcile(ctx context.Context, req ctrl.Request) (ct
 			return ctrl.Result{}, err
 		}
 		if err := syncIssueThread(ctx, r.Client, r.spiller(&proj), reader, &proj, &repo, &iss); err != nil {
-			return ctrl.Result{}, err
+			provider := providerOf(&proj)
+			recordSCMReadError(r.metrics(), provider, "list_issue_comments", err)
+			// tatara-operator#621's latent Issue half. The MergeRequest side reaches
+			// markMergeRequestGone here; this side deliberately does NOT mark the
+			// mirror closed, because Issue.Status.State="closed" drives
+			// handleIssueClosed and the WS3-I3 stop edge, which stops the owner Task.
+			// A failed READ is not entitled to make a Task-lifecycle decision. Skip
+			// the sync and fall through: the label projection and the closed branch
+			// still owe this CR work.
+			if !upstreamThreadGone(ctx, reader, &repo, provider, err) {
+				return ctrl.Result{}, err
+			}
+			// THE STAMP IS THE RATE LIMIT, and it is the only one left. mirrorSyncDue
+			// keys ONLY on LastSyncedAt, so an unstamped mirror is due on EVERY
+			// reconcile - and this arm now returns nil, which removes the
+			// controller-runtime backoff that used to bound the cost. Steady state is
+			// cadence-driven via the tail requeue either way, but every watch-triggered
+			// reconcile (a webhook comment append, the sweep, /outcome) would otherwise
+			// re-pay ListIssueComments plus the repo probe. Status.State is still not
+			// touched: the stamp records that the thread was CHECKED, which is exactly
+			// what it means on the MergeRequest side too.
+			if serr := stampIssueMirrorChecked(ctx, r.Client, r.spiller(&proj), &iss, r.now()); serr != nil {
+				return ctrl.Result{}, serr
+			}
+			log.FromContext(ctx).Info("issue: upstream thread permanently gone; skipped mirror sync, mirror left open",
+				"action", "issue_gone_mirror_read", "resource_id", iss.Name,
+				"status", scm.ErrorStatus(err))
 		}
 	}
 
@@ -164,9 +190,35 @@ func (r *IssueReconciler) doReconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// The deferred issue_write intents (C.2.12): the agent's tool call persisted
 	// one, and this is what performs it on the forge.
+	//
+	// The terminal guard is the same one the MergeRequest reconciler has carried
+	// around its drain steps since #436, and this side needs it for the same
+	// reason: every arm of the drain re-reads the thread (listThreadComments) to
+	// dedup its own marker, so on a permanently-gone issue the drain 404s exactly
+	// where the mirror sync above did. Without it #621's loop survives the fix for
+	// any Issue carrying a pending intent - it merely moves twenty lines down and
+	// costs an extra forge call per pass. The intent is NOT dropped: an agent's
+	// durable intent is not something a failed forge read is entitled to discard,
+	// so it is retried at the next cadence and stays visible in status.
+	//
+	// IT IS SCOPED TO THE WHOLE DRAIN, not to the thread re-read that motivates
+	// it, because the drain is one call and the caller cannot see which arm
+	// failed. So it also swallows a 404/410 out of CloseIssue, Comment, AddLabel
+	// and EditIssue - and the drain returns at the FIRST failing intent, so every
+	// later intent on this Issue is head-of-line blocked behind it. That is the
+	// drain's pre-existing shape on any error; what this guard removes is the
+	// ERROR line. recordSCMReadError is therefore not optional here: without it a
+	// repo silently refusing every forge write leaves no signal at all outside the
+	// raw status.pendingComments array.
 	if r.Driver != nil {
 		if err := r.Driver.DrainPendingComments(ctx, &iss); err != nil {
-			return ctrl.Result{}, err
+			if !isPermanentTargetGone(err) {
+				return ctrl.Result{}, err
+			}
+			recordSCMReadError(r.metrics(), providerOf(&proj), "drain_pending_comments", err)
+			log.FromContext(ctx).Info("issue: upstream permanently gone; stopped draining pending intents this pass",
+				"action", "issue_gone_drain", "resource_id", iss.Name,
+				"status", scm.ErrorStatus(err))
 		}
 	}
 
