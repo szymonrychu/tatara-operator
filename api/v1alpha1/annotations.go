@@ -66,6 +66,16 @@ const (
 	// individually preserved by every writer to promise that. Nothing ever removes
 	// this annotation.
 	AnnRetiredParkMigrated = "tatara.dev/retired-park-migrated"
+	// AnnRetryLaneMigrated is the ONCE-ONLY LATCH for the retry-lane migration
+	// (controller.driveRetryLaneMigration), and it is the exact analogue of
+	// AnnRetiredParkMigrated one class over: ci-red and merge-conflict lost their
+	// park writers when stage.CIRed's and stage.MergeConflict's anyMerged arms
+	// moved into the lane, so every Task ALREADY carrying one would have kept a
+	// verdict from a rule that no longer exists and aged out at ParkRetention.
+	// Its VALUE is the RFC3339 instant the migration ran; its PRESENCE is the
+	// guard, and nothing ever removes it - a Task re-parked ci-red by a
+	// mid-rollout replica is migrated once and never again.
+	AnnRetryLaneMigrated = "tatara.dev/retry-lane-migrated"
 )
 
 // AnnAutoReentries / AnnAutoReentryExhausted are the C.3 automatic-pickup
@@ -88,6 +98,21 @@ const (
 const (
 	AnnAutoReentries        = "tatara.dev/auto-reentries"
 	AnnAutoReentryExhausted = "tatara.dev/auto-reentry-exhausted"
+	// AnnRetryExhaustedCommented latches the UnparkRetry escalation comment so
+	// the 30s unpark driver cannot post it twice.
+	//
+	// ITS VALUE IS THE parkedAt OF THE PARK IT ANNOUNCED, and that is what makes
+	// it correct rather than merely quiet. A presence-only latch would silence
+	// the escalation of every LATER blocker on the same Task, which is the
+	// second failure this whole lane exists to remove; keying on the park's own
+	// timestamp scopes the silence to the one park that was already announced.
+	//
+	// It is stamped only AFTER the comment lands, so a forge outage costs a
+	// retry on the next pass rather than a lost escalation. It is metadata, not
+	// status, for the reason AnnRetiredParkMigrated gives - and because
+	// internal/stage cannot write it at all: every persist path behind that
+	// package ends in Status().Update, which silently discards annotations.
+	AnnRetryExhaustedCommented = "tatara.dev/retry-exhausted-commented"
 )
 
 // THE CI-RECOVERY ANNOTATIONS. Four keys, two pairs, and they exist because a

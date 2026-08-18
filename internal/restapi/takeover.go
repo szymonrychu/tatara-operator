@@ -65,10 +65,16 @@ func (s *Server) liveTakeoverTask(ctx context.Context, proj *tatarav1alpha1.Proj
 // MintOrUnparkTakeoverTask has an explicit arm for it. Delete this line as
 // redundant and every re-take, the whole point of the endpoint, starts 409ing.
 //
-// The class test is stated as "not the two that DO resume" rather than
-// "== UnparkNever", because there are FOUR classes, and an == UnparkNever test
+// The class test is stated as "not the ones that DO resume" rather than
+// "== UnparkNever", because there are FIVE classes, and an == UnparkNever test
 // would silently answer an UnparkRetired park 200 and do nothing - the exact
 // behaviour this gate exists to eliminate.
+//
+// UnparkRetry is on the RESUMES side, and it has to be listed explicitly for
+// the same reason UnparkTimer is: its release is a backed-off timer the unpark
+// driver arms and fires on its own, so a takeover parked ci-failed or
+// merge-conflict-retry is not stuck at all - refusing it would 409 a maintainer
+// over a park that clears itself within the hour.
 //
 // UnparkRetired IS THE ONE PLACE THE REFUSAL IS NOT EXACT, and this used to
 // claim otherwise ("a takeover carrying one is just as stuck"). It is not
@@ -91,7 +97,8 @@ func unresumableTakeoverPark(t *tatarav1alpha1.Task) bool {
 		return false // THE re-take path
 	}
 	class, ok := stage.UnparkClassFor(t.Status.ParkReason)
-	return ok && class != stage.UnparkHuman && class != stage.UnparkTimer
+	return ok && class != stage.UnparkHuman && class != stage.UnparkTimer &&
+		class != stage.UnparkRetry
 }
 
 // mrTakeover is the consumer end of the OP6 (webhook fast path) / OP12 (sweep

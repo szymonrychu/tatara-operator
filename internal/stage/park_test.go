@@ -101,10 +101,10 @@ func TestEveryParkReasonHasAnUnparkClass(t *testing.T) {
 		_, ok := stage.UnparkClassFor(r)
 		require.True(t, ok, "park reason %q has no UnparkClass; the axis must be total", r)
 	}
-	require.Len(t, stage.ParkReasons, 29)
+	require.Len(t, stage.ParkReasons, 34)
 	require.Len(t, stage.RejectReasons, 6)
 	require.Len(t, stage.DoneReasons, 2)
-	require.Len(t, stage.Reasons, 37, "the three sets must partition Reasons with no remainder")
+	require.Len(t, stage.Reasons, 42, "the three sets must partition Reasons with no remainder")
 }
 
 // TestMergeStageParksAreParkReasonsAndExcludeTheImplementationOnes pins the
@@ -303,4 +303,335 @@ func TestUpgradeDeclineToOwnershipLost(t *testing.T) {
 		require.Equal(t, stamped, tk.Status.ParkedAt.Time,
 			"a no-op must not restart the retention window either")
 	})
+}
+
+// TestTheRetryReasonsAreUnparkRetry pins the MACHINE lane. These four name a
+// technical blocker a machine is expected to clear on its own, so what releases
+// them is a timer bounded by an attempt count - not a human comment, which is
+// the whole difference between this class and UnparkHuman.
+func TestTheRetryReasonsAreUnparkRetry(t *testing.T) {
+	tests := []struct {
+		name   string
+		reason string
+		want   stage.UnparkClass
+	}{
+		{"a pipeline that has not answered yet", stage.ReasonCIPending, stage.UnparkRetry},
+		{"a check that is red", stage.ReasonCIFailed, stage.UnparkRetry},
+		{"an owned merge request the forge reports dirty", stage.ReasonMergeConflictRetry, stage.UnparkRetry},
+		{"work to ship and no merge request that can carry it", stage.ReasonMRSurfaceSpent, stage.UnparkRetry},
+		{"the lane itself, spent", stage.ReasonRetryExhausted, stage.UnparkHuman},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			require.True(t, stage.IsParkReason(tc.reason), "%q must be a park reason", tc.reason)
+			got, ok := stage.UnparkClassFor(tc.reason)
+			require.True(t, ok, "%q has no unpark class", tc.reason)
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// TestMergeAuthRefusedIsStillUnparkNever is the DELIBERATE exclusion. A refused
+// merge credential does not fix itself, and retrying a merge that may have
+// partially succeeded is how a double-merge happens - so it is the one
+// technical-looking blocker that never joins the retry lane.
+func TestMergeAuthRefusedIsStillUnparkNever(t *testing.T) {
+	got, ok := stage.UnparkClassFor(stage.ReasonMergeAuthRefused)
+	require.True(t, ok)
+	require.Equal(t, stage.UnparkNever, got)
+}
+
+// TestUnparkRetryBackoffIsExponentialAndCapped pins the SCHEDULE. n is the
+// attempts already spent, so the first lap of a fresh park waits
+// UnparkRetryBackoffBase and each further lap doubles until the cap - which is
+// CIWaitDeadline, past which this platform has already decided a pipeline that
+// has not spoken is not going to.
+func TestUnparkRetryBackoffIsExponentialAndCapped(t *testing.T) {
+	tests := []struct {
+		name     string
+		attempts int
+		want     time.Duration
+	}{
+		{"the first lap of a fresh park", 0, time.Minute},
+		{"second", 1, 2 * time.Minute},
+		{"third", 2, 4 * time.Minute},
+		{"fourth", 3, 8 * time.Minute},
+		{"fifth", 4, 16 * time.Minute},
+		{"the doubling is ceilinged, not unbounded", 5, 30 * time.Minute},
+		{"and stays there", 6, 30 * time.Minute},
+		{"a nonsense negative attempt count still serves the base wait", -1, time.Minute},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, stage.RetryWait(tc.attempts))
+
+			tk := task(v1alpha1.StateAwaitingReview)
+			require.NoError(t, stage.Park(tk, stage.ReasonCIFailed, now))
+			// The laps have to be charged against THIS blocker, which is what
+			// ArmRetry recorded on the lap that spent them: a counter with no
+			// blocker attached is one this park has not spent anything on yet.
+			tk.Status.RetryBlocker = stage.ReasonCIFailed
+			tk.Status.RetryAttempts = tc.attempts
+			require.NoError(t, stage.ArmRetry(tk, now))
+			require.NotNil(t, tk.Status.RetryNextAt)
+			require.Equal(t, now.Add(tc.want), tk.Status.RetryNextAt.Time)
+			require.Equal(t, tc.attempts+1, tk.Status.RetryAttempts,
+				"arming SPENDS the lap it schedules; nothing else charges the budget")
+		})
+	}
+}
+
+func TestArmRetryRefusesAParkThatIsNotInTheRetryLane(t *testing.T) {
+	tk := task(v1alpha1.StateAwaitingReview)
+	require.NoError(t, stage.Park(tk, stage.ReasonAwaitingHuman, now))
+	require.Error(t, stage.ArmRetry(tk, now))
+	require.Zero(t, tk.Status.RetryAttempts)
+
+	require.Error(t, stage.ArmRetry(task(v1alpha1.StateAwaitingReview), now),
+		"an un-parked Task has no lane to arm")
+}
+
+// RescheduleRetry is the verdict that is neither "still standing" nor
+// "release": the blocker has cleared and the project has no live room for the
+// pod a release would mint. Without a schedule that answer is not recorded
+// anywhere and the driver re-reads the forge on every 30s pass forever.
+func TestRescheduleRetryPacesTheReReadWithoutChargingALap(t *testing.T) {
+	tk := task(v1alpha1.StateAwaitingReview)
+	require.NoError(t, stage.Park(tk, stage.ReasonMergeConflictRetry, now))
+	tk.Status.RetryBlocker = stage.ReasonMergeConflictRetry
+	tk.Status.RetryAttempts = v1alpha1.MaxUnparkRetries
+
+	require.NoError(t, stage.RescheduleRetry(tk, now))
+	require.NotNil(t, tk.Status.RetryNextAt)
+	require.Equal(t, now.Add(stage.RetryWait(v1alpha1.MaxUnparkRetries-1)), tk.Status.RetryNextAt.Time,
+		"the wait the current lap already paid for is re-served; no lap buys a longer one")
+	require.Equal(t, v1alpha1.MaxUnparkRetries, tk.Status.RetryAttempts,
+		"the operator's own ceiling is not the blocker's lap")
+	require.Equal(t, stage.ReasonMergeConflictRetry, tk.Status.RetryBlocker)
+
+	require.Error(t, stage.RescheduleRetry(task(v1alpha1.StateAwaitingReview), now),
+		"an un-parked Task has no lane to reschedule")
+	human := task(v1alpha1.StateAwaitingReview)
+	require.NoError(t, stage.Park(human, stage.ReasonAwaitingHuman, now))
+	require.Error(t, stage.RescheduleRetry(human, now), "a human park is not on a timer")
+}
+
+// TestARetryParkIsRefusedUntilItIsDue puts the backoff in the PURE package, not
+// only in the driver: ApplyUnpark has three call sites and a webhook comment
+// must not be able to short-circuit a schedule the lane is counting laps on.
+func TestARetryParkIsRefusedUntilItIsDue(t *testing.T) {
+	tests := []struct {
+		name string
+		arm  func(*v1alpha1.Task)
+		want string
+	}{
+		{"never armed", func(*v1alpha1.Task) {}, stage.DeclineRetryNotDue},
+		{"armed, still waiting", func(tk *v1alpha1.Task) {
+			require.NoError(t, stage.ArmRetry(tk, now))
+		}, stage.DeclineRetryNotDue},
+		{"armed and due", func(tk *v1alpha1.Task) {
+			require.NoError(t, stage.ArmRetry(tk, now.Add(-2*time.Hour)))
+		}, stage.DeclineNone},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tk := task(v1alpha1.StateAwaitingReview)
+			require.NoError(t, stage.Park(tk, stage.ReasonCIFailed, now))
+			tc.arm(tk)
+			got := stage.Unpark(stage.UnparkInput{Task: tk, BotLogin: "bot", LiveHasRoom: true, Now: now})
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// A RELEASED retry park keeps its attempt count. The release is what the lane
+// is spending laps ON, so refunding it there makes the budget unreachable and
+// MaxUnparkRetries dead code - the same unbounded-loop shape StageElapsedCarry
+// is folded across a park round trip to avoid.
+func TestReleasingARetryParkKeepsTheBudgetAndDropsTheSchedule(t *testing.T) {
+	tk := task(v1alpha1.StateAwaitingReview)
+	require.NoError(t, stage.Park(tk, stage.ReasonCIFailed, now))
+	require.NoError(t, stage.ArmRetry(tk, now.Add(-time.Hour)))
+
+	require.Equal(t, stage.DeclineNone,
+		stage.Unpark(stage.UnparkInput{Task: tk, BotLogin: "bot", LiveHasRoom: true, Now: now}))
+	require.Empty(t, tk.Status.ParkReason)
+	require.Equal(t, 1, tk.Status.RetryAttempts, "the lap it just spent is not refunded")
+	require.Nil(t, tk.Status.RetryNextAt, "the schedule belongs to the park that is over")
+}
+
+// The two doors that DO refund it: real progress, and a human answering.
+func TestTheRetryBudgetIsResetByProgressAndByAHumanAnswer(t *testing.T) {
+	t.Run("a genuine state transition", func(t *testing.T) {
+		tk := task(v1alpha1.StateRefined)
+		tk.Status.RetryAttempts = 4
+		tk.Status.RetryNextAt = ptrTime(now)
+		require.NoError(t, stage.Enter(tk, nil, v1alpha1.StateUnderImplementation, "", now))
+		require.Zero(t, tk.Status.RetryAttempts)
+		require.Nil(t, tk.Status.RetryNextAt)
+	})
+
+	t.Run("a human comment releasing a human park", func(t *testing.T) {
+		tk := task(v1alpha1.StateRefined)
+		require.NoError(t, stage.Park(tk, stage.ReasonRetryExhausted, now))
+		tk.Status.RetryAttempts = v1alpha1.MaxUnparkRetries
+		tk.Status.PendingEvents = []v1alpha1.TaskEvent{{Author: "szymonrychu"}}
+
+		require.Equal(t, stage.DeclineNone, stage.Unpark(stage.UnparkInput{
+			Task: tk, BotLogin: "bot", LiveHasRoom: true, Now: now,
+			Issues: []v1alpha1.Issue{{Status: v1alpha1.IssueStatus{State: "open"}}},
+		}))
+		require.Zero(t, tk.Status.RetryAttempts,
+			"a human who answers buys the machine a fresh budget for the next blocker")
+	})
+}
+
+// ExhaustRetry is the LOUD end of the lane and it never leaves the Task
+// un-parked, exactly as repark's other caller does not.
+func TestExhaustRetryReparksToRetryExhausted(t *testing.T) {
+	tk := task(v1alpha1.StateAwaitingReview)
+	require.NoError(t, stage.Park(tk, stage.ReasonCIFailed, now))
+	require.NoError(t, stage.ArmRetry(tk, now))
+	tk.Status.RetryAttempts = v1alpha1.MaxUnparkRetries
+
+	from, err := stage.ExhaustRetry(tk, now)
+	require.NoError(t, err)
+	require.Equal(t, stage.ReasonCIFailed, from, "the caller has to name the blocker in its comment")
+	require.Equal(t, stage.ReasonRetryExhausted, tk.Status.ParkReason)
+	require.Equal(t, v1alpha1.StateAwaitingReview, tk.Status.State, "a repark never moves the Task")
+	require.Nil(t, tk.Status.RetryNextAt, "nothing is scheduled any more")
+	require.Equal(t, v1alpha1.MaxUnparkRetries, tk.Status.RetryAttempts,
+		"the spent budget is the record the escalation comment is written from")
+
+	_, err = stage.ExhaustRetry(tk, now)
+	require.Error(t, err, "retry-exhausted is not itself in the lane")
+}
+
+// TestTheRetryBudgetIsScopedToOneBlocker is finding 4's pure half. The field
+// doc says "the laps this Task has spent on its CURRENT blocker", and without
+// status.retryBlocker the counter was per-TASK: a Task that cleared ci-failed
+// and later hit merge-conflict-retry inherited the first blocker's spend and
+// escalated early, with a comment naming laps that were never spent on the
+// blocker it names.
+func TestTheRetryBudgetIsScopedToOneBlocker(t *testing.T) {
+	t.Run("the SAME blocker keeps its spend across the park round trip", func(t *testing.T) {
+		tk := task(v1alpha1.StateAwaitingReview)
+		require.NoError(t, stage.Park(tk, stage.ReasonCIFailed, now))
+		require.NoError(t, stage.ArmRetry(tk, now.Add(-time.Hour)))
+		require.Equal(t, stage.DeclineNone,
+			stage.Unpark(stage.UnparkInput{Task: tk, BotLogin: "bot", LiveHasRoom: true, Now: now}))
+
+		require.NoError(t, stage.Park(tk, stage.ReasonCIFailed, now))
+		require.NoError(t, stage.ArmRetry(tk, now))
+		require.Equal(t, 2, tk.Status.RetryAttempts, "the same blocker's laps accumulate")
+		require.Equal(t, now.Add(2*time.Minute), tk.Status.RetryNextAt.Time,
+			"and the backoff grows with them")
+	})
+
+	t.Run("a DIFFERENT blocker starts from a full budget", func(t *testing.T) {
+		tk := task(v1alpha1.StateAwaitingReview)
+		require.NoError(t, stage.Park(tk, stage.ReasonCIFailed, now))
+		for i := 0; i < 4; i++ {
+			require.NoError(t, stage.ArmRetry(tk, now.Add(-time.Hour)))
+		}
+		require.Equal(t, 4, tk.Status.RetryAttempts)
+		require.Equal(t, stage.DeclineNone,
+			stage.Unpark(stage.UnparkInput{Task: tk, BotLogin: "bot", LiveHasRoom: true, Now: now}))
+
+		require.NoError(t, stage.Park(tk, stage.ReasonMergeConflictRetry, now))
+		require.NoError(t, stage.ArmRetry(tk, now))
+		require.Equal(t, 1, tk.Status.RetryAttempts,
+			"a conflict must not inherit the red pipeline's spend")
+		require.Equal(t, stage.ReasonMergeConflictRetry, tk.Status.RetryBlocker)
+		require.Equal(t, now.Add(time.Minute), tk.Status.RetryNextAt.Time)
+	})
+}
+
+// ResetRetryBudget is the merge corridor's door onto the same protection: a
+// cursor advance ends a blocker without any state transition at all.
+func TestResetRetryBudgetLaundersAllThreeFields(t *testing.T) {
+	tk := task(v1alpha1.StateMerged)
+	require.NoError(t, stage.Park(tk, stage.ReasonCIFailed, now))
+	require.NoError(t, stage.ArmRetry(tk, now))
+
+	stage.ResetRetryBudget(tk)
+	require.Zero(t, tk.Status.RetryAttempts)
+	require.Empty(t, tk.Status.RetryBlocker)
+	require.Nil(t, tk.Status.RetryNextAt)
+}
+
+// Repark is the migration's door. It refuses the two things the unexported form
+// never had to: an un-parked Task, and a reason that is not a park reason.
+func TestReparkMovesAParkWithoutEverUnparkingIt(t *testing.T) {
+	tk := task(v1alpha1.StateMerged)
+	require.NoError(t, stage.Park(tk, stage.ReasonCIRed, now))
+
+	require.NoError(t, stage.Repark(tk, stage.ReasonCIFailed, now))
+	require.Equal(t, stage.ReasonCIFailed, tk.Status.ParkReason)
+	require.Equal(t, v1alpha1.StateMerged, tk.Status.State)
+	require.NotNil(t, tk.Status.ParkedAt)
+
+	require.Error(t, stage.Repark(tk, "not-a-park-reason", now))
+	require.Error(t, stage.Repark(task(v1alpha1.StateMerged), stage.ReasonCIFailed, now))
+}
+
+// laneStrandedTask is the state the agent-stop re-arm cap leaves behind on a
+// Task the retry lane had released: parked no-outcome in the live state the
+// release put it back into, still carrying the blocker and the laps spent on it,
+// because clearPark preserves both and no genuine transition happened.
+func laneStrandedTask(blocker string, attempts int) *v1alpha1.Task {
+	tk := task(v1alpha1.StateAwaitingReview)
+	tk.Status.RetryBlocker = blocker
+	tk.Status.RetryAttempts = attempts
+	if err := stage.Park(tk, stage.ReasonNoOutcome, now); err != nil {
+		panic(err)
+	}
+	return tk
+}
+
+// TestStrandRetryLaneEndsALaneTheAgentStopCapTookOver: the lane's terminal is
+// retry-exhausted, reached WITHOUT the Task ever being un-parked, and it returns
+// the blocker so the escalation can name what the laps were spent on. Without
+// it the cap's no-outcome park is owned by nobody: its own un-park arm declines
+// merged-mr forever, driveStrandedParks skips its class, and the retry driver no
+// longer recognises the reason.
+func TestStrandRetryLaneEndsALaneTheAgentStopCapTookOver(t *testing.T) {
+	tk := laneStrandedTask(stage.ReasonCIFailed, 2)
+
+	blocker, err := stage.StrandRetryLane(tk, now)
+	require.NoError(t, err)
+	require.Equal(t, stage.ReasonCIFailed, blocker)
+	require.Equal(t, stage.ReasonRetryExhausted, tk.Status.ParkReason)
+	require.Equal(t, v1alpha1.StateAwaitingReview, tk.Status.State)
+	require.Equal(t, 2, tk.Status.RetryAttempts, "the laps are the record the comment is written from")
+}
+
+// TestStrandRetryLaneRefusesEverythingItDoesNotOwn. no-outcome is written by
+// several paths that never went near the lane, so the blocker fingerprint is the
+// whole discriminator and it has to be checked, not assumed.
+func TestStrandRetryLaneRefusesEverythingItDoesNotOwn(t *testing.T) {
+	tests := []struct {
+		name string
+		tk   *v1alpha1.Task
+	}{
+		{"no blocker recorded: it never entered the lane", laneStrandedTask("", 0)},
+		{"a blocker with no laps spent on it", laneStrandedTask(stage.ReasonCIFailed, 0)},
+		{"laps against a reason outside the lane", laneStrandedTask(stage.ReasonAwaitingHuman, 3)},
+		{"a park that is not no-outcome", func() *v1alpha1.Task {
+			tk := task(v1alpha1.StateMerged)
+			require.NoError(t, stage.Park(tk, stage.ReasonCIFailed, now))
+			require.NoError(t, stage.ArmRetry(tk, now))
+			return tk
+		}()},
+		{"not parked at all", task(v1alpha1.StateAwaitingReview)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			before := tc.tk.Status.ParkReason
+			require.False(t, stage.LaneStranded(tc.tk))
+			_, err := stage.StrandRetryLane(tc.tk, now)
+			require.Error(t, err)
+			require.Equal(t, before, tc.tk.Status.ParkReason, "a refusal must change nothing")
+		})
+	}
 }

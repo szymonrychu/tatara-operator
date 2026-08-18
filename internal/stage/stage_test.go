@@ -444,7 +444,7 @@ func TestPodNotReadyIsNotAReason(t *testing.T) {
 }
 
 func TestReasonsIsTheClosedSetAndTheThreeVocabulariesAreDisjoint(t *testing.T) {
-	require.Len(t, stage.Reasons, 37)
+	require.Len(t, stage.Reasons, 42)
 	for _, r := range stage.RejectReasons {
 		require.False(t, stage.IsParkReason(r), "%q cannot be both a reject and a park reason", r)
 		require.False(t, stage.IsDoneReason(r))
@@ -721,13 +721,18 @@ func TestCIRedRouting(t *testing.T) {
 		require.Equal(t, stage.ParkTarget, e.To)
 		require.Equal(t, stage.ReasonAwaitingHuman, e.Reason)
 	})
-	t.Run("an already-merged sibling parks ci-red", func(t *testing.T) {
+	t.Run("an already-merged sibling parks the retry lane", func(t *testing.T) {
 		mrs := []v1alpha1.MergeRequest{{Status: v1alpha1.MergeRequestStatus{State: "merged"}}}
 		e, ok := stage.CIRed(task(v1alpha1.StateMerged), mrs, 3)
 		require.True(t, ok)
 		require.Equal(t, stage.ParkTarget, e.To)
-		require.Equal(t, stage.ReasonCIRed, e.Reason,
-			"re-implementing would re-propose merged code and recreate deleted branches")
+		require.Equal(t, stage.ReasonCIFailed, e.Reason,
+			"re-implementing would re-propose merged code and recreate deleted branches, "+
+				"so this arm still PARKS - but a red check on landed work is a machine's to clear")
+		class, _ := stage.UnparkClassFor(e.Reason)
+		require.Equal(t, stage.UnparkRetry, class)
+		require.True(t, stage.IsMergeStagePark(e.Reason),
+			"the lane changes who releases it, never where in the lifecycle it was written")
 	})
 	t.Run("bounces to under-implementation, bounded", func(t *testing.T) {
 		tk := task(v1alpha1.StateAwaitingReview)
@@ -1307,4 +1312,17 @@ func TestStandDownBypassFiresOncePerTakeoverRequest(t *testing.T) {
 	require.NoError(t, stage.Park(tk, stage.ReasonAwaitingHuman, now))
 	require.Equal(t, stage.DeclineNoHumanEvent, stage.Unpark(in()),
 		"the bypass spends nothing, so the consumed stamp is the ONLY thing bounding it")
+}
+
+// The SPENT CAP does not join the lane. ci-blocked is the exhaustion of the
+// re-implement cycle, and a budget that has already run out is exactly what
+// should reach a human rather than buy itself a second budget.
+func TestCIRedCapStillParksCIBlockedOutsideTheLane(t *testing.T) {
+	tk := task(v1alpha1.StateAwaitingReview)
+	tk.Status.CIRedReentries = v1alpha1.MaxCIRedReentries
+	e, ok := stage.CIRed(tk, nil, v1alpha1.MaxCIRedReentries)
+	require.True(t, ok)
+	require.Equal(t, stage.ReasonCIBlocked, e.Reason)
+	class, _ := stage.UnparkClassFor(e.Reason)
+	require.Equal(t, stage.UnparkNever, class)
 }

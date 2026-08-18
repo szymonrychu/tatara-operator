@@ -48,6 +48,21 @@ const (
 	// keeps the reaper's unparkFires probe honest - an un-migrated leftover still
 	// ages out at ParkRetention rather than being held alive forever.
 	UnparkRetired
+	// UnparkRetry is the MACHINE lane: the park names a technical blocker that a
+	// machine is expected to clear on its own, so the release is a TIMER and not
+	// an event. It is the only class whose release is bounded by an attempt
+	// count (status.retryAttempts, capped at MaxUnparkRetries) rather than by a
+	// counter tied to one specific edge, and it is the only one whose exhaustion
+	// is LOUD: the lane re-parks to ReasonRetryExhausted, which is UnparkHuman,
+	// and the controller posts a comment naming the blocker on the way.
+	//
+	// It differs from UnparkTimer in what the wait is FOR. A timer park waits on
+	// this operator's own next lap (a merge cursor, a deploy ledger) and its
+	// counter is per-edge; a retry park waits on something OUTSIDE the operator
+	// - a forge pipeline, a base branch that keeps moving - which is why the
+	// wait grows (UnparkRetryBackoffBase doubling to UnparkRetryBackoffCap)
+	// instead of firing on every 30s pass.
+	UnparkRetry
 )
 
 // unparkClasses is total over ParkReasons and that totality is asserted.
@@ -76,10 +91,26 @@ var unparkClasses = map[string]UnparkClass{
 	ReasonIdentityUnverified: UnparkHuman,
 	ReasonHandoffStalled:     UnparkHuman,
 
-	// A bounded retry.
+	// A bounded retry. no-outcome has a SECOND owner and needs it: its arm
+	// declines merged-mr, so on a Task the UnparkRetry lane released - which has
+	// a merged merge request by construction - the timer never fires at all. See
+	// LaneStranded.
 	ReasonMergeTimeout:  UnparkTimer,
 	ReasonDeployTimeout: UnparkTimer,
 	ReasonNoOutcome:     UnparkTimer,
+
+	// A BACKED-OFF retry against a blocker outside this operator, bounded by
+	// MaxUnparkRetries and escalated LOUDLY when the budget is spent. See
+	// UnparkRetry. merge-auth-refused is deliberately NOT here: a refused
+	// credential does not fix itself, and retrying a merge that may have
+	// partially succeeded is how a double-merge happens.
+	ReasonCIPending:          UnparkRetry,
+	ReasonCIFailed:           UnparkRetry,
+	ReasonMergeConflictRetry: UnparkRetry,
+	ReasonMRSurfaceSpent:     UnparkRetry,
+	// The lane's own terminal, and it is a HUMAN park on purpose: the machine
+	// has had MaxUnparkRetries laps and a human is the next actor.
+	ReasonRetryExhausted: UnparkHuman,
 
 	// A ONE-SHOT MIGRATION. The ceiling that wrote each of these is deleted, so
 	// the park is a verdict from a policy that no longer exists. See
@@ -159,8 +190,27 @@ var mergeStageParks = map[string]bool{
 	ReasonHeadMoving:        true,
 	ReasonCIRed:             true,
 	ReasonMergeConflict:     true,
-	ReasonDeployTimeout:     true,
-	ReasonDeployBlocked:     true,
+	// The retry-lane names for the SAME two writers (CIRed's and
+	// MergeConflict's anyMerged arms). Moving a park into the lane changes WHO
+	// releases it, not WHERE IN THE LIFECYCLE it was written, so they are
+	// classified here for the axis to stay honest about what the reason MEANS.
+	//
+	// THEY DO NO WORK TODAY, AND SAYING SO IS THE POINT. IsMergeStagePark's two
+	// production consumers (controller.driveStrandedParks and
+	// controller.closeTaskBotMRs) are both reached only PAST a
+	// `class != UnparkNever && class != UnparkRetired` filter, and both of these
+	// are UnparkRetry - so what actually keeps the ansible!16 / terraform!215
+	// shape from re-opening for them is the CLASS, not this map. These two
+	// entries are the belt to that braces: the day a consumer is added outside
+	// the class filter, or the day one of these reasons is reclassified, the
+	// refusal is already correct instead of having to be remembered.
+	// ReasonRetryExhausted is deliberately absent for the same honesty: it is
+	// UnparkHuman, no consumer reaches it either, and adding it would only widen
+	// a map whose members are already inert.
+	ReasonCIFailed:           true,
+	ReasonMergeConflictRetry: true,
+	ReasonDeployTimeout:      true,
+	ReasonDeployBlocked:      true,
 }
 
 // IsMergeStagePark reports whether reason was written at or after the merge, on
@@ -244,9 +294,221 @@ func Park(t *v1alpha1.Task, reason string, now time.Time) error {
 
 // clearPark is the ONLY assignment that empties ParkReason. It is unexported on
 // purpose: Unpark, UnparkTakeover and repark are its only callers.
+//
+// RetryNextAt goes with the park because it is a schedule FOR that park, and a
+// stale one would let the next retry park be released on a timer somebody else
+// set. RetryAttempts and RetryBlocker deliberately do NOT: see RetryAttempts'
+// field doc - refunding the lap on the release it paid for is what would make
+// MaxUnparkRetries unreachable, and the blocker name is exactly what tells the
+// next ArmRetry whether the re-park is the SAME blocker (keep the spend) or a
+// new one (start over).
 func clearPark(t *v1alpha1.Task) {
 	t.Status.ParkReason = ""
 	t.Status.ParkedAt = nil
+	t.Status.RetryNextAt = nil
+}
+
+// RetryWait is the UnparkRetry backoff: the wait an attempts-th lap serves.
+// attempts is the count ALREADY SPENT, so a fresh park (0) waits
+// UnparkRetryBackoffBase and each further lap doubles it up to
+// UnparkRetryBackoffCap. The doubling is a loop rather than a shift so a large
+// (or corrupt) counter cannot overflow into a negative duration, which would
+// make every lap due immediately - the failure direction that turns a backoff
+// into a hot loop.
+func RetryWait(attempts int) time.Duration {
+	wait := v1alpha1.UnparkRetryBackoffBase
+	for i := 0; i < attempts; i++ {
+		if wait >= v1alpha1.UnparkRetryBackoffCap {
+			break
+		}
+		wait *= 2
+	}
+	if wait > v1alpha1.UnparkRetryBackoffCap {
+		return v1alpha1.UnparkRetryBackoffCap
+	}
+	return wait
+}
+
+// ArmRetry schedules the next release of an UnparkRetry park and SPENDS the lap
+// it is scheduling. The two happen in one mutation on purpose: a schedule
+// written without the charge is a lane that retries forever, and a charge
+// written without the schedule is a lane that burns its budget on one pass.
+//
+// It is the ONLY thing that increments RetryAttempts, so "how many laps has
+// this blocker had" has exactly one writer.
+//
+// IT IS ALSO WHERE THE COUNTER IS SCOPED TO A BLOCKER. A lap is charged against
+// status.retryBlocker, and a park reason that differs from the recorded one
+// starts from zero: the previous blocker is behind us (the merge corridor moved
+// on, or a different technical wall was hit), and inheriting its spend
+// escalates early with a comment naming laps that were never spent on the
+// blocker it names.
+func ArmRetry(t *v1alpha1.Task, now time.Time) error {
+	if t.Status.ParkReason == "" {
+		return &NotParkedError{State: t.Status.State}
+	}
+	if class, ok := UnparkClassFor(t.Status.ParkReason); !ok || class != UnparkRetry {
+		return fmt.Errorf("stage: park reason %q is not in the retry lane", t.Status.ParkReason)
+	}
+	if t.Status.RetryBlocker != t.Status.ParkReason {
+		t.Status.RetryBlocker = t.Status.ParkReason
+		t.Status.RetryAttempts = 0
+	}
+	next := metav1.NewTime(now.Add(RetryWait(t.Status.RetryAttempts)))
+	t.Status.RetryNextAt = &next
+	t.Status.RetryAttempts++
+	return nil
+}
+
+// RescheduleRetry re-serves the CURRENT lap's wait WITHOUT spending another
+// one. It is ArmRetry's twin for the one verdict that is neither "the blocker is
+// still there" nor "release it": the blocker has CLEARED but the project has no
+// live room for the pod the release would mint.
+//
+// Without it that verdict is not recorded anywhere, so the driver re-reads the
+// forge for the same Task on every 30s pass and gets the same answer forever -
+// two such Tasks consume maxRetryBlockerReadsPerPass outright and defer every
+// other due park behind them. Re-arming paces the re-read by the backoff
+// instead, and the Task still releases on the first due pass that finds room.
+//
+// NO LAP IS CHARGED and retryBlocker is untouched, because a ceiling is the
+// operator's constraint and not the blocker's: charging it would escalate a
+// queue to a human as though a pipeline had failed. The wait is therefore
+// RetryWait(attempts-1) - the one the lap already paid for - and not the longer
+// one the next lap would buy.
+func RescheduleRetry(t *v1alpha1.Task, now time.Time) error {
+	if t.Status.ParkReason == "" {
+		return &NotParkedError{State: t.Status.State}
+	}
+	if class, ok := UnparkClassFor(t.Status.ParkReason); !ok || class != UnparkRetry {
+		return fmt.Errorf("stage: park reason %q is not in the retry lane", t.Status.ParkReason)
+	}
+	next := metav1.NewTime(now.Add(RetryWait(t.Status.RetryAttempts - 1)))
+	t.Status.RetryNextAt = &next
+	return nil
+}
+
+// ResetRetryBudget launders the retry lane's three status fields. It is the ONE
+// way anything outside this package refunds the budget, so "who may give a Task
+// a fresh set of laps" stays enumerable: stampEnter (a genuine transition), the
+// UnparkHuman release (a human answered), and the merge corridor advancing
+// status.mergeCursor - the one blocker-ending event that makes NO transition at
+// all, because a repo that merged and moved the cursor leaves the Task in
+// `merging` throughout.
+func ResetRetryBudget(t *v1alpha1.Task) {
+	t.Status.RetryAttempts = 0
+	t.Status.RetryBlocker = ""
+	t.Status.RetryNextAt = nil
+}
+
+// RetryDue reports whether an ARMED retry park has served its wait. An unarmed
+// park (nil RetryNextAt) is never due: the driver arms it instead, so a park
+// written by a path that forgot the schedule costs one lap of latency and not a
+// budget-free release on every pass.
+func RetryDue(t *v1alpha1.Task, now time.Time) bool {
+	return t.Status.RetryNextAt != nil && !now.Before(t.Status.RetryNextAt.Time)
+}
+
+// ExhaustRetry ends the lane: it re-parks an UnparkRetry park as
+// retry-exhausted (UnparkHuman) WITHOUT ever leaving the Task un-parked, and
+// returns the blocker reason it replaced so the caller can name it on the
+// forge. That return value is the point of doing this here rather than at the
+// call site - repark clears the reason, and an escalation that cannot say what
+// it escalated is the silent park this whole lane exists to remove.
+//
+// RetryAttempts is left AT THE CAP. It is the record the comment is written
+// from, and the human release path is what refunds it.
+func ExhaustRetry(t *v1alpha1.Task, now time.Time) (from string, err error) {
+	if t.Status.ParkReason == "" {
+		return "", &NotParkedError{State: t.Status.State}
+	}
+	if class, ok := UnparkClassFor(t.Status.ParkReason); !ok || class != UnparkRetry {
+		return "", fmt.Errorf("stage: park reason %q is not in the retry lane", t.Status.ParkReason)
+	}
+	from = t.Status.ParkReason
+	repark(t, ReasonRetryExhausted, now)
+	return from, nil
+}
+
+// LaneStranded reports whether t is a Task the retry lane RELEASED and that has
+// since been re-parked under a reason the lane no longer recognises, where
+// NOBODY owns it.
+//
+// THE SHAPE. The lane releases a park (reArm, which clears the flag and leaves
+// the state where it is), the reconciler mints the pod that release was for, the
+// agent writes a handoff note and stops, and at AgentStopReArmCap
+// reconcilePodStage parks no-outcome and spawns nothing. That park is then
+// owned by nobody: no-outcome is UnparkTimer whose own arm declines merged-mr -
+// and every Task in the lane has a merged merge request BY CONSTRUCTION, since
+// ci-failed and merge-conflict-retry are written only on the anyMerged arms of
+// CIRed and MergeConflict - driveStrandedParks refuses any class that is not
+// UnparkNever/UnparkRetired, and the retry driver no longer matches the reason.
+// The Task ages out silently at ParkRetention, which is the helmfile#27/#32,
+// ansible!17/!18, terraform!221 failure this lane exists to remove.
+//
+// THE FINGERPRINT IS retryBlocker + retryAttempts, and it is exact rather than
+// approximate. Both are written only by ArmRetry, cleared only by
+// ResetRetryBudget - stampEnter on a genuine transition, the UnparkHuman
+// release, the merge cursor advancing - and deliberately PRESERVED by clearPark
+// across the release the lane earns. So a non-zero pair on a park written
+// afterwards means: this Task spent those laps on that blocker, in the state it
+// is still in, and the lane put it back here. no-outcome is written by several
+// unrelated paths (reconcileCaps, a pre-implement state that never terminated)
+// and none of them carries the pair, which is what keeps this from escalating
+// parks that were never the lane's.
+//
+// IT DOES NOT ASK WHETHER THE PARK IS ACTUALLY UNRELEASABLE, because that needs
+// the owned merge requests and this package must not grow a second copy of
+// Unpark's own anyMerged rule: two copies of a filter that disagree do not
+// error, they silently stop matching. The caller (controller.driveUnparks) keys
+// the escalation on the decline stage.Unpark ITSELF just returned.
+func LaneStranded(t *v1alpha1.Task) bool {
+	if t.Status.ParkReason != ReasonNoOutcome || t.Status.RetryAttempts <= 0 {
+		return false
+	}
+	class, ok := UnparkClassFor(t.Status.RetryBlocker)
+	return ok && class == UnparkRetry
+}
+
+// StrandRetryLane is ExhaustRetry's twin for the lane's OTHER end: not a budget
+// spent against a standing blocker, but a lane the agent-stop re-arm cap took
+// over. It re-parks as retry-exhausted (UnparkHuman, so a comment resumes it)
+// WITHOUT ever leaving the Task un-parked, and returns the BLOCKER - not the
+// no-outcome park it replaces - because that is what the escalation has to name:
+// "no-outcome" tells a human nothing, "the pipeline that was still red" does.
+//
+// RetryAttempts is left where it is, exactly as ExhaustRetry leaves it at the
+// cap: it is the record the comment is written from, and the UnparkHuman release
+// is what refunds it.
+func StrandRetryLane(t *v1alpha1.Task, now time.Time) (blocker string, err error) {
+	if !LaneStranded(t) {
+		return "", fmt.Errorf("stage: park %q with %d laps on blocker %q is not a stranded retry lane",
+			t.Status.ParkReason, t.Status.RetryAttempts, t.Status.RetryBlocker)
+	}
+	blocker = t.Status.RetryBlocker
+	repark(t, ReasonRetryExhausted, now)
+	return blocker, nil
+}
+
+// Repark is repark for the ONE caller outside this package that needs it:
+// controller.driveRetryLaneMigration, which moves a ci-red / merge-conflict park
+// written before the retry lane existed onto its lane name. It is exported
+// rather than folded into a bespoke Unpark arm because a MIGRATION is not a
+// re-entry rule - there is no condition to evaluate, the Task never becomes
+// un-parked, and putting it in Unpark would mean every ApplyUnpark caller
+// silently re-classifying parks.
+//
+// It refuses a Task that is not parked and a reason that is not a park reason;
+// the unexported form takes compile-time constants and needs neither.
+func Repark(t *v1alpha1.Task, reason string, now time.Time) error {
+	if t.Status.ParkReason == "" {
+		return &NotParkedError{State: t.Status.State}
+	}
+	if !IsParkReason(reason) {
+		return &UnknownReasonError{Reason: reason}
+	}
+	repark(t, reason, now)
+	return nil
 }
 
 // repark swaps one park reason for another WITHOUT ever leaving the Task

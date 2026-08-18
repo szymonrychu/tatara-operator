@@ -156,6 +156,27 @@ const (
 	// not send. Three leaves a long job room and still turns 127 pods into 3.
 	// It is a CONSTANT for the same reason ResidencyCapAll is: a CRD field can
 	// be silently pruned, and the failure mode of a pruned bound is no bound.
+	//
+	// THREE IS PER STATE OCCUPANCY, NOT PER TASK, and the difference is 18. The
+	// counter is zeroed by stage.stampEnter (a genuine transition) and by
+	// stage.reArm (every un-park), so each un-park refunds the whole budget. The
+	// composition that matters is the UnparkRetry lane: it exists to RE-DRIVE the
+	// same state, so one technical blocker can hand a Task up to
+	// (1 + MaxUnparkRetries) x AgentStopReArmCap = 18 stop-and-respawn pods -
+	// the park's own occupancy plus one per lap the lane releases.
+	//
+	// THAT IS ACCEPTED, DELIBERATELY, and the refund is not the bug it looks
+	// like. Withholding it is what would break: a Task released into a state
+	// already at the cap re-parks on the very next reconcile pass without ever
+	// minting the pod the release was for, spending every lane lap in
+	// milliseconds - the #513 shape, and with the lane's escalation attached it
+	// would hand every technical blocker straight to a human. What separates 18
+	// from the 127 of the incident is that each lap is gated by a LIVE forge read
+	// (the lane releases only where the blocker has actually cleared, so each
+	// occupancy is a different world), paced by the backoff at 1+2+4+8+16 = 31
+	// minutes of wall clock, and still bounded absolutely by ResidencyCapAll,
+	// whose carry survives the park/un-park round trip. The 127-pod loop had none
+	// of the three.
 	AgentStopReArmCap = 3
 	// MaxMergeReentries bounds the merging<->reviewing re-entry cycle (fix H7).
 	MaxMergeReentries = 3
@@ -196,6 +217,38 @@ const (
 	// on kind=review Tasks (fix V7-9). NOT bounded by AgentSpec.MaxReviewRounds
 	// - that counter only moves on request_changes.
 	MaxHumanReviewRounds = 5
+	// UnparkRetryBackoffBase is the FIRST wait an UnparkRetry park serves before
+	// driveUnparks may clear it. One minute, because every UnparkRetry reason
+	// names a blocker owned by a machine that is already working on it - a
+	// pipeline that is running, a rebase an agent will push - and the cheapest
+	// correct answer to "is it done yet" is to ask again shortly. It doubles per
+	// attempt.
+	UnparkRetryBackoffBase = 1 * time.Minute
+	// UnparkRetryBackoffCap ceilings that doubling. Thirty minutes is
+	// CIWaitDeadline: past it, this platform has already decided that a pipeline
+	// which has not spoken is a pipeline that is not going to, and a retry lane
+	// that waits longer than the hold it is backstopping is a lane nobody reads.
+	UnparkRetryBackoffCap = 30 * time.Minute
+	// MaxUnparkRetries bounds the UnparkRetry lane. FIVE, matching
+	// MaxHumanReviewRounds rather than the re-entry trio's three, because a
+	// retry spends no pod on the laps that find the blocker still standing -
+	// only the one that clears it does. At the backoff above, five attempts span
+	// 1+2+4+8+16 = 31 minutes; a technical blocker still standing after half an
+	// hour is not transient and belongs in front of a human.
+	//
+	// THAT COST MODEL IS ENFORCED, NOT ASSUMED. It holds by construction only
+	// where the re-park happens inside reconcileClocks; for merge-conflict-retry
+	// nothing between the release and the (5-minutely) conflict sweep covers
+	// mergeability, so an unconditional release would mint and destroy a review
+	// pod per lap and stretch the 31 minutes into hours. controller
+	// .retryBlockerStanding is what makes the sentence above true: the lane
+	// confirms the blocker LIVE before releasing, and a blocker still standing
+	// costs the next lap and nothing else.
+	//
+	// It is counted PER TASK on status.retryAttempts, not per issue: unlike
+	// MaxAutoReentries the lane never deletes and re-mints the Task, so the
+	// counter's object outlives every lap by construction.
+	MaxUnparkRetries = 5
 	// CIPollMinInterval floors how often CI status is re-polled (fix C3).
 	CIPollMinInterval = 20 * time.Second
 	// ObjectByteBudget is the byte-exact pre-write guard ceiling for a CR

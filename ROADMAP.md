@@ -314,6 +314,40 @@ Open, out of scope, deliberately not done:
 - [ ] tatara-cli 3 new MCP tools (propose_issue/review_verdict/pr_outcome) - target tatara-cli repo.
 - [ ] Deploy 0.3.0: build + push operator image, helm package + push chart, helmfile apply.
 
+## An approved Task delivers end to end (docs/superpowers/plans/2026-08-18-tatara-deliver-end-to-end-plan.md)
+
+- [x] Half 1 - the eight observed blockers (#628, `change_significance: minor`).
+- [x] Half 2 - the `UnparkRetry` safety net: five park reasons, the `UnparkRetry`
+  class, `status.retryAttempts`/`status.retryNextAt`, a backed-off release arm on
+  the existing 30s unpark driver, and a LOUD exhaustion (repark to
+  `retry-exhausted` + a forge comment naming the blocker and every attempt +
+  `operator_task_retry_exhausted_total`). `change_significance: minor` - three
+  additive optional status fields, five additive enum values, one new class.
+- [x] Half 2 review fixes (ten findings): the release is gated on a LIVE re-read
+  of the blocker so a lap never costs a pod; `armRetryPark`'s race path is a
+  sentinel instead of a nil deref; exhaustion is re-evaluated on the armed path;
+  `status.retryBlocker` + a merge-cursor refund scope the counter to one blocker;
+  the escalation swallows its latch error, distinguishes a failed target lookup
+  from "no target", and falls back to the owned merge request; and
+  `driveRetryLaneMigration` moves the live `ci-red`/`merge-conflict` parks that
+  motivated the lane onto it (bounded by `ParkRetention`, one-way, latched).
+- [x] Half 2 review round 2 (eight findings, three of them defects the first
+  round's own fixes introduced): the armed+due path reads the blocker BEFORE
+  exhaustion and capacity, so a spent lane is never escalated on a blocker that
+  has cleared; a failed blocker read is logged instead of failing the whole
+  Project reconcile, and `maxRetryBlockerReadsPerPass` bounds how many Tasks pay
+  for a live read per pass; the migration no longer charges the park as residency
+  (which was killing migrated Tasks at `stage-deadline` on their first pass back)
+  and is capped per pass, with an alertable action for a stranded one; the
+  conflict probe is scoped to `mergeOrder[mergeCursor]`; and the escalation latch
+  is re-tried when the re-park fails. `change_significance: patch` - no API
+  change, one new metric (`operator_task_retry_blocker_read_total`).
+- [ ] `tatara-observability`: alert on `operator_task_retry_exhausted_total`, and
+  allowlist it plus `operator_task_retry_scheduled_total` and
+  `operator_task_retry_blocker_read_total`. NOT before this
+  producer is on `main` (MEMORY: a metric allowlist entry needs its producer on
+  main, or observability CI goes red on every PR).
+
 ## N5 deploy follow-ons - imagePullSecrets + neo4j tag fix (gated)
 
 1. [ ] Build + push harbor.szymonrichert.pl/containers/tatara-operator:0.2.1.

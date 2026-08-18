@@ -685,6 +685,14 @@ func (d *StageDriver) enterStageWithCursor(ctx context.Context, proj *tatarav1al
 	now := d.now()
 	reentries := task.Status.HeadMoveReentries
 	conflicts := task.Status.MergeConflictReentries
+	// A CURSOR ADVANCE IS A BLOCKER ENDING WITH NO TRANSITION, which is the one
+	// hole stampEnter cannot cover: the corridor lands repo i and moves on to
+	// repo i+1 without ever leaving `merging`, so a retry budget spent on repo
+	// i's red pipeline would follow the Task all the way down spec.mergeOrder
+	// and escalate on the last repo having in fact cleared every earlier one.
+	// Computed here, outside the closure, because the closure re-runs against a
+	// freshly-read Task whose cursor the first run already moved.
+	cursorAdvanced := cursor >= 0 && cursor != task.Status.MergeCursor
 	// Absolute assignments only: the closure is re-run to size the write and again
 	// on every conflict retry.
 	mutate := func(t *tatarav1alpha1.Task) {
@@ -692,6 +700,9 @@ func (d *StageDriver) enterStageWithCursor(ctx context.Context, proj *tatarav1al
 		t.Status.MergeConflictReentries = conflicts
 		if cursor >= 0 {
 			t.Status.MergeCursor = cursor
+		}
+		if cursorAdvanced {
+			stage.ResetRetryBudget(t)
 		}
 	}
 	if to == "" {

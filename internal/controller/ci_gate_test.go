@@ -249,14 +249,18 @@ func TestCIRedParksWhenAnEarlierRepoAlreadyMerged(t *testing.T) {
 		t.Fatalf("ReconcileMerging: %v", err)
 	}
 	got := mdGetTask(t, c, "t1")
-	if got.Status.State != tatarav1alpha1.StateMerged || !tatarav1alpha1.Parked(got) || got.Status.ParkReason != stage.ReasonCIRed {
-		t.Fatalf("state/park = %q/%q, want merged, parked(ci-red)", got.Status.State, got.Status.ParkReason)
+	if got.Status.State != tatarav1alpha1.StateMerged || !tatarav1alpha1.Parked(got) || got.Status.ParkReason != stage.ReasonCIFailed {
+		t.Fatalf("state/park = %q/%q, want merged, parked(ci-failed)", got.Status.State, got.Status.ParkReason)
 	}
 	if got.Status.CIRedReentries != 0 {
 		t.Fatalf("ciRedReentries = %d, want 0: the park is not a re-entry", got.Status.CIRedReentries)
 	}
-	if class, _ := stage.UnparkClassFor(stage.ReasonCIRed); class != stage.UnparkNever {
-		t.Fatal("parked(ci-red) must have no F.6 re-entry: a human decides")
+	// H2-C: still no re-implementation - the arm parks, it does not route - but
+	// the park is now the RETRY LANE. A red check on landed work used to strand
+	// the Task forever with its issues open; it now gets MaxUnparkRetries
+	// backed-off laps and then reaches a human out loud.
+	if class, _ := stage.UnparkClassFor(stage.ReasonCIFailed); class != stage.UnparkRetry {
+		t.Fatal("parked(ci-failed) must be in the retry lane")
 	}
 }
 
@@ -291,8 +295,8 @@ func TestCIRedParksOnAnMRMergedOutOfBandWhileTheMirrorStillSaysOpen(t *testing.T
 		t.Fatalf("DrainPendingReview: %v", err)
 	}
 	got := mdGetTask(t, c, "t1")
-	if got.Status.State != tatarav1alpha1.StateAwaitingReview || !tatarav1alpha1.Parked(got) || got.Status.ParkReason != stage.ReasonCIRed {
-		t.Fatalf("state/park = %q/%q, want awaiting-review, parked(ci-red): a merged sibling outranks the red one",
+	if got.Status.State != tatarav1alpha1.StateAwaitingReview || !tatarav1alpha1.Parked(got) || got.Status.ParkReason != stage.ReasonCIFailed {
+		t.Fatalf("state/park = %q/%q, want awaiting-review, parked(ci-failed): a merged sibling outranks the red one",
 			got.Status.State, got.Status.ParkReason)
 	}
 }
