@@ -238,10 +238,55 @@ func ResidencyExceeded(t *v1alpha1.Task, now time.Time) bool {
 	if t.Status.StateEnteredAt == nil {
 		return false
 	}
-	if t.Status.StateWorkStartedAt == nil {
+	if !workStartedHere(t) {
 		return false
 	}
 	return StateElapsedSeconds(t, now) > capacity.Seconds()
+}
+
+// workStartedHere is the B3 admission gate, and the OR is the fix for the hole
+// the agent-stop respawn loop drove through it.
+//
+// StateWorkStartedAt says "a pod became Ready in this state" and is the right
+// question - but it is a LIVE-POD field, nilled by every path that takes a pod
+// down, including controller.stopAfterAgentHandoff. So through an 80-second
+// stop-and-respawn cycle it was non-nil for roughly the 55 seconds a pod was up
+// and nil for the rest, and the absolute residency bound - the platform's only
+// dead-man switch for that shape - was disarmed for a third of every lap.
+//
+// Stats.AgentStops is the DURABLE half of the same fact: it is only ever
+// incremented by an agent-requested stop, which requires a pod that was
+// admitted, became Ready, ran a turn and wrote a handoff note. It is reset by
+// stage.Enter and by an un-park, so it never carries across state occupancies -
+// which is exactly the scope StateWorkStartedAt has. A Task that has NEVER been
+// admitted has neither, so the queue-time protection B3 exists for is untouched.
+func workStartedHere(t *v1alpha1.Task) bool {
+	return t.Status.StateWorkStartedAt != nil || t.Status.Stats.AgentStops > 0
+}
+
+// AgentStopReArmExhausted reports whether this state occupancy has spent its
+// agent-requested-stop re-arm budget: the platform has already handed this Task
+// AgentStopReArmCap replacement pods after an agent said it was done, and
+// nothing has changed since.
+//
+// A PENDING EVENT ALWAYS RE-ARMS, and that clause is what keeps this from being
+// a turn budget in disguise. The cap answers "we asked the identical question N
+// times and got the identical answer"; a queued TaskEvent is a human (or a
+// cross-kind actor) putting something NEW in front of the agent, which is a
+// different question and is entitled to a pod. The event is drained when the
+// turn is submitted, so one comment buys exactly one pod.
+//
+// It is PURE and lives here rather than in the reconciler for the reason
+// LegalFor's guards do: a bound that lives in one call site is reintroduced by
+// the next call site that does not know about it.
+func AgentStopReArmExhausted(t *v1alpha1.Task) bool {
+	if t == nil {
+		return false
+	}
+	if len(t.Status.PendingEvents) > 0 {
+		return false
+	}
+	return t.Status.Stats.AgentStops >= v1alpha1.AgentStopReArmCap
 }
 
 // ResidencyCap exposes the absolute bound for state, for reporting. ok is false

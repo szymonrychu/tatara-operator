@@ -333,3 +333,54 @@ and the ScanMarks finding.
   them) - the whole per-item high-water-mark mechanism this section was built around appears to
   have been dropped in the same redesign that deleted mrScan, without the field itself being
   removed. Confirm and either wire a consumer or delete the dead status field + CRD surface.
+
+## Agent-stop respawn loop (upgrade-qe-e4016501fd9107d9) - observability follow-on
+
+The fix (this branch) closes the loop in the operator: submit_outcome advances a
+Task whose every owned merge request has already merged instead of no-opping;
+`stats.agentStops` bounds the agent-requested-stop re-arm at
+`AgentStopReArmCap`; `ResidencyExceeded` stays armed between pods. What it
+deliberately does NOT do is add the Grafana rule - that lives in
+`tatara-observability`, whose allowlist requires the producing metric to be on
+`main` first. Add these once this ships and the metrics are live:
+
+1. [ ] **`operator_agent_requested_stop_total{project,kind,disposition}` -> allowlist.**
+2. [ ] **Alert `TataraAgentStopReArmCapped` (warning):**
+   `sum by (project, kind) (increase(operator_agent_requested_stop_total{disposition="capped"}[15m])) > 0`
+   for 5m. ANY capped stop means a Task asked to stop, was asked again, and had
+   nothing new to say - the loop was caught by the bound rather than by a human.
+   Runbook: read the Task's `status.stats.agentStops` and its
+   `parked(no-outcome)`, then the last handoff note; if the note says the work is
+   delivered, the delivery finalize did not fire and THAT is the bug.
+3. [ ] **Alert `TataraAgentStopChurn` (warning):**
+   `sum by (project, kind) (increase(operator_agent_requested_stop_total{disposition="rearmed"}[1h])) > 12`
+   for 10m. The re-arm is healthy per event and pathological as a rate: 12/h is
+   4x the busiest legitimate hour measured and 1/10th of the incident's rate.
+   This is the EDGE the incident needed and did not have - the cap stops the
+   burn, this is what says it happened.
+4. [ ] **Extend the existing pod-recreation churn rule to the new reason value.**
+   `operator_pod_recreations_total` now carries `reason="AgentStop"`. If the live
+   rule pins `reason=~"BootTimeout|PodGone|..."` rather than summing over the
+   label, it will still be blind to exactly this shape; confirm which it does.
+5. [ ] **Per-Task series was deliberately NOT added.** `operator_turn_submit_total{kind}`
+   showed the fleet symptom and nothing named the Task. The per-Task quantity now
+   lives in `Task.status.stats.agentStops` (durable, bounded, `kubectl`-visible)
+   and in the `action=agent_requested_stop` / `agent_stop_rearm_capped` log lines,
+   because a `task` label on a counter is one series per Task in the fleet behind
+   a counter that only moves during a fault (the rule `podRecreationsTotal` states
+   and `MergeCursorStalledSeconds` had to buy its way out of with an explicit
+   delete at 8 call sites). If a per-Task series is genuinely wanted, model it on
+   `MergeCursorStalledSeconds` - a gauge with a mandatory clear - not a counter.
+
+Residuals from the same branch, noted rather than silently dropped:
+
+- [ ] A merge request merged out of band by a human carries no `semver:<level>`
+  label, so CI cut no release tag. The delivery finalize enters `merged`, whose
+  already-merged branch skips `ProjectSemverLabel` entirely, so on a project with
+  a helmfile pin `deployed` waits out `deployPinFanoutDeadline` and parks
+  `deploy-timeout` (retryable, loud). Correct but unhelpful; consider projecting
+  the label onto the merged mirror so a human can tag the merge commit.
+- [ ] `ResidencyExceeded`'s arming is now durable across an AGENT-requested stop
+  (`stats.agentStops`) but is still disarmed during a G.7 TTL rotation gap, which
+  is the other documented ratchet in `idleBase`. Same class, different counter;
+  out of scope here.

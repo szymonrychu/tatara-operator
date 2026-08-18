@@ -954,7 +954,7 @@ func mrTerminalStates(mrs []tatarav1alpha1.MergeRequest) (states []string, allTe
 // pod-recreation loop rather than one wasted call.
 //
 // THE ENDPOINT DOES NOT FINALIZE - the CONVERGENT RECONCILER-SIDE finalize does
-// (terminalMREdge / ownMRsShippedEdge in internal/controller/reviewpost.go,
+// (terminalMREdge / OwnMRsShippedEdge in internal/controller/reviewpost.go,
 // wired at reconcileClocks and the pre-dispatch guard). This only stops the pod
 // re-submitting; the Task retires on its own next pass.
 func (o *outcomeCtx) terminalNoop(states []string) {
@@ -965,6 +965,115 @@ func (o *outcomeCtx) terminalNoop(states []string) {
 		append(reqLogFields(o.r), "action", "submit_outcome_noop", "task", o.task.Name,
 			"resource_id", o.task.Name, "kind", o.kind, "mr_states", strings.Join(states, ","))...)
 	writeJSON(o.w, http.StatusOK, map[string]any{"noop": true, "reason": "mr-terminal"})
+}
+
+// deliverShippedMRs advances a Task whose submitted work has ALREADY SHIPPED:
+// every merge request it controller-owns is merged on the forge. It reports
+// whether it handled the request (a response has been written).
+//
+// THE DEFECT IT CLOSES. terminalNoop covers every owned merge request reaching a
+// TERMINAL forge state, which folds two opposite facts together: "merged" is a
+// delivery and "closed unmerged" is an abandonment. For the delivery the no-op
+// is wrong in the strongest possible way - it neither advances the Task nor
+// parks it, so a Task at under-implementation whose work landed out of band has
+// NO reachable terminal at all. Task upgrade-qe-e4016501fd9107d9 (kind=upgrade,
+// project mtg) delivered mtg-decks#78 at 08:40:15Z and then spent 127 pods and
+// 119 turns on ONE bot round: the agent submitted, got the no-op, wrote a
+// close-out handoff note, stopAfterAgentHandoff took the pod down and re-armed,
+// and the dispatcher minted the next one ~80 seconds later. Its own notes read
+// "No code, no forge write, no internal issue" from turn 37 on - the agent was
+// reporting correctly and the platform kept asking.
+//
+// THE SUBMIT IS THE COMPLETENESS DECLARATION, which is why this lives at the
+// endpoint and not in a reconciler sweep. See OwnMRsShippedEdge's doc for why a
+// level-triggered sweep at under-implementation would finalize a multi-repo Task
+// mid-work.
+//
+// `merged`, NOT a terminal. The work shipped, but the Task still owes the deploy
+// ledger, the issue closes and status.deliveredAt - all of which live past
+// `merged`. ReconcileMerging then walks its idempotent already-merged branch
+// (every repo in the order is state=="merged", so the cursor advances with no
+// forge write at all) and enters `deployed`. This is OwnMRsShippedEdge's own
+// argument, unchanged; only the state it is recognised from is new.
+//
+// THE MERGE ORDER IS BACKFILLED, and without that this trades a spin for a
+// wedge. ReconcileMerging parks merge-order-missing - class UnparkNever - on an
+// empty spec.mergeOrder, and a CRON-MINTED upgrade Task never had one:
+// createUpgradeTask sets no mergeOrder and the ordinary submitted path (which is
+// what normally writes it) is precisely the path this Task cannot take. The
+// repos of the merged merge requests ARE the honest order, and the order is
+// vacuous anyway when every one of them has already landed. An order the Task
+// already carries - an adopted upgrade or a takeover mint sets one - is left
+// alone: that one was reviewed.
+//
+// A CLOSED-UNMERGED merge request is refused here and falls through to
+// terminalNoop, because OwnMRsShippedEdge answers `rejected` for it and this
+// function only ever takes the `merged` branch. Finalizing a Task rejected from
+// this endpoint would owe the B.6 terminal treatment - the public verdict on the
+// driving issue that WithTerminalIssueRelease posts - and restapi has no wiring
+// for it. The reconciler sites that DO have it own that disposition.
+func (o *outcomeCtx) deliverShippedMRs(ctx context.Context, mrs []tatarav1alpha1.MergeRequest) bool {
+	edge, ok := controller.OwnMRsShippedEdge(o.task, mrs)
+	if !ok || edge.To != tatarav1alpha1.StateMerged {
+		return false
+	}
+	// LEGALITY IS PRE-CHECKED, exactly as reconcileParkedExternalTerminal
+	// pre-checks it: an illegal edge inside the choke point costs
+	// operator_illegal_state_transition_total, whose alert declares any non-zero
+	// value a bug in the transition table. LegalFor GUARD 7 is the real gate
+	// (AllMRsMerged); this asks it before committing anything.
+	if !stage.LegalFor(o.task, mrs, o.task.Status.State, edge.To) {
+		return false
+	}
+	// VALIDATION ENDS HERE, EXECUTION BEGINS (#578), and the claim is taken
+	// BEFORE the spec write for the same reason the ordinary submitted path takes
+	// it before its own: everything below mutates, and an unclaimed mutation is
+	// one a concurrent replica can duplicate.
+	if !o.claim() {
+		return true
+	}
+	order := o.task.Spec.MergeOrder
+	if len(order) == 0 {
+		order = ownedMRRepos(mrs)
+	}
+	if err := o.s.updateTaskSpec(ctx, o.task.Name, func(t *tatarav1alpha1.Task) {
+		t.Spec.MergeOrder = order
+	}); err != nil {
+		writeClientErr(o.w, err)
+		return true
+	}
+	if !o.commit(func(t *tatarav1alpha1.Task) error {
+		if err := stage.Enter(t, mrs, edge.To, edge.Reason, o.s.now()); err != nil {
+			return err
+		}
+		agentNote(t, o.kind, "note",
+			"delivered: every merge request this task opened had already merged on the forge", o.s.now())
+		return nil
+	}) {
+		return true
+	}
+	// THE POD HAS TO COME DOWN HERE, and this is the one thing the ordinary
+	// submitted path does NOT have to do. That path lands on awaiting-review,
+	// which still runs an agent, so ensureStagePod's stale-pod check (annPodStage
+	// mismatch) collects the implement pod on the next reconcile. `merged` runs
+	// NO agent - AgentKindFor returns "" for it - so reconcilePodStage is never
+	// reached again and nothing would ever collect this one: it would hold an
+	// admission slot with no clock armed for the life of the Task. The controller
+	// choke point EnterStage does exactly this on leavingPodStage; o.commit does
+	// it only for a park, so the caller owes it. Best-effort and idempotent: the
+	// transition has already committed, so a failure here must not turn a landed
+	// delivery into an error response - the reconciler's own teardown paths
+	// repair it.
+	if derr := agent.DeleteWrapper(ctx, o.s.c, o.s.ns, o.task); derr != nil {
+		o.s.log.ErrorContext(ctx, "restapi: delivery landed but the agent pod delete failed; the task reconciler repairs it",
+			append(reqLogFields(o.r), "task", o.task.Name, "error", derr)...)
+	}
+	o.s.log.InfoContext(ctx, "restapi: submitted work had already shipped; advancing the task instead of no-opping",
+		append(reqLogFields(o.r), "action", "submit_outcome_shipped", "task", o.task.Name,
+			"resource_id", o.task.Name, "kind", o.kind, "to", edge.To,
+			"merge_order", strings.Join(order, ","))...)
+	o.ok("shipped-externally", "merge_order", strings.Join(order, ","))
+	return true
 }
 
 // takenOverNoop answers a submit_outcome whose merge requests have all moved to
@@ -1137,6 +1246,12 @@ func (o *outcomeCtx) implement(p implementPayload) {
 		// Nothing about "every MR this task owns already reached a terminal forge
 		// state" is specific to a review Task - see terminalNoop.
 		if states, term := mrTerminalStates(mrs); term {
+			// DELIVERED IS NOT THE SAME AS TERMINAL, and answering the no-op to both
+			// is what produced the upgrade-qe-e4016501fd9107d9 respawn loop. See
+			// deliverShippedMRs.
+			if o.deliverShippedMRs(ctx, mrs) {
+				return
+			}
 			o.terminalNoop(states)
 			return
 		}

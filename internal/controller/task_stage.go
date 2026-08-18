@@ -1143,6 +1143,31 @@ func (r *TaskReconciler) reconcilePodStage(ctx context.Context, proj *tatarav1al
 		return ctrl.Result{RequeueAfter: stageRequeue}, nil
 	}
 
+	// THE AGENT-REQUESTED-STOP RE-ARM CAP. An agent that wrote a handoff note and
+	// had its pod taken down leaves this Task looking exactly like one that has
+	// never had a pod (podStartedAt nil, live state), so everything below mints a
+	// replacement - which is correct for a CONTINUATION handoff and is an infinite
+	// loop for a close-out. Nothing recorded which of the two had happened until
+	// stats.agentStops did, and nothing bounded the repeat: Task
+	// upgrade-qe-e4016501fd9107d9 turned that loop 127 times in under four hours,
+	// producing 99% of the platform's agent turns for one already-delivered bot
+	// round.
+	//
+	// AHEAD OF ensureTicket, deliberately: a Task that is not going to be given a
+	// pod has no business queueing for an admission slot. The park is no-outcome -
+	// UnparkTimer, so it re-drives once the world changes, and the reason
+	// reconcileCaps already writes for the un-graceful version of the identical
+	// fact. A pending event bypasses the cap entirely; see
+	// stage.AgentStopReArmExhausted.
+	if task.Status.PodStartedAt == nil && stage.AgentStopReArmExhausted(task) {
+		l.Info("agent-requested stop re-arm cap reached; parking instead of minting another pod",
+			"action", "agent_stop_rearm_capped", "resource_id", task.Name,
+			"state", task.Status.State, "agent_kind", agentKind,
+			"agent_stops", task.Status.Stats.AgentStops, "cap", tatarav1alpha1.AgentStopReArmCap)
+		obs.AgentRequestedStop(proj.Name, task.Spec.Kind, obs.AgentStopCapped)
+		return ctrl.Result{}, r.park(ctx, proj, task, stage.ReasonNoOutcome, now)
+	}
+
 	admitted, err := r.ensureTicket(ctx, proj, task, agentKind)
 	if err != nil {
 		return ctrl.Result{}, err

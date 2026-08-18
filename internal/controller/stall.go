@@ -450,9 +450,27 @@ func (r *TaskReconciler) stopAfterAgentHandoff(ctx context.Context, proj *tatara
 	agent.AppendFailedReposNote(ctx,
 		&agent.FitNoteAppender{Client: r.Client, Spiller: r.spiller(proj), Namespace: task.Namespace},
 		task, task.Status.LastTurnFailedRepos, task.Status.LastTurnReposTurnID, now)
+	var stops int
 	if err := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 		fresh.Status.PodStartedAt = nil
 		fresh.Status.StateWorkStartedAt = nil
+		// THE STOP IS RECORDED, and until it was this function's whole memory of
+		// having run was "podStartedAt is nil again" - which is indistinguishable
+		// from a Task that has never had a pod. So it re-armed unconditionally: the
+		// dispatcher minted a replacement, the replacement agent found the identical
+		// situation, wrote the identical handoff note, and the cycle turned every
+		// ~80 seconds (upgrade-qe-e4016501fd9107d9: 127 pods, 119 turns, ONE bot
+		// round). stage.AgentStopReArmExhausted is what reads this, and stage.Enter
+		// / the un-park re-arm are what reset it - all three in a status write, all
+		// three in the same place the state itself moves.
+		//
+		// INCREMENTED ON `fresh`, NEVER ON THE CACHED COPY. patchTaskStatus re-Gets
+		// inside RetryOnConflict, so a bound computed from the reconciler's own
+		// (possibly lagging) view could write the SAME value twice and stall the
+		// counter at 1 - a monotonic quantity that is not read from the object it
+		// is written to is not monotonic.
+		fresh.Status.Stats.AgentStops++
+		stops = fresh.Status.Stats.AgentStops
 		// The handoff note the agent wrote IS the continuation state now, so the
 		// last-turn payload has been spent (#527) and must not be re-used by a
 		// later synthetic note.
@@ -461,8 +479,18 @@ func (r *TaskReconciler) stopAfterAgentHandoff(ctx context.Context, proj *tatara
 	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("agent-requested stop re-arm %s: %w", task.Name, err)
 	}
+	// THE CHURN THIS PATH NEVER REPORTED. The pod IS being recreated by the
+	// operator, which is exactly what operator_pod_recreations_total measures -
+	// but the three paths that counted one were pod-lost, never-Ready and
+	// no-handoff, so a stop-and-respawn through normal admission produced no
+	// series at all and the churn alert built on it was blind to the loudest pod
+	// loop the platform has had. stats.PodRecreations is deliberately NOT
+	// incremented: this is not a lost pod, and that counter feeds the respawn
+	// accounting RecordRespawn owns.
+	obs.PodRecreation(proj.Name, task.Spec.Kind, obs.RecreationReasonAgentStop)
+	obs.AgentRequestedStop(proj.Name, task.Spec.Kind, obs.AgentStopReArmed)
 	l.Info("agent asked to be stopped (handoff note, no turn in flight); pod stopped",
 		"action", "agent_requested_stop", "resource_id", task.Name,
-		"state", task.Status.State, "agent_kind", agentKind)
+		"state", task.Status.State, "agent_kind", agentKind, "agent_stops", stops)
 	return ctrl.Result{RequeueAfter: agentBootRequeue}, nil
 }

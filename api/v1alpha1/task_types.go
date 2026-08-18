@@ -454,6 +454,33 @@ type TaskStats struct {
 	// PodRecreations counts pod respawns within the CURRENT stage. At
 	// maxPodRecreations the stage -> failed. Reset to 0 on EVERY transition.
 	PodRecreations int `json:"podRecreations,omitempty"`
+	// AgentStops counts the agent-requested stops spent within the CURRENT state
+	// occupancy - an agent that wrote a kind=handoff note with no turn in flight,
+	// so controller.stopAfterAgentHandoff took the pod down.
+	//
+	// It exists because that stop RE-ARMED UNCONDITIONALLY. It nils podStartedAt
+	// and stateWorkStartedAt and returns a boot requeue, recording nothing about
+	// the agent having asked to stop and asking nothing about whether work
+	// remains - so the dispatcher mints a replacement pod immediately, the
+	// replacement agent finds the identical situation, writes the identical
+	// handoff note, and the cycle repeats every ~80 seconds. Task
+	// upgrade-qe-e4016501fd9107d9 spent 127 pods and 119 turns on ONE bot round
+	// that way, with the agent correctly reporting "No code, no forge write, no
+	// internal issue" on every lap since turn 37.
+	//
+	// IT IS STATUS AND NOT AN ANNOTATION, deliberately. The reset has to land in
+	// the SAME write as the state (stage.Enter, stage's reArm), and internal/stage
+	// is a STATUS-ONLY mutator: a delete() against metadata.annotations there
+	// satisfies any in-memory assertion and is silently discarded by the API
+	// server, which is a false safety net rather than a bound. It is the same
+	// class of quantity as PodRecreations, MergeReentries and HeadMoveReentries,
+	// all of which are status for the same reason.
+	//
+	// Reset to 0 on EVERY transition and on every un-park: both are a change of
+	// circumstance, and a re-driven Task must never arrive at its replacement pod
+	// already exhausted.
+	// +optional
+	AgentStops int `json:"agentStops,omitempty"`
 	// NotesSpilled / NotesSpilledRefs: notes evicted to tatara-memory by the A.7
 	// byte guard. NotesSpilledRefs ACCUMULATES, one track_id per spill batch
 	// (fix M19). They are READ BACK via task_context(notes=all) (fix H10) - notes

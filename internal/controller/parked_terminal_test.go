@@ -112,7 +112,7 @@ func TestParkedReviewTaskFinalizesRejectedWhenItsMRClosed(t *testing.T) {
 }
 
 // THE SCOPE LINE, and it is the conservative one. A NON-review Task whose MRs
-// all merged takes ownMRsShippedEdge to `merged`, which is NOT a terminal
+// all merged takes OwnMRsShippedEdge to `merged`, which is NOT a terminal
 // outcome - it still owes the merge cursor, the deploy ledger and the issue
 // closes. Resuming a parked Task into that pipeline is real work restarted
 // behind a human's back, which is exactly what a park exists to prevent. Going

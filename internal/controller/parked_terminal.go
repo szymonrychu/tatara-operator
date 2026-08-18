@@ -41,7 +41,7 @@ import (
 // Task making stage PROGRESS while it waits; an MR reaching a terminal forge
 // state is the world moving on, which makes the wait pointless but does not
 // answer the question the park was asked. Ending the Task is therefore
-// permitted; RESTARTING one is not. ownMRsShippedEdge targets `merged` for a
+// permitted; RESTARTING one is not. OwnMRsShippedEdge targets `merged` for a
 // non-review Task - still owing the merge cursor, the deploy ledger and the
 // issue closes - so that edge is deliberately NOT taken here: resuming a parked
 // Task into a live pipeline behind the back of the human it was waiting for is

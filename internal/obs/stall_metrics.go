@@ -108,10 +108,72 @@ const (
 	// writing a handoff note, so the Task was re-armed with a replacement pod
 	// rather than parked.
 	RecreationReasonNoHandoff = "NoHandoff"
+	// RecreationReasonAgentStop: the agent ASKED to be stopped - it wrote a
+	// kind=handoff note with no turn in flight - so the operator took the pod
+	// down and re-armed the Task with a replacement.
+	//
+	// IT IS THE VALUE THIS COUNTER WAS MISSING, and its absence is half of the
+	// upgrade-qe-e4016501fd9107d9 incident. api/v1alpha1/constants.go's
+	// PodReadyTimeout comment asserts that a pod loop is "made visible by the
+	// operator_pod_recreations_total{reason=BootTimeout} churn alert"; the
+	// agent-requested stop re-arms through NORMAL admission rather than through
+	// any of the three paths that counted a recreation, so the metric had ZERO
+	// series while one Task minted 127 pods in under four hours and produced 99%
+	// of the platform's agent turns. The pod was recreated by the operator on
+	// every one of those laps - which is precisely what this counter's Help says
+	// it measures - so the fix is a value, not a new metric.
+	RecreationReasonAgentStop = "AgentStop"
 )
 
+// AgentStop* is the closed set of values on the `disposition` label of
+// operator_agent_requested_stop_total: what the operator DID about an agent
+// asking to be stopped.
+const (
+	// AgentStopReArmed: a replacement pod was minted. Healthy in isolation - it
+	// is the ordinary continuation handoff - and a runaway RATE of it is the
+	// respawn loop.
+	AgentStopReArmed = "rearmed"
+	// AgentStopCapped: the re-arm budget for this state occupancy was spent, so
+	// the Task was parked no-outcome and NO pod was minted. Any non-zero rate
+	// means a Task asked to stop, was asked again, and had nothing new to say.
+	AgentStopCapped = "capped"
+)
+
+// agentRequestedStopTotal counts agent-requested stops by what the operator did
+// about them.
+//
+// IT IS THE SERIES THE BOUND IS ALERTABLE ON, and it is deliberately NOT folded
+// into operator_pod_recreations_total. That counter answers "is a project
+// churning pods" and cannot express the `capped` disposition at all - a capped
+// stop mints no pod, so it is not a recreation and must not be counted as one -
+// yet `capped` is the one value that proves the bound fired rather than the loop
+// simply having stopped on its own.
+//
+// project and kind, never task: the same rule podRecreationsTotal states. A task
+// label would put one series per Task in the fleet behind a counter that only
+// moves during a fault, and the per-Task quantity is already durable and
+// inspectable as Task.status.stats.agentStops - which is what BOUNDS the loop,
+// where the metric only watches it. The task name is on the structured log line
+// (action=agent_requested_stop / agent_stop_rearm_capped), which is not
+// cardinality-bound.
+var agentRequestedStopTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "operator_agent_requested_stop_total",
+	Help: "Agent-requested pod stops (a kind=handoff note with no turn in flight), by project, Task kind and what the operator did (rearmed, capped).",
+}, []string{"project", "kind", "disposition"})
+
 func init() {
-	ctrlmetrics.Registry.MustRegister(stallProbeTotal, podRecreationsTotal)
+	ctrlmetrics.Registry.MustRegister(stallProbeTotal, podRecreationsTotal, agentRequestedStopTotal)
+}
+
+// AgentRequestedStop increments operator_agent_requested_stop_total for one
+// agent-requested stop. disposition is one of the AgentStop* values.
+func AgentRequestedStop(project, kind, disposition string) {
+	agentRequestedStopTotal.WithLabelValues(project, kind, disposition).Inc()
+}
+
+// AgentRequestedStopCounter returns the counter for test assertions.
+func AgentRequestedStopCounter(project, kind, disposition string) prometheus.Counter {
+	return agentRequestedStopTotal.WithLabelValues(project, kind, disposition)
 }
 
 // StallProbe increments operator_stall_probe_total for one probe outcome.

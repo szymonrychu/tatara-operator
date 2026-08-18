@@ -485,7 +485,7 @@ var mrTerminalReasons = map[string]bool{
 // IT IS NARROW ON EVERY AXIS, and each guard is load-bearing:
 //
 //   - `to` must be a TERMINAL OUTCOME. This is the difference between ending a
-//     Task and RESTARTING one. ownMRsShippedEdge targets `merged`, which still
+//     Task and RESTARTING one. OwnMRsShippedEdge targets `merged`, which still
 //     owes the merge cursor, the deploy ledger and the issue closes - resuming a
 //     parked Task into that pipeline is real work restarted behind the back of
 //     the human the park was waiting for, which is precisely what a park exists
