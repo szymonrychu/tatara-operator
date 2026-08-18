@@ -287,6 +287,7 @@ jobs:
           fi
 
           red=""
+          pending=1
           if [ -n "$head_sha" ]; then
             # Guarded like every other read here, and for the same reason: a
             # bare assignment under `set -e` dies WITHOUT writing a verdict, and
@@ -306,22 +307,49 @@ jobs:
                         | select(.conclusion == "failure" or .conclusion == "timed_out"
                                  or .conclusion == "cancelled" or .conclusion == "action_required")
                         | .name] | join(", ")')"
+            pending="$(printf '%s' "$checks" \
+              | jq -r '[.check_runs[]? | select(.status != "completed")] | length')" || pending=1
           fi
           if [ -n "$red" ]; then
-            echo "::error::CD pin fan-out is STUCK: ${PARENT}#${num} carries ${VERSION} and is armed, but these checks are red: ${red} (${url})"
-            echo "::error::Auto-merge never fires on a red required check, so this pin will not land without a human."
-            verdict checks-red "${PARENT}#${num} (${url}) carries ${VERSION} and is armed, but these checks are red: ${red}."
-            exit 1
+            # A red check is terminal only if it is a REQUIRED context: auto-merge
+            # fires over a red non-required one. GitGuardian is not required on
+            # tatara-helmfile main and goes red on any PR whose commit RANGE ever
+            # carried a secret-shaped literal - an incident anchors to a commit,
+            # not to the tree, so no HEAD-side change clears it. Calling that
+            # "will not land without a human" is #622's lie with a new trigger.
+            #
+            # mergeable_state, not branch protection: reading the required
+            # contexts needs admin, and this is the field the merge is actually
+            # decided by. It only appears on the single-PR GET, hence the second
+            # call. `blocked` while a check is still RUNNING only means a
+            # required context has not answered yet, so both conditions hold or
+            # nothing is decided. Legacy commit statuses are not visible here;
+            # every check on these repos is an Actions check run.
+            if ! detail="$(api "repos/${PARENT}/pulls/${num}")"; then
+              echo "::error::CD pin fan-out: ${PARENT}#${num} carries ${VERSION} and is armed, but its merge state could not be read: ${url}"
+              verdict forge-unreadable "${PARENT}#${num} (${url}) carries ${VERSION} and is armed, but its merge state could not be read."
+              exit 1
+            fi
+            mstate="$(printf '%s' "$detail" | jq -r '.mergeable_state // "unknown"')"
+            if [ "$mstate" = blocked ] && [ "$pending" -eq 0 ]; then
+              echo "::error::CD pin fan-out is STUCK: ${PARENT}#${num} carries ${VERSION} and is armed, but these checks are red: ${red} (${url})"
+              echo "::error::Every check has reported and the forge still calls the merge blocked, so this pin will not land without a human."
+              verdict checks-red "${PARENT}#${num} (${url}) carries ${VERSION} and is armed, but these required checks are red: ${red}."
+              exit 1
+            fi
+            echo "::warning::${PARENT}#${num} has red checks that are not blocking its merge (mergeable_state=${mstate}, ${pending} still running): ${red} (${url})"
           fi
 
-          # Open, correct, armed and not red: in flight, not stalled. The
-          # operator owns the rest of the wait - deploy_stage.go bounds it at
-          # deployPinFanoutDeadline (45m) and parks at parkReason=deploy-timeout,
-          # which is already a critical alert. Failing here would only be a
-          # second, louder, wrong alarm.
-          echo "::notice::${PARENT}#${num} carries ${VERSION}, is armed and has no red check: ${url}"
+          # Open, correct, armed and nothing blocking the merge: in flight, not
+          # stalled. The operator owns the rest of the wait - deploy_stage.go
+          # bounds it at deployPinFanoutDeadline (45m) and parks at
+          # parkReason=deploy-timeout, which is already a critical alert.
+          # Failing here would only be a second, louder, wrong alarm.
+          # Deliberately not "has no red check": a non-blocking red one may have
+          # been reported above, and this detail is pasted into the alarm issue.
+          echo "::notice::${PARENT}#${num} carries ${VERSION}, is armed and has nothing blocking its merge: ${url}"
           echo "::notice::Leaving the remaining wait to the operator's 45m deployPinFanoutDeadline."
-          verdict in-flight "${PARENT}#${num} (${url}) carries ${VERSION}, is armed and has no red check; it was still in flight when this job ran."
+          verdict in-flight "${PARENT}#${num} (${url}) carries ${VERSION}, is armed and had nothing blocking its merge; it was still in flight when this job ran."
           exit 0
 
   # LOUD ON FAILURE. A red workflow run nobody looks at is what let #512 sit for

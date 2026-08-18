@@ -164,7 +164,20 @@ pr_json() { # <auto_merge json>
 }
 
 checks_json() { # <conclusion>
-  printf '{"check_runs":[{"name":"helmfile diff","conclusion":"%s"}]}' "$1"
+  printf '{"check_runs":[{"name":"helmfile diff","status":"completed","conclusion":"%s"}]}' "$1"
+}
+
+# A completed red check plus a second one that has not reported yet. Nothing is
+# decided while a check is still running, so `blocked` here means "waiting", not
+# "will never merge".
+checks_red_and_still_running_json() {
+  printf '{"check_runs":[{"name":"GitGuardian","status":"completed","conclusion":"failure"},{"name":"helmfile-diff","status":"in_progress","conclusion":null}]}'
+}
+
+# GET /pulls/{n}. mergeable_state is the only field here the list endpoint does
+# not carry, and the reason for the extra call.
+pr_detail_json() { # <mergeable_state>
+  printf '{"number":423,"html_url":"%s","mergeable_state":"%s"}' "$PR_URL" "$1"
 }
 
 # Contents routes for a given ref: whether that ref carries v3.4.0.
@@ -246,17 +259,94 @@ test_open_but_not_armed_never_merges() {
 }
 
 test_armed_but_red_never_merges_either() {
-  it "open + armed + a red check -> exit 1, state=checks-red"
+  it "open + armed + a red REQUIRED check -> exit 1, state=checks-red"
   local d; d="$(make_stub_dir)"
   routes "$d" \
     "$(contents_routes "$d" main stale)" \
     "$(contents_routes "$d" cd/deploy-train pinned)" \
     "pulls?state=open|0|$(pr_json '{"merge_method":"squash"}')" \
+    "pulls/423|0|$(pr_detail_json blocked)" \
     "check-runs|0|$(checks_json failure)"
   run_script "$d" "$(verify_script)" "${VERIFY_ENV[@]}"
   expect_rc 1
   expect_has "$OUT" "helmfile diff"
   expect_eq "$(step_output "$d" state)" "checks-red"
+}
+
+# Auto-merge waits on REQUIRED contexts only. GitGuardian is not one on
+# tatara-helmfile main, and it goes red on any PR whose commit RANGE ever
+# carried a secret-shaped literal - an incident anchors to a commit, not to the
+# tree, so no HEAD-side change clears it. Reading this as "will never land
+# without a human" is the same class of lie as #622's timeout.
+test_non_required_red_check_is_not_a_stall() {
+  it "open + armed + red check but mergeable_state=unstable -> exit 0, state=in-flight"
+  local d; d="$(make_stub_dir)"
+  routes "$d" \
+    "$(contents_routes "$d" main stale)" \
+    "$(contents_routes "$d" cd/deploy-train pinned)" \
+    "pulls?state=open|0|$(pr_json '{"merge_method":"squash"}')" \
+    "pulls/423|0|$(pr_detail_json unstable)" \
+    "check-runs|0|$(checks_json failure)"
+  run_script "$d" "$(verify_script)" "${VERIFY_ENV[@]}"
+  expect_rc 0
+  expect_eq "$(step_output "$d" state)" "in-flight"
+  # Named, so the run says what it saw - but not as an error.
+  expect_has "$OUT" "helmfile diff"
+  expect_lacks "$OUT" "::error::"
+  # The verdict detail is pasted verbatim into the alarm issue. "no red check"
+  # here would be the reader asserting something it just disproved.
+  expect_lacks "$(step_output "$d" detail)" "no red check"
+}
+
+# `blocked` while a check is still running means a REQUIRED check has not
+# reported yet. The red one may well be non-required; nothing is decided.
+test_red_check_while_another_is_still_running_is_not_a_stall() {
+  it "open + armed + red check + another still in_progress -> exit 0, state=in-flight"
+  local d; d="$(make_stub_dir)"
+  routes "$d" \
+    "$(contents_routes "$d" main stale)" \
+    "$(contents_routes "$d" cd/deploy-train pinned)" \
+    "pulls?state=open|0|$(pr_json '{"merge_method":"squash"}')" \
+    "pulls/423|0|$(pr_detail_json blocked)" \
+    "check-runs|0|$(checks_red_and_still_running_json)"
+  run_script "$d" "$(verify_script)" "${VERIFY_ENV[@]}"
+  expect_rc 0
+  expect_eq "$(step_output "$d" state)" "in-flight"
+  expect_lacks "$OUT" "::error::"
+}
+
+# mergeable_state is computed lazily and answers "unknown" until GitHub has run
+# the background job. Unknown is not blocked.
+test_unknown_mergeable_state_is_not_a_stall() {
+  it "open + armed + red check + mergeable_state=unknown -> exit 0, state=in-flight"
+  local d; d="$(make_stub_dir)"
+  routes "$d" \
+    "$(contents_routes "$d" main stale)" \
+    "$(contents_routes "$d" cd/deploy-train pinned)" \
+    "pulls?state=open|0|$(pr_json '{"merge_method":"squash"}')" \
+    "pulls/423|0|$(pr_detail_json unknown)" \
+    "check-runs|0|$(checks_json failure)"
+  run_script "$d" "$(verify_script)" "${VERIFY_ENV[@]}"
+  expect_rc 0
+  expect_eq "$(step_output "$d" state)" "in-flight"
+  expect_lacks "$OUT" "::error::"
+}
+
+# Same rule as every other read in this job: a read that FAILED is reported as
+# unreadable, never as a verdict about the PR.
+test_unreadable_mergeable_state_is_not_a_verdict() {
+  it "open + armed + red check + /pulls/{n} unreadable -> exit 1, state=forge-unreadable"
+  local d; d="$(make_stub_dir)"
+  routes "$d" \
+    "$(contents_routes "$d" main stale)" \
+    "$(contents_routes "$d" cd/deploy-train pinned)" \
+    "pulls?state=open|0|$(pr_json '{"merge_method":"squash"}')" \
+    "pulls/423|22|" \
+    "check-runs|0|$(checks_json failure)"
+  run_script "$d" "$(verify_script)" "${VERIFY_ENV[@]}"
+  expect_rc 1
+  expect_eq "$(step_output "$d" state)" "forge-unreadable"
+  expect_lacks "$OUT" "checks-red"
 }
 
 test_pr_that_does_not_carry_the_pin() {
