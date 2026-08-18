@@ -350,6 +350,30 @@ test_a_garbled_pr_body_does_not_kill_the_step() {
   expect_eq "$(step_output "$d" state)" "in-flight"
 }
 
+# `pending` is read off line 2 of a two-line jq emission, so a check NAME
+# carrying a newline shifts it. `[ "$pending" -eq 0 ]` on a non-number is a bash
+# error, which under `set -e` exits the step writing NO verdict.
+test_a_check_name_with_a_newline_does_not_kill_the_step() {
+  it "a check-run name containing a newline -> a verdict, not a crash"
+  local d; d="$(make_stub_dir)"
+  body_file "$d" checks \
+    '{"check_runs":[{"name":"line one\nline two","status":"completed","conclusion":"failure"}]}'
+  routes "$d" \
+    "$(contents_routes "$d" main stale)" \
+    "$(contents_routes "$d" cd/deploy-train pinned)" \
+    "pulls?state=open|0|$(pr_json '{"merge_method":"squash"}')" \
+    "pulls/423|0|$(pr_detail_json blocked)" \
+    "check-runs|0|@checks"
+  run_script "$d" "$(verify_script)" "${VERIFY_ENV[@]}"
+  # blocked, so the `-eq` is reached rather than short-circuited away. Bash
+  # exempts an `if` CONDITION from errexit, so the malformed comparison makes
+  # the condition false instead of killing the step - and false is the safe
+  # direction here. Pinned because moving that test out of the condition, or
+  # into an `&&` chain evaluated for its own status, would silently change it.
+  expect_rc 0
+  expect_eq "$(step_output "$d" state)" "in-flight"
+}
+
 # Same hole, other jq, opposite safe default: not being able to parse the check
 # runs is not evidence that nothing is red.
 test_a_garbled_check_runs_body_does_not_kill_the_step() {
