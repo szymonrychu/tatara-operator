@@ -350,11 +350,118 @@ test_a_garbled_pr_body_does_not_kill_the_step() {
   expect_eq "$(step_output "$d" state)" "in-flight"
 }
 
-# `pending` is read off line 2 of a two-line jq emission, so a check NAME
-# carrying a newline shifts it. `[ "$pending" -eq 0 ]` on a non-number is a bash
-# error, which under `set -e` exits the step writing NO verdict.
-test_a_check_name_with_a_newline_does_not_kill_the_step() {
-  it "a check-run name containing a newline -> a verdict, not a crash"
+# The PR-list body is the FIRST thing read off the state query, and every
+# GitHub error body is a JSON OBJECT - `.[0]` on an object is a jq hard error,
+# not a null. A bare assignment there exits the step writing NO verdict, and the
+# alarm's fallback then says "the bump job failed first" directly under a bullet
+# reading "bump job: success".
+test_a_garbled_pr_list_does_not_kill_the_step() {
+  it "pulls?state=open returns non-JSON -> exit 1, state=forge-unreadable"
+  local d; d="$(make_stub_dir)"
+  routes "$d" \
+    "$(contents_routes "$d" main stale)" \
+    "pulls?state=open|0|<html>502 Bad Gateway</html>"
+  run_script "$d" "$(verify_script)" "${VERIFY_ENV[@]}"
+  expect_rc 1
+  expect_eq "$(step_output "$d" state)" "forge-unreadable"
+}
+
+test_an_error_object_pr_list_is_not_reported_as_no_pr() {
+  it "pulls?state=open returns {\"message\":...} -> forge-unreadable, not no-pr"
+  local d; d="$(make_stub_dir)"
+  routes "$d" \
+    "$(contents_routes "$d" main stale)" \
+    "pulls?state=open|0|{\"message\":\"Bad credentials\"}"
+  run_script "$d" "$(verify_script)" "${VERIFY_ENV[@]}"
+  expect_eq "$(step_output "$d" state)" "forge-unreadable"
+}
+
+# jq on EMPTY stdin emits nothing and exits 0, so `.[0].number // empty` yields
+# "" - indistinguishable from a genuine empty list. Reporting that as no-pr is
+# the loudest verdict this job has, and its remedy text sends a human to
+# hand-apply five pins and hunt a bug in cd-release that does not exist.
+test_an_empty_pr_list_body_is_not_reported_as_no_pr() {
+  it "pulls?state=open returns a 200 with no body -> forge-unreadable, not no-pr"
+  local d; d="$(make_stub_dir)"
+  routes "$d" \
+    "$(contents_routes "$d" main stale)" \
+    "pulls?state=open|0|"
+  run_script "$d" "$(verify_script)" "${VERIFY_ENV[@]}"
+  expect_eq "$(step_output "$d" state)" "forge-unreadable"
+}
+
+# `.check_runs[]?` swallows "this is not a check-runs response" into "nothing is
+# red" - the exact conflation the guard above it claims to remove.
+test_an_error_object_check_runs_is_not_reported_as_nothing_red() {
+  it "check-runs returns {\"message\":...} -> forge-unreadable, not in-flight"
+  local d; d="$(make_stub_dir)"
+  routes "$d" \
+    "$(contents_routes "$d" main stale)" \
+    "$(contents_routes "$d" cd/deploy-train pinned)" \
+    "pulls?state=open|0|$(pr_json '{"merge_method":"squash"}')" \
+    "check-runs|0|{\"message\":\"You have exceeded a secondary rate limit\"}"
+  run_script "$d" "$(verify_script)" "${VERIFY_ENV[@]}"
+  expect_rc 1
+  expect_eq "$(step_output "$d" state)" "forge-unreadable"
+}
+
+test_an_empty_check_runs_body_is_not_reported_as_nothing_red() {
+  it "check-runs returns a 200 with no body -> forge-unreadable, not in-flight"
+  local d; d="$(make_stub_dir)"
+  routes "$d" \
+    "$(contents_routes "$d" main stale)" \
+    "$(contents_routes "$d" cd/deploy-train pinned)" \
+    "pulls?state=open|0|$(pr_json '{"merge_method":"squash"}')" \
+    "check-runs|0|"
+  run_script "$d" "$(verify_script)" "${VERIFY_ENV[@]}"
+  expect_rc 1
+  expect_eq "$(step_output "$d" state)" "forge-unreadable"
+}
+
+# A check NAME carrying a newline followed by digits shifts a VALID number onto
+# the line `pending` is read from. The count then parses cleanly as the wrong
+# value, and a PR with a check still running is asserted to be terminally stuck:
+# #622's lie, reintroduced through the parser rather than the logic.
+test_a_check_name_that_forges_a_pending_count_is_not_a_stall() {
+  it "check name 'bad\\n0' + a genuinely running check -> not checks-red"
+  local d; d="$(make_stub_dir)"
+  body_file "$d" checks \
+    '{"check_runs":[{"name":"bad\n0","status":"completed","conclusion":"failure"},{"name":"helmfile-diff","status":"in_progress","conclusion":null}]}'
+  routes "$d" \
+    "$(contents_routes "$d" main stale)" \
+    "$(contents_routes "$d" cd/deploy-train pinned)" \
+    "pulls?state=open|0|$(pr_json '{"merge_method":"squash"}')" \
+    "pulls/423|0|$(pr_detail_json blocked)" \
+    "check-runs|0|@checks"
+  run_script "$d" "$(verify_script)" "${VERIFY_ENV[@]}"
+  expect_rc 0
+  expect_eq "$(step_output "$d" state)" "in-flight"
+}
+
+# GITHUB_OUTPUT is line-oriented: a newline in a verdict corrupts every key
+# after it.
+test_a_verdict_never_carries_a_newline_into_github_output() {
+  it "a check name with a newline does not break the state/detail pair"
+  local d; d="$(make_stub_dir)"
+  body_file "$d" checks \
+    '{"check_runs":[{"name":"one\ntwo","status":"completed","conclusion":"failure"}]}'
+  routes "$d" \
+    "$(contents_routes "$d" main stale)" \
+    "$(contents_routes "$d" cd/deploy-train pinned)" \
+    "pulls?state=open|0|$(pr_json '{"merge_method":"squash"}')" \
+    "pulls/423|0|$(pr_detail_json unstable)" \
+    "check-runs|0|@checks"
+  run_script "$d" "$(verify_script)" "${VERIFY_ENV[@]}"
+  expect_eq "$(step_output "$d" state)" "in-flight"
+  expect_lacks "$(cat "$d/github_output")" "two"
+}
+
+# A newline in a check NAME used to shift the line `pending` was read from.
+# Both fields now come out of one compact JSON object, so the name is flattened
+# and the count is the count - and this case, one completed red check with
+# nothing pending on a blocked PR, is a genuine stall.
+test_a_check_name_with_a_newline_is_flattened_not_line_shifted() {
+  it "a check-run name containing a newline -> honest checks-red, name flattened"
   local d; d="$(make_stub_dir)"
   body_file "$d" checks \
     '{"check_runs":[{"name":"line one\nline two","status":"completed","conclusion":"failure"}]}'
@@ -365,13 +472,9 @@ test_a_check_name_with_a_newline_does_not_kill_the_step() {
     "pulls/423|0|$(pr_detail_json blocked)" \
     "check-runs|0|@checks"
   run_script "$d" "$(verify_script)" "${VERIFY_ENV[@]}"
-  # blocked, so the `-eq` is reached rather than short-circuited away. Bash
-  # exempts an `if` CONDITION from errexit, so the malformed comparison makes
-  # the condition false instead of killing the step - and false is the safe
-  # direction here. Pinned because moving that test out of the condition, or
-  # into an `&&` chain evaluated for its own status, would silently change it.
-  expect_rc 0
-  expect_eq "$(step_output "$d" state)" "in-flight"
+  expect_rc 1
+  expect_eq "$(step_output "$d" state)" "checks-red"
+  expect_has "$(step_output "$d" detail)" "line one line two"
 }
 
 # Same hole, other jq, opposite safe default: not being able to parse the check
@@ -588,6 +691,48 @@ test_alarm_finds_a_tracker_past_the_first_page() {
     BUMP_RESULT=failure VERIFY_RESULT=failure VERIFY_STATE=no-pr VERIFY_DETAIL=""
   expect_rc 0
   expect_has "$(cat "$d/curl.log")" "issues/622/comments"
+}
+
+# The dedupe read decides COMMENT vs NEW ISSUE. That is a nice-to-have; being
+# heard is not. Attempt 8 of run 32035597231 lost its alarm to a bare
+# `curl: (22) 503` and this job still had two bare reads in the same shape, so a
+# garbled forge produced no verdict AND no alarm - #512 verbatim. A duplicate
+# tracker beats silence.
+test_alarm_still_files_when_its_dedupe_read_fails() {
+  it "the /issues read fails outright -> an issue is still opened"
+  local d; d="$(make_stub_dir)"
+  routes "$d" "issues?state=open|22|" "repos/szymonrychu/tatara-operator/issues|0|{}"
+  run_script "$d" "$(alarm_script)" "${ALARM_ENV[@]}" \
+    BUMP_RESULT=success VERIFY_RESULT=failure VERIFY_STATE=no-pr VERIFY_DETAIL=""
+  expect_rc 0
+  expect_has "$(cat "$d/curl.log")" "repos/szymonrychu/tatara-operator/issues"
+}
+
+test_alarm_still_files_when_its_dedupe_body_is_garbled() {
+  it "the /issues read returns non-JSON -> an issue is still opened"
+  local d; d="$(make_stub_dir)"
+  routes "$d" \
+    "issues?state=open|0|<html>502 Bad Gateway</html>" \
+    "repos/szymonrychu/tatara-operator/issues|0|{}"
+  run_script "$d" "$(alarm_script)" "${ALARM_ENV[@]}" \
+    BUMP_RESULT=success VERIFY_RESULT=failure VERIFY_STATE=no-pr VERIFY_DETAIL=""
+  expect_rc 0
+  expect_has "$(cat "$d/curl.log")" "repos/szymonrychu/tatara-operator/issues"
+}
+
+# The fallback arm fires whenever verify-pin died before writing a verdict, not
+# only when bump failed - so asserting the cause put "the bump job failed first"
+# directly under a bullet reading "bump job: success".
+test_alarm_does_not_blame_the_bump_job_it_can_see_succeeded() {
+  it "no verdict but BUMP_RESULT=success -> the body does not blame bump"
+  local d; d="$(make_stub_dir)"
+  body_file "$d" issues "[]"
+  routes "$d" "issues?state=open|0|@issues" "repos/szymonrychu/tatara-operator/issues|0|{}"
+  run_script "$d" "$(alarm_script)" "${ALARM_ENV[@]}" \
+    BUMP_RESULT=success VERIFY_RESULT=failure VERIFY_STATE="" VERIFY_DETAIL=""
+  expect_rc 0
+  local body; body="$(cat "$d/post-body" 2>/dev/null || echo "")"
+  expect_lacks "$body" "the \`bump\` job failed first"
 }
 
 test_alarm_never_mistakes_a_pull_request_for_the_tracker() {

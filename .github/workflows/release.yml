@@ -256,10 +256,29 @@ jobs:
             verdict forge-unreadable "${VERSION} is not on ${PARENT} main and the forge could not be queried for ${BRANCH}."
             exit 1
           fi
-          num="$(printf '%s' "$pr" | jq -r '.[0].number // empty')"
-          url="$(printf '%s' "$pr" | jq -r '.[0].html_url // empty')"
-          head_sha="$(printf '%s' "$pr" | jq -r '.[0].head.sha // empty')"
-          armed="$(printf '%s' "$pr" | jq -r 'if (.[0].auto_merge // null) == null then "" else "yes" end')"
+          # One GUARDED read, not four bare ones. `.[0]` on a JSON OBJECT is a jq
+          # hard error, and every GitHub error body is an object - so `{"message":
+          # "Bad credentials"}` used to exit the step here writing NO verdict, and
+          # the alarm then said "the bump job failed first" under a bullet reading
+          # "bump job: success". The `ok` sentinel is what distinguishes an EMPTY
+          # body from a genuinely empty list: jq on empty stdin prints nothing and
+          # exits 0, so `.[0].number // empty` cannot tell them apart, and
+          # believing the second reading files no-pr - the loudest verdict here,
+          # whose remedy sends a human to hand-apply five pins.
+          if ! fields="$(printf '%s' "$pr" | jq -r '
+                if type != "array" then error("not a pull request list") else . end
+                | "ok", (.[0].number // ""), (.[0].html_url // ""),
+                  (.[0].head.sha // ""),
+                  (if (.[0].auto_merge // null) == null then "" else "yes" end)')" \
+             || [ -z "$fields" ]; then
+            echo "::error::CD pin fan-out: ${VERSION} is not on ${PARENT} main and the ${BRANCH} response did not parse."
+            verdict forge-unreadable "${VERSION} is not on ${PARENT} main and the forge's ${BRANCH} response could not be read."
+            exit 1
+          fi
+          num="$(printf '%s' "$fields" | sed -n 2p)"
+          url="$(printf '%s' "$fields" | sed -n 3p)"
+          head_sha="$(printf '%s' "$fields" | sed -n 4p)"
+          armed="$(printf '%s' "$fields" | sed -n 5p)"
 
           if [ -z "$num" ]; then
             echo "::error::CD pin fan-out is DOWN: ${VERSION} is not on ${PARENT} main and no open ${BRANCH} PR exists."
@@ -307,18 +326,29 @@ jobs:
             # NO verdict, and the alarm then reports "the bump job failed
             # first" about a healthy PR. Unparseable is unreadable, which is
             # already a verdict below - it is not "nothing is red".
-            if ! summary="$(printf '%s' "$checks" \
-              | jq -r '([.check_runs[]?
-                         | select(.conclusion == "failure" or .conclusion == "timed_out"
-                                  or .conclusion == "cancelled" or .conclusion == "action_required")
-                         | .name] | join(", ")),
-                        ([.check_runs[]? | select(.status != "completed")] | length)')"; then
+            # No `.check_runs[]?`: the `?` swallows "this is not a check-runs
+            # response" into "nothing is red", which is the conflation the whole
+            # job exists to remove. One compact object rather than two lines,
+            # because a check NAME may contain a newline and a line-indexed read
+            # would then take the count off the wrong line - a VALID number,
+            # silently wrong, asserting "every check has reported" while one is
+            # still running. Names are flattened for the same reason:
+            # $GITHUB_OUTPUT is line-oriented and a newline in a verdict corrupts
+            # every key after it.
+            if ! summary="$(printf '%s' "$checks" | jq -c '
+                  if (.check_runs | type) != "array" then error("no check_runs") else . end
+                  | {red: ([.check_runs[]
+                           | select(.conclusion == "failure" or .conclusion == "timed_out"
+                                    or .conclusion == "cancelled" or .conclusion == "action_required")
+                           | .name] | join(", ") | gsub("[\r\n]+"; " ")),
+                     pending: ([.check_runs[] | select(.status != "completed")] | length)}')" \
+               || [ -z "$summary" ]; then
               echo "::error::CD pin fan-out: ${PARENT}#${num} carries ${VERSION} and is armed, but its check runs did not parse: ${url}"
               verdict forge-unreadable "${PARENT}#${num} (${url}) carries ${VERSION} and is armed, but its check runs could not be read."
               exit 1
             fi
-            red="$(printf '%s' "$summary" | sed -n 1p)"
-            pending="$(printf '%s' "$summary" | sed -n 2p)"
+            red="$(printf '%s' "$summary" | jq -r .red)"
+            pending="$(printf '%s' "$summary" | jq -r .pending)"
           fi
           if [ -n "$red" ]; then
             # A red check is terminal only if it is a REQUIRED context: auto-merge
@@ -431,9 +461,19 @@ jobs:
               FIX="${FIX} assuming anything is broken."
               ;;
             *)
-              FIX="\`verify-pin\` never reached a verdict (the \`bump\` job failed first), so"
-              FIX="${FIX} no fan-out state was observed. Read the \`bump\` job's log in the run"
-              FIX="${FIX} above, then check \`cd/deploy-train\` on tatara-helmfile."
+              # This arm also fires when verify-pin died mid-step, was cancelled,
+              # or lost its runner - so it must not assert a cause it can see is
+              # false. It used to say "the bump job failed first" three lines
+              # under a bullet reading "bump job: success".
+              if [ "${BUMP_RESULT:-}" = success ]; then
+                FIX="\`bump\` succeeded but \`verify-pin\` reached no verdict, so the fan-out"
+                FIX="${FIX} state is UNKNOWN and may well be healthy. Read the \`verify-pin\` job's"
+                FIX="${FIX} log in the run above, then check \`cd/deploy-train\` on tatara-helmfile."
+              else
+                FIX="\`bump\` did not succeed, so \`verify-pin\` never ran and no fan-out state"
+                FIX="${FIX} was observed. Read the \`bump\` job's log in the run above, then check"
+                FIX="${FIX} \`cd/deploy-train\` on tatara-helmfile."
+              fi
               ;;
           esac
 
@@ -462,14 +502,24 @@ jobs:
           # tracker once this repo has a normal number of open PRs - and a miss
           # opens a DUPLICATE tracker every failed release. /search/issues had
           # no such cap; this is the cost of dropping it, and it is bounded.
+          # EVERY read in this loop is best-effort, and that is the point. The
+          # dedupe decides comment-vs-new-issue; being heard at all is the job.
+          # These were bare under `set -e`, so a 403 secondary rate limit (which
+          # curl --retry does not cover, and which a page loop invites) or a
+          # garbled body took the whole alarm down - the same silence attempt 8
+          # of run 32035597231 died of, in the one job whose purpose is to be
+          # heard. A duplicate tracker beats no tracker.
           existing=""
           page=1
           while [ "$page" -le 5 ]; do
-            batch="$(api "repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=100&page=${page}")"
+            batch="$(api "repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=100&page=${page}")" || batch=""
+            [ -n "$batch" ] || break
             existing="$(printf '%s' "$batch" | jq -r --arg t "CD pin fan-out stalled" \
-              '[.[]? | select(has("pull_request") | not) | select(.title | startswith($t))][0].number // empty')"
+              '[.[]? | select(has("pull_request") | not) | select(.title | startswith($t))][0].number // empty')" || existing=""
             if [ -n "$existing" ]; then break; fi
-            if [ "$(printf '%s' "$batch" | jq 'length')" -lt 100 ]; then break; fi
+            n="$(printf '%s' "$batch" | jq 'length')" || n=0
+            case "$n" in ''|*[!0-9]*) n=0 ;; esac
+            [ "$n" -ge 100 ] || break
             page=$((page + 1))
           done
           if [ -n "$existing" ]; then
