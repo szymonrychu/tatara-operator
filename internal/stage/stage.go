@@ -745,8 +745,7 @@ func stampEnter(t *v1alpha1.Task, to, reason string, now time.Time) {
 	// reason as the residency carry: a genuine transition means the blocker the
 	// laps were spent on is behind us, so the NEXT one starts from a full
 	// budget. A park/un-park round trip is not a transition and preserves both.
-	t.Status.RetryAttempts = 0
-	t.Status.RetryNextAt = nil
+	ResetRetryBudget(t)
 	if Live(to) {
 		t.Status.ConversationLastEventAt = &stamp
 	} else {
@@ -1437,7 +1436,11 @@ const (
 	// has not been armed at all). It is the STEADY STATE of the retry lane, so
 	// it is never logged - it is answered on every 30s pass of every waiting
 	// retry park. The counter still moves, which is what makes a lane that is
-	// waiting distinguishable from a lane nothing is driving.
+	// waiting distinguishable from a lane nothing is driving - and the DRIVER
+	// has to move it itself (controller.driveRetryLane), because it answers this
+	// decline before ApplyUnpark and so never reaches driveUnparks' shared
+	// decline arm. Every waiting retry park in the platform is one of those, so
+	// leaving it to the shared arm left the series permanently flat.
 	DeclineRetryNotDue = "retry-not-due"
 )
 
@@ -1500,7 +1503,7 @@ func Unpark(in UnparkInput) (decline string) {
 		// one that guarantees the next technical park re-escalates instantly,
 		// with zero laps in between and a comment claiming MaxUnparkRetries
 		// attempts that were spent before the human ever spoke.
-		in.Task.Status.RetryAttempts = 0
+		ResetRetryBudget(in.Task)
 	}
 	return DeclineNone
 }

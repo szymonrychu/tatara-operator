@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -35,10 +36,25 @@ import (
 //     reason with no schedule armed, this function runs on EVERY 30s pass, so a
 //     forge outage that blocked the repark would turn one escalation into a
 //     comment attempt every thirty seconds for as long as the outage lasts.
+//   - THE LATCH WRITE IS SWALLOWED FOR THE SAME REASON, and it was not: a failed
+//     latch used to return before the repark, which left the Task in the lane at
+//     the cap and brought the next pass straight back here to comment AGAIN. One
+//     transient apiserver error was a duplicate "tatara stopped retrying" comment
+//     on a human's issue; a persistent one was a comment every thirty seconds.
+//     Falling through costs nothing that matters: the repark moves the reason to
+//     retry-exhausted, which is UnparkHuman, so the lane never looks at this Task
+//     again and the latch it failed to write has nothing left to guard.
 //   - the latch is stamped only after the comment LANDS, so an outage costs a
 //     retry next pass rather than a silently lost escalation.
 //   - the latch is keyed on the park's own parkedAt, so it silences THIS
 //     escalation and not the next blocker's.
+//
+// A FAILED LOOKUP IS THE ONE THING THAT DOES STOP THE PASS. "Where do I say
+// this" failing is not "there is nowhere to say it": returning the error skips
+// the repark, so the Task stays in the lane at the cap and the next 30s pass
+// tries the whole escalation again. Re-parking through a transient apiserver
+// error would move the reason to retry-exhausted and make the escalation
+// permanently silent - precisely the failure this file exists to prevent.
 func (r *ProjectReconciler) escalateExhaustedRetry(ctx context.Context, proj *tatarav1alpha1.Project,
 	t *tatarav1alpha1.Task, now time.Time) error {
 
@@ -49,22 +65,28 @@ func (r *ProjectReconciler) escalateExhaustedRetry(ctx context.Context, proj *ta
 	stamp := parkStamp(t)
 
 	if t.Annotations[tatarav1alpha1.AnnRetryExhaustedCommented] != stamp {
-		if issueRef, ok := r.exhaustedRetryIssueRef(ctx, t); ok {
+		ref, ok, err := r.exhaustedRetryTarget(ctx, proj, t)
+		if err != nil {
+			return err
+		}
+		if ok {
 			body := retryExhaustedComment(reason, attempts, parkedAt(t), now)
-			if err := r.commentOnIssue(ctx, proj, issueRef, body); err != nil {
+			if cerr := r.commentOnIssue(ctx, proj, ref, body); cerr != nil {
 				// Logged and swallowed: see the ordering argument above.
-				l.Error(err, "retry lane: the escalation comment failed; the park still lands",
+				l.Error(cerr, "retry lane: the escalation comment failed; the park still lands",
 					"action", "retry_exhausted_comment_failed", "resource_id", t.Name,
-					"reason", reason, "issue_ref", issueRef)
-			} else if err := r.stampRetryExhaustedCommented(ctx, t, stamp); err != nil {
-				return err
+					"reason", reason, "issue_ref", ref)
+			} else if serr := r.stampRetryExhaustedCommented(ctx, t, stamp); serr != nil {
+				l.Error(serr, "retry lane: the escalation latch failed to write; the park still lands",
+					"action", "retry_exhausted_latch_failed", "resource_id", t.Name,
+					"reason", reason, "issue_ref", ref)
 			} else {
 				l.Info("retry lane: escalated a spent lane to the humans on its issue",
 					"action", "retry_exhausted_commented", "resource_id", t.Name,
-					"reason", reason, "issue_ref", issueRef, "attempts", attempts)
+					"reason", reason, "issue_ref", ref, "attempts", attempts)
 			}
 		} else {
-			l.Info("retry lane: spent, and the Task owns no issue to say so on",
+			l.Info("retry lane: spent, and the Task owns no open issue or merge request to say so on",
 				"action", "retry_exhausted_no_issue", "resource_id", t.Name,
 				"reason", reason, "attempts", attempts)
 		}
@@ -129,36 +151,98 @@ func (r *ProjectReconciler) stampRetryExhaustedCommented(ctx context.Context, t 
 	return nil
 }
 
-// exhaustedRetryIssueRef resolves where to say it: the first OPEN owned Issue,
-// as "<owner>/<repo>#<number>". A Task can own several; the escalation is about
-// the TASK, so one comment on one live thread is the right volume - and an
-// upgrade or documentation Task legitimately owns none at all, which is why the
-// caller treats a miss as "no target" rather than as an error.
-func (r *ProjectReconciler) exhaustedRetryIssueRef(ctx context.Context, t *tatarav1alpha1.Task) (string, bool) {
+// exhaustedRetryTarget resolves WHERE to say it: the first OPEN owned Issue,
+// falling back to the first OPEN owned merge request. A Task can own several;
+// the escalation is about the TASK, so one comment on one live thread is the
+// right volume.
+//
+// THE MERGE-REQUEST FALLBACK IS NOT A NICETY - IT IS THE POPULATION THIS LANE
+// IS WRITTEN FOR. Cron-minted upgrade Tasks and documentation batches own ZERO
+// Issue CRs by construction ("their deliverable IS the merge request", as
+// stage.go's own awaiting-human arm puts it), and they go through the merge
+// corridor, which is exactly where ci-failed and merge-conflict-retry are
+// written. Issue-only, those Tasks exhausted in total silence on the forge and
+// only the metric moved.
+//
+// AN ERROR IS NOT "NO TARGET". A failed List/Get returns it so the caller can
+// skip the repark and try again in 30s; only a genuinely absent or unparseable
+// target answers (false, nil), and a mirror whose Repository CR is gone is
+// SKIPPED rather than fatal - the mirror is not authoritative (loadTaskIssues
+// makes the same call).
+func (r *ProjectReconciler) exhaustedRetryTarget(ctx context.Context, proj *tatarav1alpha1.Project,
+	t *tatarav1alpha1.Task) (string, bool, error) {
+
 	l := log.FromContext(ctx)
 	issues, err := loadTaskIssues(ctx, r.Client, t)
 	if err != nil {
-		l.Error(err, "retry lane: could not load the owned issues to escalate on",
-			"action", "retry_exhausted_issue_lookup_failed", "resource_id", t.Name)
-		return "", false
+		return "", false, fmt.Errorf("unpark: load the owned issues to escalate on %s: %w", t.Name, err)
 	}
 	for i := range issues {
 		iss := &issues[i]
 		if iss.Status.State != "" && iss.Status.State != "open" {
 			continue
 		}
-		var repo tatarav1alpha1.Repository
-		key := client.ObjectKey{Namespace: t.Namespace, Name: iss.Spec.RepositoryRef}
-		if err := r.Get(ctx, key, &repo); err != nil {
+		slug, ok, serr := r.repoSlugFor(ctx, t.Namespace, iss.Spec.RepositoryRef)
+		if serr != nil {
+			return "", false, serr
+		}
+		if !ok {
 			continue
 		}
-		slug, err := scm.RepoSlugFromURL(repo.Spec.URL)
-		if err != nil {
-			continue
-		}
-		return fmt.Sprintf("%s#%d", slug, iss.Spec.Number), true
+		return fmt.Sprintf("%s#%d", slug, iss.Spec.Number), true, nil
 	}
-	return "", false
+	mrs, err := loadTaskMRs(ctx, r.Client, t)
+	if err != nil {
+		return "", false, fmt.Errorf("unpark: load the owned merge requests to escalate on %s: %w", t.Name, err)
+	}
+	// The separator is the PROVIDER's, not a formatting choice: GitLab routes a
+	// '!' ref to the merge-request note endpoint and a '#' ref to the issue one,
+	// so an issue-shaped ref would post the escalation onto whatever issue
+	// happens to carry the merge request's iid. GitHub shares one endpoint and
+	// takes '#' for both.
+	sep := "#"
+	if proj.Spec.Scm != nil && proj.Spec.Scm.Provider == "gitlab" {
+		sep = "!"
+	}
+	for i := range mrs {
+		mr := &mrs[i]
+		if mr.Status.State != "" && mr.Status.State != "open" {
+			continue
+		}
+		slug, ok, serr := r.repoSlugFor(ctx, t.Namespace, mr.Spec.RepositoryRef)
+		if serr != nil {
+			return "", false, serr
+		}
+		if !ok {
+			continue
+		}
+		l.Info("retry lane: the Task owns no open issue; escalating on its merge request instead",
+			"action", "retry_exhausted_mr_target", "resource_id", t.Name,
+			"repo", mr.Spec.RepositoryRef, "pr", mr.Spec.Number)
+		return fmt.Sprintf("%s%s%d", slug, sep, mr.Spec.Number), true, nil
+	}
+	return "", false, nil
+}
+
+// repoSlugFor resolves a Repository CR name to its forge slug. ok=false means
+// this mirror cannot address the forge (its Repository is gone, or its URL does
+// not parse) and the caller should try the next candidate; an error means the
+// LOOKUP failed and the pass must be retried rather than concluded.
+func (r *ProjectReconciler) repoSlugFor(ctx context.Context, ns, name string) (string, bool, error) {
+	var repo tatarav1alpha1.Repository
+	if err := r.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, &repo); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("unpark: get repository %s: %w", name, err)
+	}
+	slug, err := scm.RepoSlugFromURL(repo.Spec.URL)
+	if err != nil {
+		log.FromContext(ctx).Error(err, "retry lane: a repository URL does not yield a forge slug",
+			"action", "retry_exhausted_slug_failed", "repo", name, "url", repo.Spec.URL)
+		return "", false, nil
+	}
+	return slug, true, nil
 }
 
 // commentOnIssue posts one comment with the Project's own SCM credentials.

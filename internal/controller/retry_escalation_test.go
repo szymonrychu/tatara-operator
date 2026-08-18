@@ -230,3 +230,130 @@ func TestRetryExhaustedIsReleasedByAHumanComment(t *testing.T) {
 		t.Fatalf("retryAttempts = %d, want 0: a human answer buys a fresh budget", got.Status.RetryAttempts)
 	}
 }
+
+// TestAFailedLatchDoesNotRePostTheEscalation. The latch write used to return
+// early, BEFORE applyRetryExhaustion - so the Task kept its unarmed retry park
+// at the cap, the next 30s pass re-entered, and it commented AGAIN. One
+// transient apiserver error was a duplicate "tatara stopped retrying" on a
+// human's issue; a persistent one was a comment every thirty seconds. The
+// re-park alone suffices: retry-exhausted is UnparkHuman, so the lane never
+// looks at this Task again.
+func TestAFailedLatchDoesNotRePostTheEscalation(t *testing.T) {
+	proj := reProject()
+	task := reExhaustedTask("t-exhausted-latch-fails", stage.ReasonCIFailed)
+	c := newMirrorClientIntercepted(t, interceptor.Funcs{
+		Patch: func(_ context.Context, _ client.WithWatch, obj client.Object,
+			_ client.Patch, _ ...client.PatchOption) error {
+			if tk, ok := obj.(*tatarav1alpha1.Task); ok && tk.Name == "t-exhausted-latch-fails" {
+				return errors.New("apiserver is having a moment")
+			}
+			return nil
+		},
+	}, proj, mdSecret(), mdRepo("repo-a"), mdIssue(task, "repo-a", 42), task)
+	w := &mbWriter{}
+	r := &ProjectReconciler{Client: c, APIReader: c, Scheme: c.Scheme(), Metrics: wfMetrics(),
+		SCMFor: func(string) (scm.SCMWriter, error) { return w, nil }}
+
+	for i := 0; i < 3; i++ {
+		if err := r.driveUnparks(context.Background(), proj, time.Now()); err != nil {
+			t.Fatalf("pass %d: driveUnparks: %v", i, err)
+		}
+	}
+	if len(w.comments) != 1 {
+		t.Fatalf("Comment calls = %d over three passes whose latch failed, want exactly 1", len(w.comments))
+	}
+	got := mdGetTask(t, c, task.Name)
+	if got.Status.ParkReason != stage.ReasonRetryExhausted {
+		t.Fatalf("parkReason = %q, want retry-exhausted: the latch is not allowed to block the re-park",
+			got.Status.ParkReason)
+	}
+}
+
+// TestAFailedIssueLookupPostponesTheEscalation. ("", false) used to mean both
+// "this Task owns no issue" and "the lookup failed", and the caller re-parked
+// either way - which moved the reason to retry-exhausted and made the
+// escalation permanently silent on ONE transient apiserver error. That is
+// exactly the silent park this file exists to prevent.
+func TestAFailedIssueLookupPostponesTheEscalation(t *testing.T) {
+	proj := reProject()
+	task := reExhaustedTask("t-exhausted-lookup-fails", stage.ReasonCIFailed)
+	fail := true
+	c := newMirrorClientIntercepted(t, interceptor.Funcs{
+		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey,
+			obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*tatarav1alpha1.Issue); ok && fail {
+				return errors.New("etcd is having a moment")
+			}
+			return cl.Get(ctx, key, obj, opts...)
+		},
+	}, proj, mdSecret(), mdRepo("repo-a"), mdIssue(task, "repo-a", 42), task)
+	w := &mbWriter{}
+	r := &ProjectReconciler{Client: c, APIReader: c, Scheme: c.Scheme(), Metrics: wfMetrics(),
+		SCMFor: func(string) (scm.SCMWriter, error) { return w, nil }}
+
+	if err := r.driveUnparks(context.Background(), proj, time.Now()); err == nil {
+		t.Fatalf("driveUnparks swallowed the failed issue lookup")
+	}
+	got := mdGetTask(t, c, task.Name)
+	if got.Status.ParkReason != stage.ReasonCIFailed {
+		t.Fatalf("parkReason = %q, want the blocker unchanged: re-parking here loses the escalation forever",
+			got.Status.ParkReason)
+	}
+	if len(w.comments) != 0 {
+		t.Fatalf("Comment calls = %d, want 0: nothing was resolved to comment on", len(w.comments))
+	}
+
+	// The next pass, with the apiserver back, escalates for real.
+	fail = false
+	if err := r.driveUnparks(context.Background(), proj, time.Now()); err != nil {
+		t.Fatalf("driveUnparks (recovered): %v", err)
+	}
+	if len(w.comments) != 1 {
+		t.Fatalf("Comment calls = %d after recovery, want 1", len(w.comments))
+	}
+	if got := mdGetTask(t, c, task.Name); got.Status.ParkReason != stage.ReasonRetryExhausted {
+		t.Fatalf("parkReason = %q, want retry-exhausted once the escalation landed", got.Status.ParkReason)
+	}
+}
+
+// TestExhaustionEscalatesOnTheMergeRequestWhenThereIsNoIssue is the population
+// the lane is FOR. Cron-minted upgrade Tasks and documentation batches own zero
+// Issue CRs by construction - their deliverable IS the merge request - and they
+// go through the merge corridor, which is where ci-failed and
+// merge-conflict-retry are written. Issue-only, their exhaustion was silent on
+// the forge and only the metric moved.
+func TestExhaustionEscalatesOnTheMergeRequestWhenThereIsNoIssue(t *testing.T) {
+	tests := []struct {
+		provider string
+		wantRef  string
+	}{
+		{"github", "szymonrychu/repo-a#7"},
+		{"gitlab", "szymonrychu/repo-a!7"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.provider, func(t *testing.T) {
+			proj := reProject()
+			proj.Spec.Scm.Provider = tc.provider
+			task := reExhaustedTask("t-exhausted-mr-only", stage.ReasonMergeConflictRetry)
+			task.Status.IssueRefs = nil
+			task.Status.MRRefs = []string{tatarav1alpha1.MergeRequestName("repo-a", 7)}
+			c := newMirrorClient(t, proj, mdSecret(), mdRepo("repo-a"), mdMR(task, "repo-a", 7), task)
+			w := &mbWriter{}
+			r := &ProjectReconciler{Client: c, APIReader: c, Scheme: c.Scheme(), Metrics: wfMetrics(),
+				SCMFor: func(string) (scm.SCMWriter, error) { return w, nil }}
+
+			if err := r.driveUnparks(context.Background(), proj, time.Now()); err != nil {
+				t.Fatalf("driveUnparks: %v", err)
+			}
+			if len(w.comments) != 1 {
+				t.Fatalf("Comment calls = %d, want exactly 1 on the merge request", len(w.comments))
+			}
+			if w.comments[0].IssueRef != tc.wantRef {
+				t.Fatalf("comment ref = %q, want %q", w.comments[0].IssueRef, tc.wantRef)
+			}
+			if got := mdGetTask(t, c, task.Name); got.Status.ParkReason != stage.ReasonRetryExhausted {
+				t.Fatalf("parkReason = %q, want retry-exhausted", got.Status.ParkReason)
+			}
+		})
+	}
+}

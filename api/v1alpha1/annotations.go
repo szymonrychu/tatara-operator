@@ -66,6 +66,16 @@ const (
 	// individually preserved by every writer to promise that. Nothing ever removes
 	// this annotation.
 	AnnRetiredParkMigrated = "tatara.dev/retired-park-migrated"
+	// AnnRetryLaneMigrated is the ONCE-ONLY LATCH for the retry-lane migration
+	// (controller.driveRetryLaneMigration), and it is the exact analogue of
+	// AnnRetiredParkMigrated one class over: ci-red and merge-conflict lost their
+	// park writers when stage.CIRed's and stage.MergeConflict's anyMerged arms
+	// moved into the lane, so every Task ALREADY carrying one would have kept a
+	// verdict from a rule that no longer exists and aged out at ParkRetention.
+	// Its VALUE is the RFC3339 instant the migration ran; its PRESENCE is the
+	// guard, and nothing ever removes it - a Task re-parked ci-red by a
+	// mid-rollout replica is migrated once and never again.
+	AnnRetryLaneMigrated = "tatara.dev/retry-lane-migrated"
 )
 
 // AnnAutoReentries / AnnAutoReentryExhausted are the C.3 automatic-pickup

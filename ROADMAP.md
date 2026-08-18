@@ -321,8 +321,16 @@ Open, out of scope, deliberately not done:
   class, `status.retryAttempts`/`status.retryNextAt`, a backed-off release arm on
   the existing 30s unpark driver, and a LOUD exhaustion (repark to
   `retry-exhausted` + a forge comment naming the blocker and every attempt +
-  `operator_task_retry_exhausted_total`). `change_significance: minor` - two
+  `operator_task_retry_exhausted_total`). `change_significance: minor` - three
   additive optional status fields, five additive enum values, one new class.
+- [x] Half 2 review fixes (ten findings): the release is gated on a LIVE re-read
+  of the blocker so a lap never costs a pod; `armRetryPark`'s race path is a
+  sentinel instead of a nil deref; exhaustion is re-evaluated on the armed path;
+  `status.retryBlocker` + a merge-cursor refund scope the counter to one blocker;
+  the escalation swallows its latch error, distinguishes a failed target lookup
+  from "no target", and falls back to the owned merge request; and
+  `driveRetryLaneMigration` moves the live `ci-red`/`merge-conflict` parks that
+  motivated the lane onto it (bounded by `ParkRetention`, one-way, latched).
 - [ ] `tatara-observability`: alert on `operator_task_retry_exhausted_total`, and
   allowlist it plus `operator_task_retry_scheduled_total`. NOT before this
   producer is on `main` (MEMORY: a metric allowlist entry needs its producer on

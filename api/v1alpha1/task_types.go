@@ -782,9 +782,23 @@ type TaskStatus struct {
 	// StageElapsedCarrySeconds is, and laundered by the same two things: a
 	// genuine state TRANSITION (stampEnter - the blocker is behind us), and a
 	// human comment releasing an UnparkHuman park (whoever answered has bought
-	// the machine a fresh budget for whatever it hits next).
+	// the machine a fresh budget for whatever it hits next), and by the two
+	// events that end a blocker WITHOUT a state transition: the merge cursor
+	// advancing to the next repo in spec.mergeOrder, and the blocker changing
+	// identity (see RetryBlocker).
 	// +optional
 	RetryAttempts int `json:"retryAttempts,omitempty"`
+	// RetryBlocker is the park reason RetryAttempts was charged against. It is
+	// what makes the "CURRENT blocker" in RetryAttempts' doc true rather than
+	// aspirational: without it the counter is per-TASK, so a Task that cleared
+	// ci-failed and later hit merge-conflict-retry would inherit the first
+	// blocker's spend and escalate early, with a comment claiming laps that were
+	// never spent on the blocker it names.
+	//
+	// stage.ArmRetry is its only writer, and it zeroes RetryAttempts whenever
+	// the park reason it is about to charge differs from what is recorded here.
+	// +optional
+	RetryBlocker string `json:"retryBlocker,omitempty"`
 	// RetryNextAt is the earliest time an UnparkRetry park may be released. It
 	// is the SCHEDULE, not a deadline: nil on a retry park means the backoff
 	// has not been armed yet and the driver arms it on sight, so a park written

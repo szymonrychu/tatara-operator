@@ -16,6 +16,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
+	"github.com/szymonrychu/tatara-operator/internal/scm"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
@@ -342,6 +343,10 @@ func (r *ProjectReconciler) driveUnparksPaced(ctx context.Context, proj *tatarav
 	if err := r.driveRetiredUnparks(ctx, proj, now); err != nil {
 		return 0, err
 	}
+	// The retry-lane migration rides it too, and is self-limiting the same way.
+	if err := r.driveRetryLaneMigration(ctx, proj, now); err != nil {
+		return 0, err
+	}
 	// The CI recovery rides the SAME pacing for the SAME reason: it is another
 	// full-namespace sweep over parked Tasks, and #368 is about exactly that
 	// running at Reconcile()'s cadence.
@@ -481,6 +486,146 @@ func (r *ProjectReconciler) applyRetiredUnpark(ctx context.Context, t *tatarav1a
 		}
 		if err := stage.UnparkRetiredPark(fresh, now); err != nil {
 			return err
+		}
+		if err := r.Status().Update(ctx, fresh); err != nil {
+			return err
+		}
+		*t = *fresh
+		return nil
+	})
+}
+
+// retryLaneMigrations maps the two park reasons the lane SUPERSEDED onto their
+// lane names. Both lost their park writer when stage.CIRed's and
+// stage.MergeConflict's anyMerged arms moved into the lane; both stay in the
+// vocabulary (removing an enum member breaks validation on the next status write
+// of every object carrying it) and both remain the STATE reason of their
+// re-implement edge, which this migration never touches - it reads
+// status.parkReason only.
+var retryLaneMigrations = map[string]string{
+	stage.ReasonCIRed:         stage.ReasonCIFailed,
+	stage.ReasonMergeConflict: stage.ReasonMergeConflictRetry,
+}
+
+// driveRetryLaneMigration moves the PARKS THAT MOTIVATED THE LANE into it.
+//
+// WITHOUT IT THIS CHANGE FIXES NOTHING THAT IS ALREADY BROKEN. helmfile#27 and
+// #32, ansible!17 and !18 and terraform!221 - the measured population, all with
+// merged merge requests, parked Tasks and open issues - carry ci-red and
+// merge-conflict TODAY, and those two constants stay UnparkNever. Only parks
+// written after the rollout would ever reach the lane; everything already wedged
+// would stay wedged and age out at ParkRetention, silently, which is the exact
+// failure the lane exists to remove. This is driveRetiredUnparks one class over,
+// and for the same reason: a park is a verdict from a rule that no longer exists.
+//
+// IT RE-PARKS; IT NEVER UN-PARKS, and that is what makes it safe enough to run
+// unattended. driveRetiredUnparks releases outright and therefore needs a 48h
+// window to avoid resurrecting dead work with a live pod. This one only
+// RECLASSIFIES: the Task stays parked, and the lane's own machinery then applies
+// every guard it has - a backoff before the first look, a LIVE confirmation that
+// the blocker is gone before any release, capacity, and a loud escalation after
+// MaxUnparkRetries. The worst case for an ancient wedge is therefore a comment on
+// its issue and a park a human can answer, never a pod spawned against a blocker
+// that is still standing. The bound is ParkRetention: past it the reaper is about
+// to collect the Task anyway, and waking it to escalate would be noise.
+//
+// ONCE PER TASK, LATCHED ON METADATA, STAMPED FIRST. Same ordering argument as
+// AnnRetiredParkMigrated: a crash between the two leaves a Task un-migrated and
+// inert (visible, fixable), where the other order leaves one migrating on every
+// pass forever.
+func (r *ProjectReconciler) driveRetryLaneMigration(ctx context.Context, proj *tatarav1alpha1.Project,
+	now time.Time) error {
+
+	var tl tatarav1alpha1.TaskList
+	if err := r.List(ctx, &tl, client.InNamespace(proj.Namespace)); err != nil {
+		return fmt.Errorf("unpark: list tasks for the retry-lane migration: %w", err)
+	}
+	l := log.FromContext(ctx)
+	var firstErr error
+	for i := range tl.Items {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		t := &tl.Items[i]
+		if t.Spec.ProjectRef != proj.Name || !tatarav1alpha1.Parked(t) {
+			continue
+		}
+		reason := t.Status.ParkReason
+		to, ok := retryLaneMigrations[reason]
+		if !ok {
+			continue
+		}
+		if _, done := t.Annotations[tatarav1alpha1.AnnRetryLaneMigrated]; done {
+			continue
+		}
+		if age := now.Sub(parkedAt(t)); age > tatarav1alpha1.ParkRetention {
+			l.Info("retry-lane migration skipped: the park is older than ParkRetention and is being collected",
+				"action", "retry_lane_migration_skipped", "resource_id", t.Name,
+				"reason", reason, "parked_hours", int(age.Hours()))
+			continue
+		}
+		if err := r.stampRetryLaneMigrated(ctx, t, now); err != nil {
+			l.Error(err, "unpark: stamp the retry-lane migration latch",
+				"action", "retry_lane_migration_error", "resource_id", t.Name, "reason", reason)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if err := r.applyRetryLaneMigration(ctx, t, to, now); err != nil {
+			l.Error(err, "unpark: migrate a park into the retry lane",
+				"action", "retry_lane_migration_error", "resource_id", t.Name, "reason", reason)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		l.Info("migrated a park written before the retry lane existed: its blocker now gets a bounded, loud retry",
+			"action", "retry_lane_migrated", "resource_id", t.Name,
+			"reason", reason, "to", to, "state", t.Status.State, "project", proj.Name)
+	}
+	return firstErr
+}
+
+// stampRetryLaneMigrated writes the once-only latch, as a METADATA patch for the
+// reason stampRetiredParkMigrated gives.
+func (r *ProjectReconciler) stampRetryLaneMigrated(ctx context.Context, t *tatarav1alpha1.Task, now time.Time) error {
+	patch := client.MergeFrom(t.DeepCopy())
+	if t.Annotations == nil {
+		t.Annotations = map[string]string{}
+	}
+	t.Annotations[tatarav1alpha1.AnnRetryLaneMigrated] = now.UTC().Format(time.RFC3339)
+	if err := r.Patch(ctx, t, patch); err != nil {
+		return fmt.Errorf("unpark: stamp %s on %s: %w", tatarav1alpha1.AnnRetryLaneMigrated, t.Name, err)
+	}
+	return nil
+}
+
+// applyRetryLaneMigration persists the re-park under optimistic concurrency,
+// re-reading through the UNCACHED APIReader and re-checking the park under the
+// retry, exactly as the other appliers here do. parkedAt is deliberately
+// re-stamped by Repark: the lane's backoff and ParkRetention both measure from
+// it, and a Task that has just been handed a fresh five-lap budget has not been
+// "parked since last week" for either purpose.
+func (r *ProjectReconciler) applyRetryLaneMigration(ctx context.Context, t *tatarav1alpha1.Task,
+	to string, now time.Time) error {
+
+	getter := client.Reader(r.APIReader)
+	if getter == nil {
+		getter = r.Client
+	}
+	key := client.ObjectKeyFromObject(t)
+	want := t.Status.ParkReason
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := getter.Get(ctx, key, fresh); err != nil {
+			return err
+		}
+		if !tatarav1alpha1.Parked(fresh) || fresh.Status.ParkReason != want {
+			return nil // raced past this park; the latch is stamped, so never retried
+		}
+		if err := stage.Repark(fresh, to, now); err != nil {
+			return fmt.Errorf("unpark: migrate %s into the retry lane: %w", key.Name, err)
 		}
 		if err := r.Status().Update(ctx, fresh); err != nil {
 			return err
@@ -778,33 +923,97 @@ func NeedsLiveRoom(parkReason string) bool {
 // It returns handled=true when the pass is over for this Task - which is the
 // common case, because a retry park spends most of its life waiting.
 //
-// THE ORDER IS THE WHOLE DESIGN. Exhaustion is checked only where the next lap
-// would be CHARGED (an unarmed park), so the final backoff is actually served
-// rather than truncated the instant the counter reaches the cap; capacity is
-// checked before the charge, so a project at its own live-pod ceiling costs the
-// blocker no laps; and neither the wait nor the release mutates anything, so
-// this cannot become the level-triggered-sweep hazard the conflict sweep hit -
-// a counter-mutating function applied every pass to a state its remedy does not
-// clear.
+// THE ORDER IS THE WHOLE DESIGN.
+//
+//   - a lap is CHARGED only where the release will not happen, so the final
+//     backoff is actually served rather than truncated the instant the counter
+//     reaches the cap;
+//   - capacity is checked before the charge, so a project at its own live-pod
+//     ceiling costs the blocker no laps - but exhaustion is re-evaluated on the
+//     ARMED path too, because a spent lane whose release is refused on capacity
+//     would otherwise sit armed and due forever, escalating nothing and ageing
+//     nothing;
+//   - and the release itself is GATED ON THE BLOCKER, which is what makes the
+//     cost model below true.
+//
+// THE COST MODEL, AND WHY THE GATE IS NOT OPTIONAL. MaxUnparkRetries is five
+// rather than the re-entry trio's three because "a retry spends no pod on the
+// laps that find the blocker still standing". That holds by construction only
+// where the re-park happens inside reconcileClocks, i.e. the awaiting-review
+// red-CI gate. It does NOT hold for merge-conflict-retry: the conflict sweep
+// parks at awaiting-review and ParkTask kills the live review pod, an un-park
+// leaves the state at awaiting-review, NO gate in reconcileClocks covers
+// mergeability, so reconcilePodStage mints a NEW review pod and the sweep -
+// paced at defaultConflictSweepInterval - kills it again up to five minutes
+// later. Five laps would be five pods spawned and destroyed mid-turn, five
+// admission slots, and 31 minutes of nominal backoff stretched into wall-clock
+// hours by a sweep the lane has to wait on. ci-failed at under-implementation
+// is the same shape with a full implement turn per lap.
+//
+// So the lane confirms the blocker itself before releasing (retryBlockerStanding
+// - a live forge read, at most one per Task per lap, and only when the backoff
+// is actually due). A blocker still standing costs the next lap and no pod at
+// all; the release happens on the pass that finds it gone, which is the only
+// pass a pod was ever wanted on. THE DRIVER CAN DO THIS AND internal/stage
+// CANNOT: the rule lives here precisely because it needs the forge.
 func (r *ProjectReconciler) driveRetryLane(ctx context.Context, proj *tatarav1alpha1.Project,
 	t *tatarav1alpha1.Task, liveRoom bool, now time.Time) (handled bool, err error) {
 
-	if t.Status.RetryNextAt != nil {
+	l := log.FromContext(ctx)
+	reason := t.Status.ParkReason
+	armed := t.Status.RetryNextAt != nil
+	if armed {
 		if !stage.RetryDue(t, now) {
 			// STILL WAITING, and this is the steady state of the whole lane: it
 			// is answered for every waiting park on every 30s pass. Handled here
 			// rather than by falling through to ApplyUnpark so that a Task
-			// serving a 30-minute backoff costs zero API reads and zero decline
-			// counts for the sixty passes it sleeps through. stage.Unpark
-			// answers the same DeclineRetryNotDue for the two ApplyUnpark
-			// callers this driver is not (the webhook and the redeliverer),
-			// which is where the rule has to live to be binding.
+			// serving a 30-minute backoff costs zero API reads for the sixty
+			// passes it sleeps through. stage.Unpark answers the same
+			// DeclineRetryNotDue for the two ApplyUnpark callers this driver is
+			// not (the webhook and the redeliverer), which is where the rule has
+			// to live to be binding. The counter is moved HERE rather than left
+			// to driveUnparks' shared decline arm, which this early return never
+			// reaches: without it operator_unpark_declined_total{decline=
+			// "retry-not-due"} would stay flat for every park this driver owns,
+			// which is every waiting retry park in the platform.
+			if r.Metrics != nil {
+				r.Metrics.UnparkDeclined(reason, string(DeclineRetryNotDue))
+			}
 			return true, nil
 		}
-		return false, nil // due: the caller's ApplyUnpark releases it
+		if NeedsLiveRoom(reason) && !liveRoom {
+			// CAPACITY, on the armed path, and asked BEFORE the forge read: no
+			// release can happen this pass either way, so the read would be paid
+			// for nothing and would repeat every 30s for as long as the project
+			// stayed at its ceiling. The lap stays unspent (the ceiling is the
+			// operator's constraint, not the blocker's) - but a lane already AT
+			// the cap must not sit here armed and due forever, escalating nothing
+			// and ageing nothing while operator_task_retry_exhausted_total stays
+			// flat.
+			if t.Status.RetryAttempts >= tatarav1alpha1.MaxUnparkRetries {
+				return true, r.escalateExhaustedRetry(ctx, proj, t, now)
+			}
+			return true, nil
+		}
+		standing, berr := r.retryBlockerStanding(ctx, proj, t)
+		if berr != nil {
+			// NEITHER open NOR closed: nothing is charged, nothing is released,
+			// and the park is still due, so the next 30s pass re-reads. Failing
+			// open here would spend the pod this gate exists to save; failing
+			// closed would charge a lap for the operator's own read failure and
+			// escalate a blocker nobody has actually observed.
+			return true, berr
+		}
+		if !standing {
+			return false, nil // the blocker is gone: the caller's ApplyUnpark releases it
+		}
+		l.Info("retry lane: the blocker is still standing at the scheduled retry; charging the next lap instead of a pod",
+			"action", "retry_blocker_standing", "resource_id", t.Name, "reason", reason,
+			"state", t.Status.State, "attempts_spent", t.Status.RetryAttempts,
+			"max_attempts", tatarav1alpha1.MaxUnparkRetries)
 	}
-	l := log.FromContext(ctx)
-	reason := t.Status.ParkReason
+	// UNARMED, or armed-due-and-still-blocked: either way the next lap is what
+	// happens now, so this is where exhaustion and capacity are asked.
 	if t.Status.RetryAttempts >= tatarav1alpha1.MaxUnparkRetries {
 		return true, r.escalateExhaustedRetry(ctx, proj, t, now)
 	}
@@ -815,8 +1024,18 @@ func (r *ProjectReconciler) driveRetryLane(ctx context.Context, proj *tatarav1al
 		// condition for the un-park that DID get to ask.
 		return true, nil
 	}
-	if err := r.armRetryPark(ctx, t, now); err != nil {
+	armedNow, err := r.armRetryPark(ctx, t, now)
+	if err != nil {
 		return true, err
+	}
+	if !armedNow {
+		// RACED, and this is the branch that used to panic. armRetryPark leaves
+		// t untouched on the race path, so t.Status.RetryNextAt is still whatever
+		// this pass read - nil on the unarmed path - and the log line below
+		// dereferenced it. Beyond the crash it also counted a scheduled lap and
+		// logged an arming that never happened. Another writer owns this Task
+		// now; the next pass re-reads it.
+		return true, nil
 	}
 	l.Info("retry lane armed: the blocker is a machine's to clear, so the release is a timer",
 		"action", "retry_scheduled", "resource_id", t.Name, "reason", reason,
@@ -827,24 +1046,105 @@ func (r *ProjectReconciler) driveRetryLane(ctx context.Context, proj *tatarav1al
 	return true, nil
 }
 
+// retryBlockerStanding asks the FORGE whether the blocker this park names is
+// still there. It is the release gate: true means the lane spends a lap instead
+// of a pod.
+//
+// LIVE, NOT THE MIRROR, and that is not a preference. MergeRequest.status
+// .mergeable and .ciStatus are refreshed for a PARKED Task on MirrorCadenceParked
+// (24h, see conflictSweepCandidate's own note), so a mirror-based gate would
+// answer with yesterday's forge for the entire 31-minute budget and then escalate
+// on it. The cost is bounded by the backoff itself: at most one read per Task per
+// lap, five per lane, and none at all on the sixty passes a Task spends waiting.
+//
+// A REASON WITH NO PROBE IS NOT STANDING. ci-pending and mr-surface-spent have no
+// park writer (see their doc in internal/stage), so there is nothing to confirm
+// and the lane behaves exactly as it did before this gate: due means released. An
+// unwired SCMFor answers the same way, matching ciRedAtReviewedHead's rule that
+// the gate is a refinement of the release, never a precondition for it.
+func (r *ProjectReconciler) retryBlockerStanding(ctx context.Context, proj *tatarav1alpha1.Project,
+	t *tatarav1alpha1.Task) (bool, error) {
+
+	reason := t.Status.ParkReason
+	if reason != stage.ReasonCIFailed && reason != stage.ReasonMergeConflictRetry {
+		return false, nil
+	}
+	if r.SCMFor == nil {
+		return false, nil
+	}
+	mrs, err := ownedMergeRequests(ctx, r.Client, t)
+	if err != nil {
+		return false, err
+	}
+	if len(mrs) == 0 {
+		return false, nil
+	}
+	if reason == stage.ReasonCIFailed {
+		red, cerr := ciRedAtReviewedHead(ctx, r.Client, r.SCMFor, r.Metrics, proj, mrs)
+		if cerr != nil {
+			return false, fmt.Errorf("unpark: confirm the retry lane's ci blocker on %s: %w", t.Name, cerr)
+		}
+		return red != nil, nil
+	}
+	writer, token, provider, ferr := r.conflictSweepForge(ctx, proj)
+	if ferr != nil {
+		return false, fmt.Errorf("unpark: confirm the retry lane's conflict blocker on %s: %w", t.Name, ferr)
+	}
+	for i := range mrs {
+		mr := &mrs[i]
+		if mr.Status.State != "" && mr.Status.State != "open" {
+			continue
+		}
+		var repo tatarav1alpha1.Repository
+		key := types.NamespacedName{Namespace: mr.Namespace, Name: mr.Spec.RepositoryRef}
+		if err := r.Get(ctx, key, &repo); err != nil {
+			return false, fmt.Errorf("unpark: get repository %s: %w", mr.Spec.RepositoryRef, err)
+		}
+		ms, merr := writer.GetMergeState(ctx, repo.Spec.URL, token, mr.Spec.Number)
+		RecordSCM(r.Metrics, provider, "get_merge_state", merr)
+		if merr != nil {
+			return false, fmt.Errorf("unpark: merge state %s!%d: %w", mr.Spec.RepositoryRef, mr.Spec.Number, merr)
+		}
+		// DIRTY ONLY, exactly as the conflict sweep and the merge corridor have
+		// it: `blocked` is policy no commit clears, and `behind` is not a
+		// conflict at all.
+		if ms == scm.MergeStateDirty {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // armRetryPark persists stage.ArmRetry under optimistic concurrency, re-reading
 // through the UNCACHED APIReader and re-checking the park under the retry,
 // exactly as applyRetiredUnpark and applyCIRecoveryUnpark do and for the same
 // reason: a Task another writer moved in the meantime must be left alone rather
 // than charged a lap for a park that is over.
-func (r *ProjectReconciler) armRetryPark(ctx context.Context, t *tatarav1alpha1.Task, now time.Time) error {
+//
+// armed=false is that race, and it is a SENTINEL the caller must honour rather
+// than an error: nothing was written, so there is nothing to log, nothing to
+// count and - the part that used to crash the leader's whole driveUnparks loop -
+// no schedule on t to read back.
+func (r *ProjectReconciler) armRetryPark(ctx context.Context, t *tatarav1alpha1.Task,
+	now time.Time) (armed bool, err error) {
+
 	getter := client.Reader(r.APIReader)
 	if getter == nil {
 		getter = r.Client
 	}
 	key := client.ObjectKeyFromObject(t)
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		armed = false
 		fresh := &tatarav1alpha1.Task{}
 		if err := getter.Get(ctx, key, fresh); err != nil {
 			return err
 		}
-		if fresh.Status.ParkReason != t.Status.ParkReason || fresh.Status.RetryNextAt != nil {
-			return nil // raced: another pass armed it, or the park is gone
+		// The schedule is compared, not merely tested for nil: this arm now also
+		// re-arms an ALREADY-armed park whose blocker is still standing, so
+		// "unchanged since this pass read it" is the only race test that covers
+		// both entries.
+		if fresh.Status.ParkReason != t.Status.ParkReason || !sameRetrySchedule(fresh, t) {
+			return nil // raced: another writer armed, released or re-parked it
 		}
 		if err := stage.ArmRetry(fresh, now); err != nil {
 			return fmt.Errorf("unpark: arm the retry lane on %s: %w", key.Name, err)
@@ -853,8 +1153,23 @@ func (r *ProjectReconciler) armRetryPark(ctx context.Context, t *tatarav1alpha1.
 			return err
 		}
 		*t = *fresh
+		armed = true
 		return nil
 	})
+	if err != nil {
+		return false, err
+	}
+	return armed, nil
+}
+
+// sameRetrySchedule reports whether two copies of a Task carry the same
+// status.retryNextAt, nil included.
+func sameRetrySchedule(a, b *tatarav1alpha1.Task) bool {
+	x, y := a.Status.RetryNextAt, b.Status.RetryNextAt
+	if x == nil || y == nil {
+		return x == nil && y == nil
+	}
+	return x.Time.Equal(y.Time)
 }
 
 // driveUnparks applies stage.Unpark to every parked Task in proj whose park

@@ -367,6 +367,10 @@ func TestUnparkRetryBackoffIsExponentialAndCapped(t *testing.T) {
 
 			tk := task(v1alpha1.StateAwaitingReview)
 			require.NoError(t, stage.Park(tk, stage.ReasonCIFailed, now))
+			// The laps have to be charged against THIS blocker, which is what
+			// ArmRetry recorded on the lap that spent them: a counter with no
+			// blocker attached is one this park has not spent anything on yet.
+			tk.Status.RetryBlocker = stage.ReasonCIFailed
 			tk.Status.RetryAttempts = tc.attempts
 			require.NoError(t, stage.ArmRetry(tk, now))
 			require.NotNil(t, tk.Status.RetryNextAt)
@@ -476,4 +480,72 @@ func TestExhaustRetryReparksToRetryExhausted(t *testing.T) {
 
 	_, err = stage.ExhaustRetry(tk, now)
 	require.Error(t, err, "retry-exhausted is not itself in the lane")
+}
+
+// TestTheRetryBudgetIsScopedToOneBlocker is finding 4's pure half. The field
+// doc says "the laps this Task has spent on its CURRENT blocker", and without
+// status.retryBlocker the counter was per-TASK: a Task that cleared ci-failed
+// and later hit merge-conflict-retry inherited the first blocker's spend and
+// escalated early, with a comment naming laps that were never spent on the
+// blocker it names.
+func TestTheRetryBudgetIsScopedToOneBlocker(t *testing.T) {
+	t.Run("the SAME blocker keeps its spend across the park round trip", func(t *testing.T) {
+		tk := task(v1alpha1.StateAwaitingReview)
+		require.NoError(t, stage.Park(tk, stage.ReasonCIFailed, now))
+		require.NoError(t, stage.ArmRetry(tk, now.Add(-time.Hour)))
+		require.Equal(t, stage.DeclineNone,
+			stage.Unpark(stage.UnparkInput{Task: tk, BotLogin: "bot", LiveHasRoom: true, Now: now}))
+
+		require.NoError(t, stage.Park(tk, stage.ReasonCIFailed, now))
+		require.NoError(t, stage.ArmRetry(tk, now))
+		require.Equal(t, 2, tk.Status.RetryAttempts, "the same blocker's laps accumulate")
+		require.Equal(t, now.Add(2*time.Minute), tk.Status.RetryNextAt.Time,
+			"and the backoff grows with them")
+	})
+
+	t.Run("a DIFFERENT blocker starts from a full budget", func(t *testing.T) {
+		tk := task(v1alpha1.StateAwaitingReview)
+		require.NoError(t, stage.Park(tk, stage.ReasonCIFailed, now))
+		for i := 0; i < 4; i++ {
+			require.NoError(t, stage.ArmRetry(tk, now.Add(-time.Hour)))
+		}
+		require.Equal(t, 4, tk.Status.RetryAttempts)
+		require.Equal(t, stage.DeclineNone,
+			stage.Unpark(stage.UnparkInput{Task: tk, BotLogin: "bot", LiveHasRoom: true, Now: now}))
+
+		require.NoError(t, stage.Park(tk, stage.ReasonMergeConflictRetry, now))
+		require.NoError(t, stage.ArmRetry(tk, now))
+		require.Equal(t, 1, tk.Status.RetryAttempts,
+			"a conflict must not inherit the red pipeline's spend")
+		require.Equal(t, stage.ReasonMergeConflictRetry, tk.Status.RetryBlocker)
+		require.Equal(t, now.Add(time.Minute), tk.Status.RetryNextAt.Time)
+	})
+}
+
+// ResetRetryBudget is the merge corridor's door onto the same protection: a
+// cursor advance ends a blocker without any state transition at all.
+func TestResetRetryBudgetLaundersAllThreeFields(t *testing.T) {
+	tk := task(v1alpha1.StateMerged)
+	require.NoError(t, stage.Park(tk, stage.ReasonCIFailed, now))
+	require.NoError(t, stage.ArmRetry(tk, now))
+
+	stage.ResetRetryBudget(tk)
+	require.Zero(t, tk.Status.RetryAttempts)
+	require.Empty(t, tk.Status.RetryBlocker)
+	require.Nil(t, tk.Status.RetryNextAt)
+}
+
+// Repark is the migration's door. It refuses the two things the unexported form
+// never had to: an un-parked Task, and a reason that is not a park reason.
+func TestReparkMovesAParkWithoutEverUnparkingIt(t *testing.T) {
+	tk := task(v1alpha1.StateMerged)
+	require.NoError(t, stage.Park(tk, stage.ReasonCIRed, now))
+
+	require.NoError(t, stage.Repark(tk, stage.ReasonCIFailed, now))
+	require.Equal(t, stage.ReasonCIFailed, tk.Status.ParkReason)
+	require.Equal(t, v1alpha1.StateMerged, tk.Status.State)
+	require.NotNil(t, tk.Status.ParkedAt)
+
+	require.Error(t, stage.Repark(tk, "not-a-park-reason", now))
+	require.Error(t, stage.Repark(task(v1alpha1.StateMerged), stage.ReasonCIFailed, now))
 }

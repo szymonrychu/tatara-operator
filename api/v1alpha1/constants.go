@@ -189,6 +189,15 @@ const (
 	// 1+2+4+8+16 = 31 minutes; a technical blocker still standing after half an
 	// hour is not transient and belongs in front of a human.
 	//
+	// THAT COST MODEL IS ENFORCED, NOT ASSUMED. It holds by construction only
+	// where the re-park happens inside reconcileClocks; for merge-conflict-retry
+	// nothing between the release and the (5-minutely) conflict sweep covers
+	// mergeability, so an unconditional release would mint and destroy a review
+	// pod per lap and stretch the 31 minutes into hours. controller
+	// .retryBlockerStanding is what makes the sentence above true: the lane
+	// confirms the blocker LIVE before releasing, and a blocker still standing
+	// costs the next lap and nothing else.
+	//
 	// It is counted PER TASK on status.retryAttempts, not per issue: unlike
 	// MaxAutoReentries the lane never deletes and re-mints the Task, so the
 	// counter's object outlives every lap by construction.
