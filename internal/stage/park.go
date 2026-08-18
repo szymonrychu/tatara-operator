@@ -91,7 +91,10 @@ var unparkClasses = map[string]UnparkClass{
 	ReasonIdentityUnverified: UnparkHuman,
 	ReasonHandoffStalled:     UnparkHuman,
 
-	// A bounded retry.
+	// A bounded retry. no-outcome has a SECOND owner and needs it: its arm
+	// declines merged-mr, so on a Task the UnparkRetry lane released - which has
+	// a merged merge request by construction - the timer never fires at all. See
+	// LaneStranded.
 	ReasonMergeTimeout:  UnparkTimer,
 	ReasonDeployTimeout: UnparkTimer,
 	ReasonNoOutcome:     UnparkTimer,
@@ -427,6 +430,66 @@ func ExhaustRetry(t *v1alpha1.Task, now time.Time) (from string, err error) {
 	return from, nil
 }
 
+// LaneStranded reports whether t is a Task the retry lane RELEASED and that has
+// since been re-parked under a reason the lane no longer recognises, where
+// NOBODY owns it.
+//
+// THE SHAPE. The lane releases a park (reArm, which clears the flag and leaves
+// the state where it is), the reconciler mints the pod that release was for, the
+// agent writes a handoff note and stops, and at AgentStopReArmCap
+// reconcilePodStage parks no-outcome and spawns nothing. That park is then
+// owned by nobody: no-outcome is UnparkTimer whose own arm declines merged-mr -
+// and every Task in the lane has a merged merge request BY CONSTRUCTION, since
+// ci-failed and merge-conflict-retry are written only on the anyMerged arms of
+// CIRed and MergeConflict - driveStrandedParks refuses any class that is not
+// UnparkNever/UnparkRetired, and the retry driver no longer matches the reason.
+// The Task ages out silently at ParkRetention, which is the helmfile#27/#32,
+// ansible!17/!18, terraform!221 failure this lane exists to remove.
+//
+// THE FINGERPRINT IS retryBlocker + retryAttempts, and it is exact rather than
+// approximate. Both are written only by ArmRetry, cleared only by
+// ResetRetryBudget - stampEnter on a genuine transition, the UnparkHuman
+// release, the merge cursor advancing - and deliberately PRESERVED by clearPark
+// across the release the lane earns. So a non-zero pair on a park written
+// afterwards means: this Task spent those laps on that blocker, in the state it
+// is still in, and the lane put it back here. no-outcome is written by several
+// unrelated paths (reconcileCaps, a pre-implement state that never terminated)
+// and none of them carries the pair, which is what keeps this from escalating
+// parks that were never the lane's.
+//
+// IT DOES NOT ASK WHETHER THE PARK IS ACTUALLY UNRELEASABLE, because that needs
+// the owned merge requests and this package must not grow a second copy of
+// Unpark's own anyMerged rule: two copies of a filter that disagree do not
+// error, they silently stop matching. The caller (controller.driveUnparks) keys
+// the escalation on the decline stage.Unpark ITSELF just returned.
+func LaneStranded(t *v1alpha1.Task) bool {
+	if t.Status.ParkReason != ReasonNoOutcome || t.Status.RetryAttempts <= 0 {
+		return false
+	}
+	class, ok := UnparkClassFor(t.Status.RetryBlocker)
+	return ok && class == UnparkRetry
+}
+
+// StrandRetryLane is ExhaustRetry's twin for the lane's OTHER end: not a budget
+// spent against a standing blocker, but a lane the agent-stop re-arm cap took
+// over. It re-parks as retry-exhausted (UnparkHuman, so a comment resumes it)
+// WITHOUT ever leaving the Task un-parked, and returns the BLOCKER - not the
+// no-outcome park it replaces - because that is what the escalation has to name:
+// "no-outcome" tells a human nothing, "the pipeline that was still red" does.
+//
+// RetryAttempts is left where it is, exactly as ExhaustRetry leaves it at the
+// cap: it is the record the comment is written from, and the UnparkHuman release
+// is what refunds it.
+func StrandRetryLane(t *v1alpha1.Task, now time.Time) (blocker string, err error) {
+	if !LaneStranded(t) {
+		return "", fmt.Errorf("stage: park %q with %d laps on blocker %q is not a stranded retry lane",
+			t.Status.ParkReason, t.Status.RetryAttempts, t.Status.RetryBlocker)
+	}
+	blocker = t.Status.RetryBlocker
+	repark(t, ReasonRetryExhausted, now)
+	return blocker, nil
+}
+
 // Repark is repark for the ONE caller outside this package that needs it:
 // controller.driveRetryLaneMigration, which moves a ci-red / merge-conflict park
 // written before the retry lane existed onto its lane name. It is exported
@@ -684,7 +747,7 @@ var mrTerminalReasons = map[string]bool{
 // IT IS NARROW ON EVERY AXIS, and each guard is load-bearing:
 //
 //   - `to` must be a TERMINAL OUTCOME. This is the difference between ending a
-//     Task and RESTARTING one. ownMRsShippedEdge targets `merged`, which still
+//     Task and RESTARTING one. OwnMRsShippedEdge targets `merged`, which still
 //     owes the merge cursor, the deploy ledger and the issue closes - resuming a
 //     parked Task into that pipeline is real work restarted behind the back of
 //     the human the park was waiting for, which is precisely what a park exists

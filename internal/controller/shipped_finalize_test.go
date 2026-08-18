@@ -14,7 +14,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
-// ISSUE #578. ownMRsShippedEdge is the NON-review sibling of terminalMREdge, for
+// ISSUE #578. OwnMRsShippedEdge is the NON-review sibling of terminalMREdge, for
 // the shape that burned mt-i-mtg-decks-22: a kind=issue Task at awaiting-review
 // whose own MR was merged out of band. terminalMREdge is kind-locked to review,
 // so before this there was NO finalize for that Task at all - and no outcome
@@ -93,7 +93,7 @@ func TestOwnMRsShippedEdge(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			task := mdTask("t1", tc.kind, tatarav1alpha1.StateAwaitingReview)
-			edge, ok := ownMRsShippedEdge(task, tc.mrs)
+			edge, ok := OwnMRsShippedEdge(task, tc.mrs)
 			if ok != tc.wantOK {
 				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
 			}

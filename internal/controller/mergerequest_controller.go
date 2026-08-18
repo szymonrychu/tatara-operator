@@ -119,7 +119,7 @@ func (r *MergeRequestReconciler) doReconcile(ctx context.Context, req ctrl.Reque
 	// reach the gone branch below and rewrite a MERGE that already happened.
 	// mr.Status.State is not mirror-local: "merged" -> "closed" leaves
 	// stage.AllMRsTerminal true while AllMRsMerged goes false, which is exactly
-	// what terminalMREdge/ownMRsShippedEdge finalize the owner Task
+	// what terminalMREdge/OwnMRsShippedEdge finalize the owner Task
 	// rejected(mr-closed-externally) on, with a public terminal comment on the
 	// driving issue. syncMergeRequestThread itself stays unguarded: it is shared
 	// with SyncMergeRequestOnDemand, the deliberate off-cadence path.
@@ -311,7 +311,7 @@ func ciOwnerRepo(repoURL, provider string) (string, string, error) {
 //
 // "closed" is a strictly weaker claim than "merged" and rewriting one into the
 // other is not a mirror-local edit: stage.AllMRsTerminal stays true while
-// AllMRsMerged goes false, so terminalMREdge/ownMRsShippedEdge finalize the
+// AllMRsMerged goes false, so terminalMREdge/OwnMRsShippedEdge finalize the
 // owner Task rejected(mr-closed-externally) - and WithTerminalIssueRelease posts
 // that verdict publicly on the driving issue - instead of done. A 404 proves the
 // forge will not answer for this number; it does not disprove a merge the

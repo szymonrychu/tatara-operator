@@ -131,6 +131,53 @@ const (
 	// literal assertion in project_types_test.go (TestOperatorConstants),
 	// which asserts this equals 5 minutes.
 	PodReadyTimeout = 5 * time.Minute
+	// AgentStopReArmCap bounds the AGENT-REQUESTED-STOP re-arm cycle: the
+	// number of consecutive agent-requested stops one state occupancy may
+	// re-arm a replacement pod for. Past it the Task parks no-outcome and
+	// spawns NOTHING.
+	//
+	// It is the bound the comment on PodReadyTimeout above claimed already
+	// existed and did not. That comment says a pod loop is "bounded only by
+	// ResidencyCapAll and made visible by the
+	// operator_pod_recreations_total{reason=BootTimeout} churn alert"; BOTH
+	// halves failed for this shape. ResidencyCapAll is 24h measured from
+	// stateEnteredAt, which the loop does not reset - ~900 more pods for
+	// upgrade-qe-e4016501fd9107d9 - and it additionally requires
+	// stateWorkStartedAt != nil, which the agent-requested stop NILS on every
+	// lap, so the dead-man switch was armed for roughly 55 seconds of each
+	// 80-second cycle. The churn metric never saw it at all: a stop-and-respawn
+	// through normal admission recorded no recreation, so
+	// operator_pod_recreations_total had ZERO series for the whole incident.
+	//
+	// WHY THREE, AND NOT ONE. The FIRST re-arm is the legitimate continuation
+	// handoff - an agent that ran out of context mid-implementation writes its
+	// note and the next pod carries on - and the operator cannot tell that apart
+	// from "I have nothing to do" without a wire-contract field the wrapper does
+	// not send. Three leaves a long job room and still turns 127 pods into 3.
+	// It is a CONSTANT for the same reason ResidencyCapAll is: a CRD field can
+	// be silently pruned, and the failure mode of a pruned bound is no bound.
+	//
+	// THREE IS PER STATE OCCUPANCY, NOT PER TASK, and the difference is 18. The
+	// counter is zeroed by stage.stampEnter (a genuine transition) and by
+	// stage.reArm (every un-park), so each un-park refunds the whole budget. The
+	// composition that matters is the UnparkRetry lane: it exists to RE-DRIVE the
+	// same state, so one technical blocker can hand a Task up to
+	// (1 + MaxUnparkRetries) x AgentStopReArmCap = 18 stop-and-respawn pods -
+	// the park's own occupancy plus one per lap the lane releases.
+	//
+	// THAT IS ACCEPTED, DELIBERATELY, and the refund is not the bug it looks
+	// like. Withholding it is what would break: a Task released into a state
+	// already at the cap re-parks on the very next reconcile pass without ever
+	// minting the pod the release was for, spending every lane lap in
+	// milliseconds - the #513 shape, and with the lane's escalation attached it
+	// would hand every technical blocker straight to a human. What separates 18
+	// from the 127 of the incident is that each lap is gated by a LIVE forge read
+	// (the lane releases only where the blocker has actually cleared, so each
+	// occupancy is a different world), paced by the backoff at 1+2+4+8+16 = 31
+	// minutes of wall clock, and still bounded absolutely by ResidencyCapAll,
+	// whose carry survives the park/un-park round trip. The 127-pod loop had none
+	// of the three.
+	AgentStopReArmCap = 3
 	// MaxMergeReentries bounds the merging<->reviewing re-entry cycle (fix H7).
 	MaxMergeReentries = 3
 	// MaxDeployReentries bounds the deploying re-entry cycle (fix H7).

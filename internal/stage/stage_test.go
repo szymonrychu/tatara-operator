@@ -15,7 +15,7 @@ import (
 // The transition table IS the contract.
 // ---------------------------------------------------------------------------
 
-// TWENTY-FIVE edges. A new edge is a design decision, not a diff. The #521 plan
+// TWENTY-SIX edges. A new edge is a design decision, not a diff. The #521 plan
 // specified 21; the 22nd and 23rd are both the nightly DOCUMENTATION BATCH,
 // which the plan did not trace: it is MINTED straight into under-implementation
 // (no driving issue to triage, no approval to gate) and it FINISHES at
@@ -32,12 +32,24 @@ import (
 // pod and then parked awaiting-human, permanently. Takeover now rides
 // `(create) -> under-implementation`, which is where its own re-take un-park
 // already landed.
-func TestTransitionTableHasExactlyTwentyFiveEdges(t *testing.T) {
+//
+// The 26th is `under-implementation -> merged`, and it is the ONLY edge in the
+// table that exists because the world moved rather than because the platform
+// did: every merge request the Task owns has ALREADY merged on the forge, so
+// there is nothing left to open, review or merge. LegalFor GUARD 7 makes
+// AllMRsMerged the edge's own precondition, which is what keeps it from being a
+// door past review out of the state where code is written. It is the same fact
+// OwnMRsShippedEdge already finalizes from awaiting-review, recognised one state
+// earlier - and without it a Task whose work shipped out of band had NO reachable
+// terminal from under-implementation at all: submit_outcome no-opped, the agent
+// wrote a handoff note, the pod came down and the dispatcher minted another, 127
+// times (upgrade-qe-e4016501fd9107d9).
+func TestTransitionTableHasExactlyTwentySixEdges(t *testing.T) {
 	n := 0
 	for _, edges := range stage.Transitions {
 		n += len(edges)
 	}
-	require.Equal(t, 25, n,
+	require.Equal(t, 26, n,
 		"the table is the contract; a new edge is a design decision, not a diff")
 }
 
@@ -45,14 +57,15 @@ func TestTransitionTableIsExactlyTheDocumentedShape(t *testing.T) {
 	want := map[string][]string{
 		stage.Create: {v1alpha1.StateNew, v1alpha1.StateUnderImplementation,
 			v1alpha1.StateDone, v1alpha1.StateRejected},
-		v1alpha1.StateNew:                 {v1alpha1.StateRefined, v1alpha1.StateAwaitingReview, v1alpha1.StateRejected},
-		v1alpha1.StateRefined:             {v1alpha1.StateUnderImplementation, v1alpha1.StateDone, v1alpha1.StateRejected},
-		v1alpha1.StateUnderImplementation: {v1alpha1.StateAwaitingReview, v1alpha1.StateRefined, v1alpha1.StateDone, v1alpha1.StateRejected},
-		v1alpha1.StateAwaitingReview:      {v1alpha1.StateUnderImplementation, v1alpha1.StateMerged, v1alpha1.StateDone, v1alpha1.StateRejected},
-		v1alpha1.StateMerged:              {v1alpha1.StateDeployed, v1alpha1.StateAwaitingReview, v1alpha1.StateUnderImplementation, v1alpha1.StateRejected},
-		v1alpha1.StateDeployed:            {v1alpha1.StateDone},
-		v1alpha1.StateDone:                {stage.Reap},
-		v1alpha1.StateRejected:            {stage.Reap},
+		v1alpha1.StateNew:     {v1alpha1.StateRefined, v1alpha1.StateAwaitingReview, v1alpha1.StateRejected},
+		v1alpha1.StateRefined: {v1alpha1.StateUnderImplementation, v1alpha1.StateDone, v1alpha1.StateRejected},
+		v1alpha1.StateUnderImplementation: {v1alpha1.StateAwaitingReview, v1alpha1.StateMerged,
+			v1alpha1.StateRefined, v1alpha1.StateDone, v1alpha1.StateRejected},
+		v1alpha1.StateAwaitingReview: {v1alpha1.StateUnderImplementation, v1alpha1.StateMerged, v1alpha1.StateDone, v1alpha1.StateRejected},
+		v1alpha1.StateMerged:         {v1alpha1.StateDeployed, v1alpha1.StateAwaitingReview, v1alpha1.StateUnderImplementation, v1alpha1.StateRejected},
+		v1alpha1.StateDeployed:       {v1alpha1.StateDone},
+		v1alpha1.StateDone:           {stage.Reap},
+		v1alpha1.StateRejected:       {stage.Reap},
 	}
 	require.Len(t, stage.Transitions, len(want))
 	for from, tos := range want {

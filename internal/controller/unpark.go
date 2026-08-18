@@ -1648,6 +1648,39 @@ func (r *ProjectReconciler) driveUnparks(ctx context.Context, proj *tatarav1alph
 		if unparked {
 			active++ // the re-entered Task is now active; keep the cap honest this pass.
 		}
+		// THE LANE'S LAST EXIT. A Task the retry lane released can be re-parked
+		// no-outcome by the agent-stop re-arm cap, and that park is owned by
+		// NOBODY: this arm's own rule refuses it forever, driveStrandedParks skips
+		// its class, and the reason is no longer one driveRetryLane matches. It
+		// aged out at ParkRetention with the escalation the lane promised never
+		// posted - the exact silence the lane was built to remove.
+		//
+		// KEYED ON THE DECLINE, not on a second copy of the rule that produced it.
+		// merged-mr is stage.Unpark's own answer, just now, on the fresh object:
+		// part of spec.mergeOrder has landed, so no re-implement and no re-entry
+		// can ever happen here, and that is what makes the park terminal rather
+		// than merely waiting. Re-deriving anyMerged here would be a second filter
+		// that does not error when it drifts, it just stops matching (see the
+		// CIDeclineEvidence note in MEMORY.md). Any other decline - no live room,
+		// the wrong parkedFromState, a drift guard - is a park something can still
+		// release, and none of them escalates.
+		//
+		// stage.LaneStranded is the second half and the narrow one: no-outcome is
+		// written by several paths that never went near the lane, and only a Task
+		// carrying laps spent against a lane blocker in this same state occupancy
+		// is one the lane put here. AFTER the decline counter, because the repark
+		// moves status.parkReason and the counter must be labelled with the park
+		// that was actually declined.
+		if decline == DeclineMergedMR && stage.LaneStranded(t) {
+			if eerr := r.escalateExhaustedRetry(ctx, proj, t, now); eerr != nil {
+				log.FromContext(ctx).Error(eerr, "unpark: the stranded retry lane could not be escalated",
+					"action", "lane_stranded_error", "resource_id", t.Name,
+					"blocker", t.Status.RetryBlocker)
+				if firstErr == nil {
+					firstErr = eerr
+				}
+			}
+		}
 	}
 	if readBudget.deferred > 0 {
 		// ONCE per pass, with a count. Per-Task it would be a line every thirty

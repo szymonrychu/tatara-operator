@@ -419,3 +419,175 @@ func TestExhaustionEscalatesOnTheMergeRequestWhenThereIsNoIssue(t *testing.T) {
 		})
 	}
 }
+
+// reStrandedTask is FINDING 1's shape: a Task the retry lane RELEASED (it
+// carries the blocker and the laps it spent on it), whose replacement pods then
+// spent the agent-stop re-arm cap, so reconcilePodStage re-parked it no-outcome
+// from the live state the lane had put it back into.
+//
+// The merged merge request is not decoration either: ci-failed and
+// merge-conflict-retry are written ONLY on the anyMerged arms of stage.CIRed and
+// stage.MergeConflict, so EVERY Task in the lane has one by construction - which
+// is exactly what makes Unpark's no-outcome arm decline merged-mr forever.
+func reStrandedTask(name, blocker string, attempts int) *tatarav1alpha1.Task {
+	t := retryParkedTask(name, tatarav1alpha1.StateAwaitingReview, stage.ReasonNoOutcome)
+	t.Status.RetryBlocker = blocker
+	t.Status.RetryAttempts = attempts
+	t.Status.Stats.AgentStops = tatarav1alpha1.AgentStopReArmCap
+	t.Status.IssueRefs = []string{tatarav1alpha1.IssueName("repo-a", 42)}
+	t.Status.MRRefs = []string{tatarav1alpha1.MergeRequestName("repo-a", 7)}
+	return t
+}
+
+// reMergedMR is mdMR already landed, which is the only state anyMerged reads.
+func reMergedMR(task *tatarav1alpha1.Task, repo string, number int) *tatarav1alpha1.MergeRequest {
+	mr := mdMR(task, repo, number)
+	mr.Status.State = "merged"
+	return mr
+}
+
+// TestALaneReleasedTaskCappedByTheAgentStopsIsNotSilent is FINDING 1. The lane's
+// whole promise is "either it runs, or a human is told out loud", and the
+// agent-stop re-arm cap is a hole in it: it parks no-outcome, whose own un-park
+// arm declines merged-mr forever, whose class driveStrandedParks skips, and
+// whose reason is no longer a retry reason - so nothing owns the Task, no
+// comment reaches the issue, and it ages out at ParkRetention exactly as
+// helmfile#27/#32 and terraform!221 did before the lane existed.
+func TestALaneReleasedTaskCappedByTheAgentStopsIsNotSilent(t *testing.T) {
+	proj := reProject()
+	task := reStrandedTask("t-lane-stranded", stage.ReasonCIFailed, 2)
+	c := newMirrorClient(t, proj, mdSecret(), mdRepo("repo-a"),
+		reMergedMR(task, "repo-a", 7), mdIssue(task, "repo-a", 42), task)
+	w := &mbWriter{}
+	m := obs.NewOperatorMetrics(prometheus.NewRegistry())
+	r := &ProjectReconciler{Client: c, APIReader: c, Scheme: c.Scheme(), Metrics: m,
+		SCMFor: func(string) (scm.SCMWriter, error) { return w, nil }}
+
+	if err := r.driveUnparks(context.Background(), proj, time.Now()); err != nil {
+		t.Fatalf("driveUnparks: %v", err)
+	}
+	got := mdGetTask(t, c, task.Name)
+	if got.Status.ParkReason != stage.ReasonRetryExhausted {
+		t.Fatalf("parkReason = %q, want retry-exhausted: a lane that ends anywhere else ends with nobody owning it",
+			got.Status.ParkReason)
+	}
+	if got.Status.State != tatarav1alpha1.StateAwaitingReview {
+		t.Fatalf("state = %q, want unchanged awaiting-review: a repark never moves the Task", got.Status.State)
+	}
+	if len(w.comments) != 1 {
+		t.Fatalf("Comment calls = %d, want exactly 1: the escalation is the lane's promise", len(w.comments))
+	}
+	if ref := w.comments[0].IssueRef; ref != "szymonrychu/repo-a#42" {
+		t.Fatalf("comment issueRef = %q, want szymonrychu/repo-a#42", ref)
+	}
+	if body := w.comments[0].Body; !strings.Contains(body, stage.ReasonCIFailed) {
+		t.Fatalf("the escalation does not name the blocker the lane was spending laps on:\n%s", body)
+	}
+	if n := testutil.ToFloat64(m.TaskRetryExhaustedCounter(stage.ReasonNoOutcome,
+		tatarav1alpha1.StateAwaitingReview)); n != 1 {
+		t.Fatalf("operator_task_retry_exhausted_total{reason=no-outcome,state=awaiting-review} = %v, want 1", n)
+	}
+
+	// The SECOND pass must add nothing: the repark moved the reason out of
+	// no-outcome, so the arm never looks at this Task again.
+	if err := r.driveUnparks(context.Background(), proj, time.Now()); err != nil {
+		t.Fatalf("driveUnparks (second pass): %v", err)
+	}
+	if len(w.comments) != 1 {
+		t.Fatalf("Comment calls after two passes = %d, want 1", len(w.comments))
+	}
+}
+
+// TestANoOutcomeParkOutsideTheLaneIsLeftExactlyAsItWas is the other half, and it
+// is the one the fix could easily get wrong: no-outcome is written by several
+// unrelated paths (reconcileCaps, a pre-implement state that never terminated)
+// and MOST of them never went near the retry lane. Escalating those would turn a
+// timer park that the world can still release into a human wait.
+func TestANoOutcomeParkOutsideTheLaneIsLeftExactlyAsItWas(t *testing.T) {
+	tests := []struct {
+		name     string
+		blocker  string
+		attempts int
+	}{
+		{"never entered the lane", "", 0},
+		{"a blocker with no laps spent on it is not a lane", stage.ReasonCIFailed, 0},
+		{"a laps count against a reason outside the lane", stage.ReasonAwaitingHuman, 3},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			proj := reProject()
+			task := reStrandedTask("t-plain-no-outcome", tc.blocker, tc.attempts)
+			c := newMirrorClient(t, proj, mdSecret(), mdRepo("repo-a"),
+				reMergedMR(task, "repo-a", 7), mdIssue(task, "repo-a", 42), task)
+			w := &mbWriter{}
+			r := &ProjectReconciler{Client: c, APIReader: c, Scheme: c.Scheme(), Metrics: wfMetrics(),
+				SCMFor: func(string) (scm.SCMWriter, error) { return w, nil }}
+
+			if err := r.driveUnparks(context.Background(), proj, time.Now()); err != nil {
+				t.Fatalf("driveUnparks: %v", err)
+			}
+			if got := mdGetTask(t, c, task.Name); got.Status.ParkReason != stage.ReasonNoOutcome {
+				t.Fatalf("parkReason = %q, want no-outcome: this Task never entered the retry lane",
+					got.Status.ParkReason)
+			}
+			if len(w.comments) != 0 {
+				t.Fatalf("Comment calls = %d, want 0: escalating a park outside the lane is a false alarm",
+					len(w.comments))
+			}
+		})
+	}
+}
+
+// TestAReleasableNoOutcomeParkStillReleases: the escalation must be keyed on the
+// REFUSAL, not on the lane marker alone. A lane-released Task whose merge
+// requests have NOT landed is one the timer arm can still re-drive, and handing
+// it to a human instead would end a recoverable Task early.
+func TestAReleasableNoOutcomeParkStillReleases(t *testing.T) {
+	proj := reProject()
+	task := reStrandedTask("t-lane-releasable", stage.ReasonCIFailed, 2)
+	c := newMirrorClient(t, proj, mdSecret(), mdRepo("repo-a"),
+		mdMR(task, "repo-a", 7), mdIssue(task, "repo-a", 42), task)
+	w := &mbWriter{}
+	r := &ProjectReconciler{Client: c, APIReader: c, Scheme: c.Scheme(), Metrics: wfMetrics(),
+		SCMFor: func(string) (scm.SCMWriter, error) { return w, nil }}
+
+	if err := r.driveUnparks(context.Background(), proj, time.Now()); err != nil {
+		t.Fatalf("driveUnparks: %v", err)
+	}
+	got := mdGetTask(t, c, task.Name)
+	if tatarav1alpha1.Parked(got) {
+		t.Fatalf("parkReason = %q, want released: nothing had merged, so the timer arm owns this park",
+			got.Status.ParkReason)
+	}
+	if len(w.comments) != 0 {
+		t.Fatalf("Comment calls = %d, want 0: a Task that just resumed has nothing to escalate", len(w.comments))
+	}
+}
+
+// TestTheStrandedLaneCommentIsHonestAboutWhatStopped: the agent-stop cap is not
+// the only writer of a no-outcome park on a lane-released Task - reconcileCaps
+// writes the same reason for a pod that became Ready and then ended without an
+// outcome, where stats.agentStops is 0. A body that says "the agent asked to
+// stop 0 times" is the sentence that makes a human distrust the rest of it.
+func TestTheStrandedLaneCommentIsHonestAboutWhatStopped(t *testing.T) {
+	parked := time.Now().Add(-2 * time.Hour)
+	capped := strandedLaneComment(stage.ReasonCIFailed, 2, tatarav1alpha1.AgentStopReArmCap, parked, time.Now())
+	if !strings.Contains(capped, "asked to stop 3 times") {
+		t.Fatalf("the capped body does not say what the agent did:\n%s", capped)
+	}
+	died := strandedLaneComment(stage.ReasonCIFailed, 2, 0, parked, time.Now())
+	if strings.Contains(died, "stop 0 times") {
+		t.Fatalf("the un-graceful body claims an agent-stop count that nobody recorded:\n%s", died)
+	}
+	if !strings.Contains(died, "the pod ended without submitting an outcome") {
+		t.Fatalf("the un-graceful body does not say what stopped:\n%s", died)
+	}
+	for _, body := range []string{capped, died} {
+		if !strings.Contains(body, stage.ReasonCIFailed) {
+			t.Fatalf("the escalation does not name the blocker it was retrying:\n%s", body)
+		}
+		if strings.Contains(body, "still standing") {
+			t.Fatalf("the blocker CLEARED - that is why the lane released the task:\n%s", body)
+		}
+	}
+}

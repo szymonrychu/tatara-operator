@@ -228,11 +228,18 @@ func TestOutcome_B_MergedMRThenNewInstructionsIsAccepted(t *testing.T) {
 			wantJSON:  `{"noop":true,"reason":"mr-terminal"}`,
 		},
 		{
-			name:      "kind=issue submitting code when its only MR already merged",
+			// THE SUBMIT SIDE OF THE SAME FACT, and it is NOT a no-op any more.
+			// A merge request that CLOSED unmerged is terminal but is not a
+			// delivery, so the Task still has nothing to attach its outcome to and
+			// the no-op stands. The merged half moved to
+			// TestOutcome_Implement_EveryOwnedMRMerged_DeliversInsteadOfNoOpping:
+			// the no-op there neither advanced the Task nor parked it, which left
+			// it with no reachable terminal and cost 127 pods.
+			name:      "kind=issue submitting code when its only MR was closed unmerged",
 			specKind:  "issue",
 			state:     tatarav1alpha1.StateUnderImplementation,
 			agentKind: "implement",
-			mrState:   "merged",
+			mrState:   "closed",
 			body: `{"kind":"implement","payload":{"action":"submitted","title":"t","body":"b",
 			         "changeSignificance":"patch"}}`,
 			wantLabel: "mr-terminal-noop",

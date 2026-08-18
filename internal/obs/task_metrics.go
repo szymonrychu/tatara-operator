@@ -125,7 +125,7 @@ func newTaskMetrics(reg prometheus.Registerer) *taskMetrics {
 		}, []string{"reason"}),
 		retryExhaustedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_task_retry_exhausted_total",
-			Help: "UnparkRetry lanes that spent MaxUnparkRetries laps without clearing their blocker, by the ORIGINAL park reason and the state the Task was stuck in. Each increment is a Task that has been re-parked retry-exhausted and told a human so on the forge, so ANY non-zero value is an approved Task that did not deliver and is waiting on a person. This is the alertable series: before it existed the same event was a silent park nobody found for days.",
+			Help: "UnparkRetry lanes that ENDED at a human, by the park reason that ended them and the state the Task was stuck in. Each increment is a Task that has been re-parked retry-exhausted and told a human so on the forge, so ANY non-zero value is an approved Task that did not deliver and is waiting on a person. This is the alertable series: before it existed the same event was a silent park nobody found for days. Two reasons produce it and they are different failures: a LANE reason (ci-failed, merge-conflict-retry, ...) is a blocker that outlived MaxUnparkRetries laps, go and look at the merge request; no-outcome is a lane the agent-stop re-arm cap took over AFTER the blocker cleared - the pod came back and the agent asked to stop AgentStopReArmCap times without submitting an outcome - so go and look at what is still unmerged.",
 		}, []string{"reason", "state"}),
 		retryBlockerReadTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_task_retry_blocker_read_total",

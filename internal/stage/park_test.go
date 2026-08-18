@@ -574,3 +574,64 @@ func TestReparkMovesAParkWithoutEverUnparkingIt(t *testing.T) {
 	require.Error(t, stage.Repark(tk, "not-a-park-reason", now))
 	require.Error(t, stage.Repark(task(v1alpha1.StateMerged), stage.ReasonCIFailed, now))
 }
+
+// laneStrandedTask is the state the agent-stop re-arm cap leaves behind on a
+// Task the retry lane had released: parked no-outcome in the live state the
+// release put it back into, still carrying the blocker and the laps spent on it,
+// because clearPark preserves both and no genuine transition happened.
+func laneStrandedTask(blocker string, attempts int) *v1alpha1.Task {
+	tk := task(v1alpha1.StateAwaitingReview)
+	tk.Status.RetryBlocker = blocker
+	tk.Status.RetryAttempts = attempts
+	if err := stage.Park(tk, stage.ReasonNoOutcome, now); err != nil {
+		panic(err)
+	}
+	return tk
+}
+
+// TestStrandRetryLaneEndsALaneTheAgentStopCapTookOver: the lane's terminal is
+// retry-exhausted, reached WITHOUT the Task ever being un-parked, and it returns
+// the blocker so the escalation can name what the laps were spent on. Without
+// it the cap's no-outcome park is owned by nobody: its own un-park arm declines
+// merged-mr forever, driveStrandedParks skips its class, and the retry driver no
+// longer recognises the reason.
+func TestStrandRetryLaneEndsALaneTheAgentStopCapTookOver(t *testing.T) {
+	tk := laneStrandedTask(stage.ReasonCIFailed, 2)
+
+	blocker, err := stage.StrandRetryLane(tk, now)
+	require.NoError(t, err)
+	require.Equal(t, stage.ReasonCIFailed, blocker)
+	require.Equal(t, stage.ReasonRetryExhausted, tk.Status.ParkReason)
+	require.Equal(t, v1alpha1.StateAwaitingReview, tk.Status.State)
+	require.Equal(t, 2, tk.Status.RetryAttempts, "the laps are the record the comment is written from")
+}
+
+// TestStrandRetryLaneRefusesEverythingItDoesNotOwn. no-outcome is written by
+// several paths that never went near the lane, so the blocker fingerprint is the
+// whole discriminator and it has to be checked, not assumed.
+func TestStrandRetryLaneRefusesEverythingItDoesNotOwn(t *testing.T) {
+	tests := []struct {
+		name string
+		tk   *v1alpha1.Task
+	}{
+		{"no blocker recorded: it never entered the lane", laneStrandedTask("", 0)},
+		{"a blocker with no laps spent on it", laneStrandedTask(stage.ReasonCIFailed, 0)},
+		{"laps against a reason outside the lane", laneStrandedTask(stage.ReasonAwaitingHuman, 3)},
+		{"a park that is not no-outcome", func() *v1alpha1.Task {
+			tk := task(v1alpha1.StateMerged)
+			require.NoError(t, stage.Park(tk, stage.ReasonCIFailed, now))
+			require.NoError(t, stage.ArmRetry(tk, now))
+			return tk
+		}()},
+		{"not parked at all", task(v1alpha1.StateAwaitingReview)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			before := tc.tk.Status.ParkReason
+			require.False(t, stage.LaneStranded(tc.tk))
+			_, err := stage.StrandRetryLane(tc.tk, now)
+			require.Error(t, err)
+			require.Equal(t, before, tc.tk.Status.ParkReason, "a refusal must change nothing")
+		})
+	}
+}

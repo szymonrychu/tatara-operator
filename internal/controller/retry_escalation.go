@@ -68,6 +68,14 @@ import (
 // tries the whole escalation again. Re-parking through a transient apiserver
 // error would move the reason to retry-exhausted and make the escalation
 // permanently silent - precisely the failure this file exists to prevent.
+//
+// IT HAS TWO ENTRANCES, and everything above is common to both. driveRetryLane
+// brings the lane's own exhaustion (the budget is spent and a live read has just
+// confirmed the blocker standing); driveUnparks brings a lane that the
+// AGENT-STOP RE-ARM CAP took over after the lane had already released it - see
+// stage.LaneStranded. Only two things differ, and both are read off the Task
+// rather than passed in, so no caller can get the pair wrong: which reason the
+// comment names as the blocker, and which of stage's two terminals ends it.
 func (r *ProjectReconciler) escalateExhaustedRetry(ctx context.Context, proj *tatarav1alpha1.Project,
 	t *tatarav1alpha1.Task, now time.Time) error {
 
@@ -76,6 +84,13 @@ func (r *ProjectReconciler) escalateExhaustedRetry(ctx context.Context, proj *ta
 	state := t.Status.State
 	attempts := t.Status.RetryAttempts
 	stamp := parkStamp(t)
+	// stranded is read BEFORE the repark, which moves the park reason out from
+	// under stage.LaneStranded and would make every read after it answer false.
+	stranded := stage.LaneStranded(t)
+	blocker := reason
+	if stranded {
+		blocker = t.Status.RetryBlocker
+	}
 
 	// unlatched is "a comment for THIS park has landed and nothing records that
 	// yet". It is what the repark's failure path re-tries the latch for.
@@ -86,7 +101,10 @@ func (r *ProjectReconciler) escalateExhaustedRetry(ctx context.Context, proj *ta
 			return err
 		}
 		if ok {
-			body := retryExhaustedComment(reason, attempts, parkedAt(t), now)
+			body := retryExhaustedComment(blocker, attempts, parkedAt(t), now)
+			if stranded {
+				body = strandedLaneComment(blocker, attempts, t.Status.Stats.AgentStops, parkedAt(t), now)
+			}
 			if cerr := r.commentOnIssue(ctx, proj, ref, body); cerr != nil {
 				// Logged and swallowed: see the ordering argument above.
 				l.Error(cerr, "retry lane: the escalation comment failed; the park still lands",
@@ -125,8 +143,16 @@ func (r *ProjectReconciler) escalateExhaustedRetry(ctx context.Context, proj *ta
 		return err
 	}
 	l.Info("retry lane spent: the blocker outlived the machine's budget and now belongs to a human",
-		"action", "retry_exhausted", "resource_id", t.Name, "reason", reason,
-		"state", state, "attempts", attempts, "max_attempts", tatarav1alpha1.MaxUnparkRetries)
+		"action", "retry_exhausted", "resource_id", t.Name, "reason", reason, "blocker", blocker,
+		"stranded", stranded, "state", state, "attempts", attempts,
+		"max_attempts", tatarav1alpha1.MaxUnparkRetries)
+	// THE PARK REASON, NOT THE BLOCKER, is the label. The two entrances are
+	// different failures and an operator has to be able to tell them apart:
+	// reason="ci-failed" is a pipeline that stayed red for the whole budget,
+	// reason="no-outcome" is the agent-stop cap taking a lane over after the
+	// release - same alert, different thing to go and look at. It is a new VALUE
+	// on an existing label rather than a new series, so every alert on
+	// operator_task_retry_exhausted_total keeps firing unchanged.
 	r.Metrics.TaskRetryExhausted(reason, state)
 	return nil
 }
@@ -154,7 +180,7 @@ func (r *ProjectReconciler) applyRetryExhaustion(ctx context.Context, t *tatarav
 		if fresh.Status.ParkReason != t.Status.ParkReason {
 			return nil // raced past this park; the escalation is already recorded
 		}
-		if _, err := stage.ExhaustRetry(fresh, now); err != nil {
+		if err := endRetryLane(fresh, now); err != nil {
 			return fmt.Errorf("unpark: exhaust the retry lane on %s: %w", key.Name, err)
 		}
 		if err := r.Status().Update(ctx, fresh); err != nil {
@@ -163,6 +189,20 @@ func (r *ProjectReconciler) applyRetryExhaustion(ctx context.Context, t *tatarav
 		*t = *fresh
 		return nil
 	})
+}
+
+// endRetryLane re-parks t as retry-exhausted from whichever end of the lane it
+// reached. The discrimination is made on the FRESH copy inside the conflict
+// retry, not on the one the escalation was decided from, so a Task another
+// writer moved between the two reads ends up under the terminal that matches
+// what it actually is.
+func endRetryLane(t *tatarav1alpha1.Task, now time.Time) error {
+	if stage.LaneStranded(t) {
+		_, err := stage.StrandRetryLane(t, now)
+		return err
+	}
+	_, err := stage.ExhaustRetry(t, now)
+	return err
 }
 
 // stampRetryExhaustedCommented writes the latch. A METADATA patch, not a status
@@ -323,5 +363,42 @@ func retryExhaustedComment(reason string, attempts int, parkedAt, now time.Time)
 		"(a pipeline finishing, a branch rebasing), so it was retried with a growing backoff rather than "+
 		"handed straight to a person. It is still standing. Look at the merge request's checks and "+
 		"mergeability; a comment on this issue resumes the task.\n")
+	return b.String()
+}
+
+// strandedLaneComment is the OTHER escalation body, and it must not reuse the
+// one above: that one ends "It is still standing", and here the blocker is the
+// one thing that is NOT standing. The lane read the forge, found the blocker
+// gone and released the task on purpose; what failed afterwards is whatever came
+// next. Naming the cleared blocker anyway is still the right context - it is
+// what the task was parked on and where its merge corridor stopped - but the ask
+// is different, so the text is.
+//
+// TWO WRITERS REACH IT, not just the agent-stop cap, so the middle line asks the
+// counter rather than assuming it. reconcileCaps parks the same no-outcome for
+// the UN-GRACEFUL version - a pod that became Ready and then ended without an
+// outcome - and stats.agentStops is 0 there. "the agent asked to stop 0 times"
+// is the kind of sentence that makes a human distrust the whole comment.
+//
+// The closing claim that part of the merge order has landed is the CALLER's
+// (driveUnparks escalates only on stage.Unpark's own merged-mr decline), not
+// something this function could check.
+func strandedLaneComment(blocker string, attempts, stops int, parkedAt, now time.Time) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "tatara stopped working on this task and is asking for a human.\n\n")
+	fmt.Fprintf(&b, "- was retried for: `%s` (%d of %d attempts spent before it cleared)\n",
+		blocker, attempts, tatarav1alpha1.MaxUnparkRetries)
+	if stops > 0 {
+		fmt.Fprintf(&b, "- then: the agent asked to stop %d times in a row without submitting an outcome\n", stops)
+	} else {
+		fmt.Fprintf(&b, "- then: the pod ended without submitting an outcome\n")
+	}
+	if !parkedAt.IsZero() {
+		fmt.Fprintf(&b, "- stopped since: %s (%s ago)\n",
+			parkedAt.UTC().Format(time.RFC3339), now.Sub(parkedAt).Round(time.Minute))
+	}
+	fmt.Fprintf(&b, "\nPart of this task's merge order has already landed, so tatara will not re-implement "+
+		"it: that would re-propose merged code. It will not retry either - the agent had nothing left to "+
+		"say. Look at what is still unmerged and why; a comment on this issue resumes the task.\n")
 	return b.String()
 }

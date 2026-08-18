@@ -41,7 +41,7 @@ import (
 // Task making stage PROGRESS while it waits; an MR reaching a terminal forge
 // state is the world moving on, which makes the wait pointless but does not
 // answer the question the park was asked. Ending the Task is therefore
-// permitted; RESTARTING one is not. ownMRsShippedEdge targets `merged` for a
+// permitted; RESTARTING one is not. OwnMRsShippedEdge targets `merged` for a
 // non-review Task - still owing the merge cursor, the deploy ledger and the
 // issue closes - so that edge is deliberately NOT taken here: resuming a parked
 // Task into a live pipeline behind the back of the human it was waiting for is
@@ -67,7 +67,11 @@ import (
 // it parked in, and the merge corridor finishes and closes the issues through
 // the path that already exists. If the blocker outlives MaxUnparkRetries the
 // lane re-parks retry-exhausted and says so on the issue, so the case that
-// still reaches a human reaches them out loud instead of by them noticing.
+// still reaches a human reaches them out loud instead of by them noticing. The
+// lane's OTHER way out says so too: a released Task whose replacement pods spend
+// the agent-stop re-arm cap is re-parked no-outcome, and driveUnparks escalates
+// that to the same terminal (stage.LaneStranded) rather than leaving it to age
+// out under a reason nothing releases.
 //
 // So the refusal below is now what it always claimed to be: about a park that
 // is genuinely a HUMAN's to release. Widening it to admit `merged` remains
