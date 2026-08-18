@@ -170,38 +170,230 @@ jobs:
   verify-pin:
     needs: [tag, bump]
     runs-on: tatara-operator
+    outputs:
+      state: ${{ steps.verify.outputs.state }}
+      detail: ${{ steps.verify.outputs.detail }}
     steps:
       - name: read the pin back from tatara-helmfile main
+        id: verify
         env:
           TOKEN: ${{ secrets.TATARA_CD_TOKEN }}
           VERSION: ${{ needs.tag.outputs.version }}
         run: |
           set -euo pipefail
+          shopt -s inherit_errexit
           : "${VERSION:?cd-release tag did not emit a version}"
           : "${TOKEN:?TATARA_CD_TOKEN required}"
           BARE="${VERSION#v}"
+          PARENT="szymonrychu/tatara-helmfile"
+          BRANCH="cd/deploy-train"
+          # Test knobs (hack/test-cd-release-jobs.sh); CI takes the defaults.
+          ATTEMPTS="${VERIFY_POLL_ATTEMPTS:-10}"
+          NAP="${VERIFY_POLL_SLEEP:-30}"
+
+          # curl's own --retry covers exactly the transient set that broke this
+          # cascade (408/429/500/502/503/504). Attempt 8 of run 32035597231 died
+          # on a bare `curl: (22) 503` and took the alarm down with it.
           api() {
-            curl -sSf -H "Authorization: Bearer ${TOKEN}" \
-              -H "Accept: application/vnd.github.raw" \
-              "https://api.github.com/repos/szymonrychu/tatara-helmfile/contents/$1?ref=main"
+            curl -sSf --retry 5 --retry-delay 3 \
+              -H "Authorization: Bearer ${TOKEN}" \
+              -H "Accept: ${2:-application/vnd.github+json}" \
+              "https://api.github.com/$1"
           }
-          # Bounded: ~10 minutes. The healthy cascade lands a bump PR in minutes;
-          # anything past this is not a slow lap, it is a fan-out that is not
-          # running, and the operator's deploy stage must not be left polling for
-          # it (deploy_stage.go's deployPinFanoutDeadline is the other half).
-          for attempt in $(seq 1 20); do
-            if api helmfile.yaml.gotmpl | grep -q "version: ${BARE}" \
-               && api values/tatara-operator/common.yaml | grep -q "tag: \"${VERSION}\""; then
-              echo "cd: ${VERSION} is pinned on tatara-helmfile main (attempt ${attempt})"
+          raw() { api "$1" application/vnd.github.raw; }
+
+          verdict() { # <state> <detail>
+            echo "state=$1" >> "$GITHUB_OUTPUT"
+            echo "detail=$2" >> "$GITHUB_OUTPUT"
+          }
+
+          # Anchored and dot-escaped: `.` is regex-any and the match used to be
+          # unanchored, so `version: 3.4.0` was satisfied by `13.4.0` or
+          # `3.4.0-rc1`. And it demands ALL FOUR pins the bump job rewrites in
+          # one commit (tatara-operator plus the three tatara-project releases);
+          # matching "somewhere in the file" let a partially-applied fan-out -
+          # one of the four apply-pins regexes having drifted - read as landed.
+          BARE_RE="${BARE//./\\.}"
+          VER_RE="${VERSION//./\\.}"
+          OPERATOR_PINS=4
+
+          # 0 pinned, 1 not pinned, 2 could not read. "Could not read" is NOT
+          # "not pinned": conflating the two is what produced a false alarm.
+          pinned_on() { # <ref>
+            local hf vals n
+            hf="$(raw "repos/${PARENT}/contents/helmfile.yaml.gotmpl?ref=$1")" || return 2
+            vals="$(raw "repos/${PARENT}/contents/values/tatara-operator/common.yaml?ref=$1")" || return 2
+            n="$(printf '%s' "$hf" | grep -cE "^[[:space:]]*version: ${BARE_RE}[[:space:]]*$" || true)"
+            [ "$n" -ge "$OPERATOR_PINS" ] || return 1
+            printf '%s' "$vals" | grep -qE "^[[:space:]]*tag: \"${VER_RE}\"[[:space:]]*$" || return 1
+          }
+
+          # 1. Fast path. A healthy cascade lands in minutes, so poll briefly
+          # and cheaply before spending a state query on it.
+          for attempt in $(seq 1 "$ATTEMPTS"); do
+            rc=0; pinned_on main || rc=$?
+            if [ "$rc" -eq 0 ]; then
+              echo "cd: ${VERSION} is pinned on ${PARENT} main (attempt ${attempt})"
+              verdict pinned "${VERSION} is pinned on ${PARENT} main."
               exit 0
             fi
-            echo "cd: ${VERSION} not on tatara-helmfile main yet (attempt ${attempt}/20)"
-            sleep 30
+            echo "cd: ${VERSION} not on ${PARENT} main yet (attempt ${attempt}/${ATTEMPTS}, read rc=${rc})"
+            if [ "$attempt" -lt "$ATTEMPTS" ]; then sleep "$NAP"; fi
           done
-          echo "::error::CD pin fan-out did not land ${VERSION} on tatara-helmfile main within 10m."
-          echo "::error::The deploy cascade is DOWN: every task that reaches stage=deploying will"
-          echo "::error::poll a pin that does not exist until its budget parks it (issue #512)."
-          exit 1
+
+          # 2. Not on main yet. ONE state query decides between "the cascade is
+          # broken" and "the cascade is slow" - which the old 10m timeout could
+          # not tell apart. On 2026-08-17 PR #423 was open and armed the whole
+          # time and merged 28.8m after the bump, ~5m after this job gave up,
+          # and the alarm still said the bump produced nothing (#622).
+          #
+          # The bound stays short on purpose. `concurrency: cd-release-tatara-
+          # operator` with cancel-in-progress: false keeps only ONE pending run
+          # per group, so waiting out a ~40m merge here means a third merge to
+          # main evicts the queued run: a release that never gets tagged.
+          if ! pr="$(api "repos/${PARENT}/pulls?state=open&head=${PARENT%%/*}:${BRANCH}")"; then
+            echo "::error::CD pin fan-out: ${VERSION} is not on ${PARENT} main and ${BRANCH} could not be read from the forge."
+            verdict forge-unreadable "${VERSION} is not on ${PARENT} main and the forge could not be queried for ${BRANCH}."
+            exit 1
+          fi
+          # One GUARDED read, not four bare ones. `.[0]` on a JSON OBJECT is a jq
+          # hard error, and every GitHub error body is an object - so `{"message":
+          # "Bad credentials"}` used to exit the step here writing NO verdict, and
+          # the alarm then said "the bump job failed first" under a bullet reading
+          # "bump job: success". The `ok` sentinel is what distinguishes an EMPTY
+          # body from a genuinely empty list: jq on empty stdin prints nothing and
+          # exits 0, so `.[0].number // empty` cannot tell them apart, and
+          # believing the second reading files no-pr - the loudest verdict here,
+          # whose remedy sends a human to hand-apply five pins.
+          if ! fields="$(printf '%s' "$pr" | jq -r '
+                if type != "array" then error("not a pull request list") else . end
+                | "ok", (.[0].number // ""), (.[0].html_url // ""),
+                  (.[0].head.sha // ""),
+                  (if (.[0].auto_merge // null) == null then "" else "yes" end)')" \
+             || [ -z "$fields" ]; then
+            echo "::error::CD pin fan-out: ${VERSION} is not on ${PARENT} main and the ${BRANCH} response did not parse."
+            verdict forge-unreadable "${VERSION} is not on ${PARENT} main and the forge's ${BRANCH} response could not be read."
+            exit 1
+          fi
+          num="$(printf '%s' "$fields" | sed -n 2p)"
+          url="$(printf '%s' "$fields" | sed -n 3p)"
+          head_sha="$(printf '%s' "$fields" | sed -n 4p)"
+          armed="$(printf '%s' "$fields" | sed -n 5p)"
+
+          if [ -z "$num" ]; then
+            echo "::error::CD pin fan-out is DOWN: ${VERSION} is not on ${PARENT} main and no open ${BRANCH} PR exists."
+            echo "::error::The bump job pushed no pin at all, or pushed one and never opened a PR for it."
+            verdict no-pr "No open ${BRANCH} PR exists on ${PARENT}, and ${VERSION} is not on its main."
+            exit 1
+          fi
+
+          rc=0; pinned_on "$BRANCH" || rc=$?
+          if [ "$rc" -eq 2 ]; then
+            echo "::error::CD pin fan-out: ${PARENT}#${num} is open but its contents could not be read."
+            verdict forge-unreadable "${PARENT}#${num} (${url}) is open but its contents could not be read from the forge."
+            exit 1
+          fi
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::CD pin fan-out is STUCK: ${PARENT}#${num} is open but does not carry ${VERSION}: ${url}"
+            verdict pin-missing "${PARENT}#${num} (${url}) is open but does not carry ${VERSION}."
+            exit 1
+          fi
+
+          if [ -z "$armed" ]; then
+            echo "::error::CD pin fan-out is STUCK: ${PARENT}#${num} carries ${VERSION} but auto-merge is NOT armed; it will never merge on its own: ${url}"
+            verdict not-armed "${PARENT}#${num} (${url}) carries ${VERSION} but auto-merge is not armed."
+            exit 1
+          fi
+
+          red=""
+          pending=1
+          if [ -n "$head_sha" ]; then
+            # Guarded like every other read here, and for the same reason: a
+            # bare assignment under `set -e` dies WITHOUT writing a verdict, and
+            # the alarm then reports "the bump job failed first" on a healthy,
+            # armed, correct PR. curl does not retry a 403 secondary rate limit,
+            # so this is reachable.
+            # per_page=100: check-runs pages at 30 by default, and a red run on
+            # page 2 would read as "green, in flight" - the exact false-negative
+            # this verdict exists to remove.
+            if ! checks="$(api "repos/${PARENT}/commits/${head_sha}/check-runs?per_page=100")"; then
+              echo "::error::CD pin fan-out: ${PARENT}#${num} carries ${VERSION} and is armed, but its check runs could not be read: ${url}"
+              verdict forge-unreadable "${PARENT}#${num} (${url}) carries ${VERSION} and is armed, but its check runs could not be read."
+              exit 1
+            fi
+            # `|| :` on the jq, not a bare assignment: a 200 carrying a proxy
+            # error page instead of JSON exits the step under `set -e` writing
+            # NO verdict, and the alarm then reports "the bump job failed
+            # first" about a healthy PR. Unparseable is unreadable, which is
+            # already a verdict below - it is not "nothing is red".
+            # No `.check_runs[]?`: the `?` swallows "this is not a check-runs
+            # response" into "nothing is red", which is the conflation the whole
+            # job exists to remove. One compact object rather than two lines,
+            # because a check NAME may contain a newline and a line-indexed read
+            # would then take the count off the wrong line - a VALID number,
+            # silently wrong, asserting "every check has reported" while one is
+            # still running. Names are flattened for the same reason:
+            # $GITHUB_OUTPUT is line-oriented and a newline in a verdict corrupts
+            # every key after it.
+            if ! summary="$(printf '%s' "$checks" | jq -c '
+                  if (.check_runs | type) != "array" then error("no check_runs") else . end
+                  | {red: ([.check_runs[]
+                           | select(.conclusion == "failure" or .conclusion == "timed_out"
+                                    or .conclusion == "cancelled" or .conclusion == "action_required")
+                           | .name] | join(", ") | gsub("[\r\n]+"; " ")),
+                     pending: ([.check_runs[] | select(.status != "completed")] | length)}')" \
+               || [ -z "$summary" ]; then
+              echo "::error::CD pin fan-out: ${PARENT}#${num} carries ${VERSION} and is armed, but its check runs did not parse: ${url}"
+              verdict forge-unreadable "${PARENT}#${num} (${url}) carries ${VERSION} and is armed, but its check runs could not be read."
+              exit 1
+            fi
+            red="$(printf '%s' "$summary" | jq -r .red)"
+            pending="$(printf '%s' "$summary" | jq -r .pending)"
+          fi
+          if [ -n "$red" ]; then
+            # A red check is terminal only if it is a REQUIRED context: auto-merge
+            # fires over a red non-required one. GitGuardian is not required on
+            # tatara-helmfile main and goes red on any PR whose commit RANGE ever
+            # carried a secret-shaped literal - an incident anchors to a commit,
+            # not to the tree, so no HEAD-side change clears it. Calling that
+            # "will not land without a human" is #622's lie with a new trigger.
+            #
+            # mergeable_state, not branch protection: reading the required
+            # contexts needs admin, and this is the field the merge is actually
+            # decided by. It only appears on the single-PR GET, hence the second
+            # call. `blocked` while a check is still RUNNING only means a
+            # required context has not answered yet, so both conditions hold or
+            # nothing is decided. Legacy commit statuses are not visible here;
+            # every check on these repos is an Actions check run.
+            if ! detail="$(api "repos/${PARENT}/pulls/${num}")"; then
+              echo "::error::CD pin fan-out: ${PARENT}#${num} carries ${VERSION} and is armed, but its merge state could not be read: ${url}"
+              verdict forge-unreadable "${PARENT}#${num} (${url}) carries ${VERSION} and is armed, but its merge state could not be read."
+              exit 1
+            fi
+            # Unparseable is "unknown", which is already a non-blocking answer
+            # below - the same reason as the check-runs guard, opposite default:
+            # here the honest reading of "I could not tell" is not "stuck".
+            mstate="$(printf '%s' "$detail" | jq -r '.mergeable_state // "unknown"')" || mstate=unknown
+            if [ "$mstate" = blocked ] && [ "$pending" -eq 0 ]; then
+              echo "::error::CD pin fan-out is STUCK: ${PARENT}#${num} carries ${VERSION} and is armed, but these checks are red: ${red} (${url})"
+              echo "::error::Every check has reported and the forge still calls the merge blocked, so this pin will not land without a human."
+              verdict checks-red "${PARENT}#${num} (${url}) carries ${VERSION} and is armed, but these required checks are red: ${red}."
+              exit 1
+            fi
+            echo "::warning::${PARENT}#${num} has red checks that are not blocking its merge (mergeable_state=${mstate}, ${pending} still running): ${red} (${url})"
+          fi
+
+          # Open, correct, armed and nothing blocking the merge: in flight, not
+          # stalled. The operator owns the rest of the wait - deploy_stage.go
+          # bounds it at deployPinFanoutDeadline (45m) and parks at
+          # parkReason=deploy-timeout, which is already a critical alert.
+          # Failing here would only be a second, louder, wrong alarm.
+          # Deliberately not "has no red check": a non-blocking red one may have
+          # been reported above, and this detail is pasted into the alarm issue.
+          echo "::notice::${PARENT}#${num} carries ${VERSION}, is armed and has nothing blocking its merge: ${url}"
+          echo "::notice::Leaving the remaining wait to the operator's 45m deployPinFanoutDeadline."
+          verdict in-flight "${PARENT}#${num} (${url}) carries ${VERSION}, is armed and had nothing blocking its merge; it was still in flight when this job ran."
+          exit 0
 
   # LOUD ON FAILURE. A red workflow run nobody looks at is what let #512 sit for
   # ~9h, so the alarm is filed where the platform already reads: an issue on this
@@ -221,15 +413,77 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           BUMP_RESULT: ${{ needs.bump.result }}
           VERIFY_RESULT: ${{ needs.verify-pin.result }}
+          VERIFY_STATE: ${{ needs.verify-pin.outputs.state }}
+          VERIFY_DETAIL: ${{ needs.verify-pin.outputs.detail }}
         run: |
           set -euo pipefail
+          shopt -s inherit_errexit
           : "${TOKEN:?TATARA_CD_TOKEN required}"
           TITLE="CD pin fan-out stalled: ${VERSION} is not pinned in tatara-helmfile"
+
+          # Same retry as verify-pin. Attempt 8 of run 32035597231 lost its
+          # alarm to a bare `curl: (22) 503` - the one job whose whole purpose
+          # is to be heard was the one that went silent.
+          api() {
+            curl -sSf --retry 5 --retry-delay 3 \
+              -H "Authorization: Bearer ${TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/$1"
+          }
+          post() { # <path>; JSON body on stdin
+            curl -sSf --retry 5 --retry-delay 3 -X POST \
+              -H "Authorization: Bearer ${TOKEN}" -H "Content-Type: application/json" \
+              -d @- "https://api.github.com/$1"
+          }
+
+          # The remedy depends on what verify-pin actually SAW. The old text was
+          # unconditional ("the bump action produced nothing") and was wrong on
+          # 2026-08-17: PR #423 existed, was armed, and merged. It also named a
+          # `cd: bump <component> to <version>` PR, which the terminal hop never
+          # opens - it coalesces every component into one `cd: deploy-train` PR -
+          # so it sent a human hunting for something that cannot exist.
+          case "${VERIFY_STATE:-}" in
+            no-pr)
+              FIX="No open \`cd/deploy-train\` PR exists on tatara-helmfile."
+              FIX="${FIX} Apply the pin by hand (the chart versions in \`helmfile.yaml.gotmpl\`"
+              FIX="${FIX} plus the image tag in \`values/tatara-operator/common.yaml\`), open that"
+              FIX="${FIX} PR against main and merge it, then find why the \`cd-release\` bump"
+              FIX="${FIX} action opened none."
+              ;;
+            pin-missing | not-armed | checks-red)
+              FIX="The \`cd/deploy-train\` PR named above exists; drive it to merge, then"
+              FIX="${FIX} fix what stopped it. The terminal hop coalesces every component into"
+              FIX="${FIX} that ONE PR, so there is no per-component \`cd: bump\` PR to look for."
+              ;;
+            forge-unreadable)
+              FIX="The forge could not be read, so the fan-out state is UNKNOWN and may"
+              FIX="${FIX} well be healthy. Check \`cd/deploy-train\` on tatara-helmfile before"
+              FIX="${FIX} assuming anything is broken."
+              ;;
+            *)
+              # This arm also fires when verify-pin died mid-step, was cancelled,
+              # or lost its runner - so it must not assert a cause it can see is
+              # false. It used to say "the bump job failed first" three lines
+              # under a bullet reading "bump job: success".
+              if [ "${BUMP_RESULT:-}" = success ]; then
+                FIX="\`bump\` succeeded but \`verify-pin\` reached no verdict, so the fan-out"
+                FIX="${FIX} state is UNKNOWN and may well be healthy. Read the \`verify-pin\` job's"
+                FIX="${FIX} log in the run above, then check \`cd/deploy-train\` on tatara-helmfile."
+              else
+                FIX="\`bump\` did not succeed, so \`verify-pin\` never ran and no fan-out state"
+                FIX="${FIX} was observed. Read the \`bump\` job's log in the run above, then check"
+                FIX="${FIX} \`cd/deploy-train\` on tatara-helmfile."
+              fi
+              ;;
+          esac
+
           BODY=$(printf '%s\n' \
-            "The release train cut and published \`${VERSION}\`, but the pin never reached tatara-helmfile's main." \
+            "The release train cut and published \`${VERSION}\`, but the pin was not on tatara-helmfile's main when this run checked." \
             "" \
             "- bump job: \`${BUMP_RESULT}\`" \
             "- pin verification: \`${VERIFY_RESULT}\`" \
+            "- observed fan-out state: \`${VERIFY_STATE:-not observed}\`" \
+            "- ${VERIFY_DETAIL:-No fan-out state was observed.}" \
             "- run: ${RUN_URL}" \
             "" \
             "**Nothing can deploy while this is broken.** Every task that reaches" \
@@ -237,18 +491,43 @@ jobs:
             "bounds that wait and parks at \`deploy-timeout\` (issue #512), so merged work is" \
             "retryable rather than discarded - but it does not ship until this is repaired." \
             "" \
-            "Fix: open the \`cd: bump tatara-operator to ${VERSION}\` PR against tatara-helmfile by hand and merge it, then find why the \`cd-release\` bump action produced nothing.")
-          existing=$(curl -sSf -H "Authorization: Bearer ${TOKEN}" \
-            "https://api.github.com/search/issues?q=$(printf '%s' "repo:${GITHUB_REPOSITORY} is:issue is:open in:title \"CD pin fan-out stalled\"" | jq -sRr @uri)" \
-            | jq -r '.items[0].number // empty')
+            "Fix: ${FIX}")
+
+          # Plain /issues, not /search/issues: search is rate-limited separately
+          # and far more tightly, and it was 503ing throughout the 2026-08-17
+          # outage. /issues returns PULL REQUESTS too, hence the filter - a
+          # bot-authored PR whose title happens to match is not the tracker.
+          # Paged: /issues counts PULL REQUESTS toward per_page BEFORE the
+          # filter below, so a single 100-item page is not enough to find the
+          # tracker once this repo has a normal number of open PRs - and a miss
+          # opens a DUPLICATE tracker every failed release. /search/issues had
+          # no such cap; this is the cost of dropping it, and it is bounded.
+          # EVERY read in this loop is best-effort, and that is the point. The
+          # dedupe decides comment-vs-new-issue; being heard at all is the job.
+          # These were bare under `set -e`, so a 403 secondary rate limit (which
+          # curl --retry does not cover, and which a page loop invites) or a
+          # garbled body took the whole alarm down - the same silence attempt 8
+          # of run 32035597231 died of, in the one job whose purpose is to be
+          # heard. A duplicate tracker beats no tracker.
+          existing=""
+          page=1
+          while [ "$page" -le 5 ]; do
+            batch="$(api "repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=100&page=${page}")" || batch=""
+            [ -n "$batch" ] || break
+            existing="$(printf '%s' "$batch" | jq -r --arg t "CD pin fan-out stalled" \
+              '[.[]? | select(has("pull_request") | not) | select(.title | startswith($t))][0].number // empty')" || existing=""
+            if [ -n "$existing" ]; then break; fi
+            n="$(printf '%s' "$batch" | jq 'length')" || n=0
+            case "$n" in ''|*[!0-9]*) n=0 ;; esac
+            [ "$n" -ge 100 ] || break
+            page=$((page + 1))
+          done
           if [ -n "$existing" ]; then
-            jq -n --arg b "$BODY" '{body:$b}' | curl -sSf -X POST \
-              -H "Authorization: Bearer ${TOKEN}" -H "Content-Type: application/json" \
-              -d @- "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/${existing}/comments" >/dev/null
+            jq -n --arg b "$BODY" '{body:$b}' \
+              | post "repos/${GITHUB_REPOSITORY}/issues/${existing}/comments" >/dev/null
             echo "commented on existing fan-out tracker #${existing}"
           else
-            jq -n --arg t "$TITLE" --arg b "$BODY" '{title:$t, body:$b}' | curl -sSf -X POST \
-              -H "Authorization: Bearer ${TOKEN}" -H "Content-Type: application/json" \
-              -d @- "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues" >/dev/null
+            jq -n --arg t "$TITLE" --arg b "$BODY" '{title:$t, body:$b}' \
+              | post "repos/${GITHUB_REPOSITORY}/issues" >/dev/null
             echo "opened a fan-out tracker"
           fi
