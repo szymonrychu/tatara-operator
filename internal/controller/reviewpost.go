@@ -928,6 +928,9 @@ func (d *StageDriver) appendOperatorNote(ctx context.Context, proj *tatarav1alph
 // compares the STORED body, which is the truncated one; clamping after it would
 // make a note that differs from the stored copy only in its cut-off tail compare
 // unequal and be re-appended on every single reconcile.
+// WithNoteCap: an operator-authored note is still a note. Uncapped, these were
+// the appends that pushed a Task past 50 and made the agent's own handoff
+// unwritable (#616).
 func appendOperatorNoteTo(ctx context.Context, c client.Client, sp objbudget.Spiller,
 	task *tatarav1alpha1.Task, body string, now time.Time) error {
 	body = tatarav1alpha1.TruncateUTF8(body, tatarav1alpha1.NoteBodyMaxBytes)
@@ -942,7 +945,7 @@ func appendOperatorNoteTo(ctx context.Context, c client.Client, sp objbudget.Spi
 		t.Status.Notes = append(t.Status.Notes, tatarav1alpha1.Note{
 			At: at, Agent: "operator", Kind: "note", Body: body,
 		})
-	}); err != nil {
+	}, objbudget.WithNoteCap()); err != nil {
 		return fmt.Errorf("review: append operator note to %s: %w", key.Name, err)
 	}
 	return nil

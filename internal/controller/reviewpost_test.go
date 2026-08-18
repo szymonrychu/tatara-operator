@@ -12,12 +12,15 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/prompt"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // crashClient is the REAL interruption point. It wraps a client and makes the
@@ -958,5 +961,57 @@ func TestDrainPendingCommentsParkStampsTheLabel(t *testing.T) {
 	}
 	if posted != 1 {
 		t.Fatalf("re-drain posted the park notice again: %d", posted)
+	}
+}
+
+// TestAppendOperatorNote_NotesCapEvictsOldest_WithNoteCap: when operator notes
+// hit MaxNotes, WithNoteCap evicts the oldest down to MaxNotes. The evicted
+// batch goes to the Spiller; objbudget.Discarding drops it and records no entry
+// in Status.Stats.NotesSpilledRefs while still advancing NotesSpilled (#616).
+func TestAppendOperatorNote_NotesCapEvictsOldest_WithNoteCap(t *testing.T) {
+	now := time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
+	task := mdTask("t-opnote", "implement", tatarav1alpha1.StateAwaitingReview)
+
+	// Seed with exactly MaxNotes=50 notes, spaced by 1 second.
+	for i := 0; i < tatarav1alpha1.MaxNotes; i++ {
+		at := metav1.NewTime(now.Add(time.Duration(i) * time.Second))
+		task.Status.Notes = append(task.Status.Notes, tatarav1alpha1.Note{
+			At: at, Agent: "operator", Kind: "note", Body: fmt.Sprintf("seeded note %d", i),
+		})
+	}
+
+	c := newMirrorClient(t, mdProject(), mdSecret(), mdRepo("tatara-operator"), task)
+
+	// Append one operator note through appendOperatorNoteTo with Discarding spiller.
+	newBody := "appended operator note"
+	err := appendOperatorNoteTo(context.Background(), c, objbudget.Discarding, task, newBody, now.Add(time.Duration(tatarav1alpha1.MaxNotes)*time.Second))
+	if err != nil {
+		t.Fatalf("appendOperatorNoteTo: %v", err)
+	}
+
+	// Read the final state.
+	final := mdGetTask(t, c, task.Name)
+
+	// Journal did not grow to 51.
+	if len(final.Status.Notes) != tatarav1alpha1.MaxNotes {
+		t.Fatalf("notes count = %d, want %d: FitTask with WithNoteCap must evict the oldest note to stay at MaxNotes, not grow to 51",
+			len(final.Status.Notes), tatarav1alpha1.MaxNotes)
+	}
+
+	// Newest note is present.
+	if final.Status.Notes[len(final.Status.Notes)-1].Body != newBody {
+		t.Fatalf("newest note body = %q, want %q", final.Status.Notes[len(final.Status.Notes)-1].Body, newBody)
+	}
+
+	// Oldest seeded note is gone (evicted).
+	for _, n := range final.Status.Notes {
+		if n.Body == "seeded note 0" {
+			t.Fatalf("oldest seeded note must be evicted when the cap is hit")
+		}
+	}
+
+	// NotesSpilledRefs is empty (Discarding doesn't record refs).
+	if len(final.Status.Stats.NotesSpilledRefs) != 0 {
+		t.Fatalf("NotesSpilledRefs = %v, want empty: Discarding spiller must not record any spilledRefs", final.Status.Stats.NotesSpilledRefs)
 	}
 }

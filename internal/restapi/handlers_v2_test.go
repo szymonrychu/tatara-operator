@@ -715,6 +715,35 @@ func TestTaskContext_NotesAll_CompleteHistoryIsNotFlaggedTruncated(t *testing.T)
 	require.NotContains(t, w.Body.String(), "unavailable=")
 }
 
+// TestTaskContext_NotesAll_DiscardedNotesCountAsUnavailable is #616's read
+// half. On a memory-disabled Project the cap DROPS: stats.notesSpilled climbs
+// while notesSpilledRefs stays empty. unavailableNotes was computed only when
+// a ref had FAILED, so the bundle claimed a complete history it does not have.
+func TestTaskContext_NotesAll_DiscardedNotesCountAsUnavailable(t *testing.T) {
+	task := taskV2("t1", "tatara", "clarify", tatarav1alpha1.StateUnderImplementation, "implement")
+	task.Status.Notes = []tatarav1alpha1.Note{
+		{At: metav1.NewTime(frozenNow), Agent: "implement", Kind: "handoff", Body: "LIVE-NOTE"},
+	}
+	task.Status.Stats.NotesSpilled = 4
+	task.Status.Stats.NotesSpilledRefs = nil
+
+	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"), task)
+
+	w := e.do(t, http.MethodGet, "/tasks/t1/context?notes=all", "")
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var resp struct {
+		Bundle               string `json:"bundle"`
+		NotesTruncated       bool   `json:"notesTruncated"`
+		NotesUnavailableRefs int    `json:"notesUnavailableRefs"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Contains(t, resp.Bundle, `unavailable="4"`,
+		"four notes are gone; the bundle must not pretend otherwise")
+	require.True(t, resp.NotesTruncated)
+	require.Equal(t, 0, resp.NotesUnavailableRefs, "no ref FAILED - there were none")
+}
+
 // --- 7. POST /tasks/{t}/notes ---------------------------------------------
 
 func TestPostNote_StampsAgentFromStatus(t *testing.T) {
@@ -870,6 +899,37 @@ func TestPostNote_AtCapWithBrokenSpillerIs503(t *testing.T) {
 			require.Equal(t, 0, got.Status.Stats.NotesSpilled)
 		})
 	}
+}
+
+// TestPostNote_AtCapOnAMemoryDisabledProjectDropsInsteadOf503 is #616. On a
+// Project with spec.memory.enabled=false the resolver hands out
+// objbudget.Discarding, so the cap evicts and DROPS instead of refusing: a
+// 503 there is a permanent refusal, not a retryable outage, and the note
+// journal is the only continuation state between pods.
+func TestPostNote_AtCapOnAMemoryDisabledProjectDropsInsteadOf503(t *testing.T) {
+	task := taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement")
+	// 53 notes: the wedged Task's real shape. Operator-side appenders had no
+	// cap, so the journal overshot and every agent note after it 503'd.
+	for i := 0; i < 53; i++ {
+		task.Status.Notes = append(task.Status.Notes, tatarav1alpha1.Note{
+			At:    metav1.NewTime(frozenNow.Add(time.Duration(i) * time.Minute)),
+			Agent: "implement", Kind: "note", Body: fmt.Sprintf("note-%02d", i),
+		})
+	}
+	e := buildV2(t, v2Opts{
+		spillerFor: func(*tatarav1alpha1.Project) objbudget.Spiller { return objbudget.Discarding },
+	}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"), task)
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/notes", `{"kind":"handoff","body":"THE HANDOFF"}`)
+	require.Equal(t, http.StatusCreated, w.Code, "an agent must ALWAYS be able to write its handoff")
+
+	got := e.task(t, "t1")
+	require.Len(t, got.Status.Notes, 50)
+	require.Equal(t, "note-04", got.Status.Notes[0].Body, "the four oldest notes were dropped")
+	require.Equal(t, "THE HANDOFF", got.Status.Notes[49].Body)
+	require.Equal(t, 4, got.Status.Stats.NotesSpilled)
+	require.Empty(t, got.Status.Stats.NotesSpilledRefs,
+		"nothing was stored, so a ref would only make task_context(notes=all) 404")
 }
 
 func TestPostNote_UnknownFieldIs400(t *testing.T) {

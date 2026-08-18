@@ -163,6 +163,9 @@ func (a *FitNoteAppender) AppendNoteOnce(ctx context.Context, taskName string, n
 	return a.append(ctx, taskName, n, true)
 }
 
+// WithNoteCap because this IS a note appender: the C.2.6 cap is a property of
+// the journal, not of the agent-facing REST path that used to be its only
+// enforcer (#616).
 func (a *FitNoteAppender) append(ctx context.Context, taskName string, n tatarav1alpha1.Note, once bool) error {
 	return objbudget.FitTask(ctx, a.Client, a.Spiller,
 		types.NamespacedName{Namespace: a.Namespace, Name: taskName},
@@ -175,7 +178,7 @@ func (a *FitNoteAppender) append(ctx context.Context, taskName string, n tatarav
 				}
 			}
 			t.Status.Notes = append(t.Status.Notes, n)
-		})
+		}, objbudget.WithNoteCap())
 }
 
 var _ NoteAppender = (*FitNoteAppender)(nil)

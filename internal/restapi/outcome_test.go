@@ -3896,3 +3896,51 @@ func TestOutcome_Upgrade_KindMustMatchStatusAgentKind(t *testing.T) {
 	require.Equal(t, http.StatusConflict, w.Code)
 	require.Contains(t, w.Body.String(), "kind does not match the task's agent kind")
 }
+
+// TestOutcome_Commit_NotesCapEvictsOldest_WithNoteCap: commit is the single door
+// every agentNote write goes through. When notes hit MaxNotes, WithNoteCap evicts
+// the oldest down to MaxNotes. The evicted batch goes to the Spiller; Discarding
+// drops it and records no entry in Status.Stats.NotesSpilledRefs while still
+// advancing NotesSpilled (#616).
+func TestOutcome_Commit_NotesCapEvictsOldest_WithNoteCap(t *testing.T) {
+	now := time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
+	task := taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement")
+
+	// Seed with exactly MaxNotes=50 notes, spaced by 1 second.
+	for i := 0; i < tatarav1alpha1.MaxNotes; i++ {
+		at := metav1.NewTime(now.Add(time.Duration(i) * time.Second))
+		task.Status.Notes = append(task.Status.Notes, tatarav1alpha1.Note{
+			At: at, Agent: "operator", Kind: "note", Body: fmt.Sprintf("seeded note %d", i),
+		})
+	}
+
+	e := buildV2(t, v2Opts{writer: panicForge{}, now: func() time.Time { return now }, spillerFor: func(*tatarav1alpha1.Project) objbudget.Spiller { return objbudget.Discarding }},
+		projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"), task)
+
+	// Post a declined outcome which writes an agent note through commit.
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"implement","payload":{"action":"declined","reason":"the issue is already fixed"}}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	// Read the final state.
+	got := e.task(t, "t1")
+
+	// Journal did not grow to 51.
+	require.Len(t, got.Status.Notes, tatarav1alpha1.MaxNotes,
+		"commit with WithNoteCap must evict the oldest note to stay at MaxNotes, not grow to 51")
+
+	// Newest note (the one from the declined outcome) is present.
+	require.Contains(t, got.Status.Notes[len(got.Status.Notes)-1].Body, "declined: the issue is already fixed",
+		"the newly appended decline note must be at the end")
+
+	// Oldest seeded note is gone (evicted).
+	for _, n := range got.Status.Notes {
+		require.NotEqual(t, "seeded note 0", n.Body,
+			"the oldest seeded note must be evicted when the cap is hit")
+	}
+
+	// NotesSpilledRefs is empty (Discarding doesn't record refs).
+	require.Empty(t, got.Status.Stats.NotesSpilledRefs,
+		"Discarding spiller must not record any spilledRefs in Status.Stats.NotesSpilledRefs")
+}

@@ -16,9 +16,11 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/config"
 	"github.com/szymonrychu/tatara-operator/internal/ingest"
 	"github.com/szymonrychu/tatara-operator/internal/memclient"
+	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -301,15 +303,15 @@ func TestMemoryConfigFromConfig(t *testing.T) {
 // TestNewMemoryFor_ReturnsPerProjectNoteFetcher covers issue #345 fault (3):
 // restapi.Config.MemoryFor must resolve a fresh tatara-memory client per
 // Project (mirroring newSpillerFor), not one flat instance shared across
-// every project's rehydrate call. mgr is unused by the resolver body (same
-// as newSpillerFor), so nil is safe here.
+// every project's rehydrate call. The token source IS shared - one per
+// process - which is why it is passed in rather than minted per resolver.
 func TestNewMemoryFor_ReturnsPerProjectNoteFetcher(t *testing.T) {
 	cfg := config.Config{
 		OIDCIssuer:               "https://kc/realms/tatara",
 		OperatorOIDCClientID:     "tatara-operator",
 		OperatorOIDCClientSecret: "secret",
 	}
-	memoryFor := newMemoryFor(nil, cfg)
+	memoryFor := newMemoryFor(newMemoryTokenSource(cfg).Token)
 
 	projA := &tataradevv1alpha1.Project{
 		ObjectMeta: metav1.ObjectMeta{Name: "alpha"},
@@ -339,12 +341,14 @@ func TestNewMemoryFor_ReturnsPerProjectNoteFetcher(t *testing.T) {
 	}
 
 	// A project whose memory stack is not up yet (Status.Memory nil) must not
-	// panic the resolver - it resolves to a client dialing an empty endpoint,
-	// which fails the write/fetch at request time (existing Fit*/rehydrate
-	// error handling), not at construction time.
+	// panic the resolver. It resolves to NIL rather than to a client dialing
+	// "": rehydrateNotes handles a nil NoteFetcher as reason="unconfigured",
+	// whereas an empty-baseURL client turns every Fetch into
+	// `unsupported protocol scheme ""` and reports a wiring gap as a memory
+	// outage (#616).
 	projC := &tataradevv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "gamma"}}
-	if got := memoryFor(projC); got == nil {
-		t.Fatal("newMemoryFor must not return nil for a project with no memory status yet")
+	if got := memoryFor(projC); got != nil {
+		t.Fatalf("newMemoryFor(no memory status) = %#v, want nil", got)
 	}
 }
 
@@ -395,5 +399,65 @@ func TestAdoptionSeedRunnable_ListFailureIsNotFatal(t *testing.T) {
 	r := adoptionSeedRunnable{reader: c, namespace: "tatara"}
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("Start must swallow a list failure, got %v", err)
+	}
+}
+
+// TestNewSpillerFor_ResolvesThreeStates is issue #616. disableMemory clears
+// status.memory.endpoint but leaves status.memory NON-NIL, and memclient.New
+// never returns nil, so both resolvers used to hand out a live client aimed at
+// "" - every spill then failed with `unsupported protocol scheme ""`, was
+// classified spill_error, and 503'd the agent forever on a Project that is
+// deliberately memory-free.
+//
+// The three states are distinct on purpose. MemoryDisabled keys on SPEC, not
+// on the empty endpoint: an ENABLED project mid-provision also has an empty
+// endpoint, and it must keep BLOCKING (nil -> unconfigured -> 503) rather than
+// silently destroying notes it could have spilled a minute later.
+func TestNewSpillerFor_ResolvesThreeStates(t *testing.T) {
+	cfg := config.Config{
+		OIDCIssuer:               "https://kc/realms/tatara",
+		OperatorOIDCClientID:     "tatara-operator",
+		OperatorOIDCClientSecret: "secret",
+	}
+	tokens := newMemoryTokenSource(cfg).Token
+	spillerFor := newSpillerFor(tokens)
+	memoryFor := newMemoryFor(tokens)
+
+	disabled := &tataradevv1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "tatara"},
+		Spec: tataradevv1alpha1.ProjectSpec{
+			Memory: &tataradevv1alpha1.MemorySpec{Enabled: ptr.To(false)},
+		},
+		Status: tataradevv1alpha1.ProjectStatus{
+			Memory: &tataradevv1alpha1.MemoryStatus{Phase: tataradevv1alpha1.MemoryPhaseDisabled},
+		},
+	}
+	provisioning := &tataradevv1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "mid-provision"},
+		Status:     tataradevv1alpha1.ProjectStatus{Memory: &tataradevv1alpha1.MemoryStatus{}},
+	}
+	ready := &tataradevv1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "ready"},
+		Status:     tataradevv1alpha1.ProjectStatus{Memory: &tataradevv1alpha1.MemoryStatus{Endpoint: "http://tatara-memory.ready.svc:8080"}},
+	}
+
+	if got := spillerFor(disabled); got != objbudget.Discarding {
+		t.Fatalf("spillerFor(memory-disabled) = %#v, want objbudget.Discarding", got)
+	}
+	if got := spillerFor(provisioning); got != nil {
+		t.Fatalf("spillerFor(endpoint-less but ENABLED) = %#v, want nil so the write blocks as unconfigured", got)
+	}
+	if _, ok := spillerFor(ready).(*memclient.Client); !ok {
+		t.Fatalf("spillerFor(ready) = %T, want *memclient.Client", spillerFor(ready))
+	}
+
+	if got := memoryFor(disabled); got != nil {
+		t.Fatalf("memoryFor(memory-disabled) = %#v, want nil", got)
+	}
+	if got := memoryFor(provisioning); got != nil {
+		t.Fatalf("memoryFor(endpoint-less) = %#v, want nil", got)
+	}
+	if _, ok := memoryFor(ready).(*memclient.Client); !ok {
+		t.Fatalf("memoryFor(ready) = %T, want *memclient.Client", memoryFor(ready))
 	}
 }

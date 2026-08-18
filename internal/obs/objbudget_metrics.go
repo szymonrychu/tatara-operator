@@ -15,6 +15,7 @@ type ObjBudgetMetrics struct {
 	objectSizeBytes     *prometheus.HistogramVec
 	objectTooLargeTotal *prometheus.CounterVec
 	commentSpillTotal   *prometheus.CounterVec
+	evictedDroppedTotal *prometheus.CounterVec
 	spillBlockedTotal   *prometheus.CounterVec
 }
 
@@ -35,6 +36,17 @@ func NewObjBudgetMetrics(reg prometheus.Registerer) *ObjBudgetMetrics {
 			Name: "operator_comment_spill_total",
 			Help: "Eviction batches spilled to tatara-memory by the A.7 byte-budget guard, by kind.",
 		}, []string{"kind"}),
+		// The A.7 inversion (objbudget.Discarding): on a Project with
+		// spec.memory.enabled=false there is no spill target and never will be,
+		// so evicted items are DROPPED rather than the write being refused.
+		// Separate from commentSpillTotal because these items are gone, not
+		// stored, and separate from spillBlockedTotal because nothing failed -
+		// an alert on either that swallowed this would be wrong in both
+		// directions.
+		evictedDroppedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_objbudget_evicted_dropped_total",
+			Help: "Eviction batches DISCARDED rather than spilled, because the owning project has no memory stack by configuration, by kind.",
+		}, []string{"kind"}),
 		// The A.7 guard REFUSES a write it cannot spill (SPILL FIRST, DROP ONLY
 		// ON SPILL SUCCESS). That policy is deliberate - a memory outage is a
 		// fault that gets repaired, and no comment or note should be lost
@@ -47,7 +59,8 @@ func NewObjBudgetMetrics(reg prometheus.Registerer) *ObjBudgetMetrics {
 			Help: "Guarded writes refused because their eviction batch could not be spilled to tatara-memory, by kind and reason.",
 		}, []string{"kind", "reason"}),
 	}
-	reg.MustRegister(m.objectSizeBytes, m.objectTooLargeTotal, m.commentSpillTotal, m.spillBlockedTotal)
+	reg.MustRegister(m.objectSizeBytes, m.objectTooLargeTotal, m.commentSpillTotal,
+		m.evictedDroppedTotal, m.spillBlockedTotal)
 	// Pre-seed the two real reasons per guarded kind so a healthy operator
 	// exposes a zero baseline from startup (metric-wiring audit convention,
 	// issue #370) instead of a rate alert with no series to evaluate on the
@@ -55,6 +68,7 @@ func NewObjBudgetMetrics(reg prometheus.Registerer) *ObjBudgetMetrics {
 	for _, kind := range []string{"Issue", "MergeRequest", "Task"} {
 		m.spillBlockedTotal.WithLabelValues(kind, objbudget.SpillBlockedReasonError)
 		m.spillBlockedTotal.WithLabelValues(kind, objbudget.SpillBlockedReasonUnconfigured)
+		m.evictedDroppedTotal.WithLabelValues(kind)
 	}
 	return m
 }
@@ -72,6 +86,11 @@ func (m *ObjBudgetMetrics) IncObjectTooLarge(kind, name string) {
 // IncCommentSpill implements objbudget.Metrics.
 func (m *ObjBudgetMetrics) IncCommentSpill(kind string) {
 	m.commentSpillTotal.WithLabelValues(kind).Inc()
+}
+
+// IncEvictedDropped implements objbudget.Metrics.
+func (m *ObjBudgetMetrics) IncEvictedDropped(kind string) {
+	m.evictedDroppedTotal.WithLabelValues(kind).Inc()
 }
 
 // IncSpillBlocked implements objbudget.Metrics.
