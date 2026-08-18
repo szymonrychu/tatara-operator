@@ -332,6 +332,39 @@ test_unknown_mergeable_state_is_not_a_stall() {
   expect_lacks "$OUT" "::error::"
 }
 
+# A 200 carrying something that is not JSON (a proxy error page, a truncated
+# body) must not kill the step. A bare assignment under `set -e` exits writing
+# NO verdict, and the alarm then reports "the bump job failed first" about a
+# healthy PR - the defect class this job exists to remove.
+test_a_garbled_pr_body_does_not_kill_the_step() {
+  it "open + armed + red check + /pulls/{n} returns non-JSON -> a verdict, not a crash"
+  local d; d="$(make_stub_dir)"
+  routes "$d" \
+    "$(contents_routes "$d" main stale)" \
+    "$(contents_routes "$d" cd/deploy-train pinned)" \
+    "pulls?state=open|0|$(pr_json '{"merge_method":"squash"}')" \
+    "pulls/423|0|<html>502 Bad Gateway</html>" \
+    "check-runs|0|$(checks_json failure)"
+  run_script "$d" "$(verify_script)" "${VERIFY_ENV[@]}"
+  expect_rc 0
+  expect_eq "$(step_output "$d" state)" "in-flight"
+}
+
+# Same hole, other jq, opposite safe default: not being able to parse the check
+# runs is not evidence that nothing is red.
+test_a_garbled_check_runs_body_does_not_kill_the_step() {
+  it "open + armed + check-runs returns non-JSON -> exit 1, state=forge-unreadable"
+  local d; d="$(make_stub_dir)"
+  routes "$d" \
+    "$(contents_routes "$d" main stale)" \
+    "$(contents_routes "$d" cd/deploy-train pinned)" \
+    "pulls?state=open|0|$(pr_json '{"merge_method":"squash"}')" \
+    "check-runs|0|<html>502 Bad Gateway</html>"
+  run_script "$d" "$(verify_script)" "${VERIFY_ENV[@]}"
+  expect_rc 1
+  expect_eq "$(step_output "$d" state)" "forge-unreadable"
+}
+
 # Same rule as every other read in this job: a read that FAILED is reported as
 # unreadable, never as a verdict about the PR.
 test_unreadable_mergeable_state_is_not_a_verdict() {

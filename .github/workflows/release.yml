@@ -302,13 +302,23 @@ jobs:
               verdict forge-unreadable "${PARENT}#${num} (${url}) carries ${VERSION} and is armed, but its check runs could not be read."
               exit 1
             fi
-            red="$(printf '%s' "$checks" \
-              | jq -r '[.check_runs[]?
-                        | select(.conclusion == "failure" or .conclusion == "timed_out"
-                                 or .conclusion == "cancelled" or .conclusion == "action_required")
-                        | .name] | join(", ")')"
-            pending="$(printf '%s' "$checks" \
-              | jq -r '[.check_runs[]? | select(.status != "completed")] | length')" || pending=1
+            # `|| :` on the jq, not a bare assignment: a 200 carrying a proxy
+            # error page instead of JSON exits the step under `set -e` writing
+            # NO verdict, and the alarm then reports "the bump job failed
+            # first" about a healthy PR. Unparseable is unreadable, which is
+            # already a verdict below - it is not "nothing is red".
+            if ! summary="$(printf '%s' "$checks" \
+              | jq -r '([.check_runs[]?
+                         | select(.conclusion == "failure" or .conclusion == "timed_out"
+                                  or .conclusion == "cancelled" or .conclusion == "action_required")
+                         | .name] | join(", ")),
+                        ([.check_runs[]? | select(.status != "completed")] | length)')"; then
+              echo "::error::CD pin fan-out: ${PARENT}#${num} carries ${VERSION} and is armed, but its check runs did not parse: ${url}"
+              verdict forge-unreadable "${PARENT}#${num} (${url}) carries ${VERSION} and is armed, but its check runs could not be read."
+              exit 1
+            fi
+            red="$(printf '%s' "$summary" | sed -n 1p)"
+            pending="$(printf '%s' "$summary" | sed -n 2p)"
           fi
           if [ -n "$red" ]; then
             # A red check is terminal only if it is a REQUIRED context: auto-merge
@@ -330,7 +340,10 @@ jobs:
               verdict forge-unreadable "${PARENT}#${num} (${url}) carries ${VERSION} and is armed, but its merge state could not be read."
               exit 1
             fi
-            mstate="$(printf '%s' "$detail" | jq -r '.mergeable_state // "unknown"')"
+            # Unparseable is "unknown", which is already a non-blocking answer
+            # below - the same reason as the check-runs guard, opposite default:
+            # here the honest reading of "I could not tell" is not "stuck".
+            mstate="$(printf '%s' "$detail" | jq -r '.mergeable_state // "unknown"')" || mstate=unknown
             if [ "$mstate" = blocked ] && [ "$pending" -eq 0 ]; then
               echo "::error::CD pin fan-out is STUCK: ${PARENT}#${num} carries ${VERSION} and is armed, but these checks are red: ${red} (${url})"
               echo "::error::Every check has reported and the forge still calls the merge blocked, so this pin will not land without a human."
