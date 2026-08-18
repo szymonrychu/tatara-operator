@@ -25,6 +25,7 @@ type taskMetrics struct {
 	botRounds               *prometheus.GaugeVec
 	retryScheduledTotal     *prometheus.CounterVec
 	retryExhaustedTotal     *prometheus.CounterVec
+	retryBlockerReadTotal   *prometheus.CounterVec
 }
 
 // newTaskMetrics registers the task collectors on reg and returns the bundle.
@@ -126,6 +127,10 @@ func newTaskMetrics(reg prometheus.Registerer) *taskMetrics {
 			Name: "operator_task_retry_exhausted_total",
 			Help: "UnparkRetry lanes that spent MaxUnparkRetries laps without clearing their blocker, by the ORIGINAL park reason and the state the Task was stuck in. Each increment is a Task that has been re-parked retry-exhausted and told a human so on the forge, so ANY non-zero value is an approved Task that did not deliver and is waiting on a person. This is the alertable series: before it existed the same event was a silent park nobody found for days.",
 		}, []string{"reason", "state"}),
+		retryBlockerReadTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_task_retry_blocker_read_total",
+			Help: "LIVE forge confirmations the UnparkRetry lane made before releasing a park, by the park reason and the answer: standing (the blocker is still there, so the lane charges a lap instead of spawning a pod), cleared (it is gone, so the park is released), error (the read did not answer, so nothing is charged or released and the next pass re-reads) and deferred (this pass's maxRetryBlockerReadsPerPass allowance was already spent). A persistently non-zero deferred rate says the per-pass cap is too small for the due backlog; a persistently non-zero error rate says the gate is not gating and every release is happening blind.",
+		}, []string{"reason", "result"}),
 	}
 	reg.MustRegister(
 		m.taskTokensTotal,
@@ -148,6 +153,7 @@ func newTaskMetrics(reg prometheus.Registerer) *taskMetrics {
 		m.botRounds,
 		m.retryScheduledTotal,
 		m.retryExhaustedTotal,
+		m.retryBlockerReadTotal,
 	)
 	return m
 }
@@ -182,6 +188,30 @@ func (m *OperatorMetrics) TaskRetryExhausted(reason, state string) {
 // counter for (reason,state), for test assertions.
 func (m *OperatorMetrics) TaskRetryExhaustedCounter(reason, state string) prometheus.Counter {
 	return m.retryExhaustedTotal.WithLabelValues(reason, state)
+}
+
+// The four answers a live blocker read can produce. They are constants because
+// the metric's `result` label and the driver's branches must not drift apart.
+const (
+	RetryBlockerReadStanding = "standing"
+	RetryBlockerReadCleared  = "cleared"
+	RetryBlockerReadError    = "error"
+	RetryBlockerReadDeferred = "deferred"
+)
+
+// TaskRetryBlockerRead increments operator_task_retry_blocker_read_total for one
+// attempted live confirmation. Nil-safe for the reason the two above are.
+func (m *OperatorMetrics) TaskRetryBlockerRead(reason, result string) {
+	if m == nil || m.retryBlockerReadTotal == nil {
+		return
+	}
+	m.retryBlockerReadTotal.WithLabelValues(reason, result).Inc()
+}
+
+// TaskRetryBlockerReadCounter returns the operator_task_retry_blocker_read_total
+// counter for (reason,result), for test assertions.
+func (m *OperatorMetrics) TaskRetryBlockerReadCounter(reason, result string) prometheus.Counter {
+	return m.retryBlockerReadTotal.WithLabelValues(reason, result)
 }
 
 // addPositive adds delta to the vec's counter for the given labels, but only

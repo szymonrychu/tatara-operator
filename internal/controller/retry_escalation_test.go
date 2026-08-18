@@ -160,6 +160,60 @@ func TestRetryExhaustionCommentsOnceEvenWhenTheReparkFails(t *testing.T) {
 	}
 }
 
+// TestADeliveredEscalationIsLatchedEvenWhenTheReparkFails is LOW 6, and it is
+// the window swallowing the latch error does NOT close. Both writes go to the
+// same object on the same apiserver, so their failures are CORRELATED: during a
+// blip the latch write fails, the re-park fails too, the Task stays in the lane
+// at the cap, and the next 30s pass posts the escalation comment again - which
+// is the duplicate-comment storm the latch exists to prevent. Falling through is
+// only safe when the re-park actually lands; when it does not, the latch for a
+// comment that DID land has to be re-tried before returning.
+func TestADeliveredEscalationIsLatchedEvenWhenTheReparkFails(t *testing.T) {
+	proj := reProject()
+	task := reExhaustedTask("t-exhausted-latch-and-repark-fail", stage.ReasonCIFailed)
+	patches := 0
+	c := newMirrorClientIntercepted(t, interceptor.Funcs{
+		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object,
+			p client.Patch, opts ...client.PatchOption) error {
+			if tk, ok := obj.(*tatarav1alpha1.Task); ok && tk.Name == "t-exhausted-latch-and-repark-fail" {
+				patches++
+				if patches == 1 {
+					return errors.New("apiserver is having a moment")
+				}
+			}
+			return cl.Patch(ctx, obj, p, opts...)
+		},
+		SubResourceUpdate: func(_ context.Context, _ client.Client, _ string,
+			obj client.Object, _ ...client.SubResourceUpdateOption) error {
+			if tk, ok := obj.(*tatarav1alpha1.Task); ok && tk.Name == "t-exhausted-latch-and-repark-fail" {
+				return errors.New("apiserver is having a moment")
+			}
+			return nil
+		},
+	}, proj, mdSecret(), mdRepo("repo-a"), mdIssue(task, "repo-a", 42), task)
+	w := &mbWriter{}
+	r := &ProjectReconciler{Client: c, APIReader: c, Scheme: c.Scheme(), Metrics: wfMetrics(),
+		SCMFor: func(string) (scm.SCMWriter, error) { return w, nil }}
+
+	for i := 0; i < 3; i++ {
+		if err := r.driveUnparks(context.Background(), proj, time.Now()); err == nil {
+			t.Fatalf("pass %d: driveUnparks swallowed the failed repark", i)
+		}
+	}
+	if len(w.comments) != 1 {
+		t.Fatalf("Comment calls = %d over three passes, want exactly 1: a correlated apiserver blip "+
+			"re-posts the escalation on every pass", len(w.comments))
+	}
+	got := mdGetTask(t, c, task.Name)
+	if got.Annotations[tatarav1alpha1.AnnRetryExhaustedCommented] != parkStamp(got) {
+		t.Fatalf("latch = %q, want the delivered comment latched at %q",
+			got.Annotations[tatarav1alpha1.AnnRetryExhaustedCommented], parkStamp(got))
+	}
+	if got.Status.ParkReason != stage.ReasonCIFailed {
+		t.Fatalf("parkReason = %q, want the blocker unchanged: the repark did not land", got.Status.ParkReason)
+	}
+}
+
 // A forge outage must not cost the repark. The park is the correctness-critical
 // half: without it the lane re-escalates every 30s forever, calling the forge
 // each time.

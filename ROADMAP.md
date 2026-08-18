@@ -331,8 +331,20 @@ Open, out of scope, deliberately not done:
   from "no target", and falls back to the owned merge request; and
   `driveRetryLaneMigration` moves the live `ci-red`/`merge-conflict` parks that
   motivated the lane onto it (bounded by `ParkRetention`, one-way, latched).
+- [x] Half 2 review round 2 (eight findings, three of them defects the first
+  round's own fixes introduced): the armed+due path reads the blocker BEFORE
+  exhaustion and capacity, so a spent lane is never escalated on a blocker that
+  has cleared; a failed blocker read is logged instead of failing the whole
+  Project reconcile, and `maxRetryBlockerReadsPerPass` bounds how many Tasks pay
+  for a live read per pass; the migration no longer charges the park as residency
+  (which was killing migrated Tasks at `stage-deadline` on their first pass back)
+  and is capped per pass, with an alertable action for a stranded one; the
+  conflict probe is scoped to `mergeOrder[mergeCursor]`; and the escalation latch
+  is re-tried when the re-park fails. `change_significance: patch` - no API
+  change, one new metric (`operator_task_retry_blocker_read_total`).
 - [ ] `tatara-observability`: alert on `operator_task_retry_exhausted_total`, and
-  allowlist it plus `operator_task_retry_scheduled_total`. NOT before this
+  allowlist it plus `operator_task_retry_scheduled_total` and
+  `operator_task_retry_blocker_read_total`. NOT before this
   producer is on `main` (MEMORY: a metric allowlist entry needs its producer on
   main, or observability CI goes red on every PR).
 

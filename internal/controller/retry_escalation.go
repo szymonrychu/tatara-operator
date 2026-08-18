@@ -36,6 +36,7 @@ import (
 //     reason with no schedule armed, this function runs on EVERY 30s pass, so a
 //     forge outage that blocked the repark would turn one escalation into a
 //     comment attempt every thirty seconds for as long as the outage lasts.
+//
 //   - THE LATCH WRITE IS SWALLOWED FOR THE SAME REASON, and it was not: a failed
 //     latch used to return before the repark, which left the Task in the lane at
 //     the cap and brought the next pass straight back here to comment AGAIN. One
@@ -44,8 +45,20 @@ import (
 //     Falling through costs nothing that matters: the repark moves the reason to
 //     retry-exhausted, which is UnparkHuman, so the lane never looks at this Task
 //     again and the latch it failed to write has nothing left to guard.
+//
+//     THAT ARGUMENT ONLY HOLDS WHERE THE REPARK LANDS, and the two writes go to
+//     the same object on the same apiserver, so their failures are CORRELATED:
+//     during a blip the latch fails, the repark fails too, the Task stays in the
+//     lane at the cap, and the next pass posts the comment again - the exact
+//     storm the swallow was supposed to have prevented. So a repark that fails
+//     RE-TRIES the latch for a comment that did land, best-effort, before
+//     returning. It cannot be one write instead: the latch is metadata and the
+//     repark is the status subresource, and every persist path behind
+//     internal/stage ends in Status().Update, which discards annotations.
+//
 //   - the latch is stamped only after the comment LANDS, so an outage costs a
 //     retry next pass rather than a silently lost escalation.
+//
 //   - the latch is keyed on the park's own parkedAt, so it silences THIS
 //     escalation and not the next blocker's.
 //
@@ -64,6 +77,9 @@ func (r *ProjectReconciler) escalateExhaustedRetry(ctx context.Context, proj *ta
 	attempts := t.Status.RetryAttempts
 	stamp := parkStamp(t)
 
+	// unlatched is "a comment for THIS park has landed and nothing records that
+	// yet". It is what the repark's failure path re-tries the latch for.
+	unlatched := false
 	if t.Annotations[tatarav1alpha1.AnnRetryExhaustedCommented] != stamp {
 		ref, ok, err := r.exhaustedRetryTarget(ctx, proj, t)
 		if err != nil {
@@ -77,6 +93,7 @@ func (r *ProjectReconciler) escalateExhaustedRetry(ctx context.Context, proj *ta
 					"action", "retry_exhausted_comment_failed", "resource_id", t.Name,
 					"reason", reason, "issue_ref", ref)
 			} else if serr := r.stampRetryExhaustedCommented(ctx, t, stamp); serr != nil {
+				unlatched = true
 				l.Error(serr, "retry lane: the escalation latch failed to write; the park still lands",
 					"action", "retry_exhausted_latch_failed", "resource_id", t.Name,
 					"reason", reason, "issue_ref", ref)
@@ -93,6 +110,18 @@ func (r *ProjectReconciler) escalateExhaustedRetry(ctx context.Context, proj *ta
 	}
 
 	if err := r.applyRetryExhaustion(ctx, t, now); err != nil {
+		if unlatched {
+			// The repark did NOT move the reason, so this Task comes back here on
+			// the next pass and would comment again. One more attempt at the latch,
+			// best-effort: the failures are correlated, so it usually fails too -
+			// but a blip that cleared between the two writes is common enough that
+			// this is the difference between one comment and one per thirty seconds.
+			if serr := r.stampRetryExhaustedCommented(ctx, t, stamp); serr != nil {
+				l.Error(serr, "retry lane: the escalation is delivered but neither latched nor re-parked; "+
+					"the next pass may re-post it",
+					"action", "retry_exhausted_latch_failed", "resource_id", t.Name, "reason", reason)
+			}
+		}
 		return err
 	}
 	l.Info("retry lane spent: the blocker outlived the machine's budget and now belongs to a human",
@@ -139,15 +168,22 @@ func (r *ProjectReconciler) applyRetryExhaustion(ctx context.Context, t *tatarav
 // stampRetryExhaustedCommented writes the latch. A METADATA patch, not a status
 // write: the two subresources are independent, so this cannot be lost by the
 // status update that follows it.
+//
+// t IS NOT MUTATED UNTIL THE PATCH LANDS, unlike the other stampers here, and
+// this one has a caller that retries it: the repark's failure path. Mutating
+// first would leave the in-memory Task carrying an annotation the apiserver
+// never got, so MergeFrom would compute an EMPTY diff on the retry and the
+// second attempt would silently write nothing at all.
 func (r *ProjectReconciler) stampRetryExhaustedCommented(ctx context.Context, t *tatarav1alpha1.Task, stamp string) error {
-	patch := client.MergeFrom(t.DeepCopy())
-	if t.Annotations == nil {
-		t.Annotations = map[string]string{}
+	stamped := t.DeepCopy()
+	if stamped.Annotations == nil {
+		stamped.Annotations = map[string]string{}
 	}
-	t.Annotations[tatarav1alpha1.AnnRetryExhaustedCommented] = stamp
-	if err := r.Patch(ctx, t, patch); err != nil {
+	stamped.Annotations[tatarav1alpha1.AnnRetryExhaustedCommented] = stamp
+	if err := r.Patch(ctx, stamped, client.MergeFrom(t)); err != nil {
 		return fmt.Errorf("unpark: stamp %s on %s: %w", tatarav1alpha1.AnnRetryExhaustedCommented, t.Name, err)
 	}
+	*t = *stamped
 	return nil
 }
 
