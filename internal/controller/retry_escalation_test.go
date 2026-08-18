@@ -30,9 +30,17 @@ func reProject() *tatarav1alpha1.Project {
 // reExhaustedTask is a Task whose retry lane is spent: parked in the lane, at
 // the cap, with no schedule armed - which is exactly the state driveRetryLane
 // reaches on the pass after the last backoff was served.
+//
+// retryBlocker IS the reason, and that is not decoration. The counter is scoped
+// to the blocker it was spent on (stage.ArmRetry, which is the only thing that
+// increments it), so attempts=5 with an empty or foreign retryBlocker is a state
+// no writer produces - and the exhaustion check now refuses to escalate on one,
+// because inheriting another blocker's spend is what dragged a human in after
+// zero laps on the blocker the comment named.
 func reExhaustedTask(name, reason string) *tatarav1alpha1.Task {
 	t := retryParkedTask(name, tatarav1alpha1.StateMerged, reason)
 	t.Status.RetryAttempts = tatarav1alpha1.MaxUnparkRetries
+	t.Status.RetryBlocker = reason
 	t.Status.IssueRefs = []string{tatarav1alpha1.IssueName("repo-a", 42)}
 	return t
 }

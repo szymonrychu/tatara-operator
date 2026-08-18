@@ -391,6 +391,31 @@ func TestArmRetryRefusesAParkThatIsNotInTheRetryLane(t *testing.T) {
 		"an un-parked Task has no lane to arm")
 }
 
+// RescheduleRetry is the verdict that is neither "still standing" nor
+// "release": the blocker has cleared and the project has no live room for the
+// pod a release would mint. Without a schedule that answer is not recorded
+// anywhere and the driver re-reads the forge on every 30s pass forever.
+func TestRescheduleRetryPacesTheReReadWithoutChargingALap(t *testing.T) {
+	tk := task(v1alpha1.StateAwaitingReview)
+	require.NoError(t, stage.Park(tk, stage.ReasonMergeConflictRetry, now))
+	tk.Status.RetryBlocker = stage.ReasonMergeConflictRetry
+	tk.Status.RetryAttempts = v1alpha1.MaxUnparkRetries
+
+	require.NoError(t, stage.RescheduleRetry(tk, now))
+	require.NotNil(t, tk.Status.RetryNextAt)
+	require.Equal(t, now.Add(stage.RetryWait(v1alpha1.MaxUnparkRetries-1)), tk.Status.RetryNextAt.Time,
+		"the wait the current lap already paid for is re-served; no lap buys a longer one")
+	require.Equal(t, v1alpha1.MaxUnparkRetries, tk.Status.RetryAttempts,
+		"the operator's own ceiling is not the blocker's lap")
+	require.Equal(t, stage.ReasonMergeConflictRetry, tk.Status.RetryBlocker)
+
+	require.Error(t, stage.RescheduleRetry(task(v1alpha1.StateAwaitingReview), now),
+		"an un-parked Task has no lane to reschedule")
+	human := task(v1alpha1.StateAwaitingReview)
+	require.NoError(t, stage.Park(human, stage.ReasonAwaitingHuman, now))
+	require.Error(t, stage.RescheduleRetry(human, now), "a human park is not on a timer")
+}
+
 // TestARetryParkIsRefusedUntilItIsDue puts the backoff in the PURE package, not
 // only in the driver: ApplyUnpark has three call sites and a webhook comment
 // must not be able to short-circuit a schedule the lane is counting laps on.

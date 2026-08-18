@@ -357,6 +357,34 @@ func ArmRetry(t *v1alpha1.Task, now time.Time) error {
 	return nil
 }
 
+// RescheduleRetry re-serves the CURRENT lap's wait WITHOUT spending another
+// one. It is ArmRetry's twin for the one verdict that is neither "the blocker is
+// still there" nor "release it": the blocker has CLEARED but the project has no
+// live room for the pod the release would mint.
+//
+// Without it that verdict is not recorded anywhere, so the driver re-reads the
+// forge for the same Task on every 30s pass and gets the same answer forever -
+// two such Tasks consume maxRetryBlockerReadsPerPass outright and defer every
+// other due park behind them. Re-arming paces the re-read by the backoff
+// instead, and the Task still releases on the first due pass that finds room.
+//
+// NO LAP IS CHARGED and retryBlocker is untouched, because a ceiling is the
+// operator's constraint and not the blocker's: charging it would escalate a
+// queue to a human as though a pipeline had failed. The wait is therefore
+// RetryWait(attempts-1) - the one the lap already paid for - and not the longer
+// one the next lap would buy.
+func RescheduleRetry(t *v1alpha1.Task, now time.Time) error {
+	if t.Status.ParkReason == "" {
+		return &NotParkedError{State: t.Status.State}
+	}
+	if class, ok := UnparkClassFor(t.Status.ParkReason); !ok || class != UnparkRetry {
+		return fmt.Errorf("stage: park reason %q is not in the retry lane", t.Status.ParkReason)
+	}
+	next := metav1.NewTime(now.Add(RetryWait(t.Status.RetryAttempts - 1)))
+	t.Status.RetryNextAt = &next
+	return nil
+}
+
 // ResetRetryBudget launders the retry lane's three status fields. It is the ONE
 // way anything outside this package refunds the budget, so "who may give a Task
 // a fresh set of laps" stays enumerable: stampEnter (a genuine transition), the

@@ -382,10 +382,26 @@ const RetiredParkMigrationWindow = 48 * time.Hour
 //
 // TWO, so the worst case is ~3 minutes of blocked reconciliation rather than
 // thirty, and the typical case (a forge answering in milliseconds) is unchanged.
-// It does not starve: a Task that IS served either releases or re-arms into a
-// backoff of at least UnparkRetryBackoffBase, so it stops competing for the
-// budget and the queue drains at 2 per pacing interval - far above any rate at
-// which parks actually come due.
+//
+// THE FAIRNESS BOUND IS CONDITIONAL, NOT ABSOLUTE, and the "it does not starve"
+// this doc used to open with was too strong. driveUnparks walks tl.Items in the
+// API's stable list order, so service is by NAME: there is no rotation and no
+// queue, and an earlier-named Task wins the budget every pass. What bounds the
+// wait is that a Task which IS served stops competing - it releases, or arms
+// (or re-schedules) a wait between UnparkRetryBackoffBase (1m, a park's first
+// lap) and RetryWait(MaxUnparkRetries-1) (16m, the longest the lane ever serves,
+// since the fifth lap's read escalates instead of arming another).
+//
+// So the pass drains 2 per defaultUnparkDriveInterval = 4/min against a demand
+// of one read per lane-parked Task per its own backoff. The condition is
+// therefore N < 4 x (mean backoff in minutes) - roughly 64 Tasks once a
+// population has settled onto the long laps, and as few as a handful on the
+// pass after a bulk migration puts everything on the 1m first lap at once (which
+// is what maxRetryLaneMigrationsPerPass exists to stagger). Above that line, and
+// only above it, a Task LATER in name order can be deferred for as long as the
+// backlog ahead of it lasts. It is visible before it bites:
+// operator_task_retry_blocker_read_total{result="deferred"} going persistently
+// non-zero is the signal to raise this number.
 const maxRetryBlockerReadsPerPass = 2
 
 // maxRetryLaneMigrationsPerPass BOUNDS the retry-lane migration the same way.
@@ -1131,11 +1147,50 @@ func (r *ProjectReconciler) driveRetryLane(ctx context.Context, proj *tatarav1al
 			return true, nil
 		}
 		if !standing {
+			// THE COUNTER GOES INSIDE THE PROBE GUARD. retryBlockerStanding
+			// answers (false, nil) for a reason with no probe (ci-pending,
+			// mr-surface-spent) and for an unwired SCMFor without touching the
+			// forge at all, and counting those as cleared reads diluted the
+			// denominator of rate(error)/rate(standing+cleared+error) - the ratio
+			// that says whether this gate is gating anything.
+			if r.retryBlockerProbed(reason) {
+				r.Metrics.TaskRetryBlockerRead(reason, obs.RetryBlockerReadCleared)
+			}
+			if stage.Live(t.Status.State) && !liveRoom {
+				// CLEARED, AND NOTHING CAN ACT ON IT THIS PASS. Reachable only at
+				// the cap, because below it the capacity arm above has already
+				// returned - and at the cap the read is mandatory, so the pass
+				// cannot simply be skipped. ApplyUnpark would decline
+				// no-live-room and change nothing, leaving the Task due again
+				// thirty seconds later: the same forge read, the same answer, for
+				// as long as the ceiling holds, and liveRoomBudget is zeroed for a
+				// whole pass by a transient countLive error too. Two such Tasks
+				// spend maxRetryBlockerReadsPerPass outright and defer every other
+				// due park indefinitely. Re-arming the SAME wait paces the re-read
+				// by the backoff without charging a lap for the operator's own
+				// ceiling; the decline is counted here because ApplyUnpark no
+				// longer gets to.
+				//
+				// THE TEST IS THE STATE, NOT NeedsLiveRoom(reason), and the
+				// difference is a release this branch must NOT swallow: it exists
+				// only to predict what stage.liveRoomDecline is about to answer,
+				// and that refuses on Live(state) && !LiveHasRoom. NeedsLiveRoom
+				// is keyed on the reason alone and over-approximates on purpose
+				// (it answers before the capacity List is paid for), so it is true
+				// for a merge-conflict-retry park at `merged` - where no pod is
+				// minted, the ceiling has nothing to say, and ApplyUnpark releases
+				// whatever the project's occupancy is.
+				rescheduled, rerr := r.rescheduleRetryPark(ctx, t, now)
+				if rerr != nil {
+					return true, rerr
+				}
+				if rescheduled && r.Metrics != nil {
+					r.Metrics.UnparkDeclined(reason, string(DeclineNoLiveRoom))
+				}
+				return true, nil
+			}
 			// The blocker is GONE: hand the Task to the caller's ApplyUnpark,
-			// which applies every remaining rule - capacity included, declining
-			// no-live-room and retaining the lane if the project has no room.
-			// Nothing is spent either way.
-			r.Metrics.TaskRetryBlockerRead(reason, obs.RetryBlockerReadCleared)
+			// which applies every remaining rule. Nothing is spent either way.
 			return false, nil
 		}
 		r.Metrics.TaskRetryBlockerRead(reason, obs.RetryBlockerReadStanding)
@@ -1156,7 +1211,24 @@ func (r *ProjectReconciler) driveRetryLane(ctx context.Context, proj *tatarav1al
 	// park itself is the observation, written by the corridor or the sweep that
 	// read the forge. The next lap is what happens now, so this is where
 	// exhaustion and capacity are asked.
-	if t.Status.RetryAttempts >= tatarav1alpha1.MaxUnparkRetries {
+	//
+	// THE BUDGET IS THE BLOCKER'S, NOT THE TASK'S, and this check has to say so
+	// itself. stage.ArmRetry scopes the counter (a reason differing from
+	// status.retryBlocker starts from zero) but it runs AFTER this, so reading
+	// retryAttempts alone escalated a Task that had spent nothing at all on the
+	// blocker in front of it: clearPark deliberately preserves retryAttempts and
+	// retryBlocker across the release a spent lane earns when its blocker finally
+	// clears, so the very next technical park - a different reason, unarmed,
+	// inherited at the cap - went straight to escalateExhaustedRetry with zero
+	// laps and zero forge reads, and re-parked retry-exhausted (UnparkHuman) with
+	// a comment naming five attempts and a backoff schedule that belonged to the
+	// blocker before it.
+	//
+	// The ARMED arm above needs no such guard: RetryNextAt is written only by
+	// ArmRetry, cleared by clearPark and ResetRetryBudget, and ParkReason cannot
+	// change while it is set (Park is idempotent on an already-parked Task, and
+	// repark goes through clearPark) - so armed implies retryBlocker == reason.
+	if t.Status.RetryBlocker == reason && t.Status.RetryAttempts >= tatarav1alpha1.MaxUnparkRetries {
 		return true, r.escalateExhaustedRetry(ctx, proj, t, now)
 	}
 	if NeedsLiveRoom(reason) && !liveRoom {
@@ -1234,19 +1306,22 @@ func (r *ProjectReconciler) chargeNextRetryLap(ctx context.Context, t *tatarav1a
 // on the sixty passes a Task spends waiting, and maxRetryBlockerReadsPerPass
 // bounds how many Tasks may pay in the same pass.
 //
-// THE CONFLICT PROBE IS CURSOR-SCOPED, and that is what keeps it honest against
-// the corridor it is gating. The corridor reads mergeability one repo at a time
-// in mergeOrder and stops at the first blocker, so a gate folding "is ANY open
-// owned merge request dirty" answers about repos the corridor will not reach for
-// laps yet: with [operator, cli, helmfile], operator merged and cli's conflict
-// cleared two minutes later, a stale helmfile branch made every lap report
-// standing, burnt the whole budget and escalated naming helmfile - when the
-// corridor would have merged cli and advanced the cursor, which refunds the
-// budget outright. With no mergeOrder resolved (a park written before /outcome
-// set one) there is no corridor position to scope to and the fold is all there
-// is. ciRedAtReviewedHead's own all-merge-request fold is left ALONE: red CI
-// anywhere in the order blocks the whole change, which is what the rest of the
-// system already assumes.
+// THE CONFLICT PROBE IS CURSOR-SCOPED IN AN OPERATOR-DRIVEN STATE AND A FULL
+// FOLD EVERYWHERE ELSE, because merge-conflict-retry has two writers and the
+// probe has to match whichever of them would re-park the Task on release. In
+// `merged` that is the merge corridor, which reads mergeability one repo at a
+// time in mergeOrder and stops at the first blocker - so a fold there answers
+// about repos the corridor will not reach for laps yet, and burns the budget on
+// them. Outside it the corridor is not running at all and the only writer left
+// is the conflict sweep, which folds over every owned merge request. See
+// corridorMergeRequests for the whole of that argument. With no mergeOrder
+// resolved (a park written before /outcome set one) there is no corridor
+// position to scope to and the fold is all there is either way.
+//
+// ciRedAtReviewedHead's own all-merge-request fold is left ALONE, and it needs
+// no state condition: red CI anywhere in the order blocks the whole change, and
+// the SAME function is what ci_gate.go uses to WRITE the ci-failed park, so
+// probe and writer agree by construction.
 //
 // Which reasons it probes at all is retryBlockerProbed's, not this function's.
 func (r *ProjectReconciler) retryBlockerStanding(ctx context.Context, proj *tatarav1alpha1.Project,
@@ -1325,11 +1400,36 @@ func (r *ProjectReconciler) retryBlockerProbed(reason string) bool {
 // back: the caller's fold is then the only answer available, which is what it
 // did before the cursor existed.
 //
+// ONLY IN AN OPERATOR-DRIVEN STATE, because that is the only place the corridor
+// is the writer. merge-conflict-retry has TWO writers and the scoping matches
+// exactly one of them:
+//
+//   - StageDriver.mergeConflict (merge.go), reachable only from `merged`, probes
+//     spec.mergeOrder[mergeCursor] and stops at the first blocker. Scoping to the
+//     cursor is what keeps the gate honest against it, and the release it allows
+//     is cheap even when it turns out to be early: no agent pod is minted in an
+//     operator-driven state, so the worst case is one corridor pass, which either
+//     merges the cursor repo (advancing the cursor, which refunds the budget) or
+//     re-parks having cost nothing but a forge read.
+//   - enterMergeConflict (conflict_sweep.go), which runs over every state in
+//     stage.Live || stage.OperatorDriven, iterates EVERY owned merge request in
+//     CR-name order and parks on the first dirty one. It is not cursor-scoped and
+//     nothing makes it so. Narrowing the probe to the cursor where the sweep is
+//     the writer releases a park the sweep re-writes within
+//     defaultConflictSweepInterval - and at awaiting-review the release mints a
+//     review pod that the re-park then kills mid-turn. clearPark preserves
+//     retryAttempts, so five laps of that burn five pods and escalate, where the
+//     all-MR fold spends one lap and no pod. So outside the corridor's own states
+//     the fold is over everything, which is the sweep's own question.
+//
 // mrForRepo is the corridor's own resolver, so "which merge request is repo X's"
 // cannot drift between the two.
 func corridorMergeRequests(t *tatarav1alpha1.Task,
 	mrs []tatarav1alpha1.MergeRequest) []tatarav1alpha1.MergeRequest {
 
+	if !stage.OperatorDriven(t.Status.State) {
+		return mrs
+	}
 	cursor := t.Status.MergeCursor
 	if cursor < 0 || cursor >= len(t.Spec.MergeOrder) {
 		return mrs
@@ -1354,13 +1454,35 @@ func corridorMergeRequests(t *tatarav1alpha1.Task,
 func (r *ProjectReconciler) armRetryPark(ctx context.Context, t *tatarav1alpha1.Task,
 	now time.Time) (armed bool, err error) {
 
+	return r.writeRetryPark(ctx, t, stage.ArmRetry, now)
+}
+
+// rescheduleRetryPark persists stage.RescheduleRetry under the same optimistic
+// concurrency and the same race sentinel as armRetryPark. It is the pass that
+// found the blocker CLEARED and the project out of live room: the verdict is
+// worth keeping (the re-read is paced by the backoff instead of by the driver's
+// 30s interval) and the lap is not the blocker's to charge.
+func (r *ProjectReconciler) rescheduleRetryPark(ctx context.Context, t *tatarav1alpha1.Task,
+	now time.Time) (rescheduled bool, err error) {
+
+	return r.writeRetryPark(ctx, t, stage.RescheduleRetry, now)
+}
+
+// writeRetryPark is the CAS both of the above are: re-read through the UNCACHED
+// APIReader, re-check the park under the retry, apply, persist. Shared rather
+// than copied so the race test - the one thing that keeps a Task another writer
+// has moved from being charged for a park that is over - cannot drift between
+// them.
+func (r *ProjectReconciler) writeRetryPark(ctx context.Context, t *tatarav1alpha1.Task,
+	apply func(*tatarav1alpha1.Task, time.Time) error, now time.Time) (written bool, err error) {
+
 	getter := client.Reader(r.APIReader)
 	if getter == nil {
 		getter = r.Client
 	}
 	key := client.ObjectKeyFromObject(t)
 	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		armed = false
+		written = false
 		fresh := &tatarav1alpha1.Task{}
 		if err := getter.Get(ctx, key, fresh); err != nil {
 			return err
@@ -1372,20 +1494,20 @@ func (r *ProjectReconciler) armRetryPark(ctx context.Context, t *tatarav1alpha1.
 		if fresh.Status.ParkReason != t.Status.ParkReason || !sameRetrySchedule(fresh, t) {
 			return nil // raced: another writer armed, released or re-parked it
 		}
-		if err := stage.ArmRetry(fresh, now); err != nil {
-			return fmt.Errorf("unpark: arm the retry lane on %s: %w", key.Name, err)
+		if err := apply(fresh, now); err != nil {
+			return fmt.Errorf("unpark: write the retry lane's schedule on %s: %w", key.Name, err)
 		}
 		if err := r.Status().Update(ctx, fresh); err != nil {
 			return err
 		}
 		*t = *fresh
-		armed = true
+		written = true
 		return nil
 	})
 	if err != nil {
 		return false, err
 	}
-	return armed, nil
+	return written, nil
 }
 
 // sameRetrySchedule reports whether two copies of a Task carry the same

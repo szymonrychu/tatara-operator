@@ -823,26 +823,45 @@ func TestAStrandedRetryLaneMigrationIsAlertable(t *testing.T) {
 	}
 }
 
-// TestTheConflictGateAsksOnlyTheRepoTheCorridorIsAt is MEDIUM 4. The merge
-// corridor reads GetMergeState one repo at a time in mergeCursor order and stops
-// at the first blocker; a gate that folds "is ANY open owned MR dirty" therefore
-// reports standing for a repo the corridor was never going to reach this lap -
-// with [operator, cli, helmfile], operator merged and cli's conflict cleared two
-// minutes later, a stale helmfile branch kept answering "standing" for five laps
-// and escalated on a repo the corridor had not started.
-func TestTheConflictGateAsksOnlyTheRepoTheCorridorIsAt(t *testing.T) {
+// TestTheConflictGateMatchesWhicheverWriterWouldRePark. merge-conflict-retry has
+// TWO writers, and the probe has to ask whichever of them would re-park the Task
+// the moment the lane released it.
+//
+//   - IN AN OPERATOR-DRIVEN STATE the writer is the merge corridor, which reads
+//     GetMergeState one repo at a time in mergeCursor order and stops at the
+//     first blocker. A gate folding "is ANY open owned MR dirty" reports standing
+//     for a repo the corridor was never going to reach this lap: with [operator,
+//     cli, helmfile], operator merged and cli's conflict cleared two minutes
+//     later, a stale helmfile branch kept answering standing for five laps and
+//     escalated on a repo the corridor had not started - when releasing would
+//     have merged cli and advanced the cursor, which refunds the budget outright.
+//     Nothing mints a pod at `merged` either, so a release that turns out to be
+//     early costs a corridor pass and no admission slot.
+//   - ANYWHERE ELSE the corridor is not running and the only writer left is the
+//     conflict sweep (conflict_sweep.go), which walks EVERY owned merge request
+//     in CR-name order, is not cursor-scoped at all, and parks on the first dirty
+//     one. Cursor-scoping the probe there releases a park the sweep re-writes
+//     within defaultConflictSweepInterval - and the release at awaiting-review
+//     mints a review pod that the re-park then kills mid-turn. clearPark
+//     preserves retryAttempts, so five laps of that burn five pods and then
+//     escalate: strictly worse than the all-MR fold, which spends a lap and no
+//     pod at all.
+func TestTheConflictGateMatchesWhicheverWriterWouldRePark(t *testing.T) {
 	tests := []struct {
 		name       string
+		state      string
 		cursor     int
 		wantParked bool
+		wantReads  int
 	}{
-		{"the corridor is at the clean repo", 0, false},
-		{"the corridor is at the dirty repo", 1, true},
+		{"the corridor is at the clean repo", tatarav1alpha1.StateMerged, 0, false, 1},
+		{"the corridor is at the dirty repo", tatarav1alpha1.StateMerged, 1, true, 1},
+		{"the sweep's park is not the corridor's", tatarav1alpha1.StateAwaitingReview, 0, true, 2},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			proj := rlProject()
-			task := rlDueTask("t-cursor-scope", tatarav1alpha1.StateMerged, stage.ReasonMergeConflictRetry, 1)
+			task := rlDueTask("t-cursor-scope", tc.state, stage.ReasonMergeConflictRetry, 1)
 			task.Spec.MergeOrder = []string{"repo-a", "repo-b"}
 			task.Status.MergeCursor = tc.cursor
 			task.Status.MRRefs = []string{
@@ -861,9 +880,15 @@ func TestTheConflictGateAsksOnlyTheRepoTheCorridorIsAt(t *testing.T) {
 			if parked := tatarav1alpha1.Parked(got); parked != tc.wantParked {
 				t.Fatalf("parked = %v (%q), want %v", parked, got.Status.ParkReason, tc.wantParked)
 			}
-			if f.mergeCalls != 1 {
-				t.Fatalf("GetMergeState calls = %d, want exactly 1: the probe is scoped to mergeOrder[cursor]",
-					f.mergeCalls)
+			if f.mergeCalls != tc.wantReads {
+				t.Fatalf("GetMergeState calls = %d, want %d", f.mergeCalls, tc.wantReads)
+			}
+			if !tc.wantParked {
+				return
+			}
+			if got.Status.RetryAttempts != 2 {
+				t.Fatalf("retryAttempts = %d, want 2: a standing blocker costs the NEXT lap, not a pod",
+					got.Status.RetryAttempts)
 			}
 		})
 	}
@@ -909,5 +934,191 @@ func TestAdvancingTheMergeCursorRefundsTheRetryBudget(t *testing.T) {
 	}
 	if again := mdGetTask(t, c, task.Name); again.Status.RetryAttempts != 3 {
 		t.Fatalf("retryAttempts = %d, want 3: a poll that moves nothing refunds nothing", again.Status.RetryAttempts)
+	}
+}
+
+// TestANewBlockerGetsItsOwnBudgetBeforeAHumanIsCalled is the exhaustion check's
+// half of the blocker scoping. stage.ArmRetry already zeroes retryAttempts when
+// the reason it is about to charge differs from status.retryBlocker, but the
+// UNARMED exhaustion check ran BEFORE it and read retryAttempts alone - so the
+// laundering never happened.
+//
+// Every step of the sequence is reachable: a Task spends five laps on
+// merge-conflict-retry, the sixth read finds the conflict CLEARED, and clearPark
+// deliberately preserves retryAttempts and retryBlocker across the release. The
+// Task then runs, CI goes red at the reviewed head with part of mergeOrder
+// already landed, and ci_gate.go parks ci-failed with no schedule armed. The
+// driver saw attempts(5) >= MaxUnparkRetries and escalated to a human on the
+// spot: zero laps, zero forge reads, and a comment naming ci-failed with "five
+// attempts ... waiting 1m0s, 2m0s, 4m0s, 8m0s, 16m0s between them ... It is
+// still standing", every word of it about the OTHER blocker. retry-exhausted is
+// UnparkHuman, so only a human could resume it.
+func TestANewBlockerGetsItsOwnBudgetBeforeAHumanIsCalled(t *testing.T) {
+	proj := rlProject()
+	// UNARMED, at the cap, and the spend belongs to the blocker BEFORE this one.
+	task := retryParkedTask("t-new-blocker", tatarav1alpha1.StateAwaitingReview, stage.ReasonCIFailed)
+	task.Status.RetryAttempts = tatarav1alpha1.MaxUnparkRetries
+	task.Status.RetryBlocker = stage.ReasonMergeConflictRetry
+	task.Status.MRRefs = []string{tatarav1alpha1.MergeRequestName("repo-a", 7)}
+	task.Status.IssueRefs = []string{tatarav1alpha1.IssueName("repo-a", 42)}
+
+	c := newMirrorClient(t, proj, mdSecret(), mdRepo("repo-a"),
+		mdMR(task, "repo-a", 7), mdIssue(task, "repo-a", 42), task)
+	m := obs.NewOperatorMetrics(prometheus.NewRegistry())
+	f := &rlForge{}
+	r := rlReconciler(c, f, m)
+
+	if err := r.driveUnparks(context.Background(), proj, time.Now()); err != nil {
+		t.Fatalf("driveUnparks: %v", err)
+	}
+	got := mdGetTask(t, c, task.Name)
+	if got.Status.ParkReason != stage.ReasonCIFailed {
+		t.Fatalf("parkReason = %q, want ci-failed: a blocker nobody has spent a lap on must not escalate",
+			got.Status.ParkReason)
+	}
+	if got.Status.RetryBlocker != stage.ReasonCIFailed {
+		t.Fatalf("retryBlocker = %q, want ci-failed: the lap is charged against the blocker in front of it",
+			got.Status.RetryBlocker)
+	}
+	if got.Status.RetryAttempts != 1 {
+		t.Fatalf("retryAttempts = %d, want 1: a new blocker starts from zero", got.Status.RetryAttempts)
+	}
+	if got.Status.RetryNextAt == nil {
+		t.Fatalf("retryNextAt is nil: the new blocker got no schedule at all")
+	}
+	if len(f.comments) != 0 {
+		t.Fatalf("Comment calls = %d, want 0: nobody has been told anything worth escalating yet:\n%v",
+			len(f.comments), f.comments)
+	}
+	if n := testutil.ToFloat64(m.TaskRetryExhaustedCounter(stage.ReasonCIFailed,
+		tatarav1alpha1.StateAwaitingReview)); n != 0 {
+		t.Fatalf("operator_task_retry_exhausted_total = %v, want 0", n)
+	}
+}
+
+// TestAClearedBlockerWithNoLiveRoomIsPacedByItsBackoff is MEDIUM 3. At the cap
+// the capacity short-circuit is deliberately NOT taken (that is what stops the
+// escalation deciding a human's involvement without reading the forge), so a
+// Task whose blocker has CLEARED but whose project has no live room re-read the
+// forge on every 30s pass, forever: the read answers cleared, ApplyUnpark
+// declines no-live-room, and nothing about the Task changes. liveRoomBudget is
+// also zeroed for a whole pass by a transient countLive error, so this needs no
+// full project to reach. With maxRetryBlockerReadsPerPass = 2, TWO such Tasks
+// consume the entire pass allowance indefinitely and defer every other due park
+// behind them - the starvation that constant's own doc says cannot happen.
+//
+// The verdict is PACED by the backoff instead: the schedule is re-armed without
+// charging a lap, so the re-read costs one read per RetryWait rather than one
+// per pass, and the Task still releases on the first due pass that finds room.
+func TestAClearedBlockerWithNoLiveRoomIsPacedByItsBackoff(t *testing.T) {
+	now := time.Now()
+	proj := rlProject()
+	proj.Spec.MaxLivePods = 1
+	task := rlDueTask("t-cleared-noroom", tatarav1alpha1.StateAwaitingReview,
+		stage.ReasonMergeConflictRetry, tatarav1alpha1.MaxUnparkRetries)
+	// The occupant holds the project's only live slot.
+	occupant := retryParkedTask("t-occupant", tatarav1alpha1.StateUnderImplementation, "")
+	occupant.Status.ParkReason = ""
+	occupant.Status.ParkedFromState = ""
+
+	c := newMirrorClient(t, proj, mdSecret(), mdRepo("repo-a"), mdMR(task, "repo-a", 7), task, occupant)
+	m := obs.NewOperatorMetrics(prometheus.NewRegistry())
+	f := &rlForge{mergeState: map[int]scm.MergeState{7: scm.MergeStateClean}}
+	r := rlReconciler(c, f, m)
+
+	if err := r.driveUnparks(context.Background(), proj, now); err != nil {
+		t.Fatalf("driveUnparks: %v", err)
+	}
+	got := mdGetTask(t, c, task.Name)
+	if got.Status.ParkReason != stage.ReasonMergeConflictRetry {
+		t.Fatalf("parkReason = %q, want the lane retained: no room means no release", got.Status.ParkReason)
+	}
+	if got.Status.RetryAttempts != tatarav1alpha1.MaxUnparkRetries {
+		t.Fatalf("retryAttempts = %d, want it left at the cap: the ceiling is not the blocker's lap",
+			got.Status.RetryAttempts)
+	}
+	if got.Status.RetryNextAt == nil || !got.Status.RetryNextAt.After(now) {
+		t.Fatalf("retryNextAt = %v, want a future schedule: an unpaced cleared verdict re-reads the forge "+
+			"every 30s forever and starves the project's read budget", got.Status.RetryNextAt)
+	}
+	if n := testutil.ToFloat64(m.UnparkDeclinedCounter(stage.ReasonMergeConflictRetry,
+		string(DeclineNoLiveRoom))); n != 1 {
+		t.Fatalf("operator_unpark_declined_total{decline=no-live-room} = %v, want 1: pacing the re-read "+
+			"must not make the capacity refusal invisible", n)
+	}
+	if f.mergeCalls != 1 {
+		t.Fatalf("GetMergeState calls = %d, want 1", f.mergeCalls)
+	}
+
+	// The very next pass, thirty seconds later, must read nothing at all.
+	if err := r.driveUnparks(context.Background(), proj, now.Add(30*time.Second)); err != nil {
+		t.Fatalf("driveUnparks (second pass): %v", err)
+	}
+	if f.mergeCalls != 1 {
+		t.Fatalf("GetMergeState calls = %d after the second pass, want still 1", f.mergeCalls)
+	}
+}
+
+// TestAProbelessReasonIsNotCountedAsAClearedRead is LOW 4.
+// retryBlockerStanding returns (false, nil) WITHOUT touching the forge for a
+// reason that has no probe (ci-pending, mr-surface-spent) and for an unwired
+// SCMFor, and the cleared counter still moved - diluting the denominator of
+// rate(error) / rate(standing + cleared + error), which is the ratio that says
+// whether the gate is gating at all.
+func TestAProbelessReasonIsNotCountedAsAClearedRead(t *testing.T) {
+	proj := rlProject()
+	task := rlDueTask("t-probeless-read", tatarav1alpha1.StateMerged, stage.ReasonCIPending, 1)
+	task.Status.MRRefs = nil
+	c := newMirrorClient(t, proj, mdSecret(), task)
+	m := obs.NewOperatorMetrics(prometheus.NewRegistry())
+	r := rlReconciler(c, &rlForge{}, m)
+
+	if err := r.driveUnparks(context.Background(), proj, time.Now()); err != nil {
+		t.Fatalf("driveUnparks: %v", err)
+	}
+	if n := testutil.ToFloat64(m.TaskRetryBlockerReadCounter(stage.ReasonCIPending,
+		obs.RetryBlockerReadCleared)); n != 0 {
+		t.Fatalf("operator_task_retry_blocker_read_total{reason=ci-pending,result=cleared} = %v, want 0: "+
+			"no forge read was ever made", n)
+	}
+	if got := mdGetTask(t, c, task.Name); tatarav1alpha1.Parked(got) {
+		t.Fatalf("still parked(%s): a reason with no probe releases on its due pass exactly as before",
+			got.Status.ParkReason)
+	}
+}
+
+// TestAClearedBlockerInAnOperatorDrivenStateIgnoresTheLivePodCeiling is the trap
+// the pacing above is one wrong predicate away from. NeedsLiveRoom is keyed on
+// the park REASON and over-approximates deliberately - it has to answer before
+// the capacity List is paid for - so it is true for merge-conflict-retry
+// wherever that park was written. stage.liveRoomDecline, which is what actually
+// refuses the release, tests the STATE: Live(state) && !LiveHasRoom. At `merged`
+// no pod is minted at all, so the ceiling has nothing to say and ApplyUnpark
+// releases whatever the project's occupancy is. A pacing branch keyed on the
+// reason would swallow that release and hold a Task the corridor was ready to
+// resume behind an unrelated project ceiling, forever.
+func TestAClearedBlockerInAnOperatorDrivenStateIgnoresTheLivePodCeiling(t *testing.T) {
+	proj := rlProject()
+	proj.Spec.MaxLivePods = 1
+	task := rlDueTask("t-cleared-noroom-merged", tatarav1alpha1.StateMerged,
+		stage.ReasonMergeConflictRetry, tatarav1alpha1.MaxUnparkRetries)
+	occupant := retryParkedTask("t-occupant", tatarav1alpha1.StateUnderImplementation, "")
+	occupant.Status.ParkReason = ""
+	occupant.Status.ParkedFromState = ""
+
+	c := newMirrorClient(t, proj, mdSecret(), mdRepo("repo-a"), mdMR(task, "repo-a", 7), task, occupant)
+	f := &rlForge{mergeState: map[int]scm.MergeState{7: scm.MergeStateClean}}
+	r := rlReconciler(c, f, wfMetrics())
+
+	if err := r.driveUnparks(context.Background(), proj, time.Now()); err != nil {
+		t.Fatalf("driveUnparks: %v", err)
+	}
+	got := mdGetTask(t, c, task.Name)
+	if tatarav1alpha1.Parked(got) {
+		t.Fatalf("still parked(%s): the live-pod ceiling refused a release that mints no pod",
+			got.Status.ParkReason)
+	}
+	if got.Status.State != tatarav1alpha1.StateMerged {
+		t.Fatalf("state = %q, want unchanged merged: an un-park never moves the Task", got.Status.State)
 	}
 }
