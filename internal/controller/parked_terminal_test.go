@@ -282,3 +282,80 @@ func TestTerminalIssueReleaseIsPaced(t *testing.T) {
 	require.Empty(t, w.comments, "no forge write may escape the limiter")
 	require.Empty(t, w.labels)
 }
+
+// ---------------------------------------------------------------------------
+// H2-E. THE STRAND THIS GUARD USED TO OWN, AND WHO OWNS IT NOW.
+//
+// The refusal above is deliberate and stays: `merged` is not a terminal
+// outcome, so admitting it here would resume a live pipeline behind the back of
+// the human the park was waiting for. What it does NOT answer is the shape it
+// was measured against - an implement Task whose owned merge requests all
+// landed, parked mid-corridor, its issues open forever (helmfile#27/#32,
+// ansible!17 and !18, terraform!221). That Task is not waiting on a human at
+// all; it is waiting on a red check or a dirty branch.
+//
+// H2-C moved exactly those parks into the retry lane, so the answer is now
+// upstream of this file: the park RELEASES ITSELF, the Task re-enters the
+// ordinary reconcile path at awaiting-review, and the merge corridor closes its
+// issues through the path that already exists. Nothing here is widened.
+// ---------------------------------------------------------------------------
+
+// retryDueParkedMergedFixture is parkedMergedFixture in the retry lane, with
+// its backoff already served - the state driveUnparks finds one backoff after
+// the blocker was recorded.
+func retryDueParkedMergedFixture(t *testing.T, name, kind, reason string) (
+	*tatarav1alpha1.Project, *tatarav1alpha1.Task, *tatarav1alpha1.MergeRequest) {
+
+	t.Helper()
+	proj, task, mr := parkedMergedFixture(t, name, kind, reason, "merged")
+	proj.Spec.MaxOpenTasks = 6
+	// mrRefs is what stage.Unpark actually reads (loadTaskMRs), so without it
+	// the "every owned MR merged" half of this fixture would be invisible to
+	// the rule under test and the assertion would pass vacuously.
+	task.Status.MRRefs = []string{mr.Name}
+	task.Status.RetryAttempts = 1
+	task.Status.RetryNextAt = &metav1.Time{Time: time.Now().Add(-time.Minute)}
+	return proj, task, mr
+}
+
+// TestParkedTechnicalParkWithMergedMRsReleasesItself is the H2-E resolution.
+// The merged merge requests are the point: every OTHER un-park arm refuses on
+// anyMerged (DeclineMergedMR), and a retry arm that copied that refusal would
+// have re-created the strand it exists to remove.
+func TestParkedTechnicalParkWithMergedMRsReleasesItself(t *testing.T) {
+	for _, reason := range []string{stage.ReasonCIFailed, stage.ReasonMergeConflictRetry} {
+		t.Run(reason, func(t *testing.T) {
+			proj, task, mr := retryDueParkedMergedFixture(t, "mt-i-27", "implement", reason)
+			c := newMirrorClient(t, proj, mdSecret(), task, mr)
+			r := &ProjectReconciler{Client: c, APIReader: c, Scheme: c.Scheme(), Metrics: wfMetrics()}
+
+			require.NoError(t, r.driveUnparks(context.Background(), proj, time.Now()))
+
+			got := mdGetTask(t, c, "mt-i-27")
+			require.False(t, tatarav1alpha1.Parked(got),
+				"a technical park on a Task whose work has LANDED must not wait for a human; "+
+					"the corridor it interrupted is what closes the issues")
+			require.Equal(t, tatarav1alpha1.StateAwaitingReview, got.Status.State,
+				"an un-park returns the Task to where it was, back in the ordinary reconcile path")
+		})
+	}
+}
+
+// THE UNCHANGED HALF, and it is non-negotiable. An awaiting-human park on the
+// same Task is a genuine human wait: the retry lane must not touch it, and
+// neither must the terminal self-heal.
+func TestParkedAwaitingHumanTaskWithMergedMRsStillStaysParked(t *testing.T) {
+	proj, task, mr := parkedMergedFixture(t, "mt-i-28", "implement", stage.ReasonAwaitingHuman, "merged")
+	task.Status.MRRefs = []string{mr.Name}
+	c := newMirrorClient(t, proj, mdSecret(), task, mr)
+	r := &ProjectReconciler{Client: c, APIReader: c, Scheme: c.Scheme(), Metrics: wfMetrics()}
+
+	require.NoError(t, r.driveUnparks(context.Background(), proj, time.Now()))
+	drive(t, tsReconciler(c), "mt-i-28")
+
+	got := mdGetTask(t, c, "mt-i-28")
+	require.True(t, tatarav1alpha1.Parked(got),
+		"no non-bot comment has arrived; nothing may resume this Task")
+	require.Equal(t, stage.ReasonAwaitingHuman, got.Status.ParkReason)
+	require.Equal(t, tatarav1alpha1.StateAwaitingReview, got.Status.State)
+}

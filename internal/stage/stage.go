@@ -138,9 +138,44 @@ const (
 	ReasonCIRed                  = "ci-red"
 	ReasonCIBlocked              = "ci-blocked"
 	ReasonMergeConflict          = "merge-conflict"
+	// THE RETRY LANE (UnparkRetry). These four name a blocker a MACHINE is
+	// already working on - a pipeline that is running, a rebase an agent will
+	// push, a merge request that does not exist yet - so what releases them is a
+	// timer with a backoff, not a human comment. The fifth is the lane's own
+	// exhaustion terminal and is UnparkHuman: at that point the machine has had
+	// its budget and a human is the next actor.
+	//
+	// TWO OF THEM HAVE NO WRITER YET, DELIBERATELY, and that is a decision and
+	// not an unfinished migration. A park is a one-way door - a parked Task is
+	// excluded from dispatch entirely - so a reason gets a writer only where a
+	// park ALREADY happens and strands:
+	//
+	//	ci-pending        NOTHING may park on a pipeline that is merely running.
+	//	                  The CI hold (status.ciWaitSince) holds at
+	//	                  under-implementation and is FAIL-OPEN by construction:
+	//	                  green advances, red bounces, and CIWaitDeadline
+	//	                  advances anyway. Replacing that with a park would turn
+	//	                  a bounded wait into a stall that needs this lane to
+	//	                  undo it - strictly worse than the wait it replaces.
+	//	mr-surface-spent  restapi's follow-on refusal is a 409 the agent reads
+	//	                  and acts on mid-turn, not a park: the Task is live and
+	//	                  keeps its pod. Parking there would kill the running
+	//	                  turn to schedule a retry of a predicate ("this Task
+	//	                  owes no uncovered open issue") that no amount of
+	//	                  waiting changes.
+	//
+	// Both stay in the closed set and in the CRD enum: they cost nothing there,
+	// they are what a future writer needs to already exist, and a reason removed
+	// from the enum breaks validation on the next status write of every object
+	// already carrying it.
+	ReasonCIPending          = "ci-pending"
+	ReasonCIFailed           = "ci-failed"
+	ReasonMergeConflictRetry = "merge-conflict-retry"
+	ReasonMRSurfaceSpent     = "mr-surface-spent"
+	ReasonRetryExhausted     = "retry-exhausted"
 )
 
-// ParkReasons is the 29-member vocabulary of status.parkReason. It is the CRD
+// ParkReasons is the 34-member vocabulary of status.parkReason. It is the CRD
 // enum on that field, verbatim.
 var ParkReasons = []string{
 	ReasonBacklogSweep,
@@ -172,6 +207,11 @@ var ParkReasons = []string{
 	ReasonCIRed,
 	ReasonCIBlocked,
 	ReasonMergeConflict,
+	ReasonCIPending,
+	ReasonCIFailed,
+	ReasonMergeConflictRetry,
+	ReasonMRSurfaceSpent,
+	ReasonRetryExhausted,
 }
 
 // RejectReasons is the 6-member vocabulary of status.stateReason on `rejected`.
@@ -701,6 +741,12 @@ func stampEnter(t *v1alpha1.Task, to, reason string, now time.Time) {
 	t.Status.LastTurnReposTurnID = ""
 	t.Status.Stats.PodRecreations = 0
 	t.Status.StageElapsedCarrySeconds = 0
+	// The retry budget is laundered by exactly the same event and for the same
+	// reason as the residency carry: a genuine transition means the blocker the
+	// laps were spent on is behind us, so the NEXT one starts from a full
+	// budget. A park/un-park round trip is not a transition and preserves both.
+	t.Status.RetryAttempts = 0
+	t.Status.RetryNextAt = nil
 	if Live(to) {
 		t.Status.ConversationLastEventAt = &stamp
 	} else {
@@ -1215,15 +1261,28 @@ func HeadMoved(t *v1alpha1.Task, maxHeadMoveReentries int) (Edge, bool) {
 //
 //   - kind=review: fixing a human's PR is a HUMAN action, so it parks
 //     awaiting-human exactly like every other kind=review verdict.
+//
 //   - anyMerged(mrs): part of spec.mergeOrder has already landed, and
 //     re-implementing would re-propose merged code and recreate deleted
-//     branches. It parks ci-red, which has no re-entry: a human decides.
+//     branches. It parks ci-failed, which is the RETRY LANE: still no
+//     re-implementation (this arm parks, it does not route), but the release is
+//     a backed-off timer rather than nothing at all. That is H2-C, and the
+//     shape it fixes is measured: an implement Task with landed merge requests
+//     and a red check parked here and stayed parked, so the merge corridor
+//     never finished and its issues never closed (helmfile#27/#32, ansible!17
+//     and !18, terraform!221). The lane gives the check MaxUnparkRetries laps
+//     to go green and then says so on the issue.
+//
+//     ci-red ITSELF STAYS in the vocabulary and in the enum: removing an enum
+//     member breaks validation on the next status write of every object already
+//     carrying it, and it is still the STATE reason of the re-implement edge
+//     below.
 func CIRed(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, maxCIRedReentries int) (Edge, bool) {
 	if t.Spec.Kind == kindReview {
 		return Edge{To: ParkTarget, Reason: ReasonAwaitingHuman}, true
 	}
 	if anyMerged(mrs) {
-		return Edge{To: ParkTarget, Reason: ReasonCIRed}, true
+		return Edge{To: ParkTarget, Reason: ReasonCIFailed}, true
 	}
 	if t.Status.CIRedReentries >= maxCIRedReentries {
 		return Edge{To: ParkTarget, Reason: ReasonCIBlocked}, true
@@ -1262,15 +1321,25 @@ func CIRed(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, maxCIRedReentries int)
 //   - kind=review: a human's merge request; GUARD 1 refuses under-implementation
 //     for it from anywhere, and returning an edge Enter would then reject would
 //     wedge the corridor. It parks awaiting-human.
+//
 //   - anyMerged(mrs): part of spec.mergeOrder has already landed, so
 //     re-implementing would re-propose merged code and recreate deleted
-//     branches. It parks merge-conflict, which has no re-entry: a human decides.
+//     branches. It parks merge-conflict-retry, the RETRY LANE, for the reason
+//     CIRed's twin arm does: the arm parks rather than routes either way, and a
+//     conflict against a base branch that keeps moving is exactly the kind of
+//     blocker that clears itself on a later lap. The CAP does not follow it -
+//     merge-blocked stays UnparkNever, because a spent budget is what should
+//     reach a human, not what should be handed a second budget.
+//
+//     merge-conflict ITSELF STAYS in the vocabulary and in the enum, for the
+//     enum-validation reason ci-red does, and remains the STATE reason of the
+//     re-implement edge below.
 func MergeConflict(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, maxMergeConflictReentries int) (Edge, bool) {
 	if t.Spec.Kind == kindReview {
 		return Edge{To: ParkTarget, Reason: ReasonAwaitingHuman}, true
 	}
 	if anyMerged(mrs) {
-		return Edge{To: ParkTarget, Reason: ReasonMergeConflict}, true
+		return Edge{To: ParkTarget, Reason: ReasonMergeConflictRetry}, true
 	}
 	if t.Status.MergeConflictReentries >= maxMergeConflictReentries {
 		return Edge{To: ParkTarget, Reason: ReasonMergeBlocked}, true
@@ -1364,6 +1433,12 @@ const (
 	// Task is RE-PARKED with the matching blocked reason, which is UnparkNever,
 	// so it ages out instead of retrying forever.
 	DeclineRetryBudgetSpent = "retry-budget-spent"
+	// DeclineRetryNotDue: an UnparkRetry park whose backoff has not elapsed (or
+	// has not been armed at all). It is the STEADY STATE of the retry lane, so
+	// it is never logged - it is answered on every 30s pass of every waiting
+	// retry park. The counter still moves, which is what makes a lane that is
+	// waiting distinguishable from a lane nothing is driving.
+	DeclineRetryNotDue = "retry-not-due"
 )
 
 // UnparkDeclines is the closed decline vocabulary as data, for the metric's
@@ -1380,6 +1455,7 @@ var UnparkDeclines = []string{
 	DeclineWrongParkedFrom,
 	DeclineNoReentry,
 	DeclineRetryBudgetSpent,
+	DeclineRetryNotDue,
 }
 
 // Unpark is the re-entry function, and this is its entire body. A parked Task
@@ -1419,6 +1495,12 @@ func Unpark(in UnparkInput) (decline string) {
 	// left to release it.
 	if class, ok := UnparkClassFor(reason); ok && class == UnparkHuman {
 		consumeUnparkEvents(in.Task, in.BotLogin, unparkNow(in))
+		// A HUMAN ANSWERED, so the machine gets a fresh retry budget. Without
+		// this the one release that is supposed to end an escalation is also the
+		// one that guarantees the next technical park re-escalates instantly,
+		// with zero laps in between and a comment claiming MaxUnparkRetries
+		// attempts that were spent before the human ever spoke.
+		in.Task.Status.RetryAttempts = 0
 	}
 	return DeclineNone
 }
@@ -1520,7 +1602,35 @@ func unparkRule(in UnparkInput) (decline string) {
 		reArm(t, now)
 		return DeclineNone
 
-	case ReasonAwaitingHuman:
+	case ReasonCIPending, ReasonCIFailed, ReasonMergeConflictRetry, ReasonMRSurfaceSpent:
+		// THE MACHINE LANE. There is no condition to re-evaluate here and there
+		// must not be one: internal/stage is pure, the blocker lives on a forge,
+		// and the state machine re-reads it on the next pass anyway. The rule is
+		// only "has the backoff elapsed" - if the blocker is still standing the
+		// Task re-parks under the same reason, spends the next (longer) lap, and
+		// the fifth one reaches ExhaustRetry.
+		//
+		// NO anyMerged REFUSAL, unlike the timer and human arms. A merged owned
+		// merge request is exactly the case this lane exists for: the Task
+		// parked mid-corridor with work already landed, and refusing to resume
+		// leaves its issues open forever (helmfile#27/#32, ansible!17/!18,
+		// terraform!221). Un-parking never moves state, so nothing here can
+		// re-propose merged code; it hands the Task back to the corridor that
+		// was already running.
+		if !RetryDue(t, now) {
+			return DeclineRetryNotDue
+		}
+		if d := liveRoomDecline(t, in); d != DeclineNone {
+			return d
+		}
+		reArm(t, now)
+		return DeclineNone
+
+	case ReasonAwaitingHuman, ReasonRetryExhausted:
+		// retry-exhausted SHARES the awaiting-human arm, which is the whole
+		// point of classifying it UnparkHuman: once the machine's budget is
+		// spent the park behaves like every other human wait, releases on the
+		// next non-bot comment, and ages out at ParkRetention if nobody answers.
 		if t.Spec.Kind == kindReview {
 			// A review-kind Task may NEVER enter under-implementation or merged.
 			// There is no path, no condition, no exception - and un-park no

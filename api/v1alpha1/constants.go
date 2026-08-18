@@ -170,6 +170,29 @@ const (
 	// on kind=review Tasks (fix V7-9). NOT bounded by AgentSpec.MaxReviewRounds
 	// - that counter only moves on request_changes.
 	MaxHumanReviewRounds = 5
+	// UnparkRetryBackoffBase is the FIRST wait an UnparkRetry park serves before
+	// driveUnparks may clear it. One minute, because every UnparkRetry reason
+	// names a blocker owned by a machine that is already working on it - a
+	// pipeline that is running, a rebase an agent will push - and the cheapest
+	// correct answer to "is it done yet" is to ask again shortly. It doubles per
+	// attempt.
+	UnparkRetryBackoffBase = 1 * time.Minute
+	// UnparkRetryBackoffCap ceilings that doubling. Thirty minutes is
+	// CIWaitDeadline: past it, this platform has already decided that a pipeline
+	// which has not spoken is a pipeline that is not going to, and a retry lane
+	// that waits longer than the hold it is backstopping is a lane nobody reads.
+	UnparkRetryBackoffCap = 30 * time.Minute
+	// MaxUnparkRetries bounds the UnparkRetry lane. FIVE, matching
+	// MaxHumanReviewRounds rather than the re-entry trio's three, because a
+	// retry spends no pod on the laps that find the blocker still standing -
+	// only the one that clears it does. At the backoff above, five attempts span
+	// 1+2+4+8+16 = 31 minutes; a technical blocker still standing after half an
+	// hour is not transient and belongs in front of a human.
+	//
+	// It is counted PER TASK on status.retryAttempts, not per issue: unlike
+	// MaxAutoReentries the lane never deletes and re-mints the Task, so the
+	// counter's object outlives every lap by construction.
+	MaxUnparkRetries = 5
 	// CIPollMinInterval floors how often CI status is re-polled (fix C3).
 	CIPollMinInterval = 20 * time.Second
 	// ObjectByteBudget is the byte-exact pre-write guard ceiling for a CR

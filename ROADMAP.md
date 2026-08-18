@@ -314,6 +314,20 @@ Open, out of scope, deliberately not done:
 - [ ] tatara-cli 3 new MCP tools (propose_issue/review_verdict/pr_outcome) - target tatara-cli repo.
 - [ ] Deploy 0.3.0: build + push operator image, helm package + push chart, helmfile apply.
 
+## An approved Task delivers end to end (docs/superpowers/plans/2026-08-18-tatara-deliver-end-to-end-plan.md)
+
+- [x] Half 1 - the eight observed blockers (#628, `change_significance: minor`).
+- [x] Half 2 - the `UnparkRetry` safety net: five park reasons, the `UnparkRetry`
+  class, `status.retryAttempts`/`status.retryNextAt`, a backed-off release arm on
+  the existing 30s unpark driver, and a LOUD exhaustion (repark to
+  `retry-exhausted` + a forge comment naming the blocker and every attempt +
+  `operator_task_retry_exhausted_total`). `change_significance: minor` - two
+  additive optional status fields, five additive enum values, one new class.
+- [ ] `tatara-observability`: alert on `operator_task_retry_exhausted_total`, and
+  allowlist it plus `operator_task_retry_scheduled_total`. NOT before this
+  producer is on `main` (MEMORY: a metric allowlist entry needs its producer on
+  main, or observability CI goes red on every PR).
+
 ## N5 deploy follow-ons - imagePullSecrets + neo4j tag fix (gated)
 
 1. [ ] Build + push harbor.szymonrichert.pl/containers/tatara-operator:0.2.1.

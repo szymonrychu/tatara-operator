@@ -530,7 +530,7 @@ type TaskStatus struct {
 	// stage.Enter asserts ParkReason == "" on every non-park edge and refuses
 	// otherwise, and stage.Unpark is the ONE function that clears it. Nothing
 	// else in the codebase may assign to this field.
-	// +kubebuilder:validation:Enum=backlog-sweep;triage-stalled;name-too-long;stage-deadline;awaiting-human;identity-unverified;implement-declined;review-loop-exhausted;review-post-refused;merge-timeout;merge-blocked;merge-order-missing;deploy-timeout;deploy-blocked;no-outcome;turn-budget-exhausted;pod-recreation-exhausted;object-too-large;fold-adoption-unverified;admission-starved;agent-contract-mismatch;operator-error;head-moving;handoff-stalled;ownership-lost;merge-auth-refused;ci-red;ci-blocked;merge-conflict
+	// +kubebuilder:validation:Enum=backlog-sweep;triage-stalled;name-too-long;stage-deadline;awaiting-human;identity-unverified;implement-declined;review-loop-exhausted;review-post-refused;merge-timeout;merge-blocked;merge-order-missing;deploy-timeout;deploy-blocked;no-outcome;turn-budget-exhausted;pod-recreation-exhausted;object-too-large;fold-adoption-unverified;admission-starved;agent-contract-mismatch;operator-error;head-moving;handoff-stalled;ownership-lost;merge-auth-refused;ci-red;ci-blocked;merge-conflict;ci-pending;ci-failed;merge-conflict-retry;mr-surface-spent;retry-exhausted
 	// +optional
 	ParkReason string `json:"parkReason,omitempty"`
 	// +optional
@@ -770,6 +770,28 @@ type TaskStatus struct {
 	// is a real cost amplifier on a chatty PR thread.
 	// +optional
 	HumanReviewRounds int `json:"humanReviewRounds,omitempty"`
+	// RetryAttempts counts the UnparkRetry laps this Task has spent on its
+	// CURRENT blocker. Cap MaxUnparkRetries, then the lane re-parks to
+	// retry-exhausted and says so on the forge.
+	//
+	// IT SURVIVES THE RELEASE IT PAID FOR, and that is the whole reason the
+	// cap is reachable: an un-park does not move state, so a retry that finds
+	// the blocker still standing re-parks under the same reason, and a counter
+	// zeroed by the release would refund every lap and make MaxUnparkRetries
+	// dead code. It is folded across the park round trip exactly as
+	// StageElapsedCarrySeconds is, and laundered by the same two things: a
+	// genuine state TRANSITION (stampEnter - the blocker is behind us), and a
+	// human comment releasing an UnparkHuman park (whoever answered has bought
+	// the machine a fresh budget for whatever it hits next).
+	// +optional
+	RetryAttempts int `json:"retryAttempts,omitempty"`
+	// RetryNextAt is the earliest time an UnparkRetry park may be released. It
+	// is the SCHEDULE, not a deadline: nil on a retry park means the backoff
+	// has not been armed yet and the driver arms it on sight, so a park written
+	// by an older build (or by a path that forgot) is picked up rather than
+	// stranded. It is cleared with the park.
+	// +optional
+	RetryNextAt *metav1.Time `json:"retryNextAt,omitempty"`
 	// FoldInFlight names the member Tasks a refine umbrella is mid-adoption of.
 	// The reaper SKIPS any Task named here (fix 8), but ONLY while
 	// FoldInFlightActive - see there.

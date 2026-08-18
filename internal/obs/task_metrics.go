@@ -23,6 +23,8 @@ type taskMetrics struct {
 	parkedLivePodRepaired   *prometheus.CounterVec
 	orphanedTurnCleared     *prometheus.CounterVec
 	botRounds               *prometheus.GaugeVec
+	retryScheduledTotal     *prometheus.CounterVec
+	retryExhaustedTotal     *prometheus.CounterVec
 }
 
 // newTaskMetrics registers the task collectors on reg and returns the bundle.
@@ -116,6 +118,14 @@ func newTaskMetrics(reg prometheus.Registerer) *taskMetrics {
 			Name: "operator_bot_rounds",
 			Help: "Highest consecutive agent-authored comment rounds with no intervening human comment, by project. There is deliberately no ping-pong cap (decision D7); this gauge is the ONLY way a cycling agent pair becomes observable before a human finds it by reading duplicate comments.",
 		}, []string{"project"}),
+		retryScheduledTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_task_retry_scheduled_total",
+			Help: "UnparkRetry laps SCHEDULED, by the park reason that named the blocker. One increment is one backed-off attempt charged against MaxUnparkRetries, so a Task contributes at most five before it escalates. It is the denominator for operator_task_retry_exhausted_total: a rising schedule rate with a flat exhaustion rate is the lane working (blockers clearing themselves); the two rising together means the retries are not clearing anything and the backoff is only delaying a human.",
+		}, []string{"reason"}),
+		retryExhaustedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_task_retry_exhausted_total",
+			Help: "UnparkRetry lanes that spent MaxUnparkRetries laps without clearing their blocker, by the ORIGINAL park reason and the state the Task was stuck in. Each increment is a Task that has been re-parked retry-exhausted and told a human so on the forge, so ANY non-zero value is an approved Task that did not deliver and is waiting on a person. This is the alertable series: before it existed the same event was a silent park nobody found for days.",
+		}, []string{"reason", "state"}),
 	}
 	reg.MustRegister(
 		m.taskTokensTotal,
@@ -136,8 +146,42 @@ func newTaskMetrics(reg prometheus.Registerer) *taskMetrics {
 		m.parkedLivePodRepaired,
 		m.orphanedTurnCleared,
 		m.botRounds,
+		m.retryScheduledTotal,
+		m.retryExhaustedTotal,
 	)
 	return m
+}
+
+// TaskRetryScheduled increments operator_task_retry_scheduled_total for one
+// armed UnparkRetry lap. Nil-safe: a reconciler wired without metrics is a
+// test, not an outage.
+func (m *OperatorMetrics) TaskRetryScheduled(reason string) {
+	if m == nil || m.retryScheduledTotal == nil {
+		return
+	}
+	m.retryScheduledTotal.WithLabelValues(reason).Inc()
+}
+
+// TaskRetryScheduledCounter returns the operator_task_retry_scheduled_total
+// counter for reason, for test assertions.
+func (m *OperatorMetrics) TaskRetryScheduledCounter(reason string) prometheus.Counter {
+	return m.retryScheduledTotal.WithLabelValues(reason)
+}
+
+// TaskRetryExhausted increments operator_task_retry_exhausted_total for one
+// spent retry lane, by the blocker it failed to clear and the state it is stuck
+// in. Nil-safe for the same reason.
+func (m *OperatorMetrics) TaskRetryExhausted(reason, state string) {
+	if m == nil || m.retryExhaustedTotal == nil {
+		return
+	}
+	m.retryExhaustedTotal.WithLabelValues(reason, state).Inc()
+}
+
+// TaskRetryExhaustedCounter returns the operator_task_retry_exhausted_total
+// counter for (reason,state), for test assertions.
+func (m *OperatorMetrics) TaskRetryExhaustedCounter(reason, state string) prometheus.Counter {
+	return m.retryExhaustedTotal.WithLabelValues(reason, state)
 }
 
 // addPositive adds delta to the vec's counter for the given labels, but only

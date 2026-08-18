@@ -125,6 +125,7 @@ const (
 	DeclineNotParked        UnparkDecline = stage.DeclineNotParked
 	DeclineRetryBudgetSpent UnparkDecline = stage.DeclineRetryBudgetSpent
 	DeclineNoReentry        UnparkDecline = stage.DeclineNoReentry
+	DeclineRetryNotDue      UnparkDecline = stage.DeclineRetryNotDue
 )
 
 // DeclineFor maps a stage-package decline code onto this package's typed
@@ -137,7 +138,8 @@ func DeclineFor(code string) UnparkDecline {
 	case stage.DeclineNoHumanEvent, stage.DeclineOverCap, stage.DeclineNoLiveRoom,
 		stage.DeclineNoOpenIssues, stage.DeclineMergedMR,
 		stage.DeclineRoundsExhausted, stage.DeclineTurnsExhausted, stage.DeclineWrongParkedFrom,
-		stage.DeclineNotParked, stage.DeclineRetryBudgetSpent, stage.DeclineNoReentry:
+		stage.DeclineNotParked, stage.DeclineRetryBudgetSpent, stage.DeclineNoReentry,
+		stage.DeclineRetryNotDue:
 		return UnparkDecline(code)
 	default:
 		return DeclineRule
@@ -755,9 +757,104 @@ func NeedsLiveRoom(parkReason string) bool {
 	case stage.ReasonAwaitingHuman, stage.ReasonIdentityUnverified,
 		stage.ReasonHandoffStalled, stage.ReasonNoOutcome:
 		return true
+	case stage.ReasonRetryExhausted:
+		// It shares the awaiting-human arm, so it consults the same ceiling.
+		return true
+	case stage.ReasonCIPending, stage.ReasonCIFailed,
+		stage.ReasonMergeConflictRetry, stage.ReasonMRSurfaceSpent:
+		// THE RETRY LANE IS NOT EXEMPT, and omitting it here would not be a
+		// missed optimisation - it would be a permanent wedge. liveRoomDecline
+		// answers no-live-room for ANY live state whenever the caller passed
+		// false, and driveUnparks passes NeedsLiveRoom(reason) && budget > 0, so
+		// a lane left out of this switch declines every release from
+		// awaiting-review forever while still spending its laps.
+		return true
 	default:
 		return false
 	}
+}
+
+// driveRetryLane is driveUnparks' UnparkRetry arm, applied before ApplyUnpark.
+// It returns handled=true when the pass is over for this Task - which is the
+// common case, because a retry park spends most of its life waiting.
+//
+// THE ORDER IS THE WHOLE DESIGN. Exhaustion is checked only where the next lap
+// would be CHARGED (an unarmed park), so the final backoff is actually served
+// rather than truncated the instant the counter reaches the cap; capacity is
+// checked before the charge, so a project at its own live-pod ceiling costs the
+// blocker no laps; and neither the wait nor the release mutates anything, so
+// this cannot become the level-triggered-sweep hazard the conflict sweep hit -
+// a counter-mutating function applied every pass to a state its remedy does not
+// clear.
+func (r *ProjectReconciler) driveRetryLane(ctx context.Context, proj *tatarav1alpha1.Project,
+	t *tatarav1alpha1.Task, liveRoom bool, now time.Time) (handled bool, err error) {
+
+	if t.Status.RetryNextAt != nil {
+		if !stage.RetryDue(t, now) {
+			// STILL WAITING, and this is the steady state of the whole lane: it
+			// is answered for every waiting park on every 30s pass. Handled here
+			// rather than by falling through to ApplyUnpark so that a Task
+			// serving a 30-minute backoff costs zero API reads and zero decline
+			// counts for the sixty passes it sleeps through. stage.Unpark
+			// answers the same DeclineRetryNotDue for the two ApplyUnpark
+			// callers this driver is not (the webhook and the redeliverer),
+			// which is where the rule has to live to be binding.
+			return true, nil
+		}
+		return false, nil // due: the caller's ApplyUnpark releases it
+	}
+	l := log.FromContext(ctx)
+	reason := t.Status.ParkReason
+	if t.Status.RetryAttempts >= tatarav1alpha1.MaxUnparkRetries {
+		return true, r.escalateExhaustedRetry(ctx, proj, t, now)
+	}
+	if NeedsLiveRoom(reason) && !liveRoom {
+		// No lap is charged and nothing is armed: the next pass with room picks
+		// this up unchanged. Not logged - it is answered every 30s while the
+		// project is busy, and DeclineNoLiveRoom already names the same
+		// condition for the un-park that DID get to ask.
+		return true, nil
+	}
+	if err := r.armRetryPark(ctx, t, now); err != nil {
+		return true, err
+	}
+	l.Info("retry lane armed: the blocker is a machine's to clear, so the release is a timer",
+		"action", "retry_scheduled", "resource_id", t.Name, "reason", reason,
+		"state", t.Status.State, "attempt", t.Status.RetryAttempts,
+		"max_attempts", tatarav1alpha1.MaxUnparkRetries,
+		"next_at", t.Status.RetryNextAt.Time.UTC().Format(time.RFC3339))
+	r.Metrics.TaskRetryScheduled(reason)
+	return true, nil
+}
+
+// armRetryPark persists stage.ArmRetry under optimistic concurrency, re-reading
+// through the UNCACHED APIReader and re-checking the park under the retry,
+// exactly as applyRetiredUnpark and applyCIRecoveryUnpark do and for the same
+// reason: a Task another writer moved in the meantime must be left alone rather
+// than charged a lap for a park that is over.
+func (r *ProjectReconciler) armRetryPark(ctx context.Context, t *tatarav1alpha1.Task, now time.Time) error {
+	getter := client.Reader(r.APIReader)
+	if getter == nil {
+		getter = r.Client
+	}
+	key := client.ObjectKeyFromObject(t)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := getter.Get(ctx, key, fresh); err != nil {
+			return err
+		}
+		if fresh.Status.ParkReason != t.Status.ParkReason || fresh.Status.RetryNextAt != nil {
+			return nil // raced: another pass armed it, or the park is gone
+		}
+		if err := stage.ArmRetry(fresh, now); err != nil {
+			return fmt.Errorf("unpark: arm the retry lane on %s: %w", key.Name, err)
+		}
+		if err := r.Status().Update(ctx, fresh); err != nil {
+			return err
+		}
+		*t = *fresh
+		return nil
+	})
 }
 
 // driveUnparks applies stage.Unpark to every parked Task in proj whose park
@@ -822,6 +919,20 @@ func (r *ProjectReconciler) driveUnparks(ctx context.Context, proj *tatarav1alph
 			continue
 		}
 		liveRoom := NeedsLiveRoom(t.Status.ParkReason) && liveRoomBudget > 0
+		if class, ok := stage.UnparkClassFor(t.Status.ParkReason); ok && class == stage.UnparkRetry {
+			handled, rerr := r.driveRetryLane(ctx, proj, t, liveRoom, now)
+			if rerr != nil {
+				log.FromContext(ctx).Error(rerr, "unpark: retry lane failed",
+					"action", "retry_lane_error", "resource_id", t.Name, "reason", t.Status.ParkReason)
+				if firstErr == nil {
+					firstErr = rerr
+				}
+				continue
+			}
+			if handled {
+				continue
+			}
+		}
 		wasLive := stage.Live(t.Status.State)
 		unparked, decline, err := ApplyUnpark(ctx, r.Client, r.APIReader, proj, t, active, maxOpen, liveRoom, now)
 		if err != nil {

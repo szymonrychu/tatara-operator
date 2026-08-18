@@ -52,6 +52,27 @@ import (
 // UnparkNever reason belongs to driveStrandedParks (C.3), and one parked
 // awaiting-human is waiting on a human who has genuinely not answered.
 //
+// THAT LAST SENTENCE USED TO BE HALF FALSE, and H2-E is where it stopped being.
+// The measured shape was an implement Task whose owned merge requests had ALL
+// merged, parked mid-corridor, refused here at the terminal-outcome test, and
+// left with its issues open indefinitely - helmfile#27 and #32, ansible!17 and
+// !18, terraform!221. Those Tasks were not waiting on anybody: they were parked
+// on a red check or a dirty branch, i.e. on a machine, under a reason nothing
+// released.
+//
+// THE FIX IS UPSTREAM OF THIS FILE AND NOTHING HERE IS WIDENED. Those two parks
+// (stage.CIRed's and stage.MergeConflict's anyMerged arms) now carry ci-failed
+// and merge-conflict-retry, class UnparkRetry: the park releases ITSELF on a
+// backed-off timer, the Task re-enters the ordinary reconcile path at the state
+// it parked in, and the merge corridor finishes and closes the issues through
+// the path that already exists. If the blocker outlives MaxUnparkRetries the
+// lane re-parks retry-exhausted and says so on the issue, so the case that
+// still reaches a human reaches them out loud instead of by them noticing.
+//
+// So the refusal below is now what it always claimed to be: about a park that
+// is genuinely a HUMAN's to release. Widening it to admit `merged` remains
+// forbidden, and TestParkedNonReviewTaskWithMergedMRStaysParked is unchanged.
+//
 // C.2 STILL RUNS. It goes through r.enter, so the choke point posts the terminal
 // notice and stamps tatara-parked on every still-open owned Issue - which is the
 // entire point: a review Task going terminal is exactly when its issue must not

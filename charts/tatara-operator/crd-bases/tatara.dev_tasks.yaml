@@ -647,6 +647,11 @@ spec:
                 - ci-red
                 - ci-blocked
                 - merge-conflict
+                - ci-pending
+                - ci-failed
+                - merge-conflict-retry
+                - mr-surface-spent
+                - retry-exhausted
                 type: string
               parkedAt:
                 format: date-time
@@ -761,6 +766,31 @@ spec:
                   (modelForKind: per-kind override else project-wide). Stamped once at
                   pod-creation; read by the token/terminal metrics so $ is priced by the
                   model that actually ran.
+                type: string
+              retryAttempts:
+                description: |-
+                  RetryAttempts counts the UnparkRetry laps this Task has spent on its
+                  CURRENT blocker. Cap MaxUnparkRetries, then the lane re-parks to
+                  retry-exhausted and says so on the forge.
+
+                  IT SURVIVES THE RELEASE IT PAID FOR, and that is the whole reason the
+                  cap is reachable: an un-park does not move state, so a retry that finds
+                  the blocker still standing re-parks under the same reason, and a counter
+                  zeroed by the release would refund every lap and make MaxUnparkRetries
+                  dead code. It is folded across the park round trip exactly as
+                  StageElapsedCarrySeconds is, and laundered by the same two things: a
+                  genuine state TRANSITION (stampEnter - the blocker is behind us), and a
+                  human comment releasing an UnparkHuman park (whoever answered has bought
+                  the machine a fresh budget for whatever it hits next).
+                type: integer
+              retryNextAt:
+                description: |-
+                  RetryNextAt is the earliest time an UnparkRetry park may be released. It
+                  is the SCHEDULE, not a deadline: nil on a retry park means the backoff
+                  has not been armed yet and the driver arms it on sight, so a park written
+                  by an older build (or by a path that forgot) is picked up rather than
+                  stranded. It is cleared with the park.
+                format: date-time
                 type: string
               shortDescription:
                 description: |-

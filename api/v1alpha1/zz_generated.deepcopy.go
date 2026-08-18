@@ -1590,6 +1590,10 @@ func (in *TaskStatus) DeepCopyInto(out *TaskStatus) {
 		in, out := &in.CIWaitSince, &out.CIWaitSince
 		*out = (*in).DeepCopy()
 	}
+	if in.RetryNextAt != nil {
+		in, out := &in.RetryNextAt, &out.RetryNextAt
+		*out = (*in).DeepCopy()
+	}
 	if in.FoldInFlight != nil {
 		in, out := &in.FoldInFlight, &out.FoldInFlight
 		*out = make([]string, len(*in))
