@@ -524,15 +524,27 @@ func agentJob(agentKind string, task *tatarav1alpha1.Task, proj *tatarav1alpha1.
 			"batch (listed in the goal above). Update the documentation repo for whichever of them are " +
 			"doc-relevant, in ONE pull request, and no-op on the ones that are not.\n\n" +
 			resumedBranchMergeRule +
-			"`submit_outcome(kind=documentation, action=submitted, ...)` when the docs PR is open, or " +
-			"`action=declined` when nothing delivered was doc-relevant. `declined` is a correct answer."
+			"End with one of three outcomes:\n\n" +
+			"  - `submit_outcome(kind=documentation, action=submitted, ...)` when the docs PR is open.\n" +
+			"  - `submit_outcome(kind=documentation, action=declined, decline_reason=...)` when nothing " +
+			"delivered was doc-relevant. `declined` is a correct answer.\n" +
+			"  - `submit_outcome(kind=documentation, action=discuss, reason=...)` when you are blocked " +
+			"on something you cannot resolve yourself and a human decision is genuinely needed. " +
+			"`discuss` parks the Task at awaiting-human and resumes it on the next human comment as " +
+			"long as this Task has an open merge request; `declined` does not. Open your merge " +
+			"request before you ask, or there is nothing for a human to comment on and the Task " +
+			"cannot resume."
 
 	case stage.AgentUpgrade:
-		// NO GATE ARM. This kind's outcome schema (tatara-cli, shared verbatim
-		// with documentation) has action=submitted|declined and nothing else:
+		// NO APPROVAL GATE. This kind's outcome schema (tatara-cli, shared
+		// verbatim with documentation) has action=submitted|declined|discuss:
 		// nobody filed an issue for a scheduled upgrade and there is no
-		// maintainer comment to cite. Naming a gate field here would send the
-		// agent looking for an approval it can neither obtain nor submit.
+		// maintainer comment to cite, so approved and rejected are not on this
+		// schema. Naming an approval gate field here would send the agent
+		// looking for a citation it can neither obtain nor submit. discuss IS
+		// on this schema - it parks the Task at awaiting-human (recoverable)
+		// for the question declined cannot ask, so it gets its own arm below
+		// rather than being left undiscoverable.
 		//
 		// `submit_outcome` is written WITHOUT a kind argument on purpose. The cli
 		// stamps kind server-side from the pod's tool profile, the schema is
@@ -583,7 +595,13 @@ func agentJob(agentKind string, task *tatarav1alpha1.Task, proj *tatarav1alpha1.
 			submittedTitleBodyRule +
 			"If no unit is worth taking this cycle, or the one you picked turns out to be unsafe, " +
 			"`submit_outcome(action=declined, decline_reason=...)`. `declined` is a correct and " +
-			"common answer, and there is no partial delivery." +
+			"common answer, and there is no partial delivery.\n\n" +
+			"If instead you are blocked on something you cannot resolve yourself and a human " +
+			"decision is genuinely needed - not a case of your own judgment - " +
+			"`submit_outcome(action=discuss, reason=...)` instead. `discuss` parks the Task at " +
+			"awaiting-human and resumes it on the next human comment as long as this Task has an " +
+			"open merge request; `declined` does not. Open your merge request before you ask, or " +
+			"there is nothing for a human to comment on and the Task cannot resume." +
 			promptguidance.ToolingConsumeGuidance
 
 	default:

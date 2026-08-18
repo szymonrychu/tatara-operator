@@ -9,7 +9,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	tatarav1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
@@ -133,7 +132,16 @@ func (s *Server) deliverPendingEvent(ctx context.Context, proj tatarav1.Project,
 		(task.Status.ParkReason == stage.ReasonAwaitingHuman ||
 			task.Status.ParkReason == stage.ReasonBacklogSweep ||
 			task.Status.ParkReason == stage.ReasonIdentityUnverified) {
-		s.driveCommentUnpark(ctx, &proj, task)
+		if s.driveCommentUnpark(ctx, &proj, task) {
+			// THE UN-PARK IS THE DELIVERY. Running driveLiveTurn after it judges
+			// the SAME event a second time, against a Task whose events ApplyUnpark
+			// has just write-back stamped as consumed (stage.consumeUnparkEvents) -
+			// so DeliverLiveTurn's takeoverCandidate can only ever read false and a
+			// take-over that was just HONOURED is recorded as
+			// live_entry_declined{rounds-exhausted}. A false decline on the one
+			// path that counter exists to observe is worse than no reading at all.
+			return
+		}
 	}
 	// A LIVE state. The event is already queued above, but a Task whose pod has
 	// finished its turn is deaf to it until something moves: this is what gives
@@ -379,11 +387,14 @@ func (s *Server) resolveOwningTask(ctx context.Context, proj *tatarav1.Project,
 // path, one maxOpenTasks re-check at re-entry (H8: a promotion is not a mint),
 // one set of decline metrics. The project-reconcile driveUnparks loop backstops
 // this.
-func (s *Server) driveCommentUnpark(ctx context.Context, proj *tatarav1.Project, task *tatarav1.Task) {
+// It reports whether the Task actually un-parked, which is what tells the
+// caller this event has already been HONOURED and must not be judged a second
+// time by driveLiveTurn.
+func (s *Server) driveCommentUnpark(ctx context.Context, proj *tatarav1.Project, task *tatarav1.Task) bool {
 	active, err := controller.CountActiveTasks(ctx, s.cfg.Client, proj)
 	if err != nil {
 		s.log.ErrorContext(ctx, "pendingEvents: count active tasks failed", "error", err, "task", task.Name)
-		return
+		return false
 	}
 	maxOpen := proj.Spec.MaxOpenTasks
 	if maxOpen <= 0 {
@@ -408,7 +419,7 @@ func (s *Server) driveCommentUnpark(ctx context.Context, proj *tatarav1.Project,
 	unparked, decline, err := controller.ApplyUnpark(ctx, s.cfg.Client, s.cfg.APIReader, proj, task, active, maxOpen, liveRoom, time.Now())
 	if err != nil {
 		s.log.ErrorContext(ctx, "pendingEvents: comment-driven unpark failed", "error", err, "task", task.Name)
-		return
+		return false
 	}
 	if decline != controller.DeclineNone {
 		s.cfg.Metrics.UnparkDeclined(task.Status.ParkReason, string(decline))
@@ -426,10 +437,11 @@ func (s *Server) driveCommentUnpark(ctx context.Context, proj *tatarav1.Project,
 		s.log.InfoContext(ctx, "pendingEvents: comment-driven unpark declined",
 			"action", "pending_event_unpark_declined", "task", task.Name, "park_reason", task.Status.ParkReason,
 			"decline_kind", string(decline))
-		return
+		return false
 	}
 	s.log.InfoContext(ctx, "pendingEvents: unparked task on human comment",
 		"action", "pending_event_unpark", "task", task.Name, "state", task.Status.State, "reason_from", task.Status.ParkReason)
+	return true
 }
 
 // syncOwnedIssueThread is D2's one forge read: it re-syncs the owned Issue's
@@ -515,62 +527,4 @@ func (s *Server) scmReader(ctx context.Context, proj *tatarav1.Project) (scm.SCM
 		return nil, fmt.Errorf("pendingEvents: build scm reader: %w", err)
 	}
 	return reader, nil
-}
-
-// ClearDeliveredEvents removes exactly the delivered events from
-// task.Status.PendingEvents - a SET-DIFFERENCE keyed on (Kind, Repo, Number,
-// At), inside RetryOnConflict, NEVER a blind PendingEvents = nil.
-//
-// Every RetryOnConflict attempt re-Gets the Task before subtracting, so a
-// webhook that queues a NEW event between the caller's bundle render and this
-// call is not lost: if that append lands (and commits) before this function's
-// Update, the Update conflicts, the retry re-Gets the now-appended state, and
-// the subtraction runs against a base that already contains the new event -
-// which survives. Only events actually named in delivered are ever removed.
-func ClearDeliveredEvents(ctx context.Context, c client.Client, task *tatarav1.Task, delivered []tatarav1.TaskEvent) error {
-	key := client.ObjectKeyFromObject(task)
-	fresh := &tatarav1.Task{}
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh = &tatarav1.Task{}
-		if err := c.Get(ctx, key, fresh); err != nil {
-			return err
-		}
-		fresh.Status.PendingEvents = subtractEvents(fresh.Status.PendingEvents, delivered)
-		return c.Status().Update(ctx, fresh)
-	})
-	if err != nil {
-		return fmt.Errorf("webhook: clear delivered events on %s: %w", task.Name, err)
-	}
-	*task = *fresh
-	return nil
-}
-
-// eventKey is the delivery identity contract E.3's clear step keys on:
-// (Kind, Repo, Number, At). At is normalized through Rfc3339Copy - the
-// second-precision truncation the API server itself applies on a real
-// round-trip - so a key computed from a freshly-constructed TaskEvent matches
-// the same event read back after being persisted.
-func eventKey(ev tatarav1.TaskEvent) [4]string {
-	return [4]string{ev.Kind, ev.Repo, strconv.Itoa(ev.Number), ev.At.Rfc3339Copy().UTC().Format(time.RFC3339)}
-}
-
-// subtractEvents returns cur with every event whose key matches one in
-// delivered removed. Pure set-difference; order of the survivors is
-// preserved.
-func subtractEvents(cur, delivered []tatarav1.TaskEvent) []tatarav1.TaskEvent {
-	if len(delivered) == 0 {
-		return cur
-	}
-	remove := make(map[[4]string]struct{}, len(delivered))
-	for _, ev := range delivered {
-		remove[eventKey(ev)] = struct{}{}
-	}
-	out := make([]tatarav1.TaskEvent, 0, len(cur))
-	for _, ev := range cur {
-		if _, ok := remove[eventKey(ev)]; ok {
-			continue
-		}
-		out = append(out, ev)
-	}
-	return out
 }

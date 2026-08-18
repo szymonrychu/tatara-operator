@@ -186,9 +186,13 @@ func TestDriveCIRecoveryUnparks_IgnoresEveryOtherParkReason(t *testing.T) {
 	now := time.Now()
 	proj := reapProject("cirec")
 
+	// awaiting-human is NOT in this list any more: since the discuss verdict
+	// stamps the same evidence, an awaiting-human park that carries it is the
+	// second case this driver owns. The evidence, not the reason, is what keeps
+	// it narrow - see TestDriveCIRecoveryUnparks_LeavesAnEvidencelessAwaitingHumanParkAlone.
 	for _, reason := range []string{
 		stage.ReasonCIRed, stage.ReasonCIBlocked, stage.ReasonMergeBlocked,
-		stage.ReasonAwaitingHuman, stage.ReasonOwnershipLost,
+		stage.ReasonOwnershipLost,
 	} {
 		t.Run(reason, func(t *testing.T) {
 			tk := ciDeclinedTask("implement", tatarav1alpha1.CIEvidenceRed, ciRecoveryMR+"@4c11cad2")
@@ -278,6 +282,133 @@ func TestDriveCIRecoveryUnparks_TheCeilingIsAbsolute(t *testing.T) {
 	}
 }
 
+// THE SECOND SHAPE THE DRIVER OWNS. An agent that cannot submit because the
+// readiness gate answered 409 ci-red may decline OR ask a human, and asking is
+// the better answer - but it parks awaiting-human, and until the discuss verdict
+// stamped the same evidence the better answer was the one that could never be
+// re-driven. Same five conditions, same annotations, one more park reason.
+func TestDriveCIRecoveryUnparks_ReleasesAnAwaitingHumanParkWithRedCIEvidence(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+	proj := reapProject("cirec")
+	tk := ciDeclinedTask("implement", tatarav1alpha1.CIEvidenceRed, ciRecoveryMR+"@4c11cad2")
+	tk.Status.ParkReason = stage.ReasonAwaitingHuman
+	mr := ciRecoveryMirror("open", tatarav1alpha1.OwnershipTatara, "green", "4c11cad2")
+	r := newUnparkTestReconciler(t, proj, reapSecret(), tk, mr)
+	counter := r.Metrics.TaskUnparkedCounter(stage.ReasonAwaitingHuman, obs.UnparkClassCIRecovered)
+
+	require.NoError(t, r.driveCIRecoveryUnparks(ctx, proj, now))
+
+	got := &tatarav1alpha1.Task{}
+	require.NoError(t, r.Get(ctx, objectKeyOf(tk), got))
+	require.False(t, tatarav1alpha1.Parked(got), "the blocker the agent asked about has cleared itself")
+	require.Equal(t, tatarav1alpha1.StateUnderImplementation, got.Status.State)
+	require.Equal(t, "1", got.Annotations[tatarav1alpha1.AnnCIRecoveryUnparks])
+	require.Equal(t, float64(1), testutil.ToFloat64(counter),
+		"the metric must name the reason that was actually released, not a literal")
+}
+
+// THE SAFETY PIN, and the reason widening the reason filter is not a widening of
+// the driver. awaiting-human is by far the most common park on the platform and
+// almost all of it is a genuine question for a human. Only the discuss and
+// decline commits stamp AnnDeclineCI, so a park with no evidence - which is every
+// ordinary "I asked a maintainer something" - is untouched no matter how green
+// its merge requests are.
+func TestDriveCIRecoveryUnparks_LeavesAnEvidencelessAwaitingHumanParkAlone(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+	proj := reapProject("cirec")
+
+	for _, tc := range []struct {
+		name      string
+		ci, heads string
+	}{
+		{"no evidence at all: an ordinary question for a human", "", ""},
+		{"evidence says ci was green: the question was never about ci",
+			tatarav1alpha1.CIEvidenceGreen, ciRecoveryMR + "@4c11cad2"},
+		{"evidence says ci had no verdict yet",
+			tatarav1alpha1.CIEvidenceUnknown, ciRecoveryMR + "@4c11cad2"},
+		{"a red with no heads is not a fingerprint and cannot be matched",
+			tatarav1alpha1.CIEvidenceRed, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tk := ciDeclinedTask("implement", tc.ci, tc.heads)
+			tk.Status.ParkReason = stage.ReasonAwaitingHuman
+			mr := ciRecoveryMirror("open", tatarav1alpha1.OwnershipTatara, "green", "4c11cad2")
+			r := newUnparkTestReconciler(t, proj, reapSecret(), tk, mr)
+
+			require.NoError(t, r.driveCIRecoveryUnparks(ctx, proj, now))
+
+			got := &tatarav1alpha1.Task{}
+			require.NoError(t, r.Get(ctx, objectKeyOf(tk), got))
+			require.True(t, tatarav1alpha1.Parked(got),
+				"a human is still owed an answer and nothing here proves otherwise")
+			require.Equal(t, stage.ReasonAwaitingHuman, got.Status.ParkReason)
+			require.NotContains(t, got.Annotations, tatarav1alpha1.AnnCIRecoveryUnparks)
+		})
+	}
+}
+
+// The bound is the SAME bound. A widened reason filter that shipped its own
+// unlatched lane would be a second ping-pong nobody counted.
+func TestDriveCIRecoveryUnparks_StillRespectsTheHeadLatchAndTheCapOnAwaitingHuman(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+	proj := reapProject("cirec")
+
+	t.Run("the head latch refuses a second lap at the same head", func(t *testing.T) {
+		declined := ciRecoveryMR + "@4c11cad2"
+		tk := ciDeclinedTask("implement", tatarav1alpha1.CIEvidenceRed, declined)
+		tk.Status.ParkReason = stage.ReasonAwaitingHuman
+		tk.Annotations[tatarav1alpha1.AnnCIRecoveryHeads] = declined
+		tk.Annotations[tatarav1alpha1.AnnCIRecoveryUnparks] = "1"
+		mr := ciRecoveryMirror("open", tatarav1alpha1.OwnershipTatara, "green", "4c11cad2")
+		r := newUnparkTestReconciler(t, proj, reapSecret(), tk, mr)
+
+		require.NoError(t, r.driveCIRecoveryUnparks(ctx, proj, now))
+
+		got := &tatarav1alpha1.Task{}
+		require.NoError(t, r.Get(ctx, objectKeyOf(tk), got))
+		require.True(t, tatarav1alpha1.Parked(got))
+		require.Equal(t, "1", got.Annotations[tatarav1alpha1.AnnCIRecoveryUnparks])
+	})
+
+	t.Run("the absolute ceiling refuses a fresh head once it is spent", func(t *testing.T) {
+		tk := ciDeclinedTask("implement", tatarav1alpha1.CIEvidenceRed, ciRecoveryMR+"@newhead1")
+		tk.Status.ParkReason = stage.ReasonAwaitingHuman
+		tk.Annotations[tatarav1alpha1.AnnCIRecoveryHeads] = ciRecoveryMR + "@oldhead0"
+		tk.Annotations[tatarav1alpha1.AnnCIRecoveryUnparks] = strconv.Itoa(tatarav1alpha1.MaxCIRecoveryUnparks)
+		mr := ciRecoveryMirror("open", tatarav1alpha1.OwnershipTatara, "green", "newhead1")
+		r := newUnparkTestReconciler(t, proj, reapSecret(), tk, mr)
+
+		require.NoError(t, r.driveCIRecoveryUnparks(ctx, proj, now))
+
+		got := &tatarav1alpha1.Task{}
+		require.NoError(t, r.Get(ctx, objectKeyOf(tk), got))
+		require.True(t, tatarav1alpha1.Parked(got))
+		require.Equal(t, stage.ReasonAwaitingHuman, got.Status.ParkReason)
+	})
+}
+
+// A TAKEOVER stays excluded on the new reason too: the exclusion is on the Task
+// kind, not on the reason it happens to be parked with.
+func TestDriveCIRecoveryUnparks_NeverTouchesATakeoverParkedAwaitingHuman(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+	proj := reapProject("cirec")
+	tk := ciDeclinedTask(stage.KindTakeover, tatarav1alpha1.CIEvidenceRed, ciRecoveryMR+"@4c11cad2")
+	tk.Status.ParkReason = stage.ReasonAwaitingHuman
+	mr := ciRecoveryMirror("open", tatarav1alpha1.OwnershipTatara, "green", "4c11cad2")
+	r := newUnparkTestReconciler(t, proj, reapSecret(), tk, mr)
+
+	require.NoError(t, r.driveCIRecoveryUnparks(ctx, proj, now))
+
+	got := &tatarav1alpha1.Task{}
+	require.NoError(t, r.Get(ctx, objectKeyOf(tk), got))
+	require.True(t, tatarav1alpha1.Parked(got))
+	require.Equal(t, stage.ReasonAwaitingHuman, got.Status.ParkReason)
+}
+
 // CONSTRAINT 1's FAILURE MODE, pinned. This driver lives OUTSIDE stage.Unpark
 // on purpose: implement-declined stays UnparkNever, so the reaper's unparkFires
 // probe still answers "no re-entry" and a Task this driver never fires for ages
@@ -304,9 +435,9 @@ func TestUnparkCIRecovered_RefusesAnythingOutsideItsCase(t *testing.T) {
 	now := time.Now()
 
 	other := ciDeclinedTask("implement", "", "")
-	other.Status.ParkReason = stage.ReasonAwaitingHuman
+	other.Status.ParkReason = stage.ReasonMergeBlocked
 	require.Error(t, stage.UnparkCIRecovered(other, now))
-	require.Equal(t, stage.ReasonAwaitingHuman, other.Status.ParkReason)
+	require.Equal(t, stage.ReasonMergeBlocked, other.Status.ParkReason)
 
 	notParked := ciDeclinedTask("implement", "", "")
 	notParked.Status.ParkReason = ""
@@ -315,4 +446,32 @@ func TestUnparkCIRecovered_RefusesAnythingOutsideItsCase(t *testing.T) {
 	takeover := ciDeclinedTask(stage.KindTakeover, "", "")
 	require.Error(t, stage.UnparkCIRecovered(takeover, now))
 	require.Equal(t, stage.ReasonImplementDeclined, takeover.Status.ParkReason)
+}
+
+// THE CEILING THE RECOVERY USED TO WALK STRAIGHT PAST. UnparkCIRecovered
+// re-arms the LIVE state the Task parked in, so the very next reconcile mints an
+// agent pod - and this driver is the one un-park path that never asked whether
+// the project had room for one. Every other one (stage.Unpark's liveRoomDecline,
+// the reaper's unparkFires probe, ownership_redeliver) does.
+func TestDriveCIRecoveryUnparks_RefusesWhenTheProjectIsAtItsLivePodCeiling(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+	proj := reapProject("cirec")
+	proj.Spec.MaxLivePods = 1
+
+	tk := ciDeclinedTask("upgrade", tatarav1alpha1.CIEvidenceRed, ciRecoveryMR+"@4c11cad2")
+	mr := ciRecoveryMirror("open", tatarav1alpha1.OwnershipTatara, "green", "4c11cad2")
+	// One live, un-parked Task already occupies the only slot.
+	busy := reapTask("cirec", "t-live", "implement", tatarav1alpha1.StateUnderImplementation, "", now)
+	r := newUnparkTestReconciler(t, proj, reapSecret(), tk, mr, busy)
+
+	require.NoError(t, r.driveCIRecoveryUnparks(ctx, proj, now))
+
+	got := &tatarav1alpha1.Task{}
+	require.NoError(t, r.Get(ctx, objectKeyOf(tk), got))
+	require.True(t, tatarav1alpha1.Parked(got),
+		"the project is at its live-pod ceiling; the recovery must wait, not push it over")
+	require.NotContains(t, got.Annotations, tatarav1alpha1.AnnCIRecoveryUnparks,
+		"and it must not spend a lap of the absolute bound on a refusal it will retry")
+	require.NotContains(t, got.Annotations, tatarav1alpha1.AnnCIRecoveryHeads)
 }

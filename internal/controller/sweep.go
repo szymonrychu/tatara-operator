@@ -564,9 +564,42 @@ func (m *Minter) dropStaleOwner(ctx context.Context, cr client.Object, owner str
 // that order - not a stage and a stage reason (#521). A backlog owner is `new`
 // AND parked(backlog-sweep): the two are orthogonal now, so an owner that costs
 // nothing no longer has to wear a fake terminal stage to say so.
-func MintStage(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, iss scm.Issue, webhookOriginated bool) (string, string) {
+func MintStage(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, iss scm.Issue,
+	cr *tatarav1alpha1.Issue, webhookOriginated bool) (string, string) {
+
 	if hasLabel(iss.Labels, TataraParkedLabel) {
 		return tatarav1alpha1.StateNew, stage.ReasonBacklogSweep
+	}
+	// A PRIOR APPROVAL IS NOT LOST BY A RE-MINT. The clause below keys on the
+	// issue AUTHOR alone, so an already-approved BOT-authored issue - the shape
+	// every tatara-proposed brainstorm ends up in - came back new +
+	// backlog-sweep on its next mint, with the verdict silently dropped and
+	// nothing to age the park out: botRounds is 0 on a fresh Task, so the
+	// unpark backstop had no round to count. It took a human comment to move
+	// again (ccw#173: approved 2026-08-16, re-minted 2026-08-17, parked until a
+	// human spoke).
+	//
+	// THE VERDICT IS READ FROM THE MIRROR FIELD, NEVER FROM A LABEL. C.6 makes
+	// Issue.status.status the only input and the approved label a ONE-WAY
+	// PROJECTION of it (issue_controller.go: "No label is EVER read to produce
+	// status"); reading the label back here would re-create the label -> status
+	// path C.6 deleted. The field is trustworthy precisely because exactly two
+	// grammar-accepted paths write it (labels.go). The MR side already does
+	// this - MintReviewStage switches on cr.Status.Status.
+	//
+	// It sits AFTER the tatara-parked gate: an explicit park still wins, which
+	// is the same precedence the trusted-author clause has.
+	//
+	// A nil cr (no mirror yet) keeps the pre-approval default.
+	//
+	// BOTH CONJUNCTS, because the gate downstream of this mint reads both:
+	// verifyOneIssue (approval_grammar.go) short-circuits on
+	// `Status == "approved" && Status.Approval != nil` and falls through to the
+	// full citation grammar otherwise. Minting ACTIVE on the status alone would
+	// hand an approver-less legacy approval a clarify-free start that the gate
+	// itself would then refuse - two readings of "is this approved", disagreeing.
+	if cr != nil && cr.Status.Status == "approved" && cr.Status.Approval != nil {
+		return tatarav1alpha1.StateNew, ""
 	}
 	if iss.Author != botLoginOf(proj) && tatarav1alpha1.IsTrustedAuthor(proj, repo, iss.Author) {
 		return tatarav1alpha1.StateNew, ""
@@ -1630,7 +1663,7 @@ func (r *ProjectReconciler) sweepIssues(ctx context.Context, proj *tatarav1alpha
 		// HMAC-verified webhook said so: it mints ACTIVE even though its thread is
 		// empty. Nothing else can tell it from a cold backlog issue.
 		live := WebhookOriginated(cr)
-		stg, reason := MintStage(proj, repo, ext, live)
+		stg, reason := MintStage(proj, repo, ext, cr, live)
 		if !budget.allow(ctx, reason) {
 			skipIssueMetered(ctx, proj, repo, ref.Number, activity, SweepSkipMintBudget,
 				budget.countBudgetSkip())
@@ -1732,13 +1765,22 @@ func (r *ProjectReconciler) sweepPRs(ctx context.Context, proj *tatarav1alpha1.P
 
 		switch disp {
 		case PRAdopt:
-			if aerr := r.adoptPRIntoTask(ctx, proj, repo, pr, ownerTask, sp); aerr != nil {
+			// LOGGED ON THE TRANSITION, NOT ON THE PASS - the same shape the
+			// PRAdoptUpgrade arm below gets from EnqueueEvent's created. Adoption is
+			// idempotent and PRAdopt stays the disposition for as long as the PR is
+			// open, so an unconditional line reported ONE adoption as an adoption per
+			// sweep pass forever: indistinguishable, in the log, from a real adoption
+			// loop.
+			adopted, aerr := r.adoptPRIntoTask(ctx, proj, repo, pr, ownerTask, sp)
+			if aerr != nil {
 				fail("adopt_pr", aerr, "repo", repo.Name, "number", pr.Number)
 				continue
 			}
-			l.Info("sweep: adopted agent PR into its owning task",
-				"action", "sweep_adopt_pr", "resource_id", ownerTask.Name, "activity", activity,
-				"repo", repo.Name, "number", pr.Number, "head_branch", pr.HeadBranch)
+			if adopted {
+				l.Info("sweep: adopted agent PR into its owning task",
+					"action", "sweep_adopt_pr", "resource_id", ownerTask.Name, "activity", activity,
+					"repo", repo.Name, "number", pr.Number, "head_branch", pr.HeadBranch)
+			}
 		case PRAdoptUpgrade:
 			// THE SWEEP ENQUEUES, IT NO LONGER MINTS - and the cap it used to
 			// enforce here is gone with it. adoptHeadroom was recomputed once per
@@ -2150,22 +2192,38 @@ func (r *ProjectReconciler) activeTaskCount(ctx context.Context, proj *tatarav1a
 
 // adoptPRIntoTask is clause 1's write half: the MergeRequest CR is mirrored,
 // owned by the Task, and appended to its mrRefs.
+//
+// It reports whether that last step was a real TRANSITION. Every write here is
+// idempotent, so re-running it on an already-adopted PR - which the sweep does
+// on every pass, because PRAdopt stays the disposition while the PR is open -
+// is harmless but is NOT an adoption, and the caller must not report it as one.
+// Same contract as EnqueueEvent's created, which the PRAdoptUpgrade arm already
+// gates its log on.
 func (r *ProjectReconciler) adoptPRIntoTask(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository,
-	pr scm.PRRef, task *tatarav1alpha1.Task, sp objbudget.Spiller) error {
+	pr scm.PRRef, task *tatarav1alpha1.Task, sp objbudget.Spiller) (bool, error) {
 
 	ext := mrSnapshot(proj, repo, pr)
 	if err := r.bindMRToTask(ctx, proj, repo, ext, task, sp); err != nil {
-		return err
+		return false, err
 	}
 	mrName := tatarav1alpha1.MergeRequestName(repo.Name, pr.Number)
-	return objbudget.FitTask(ctx, r.Client, sp, client.ObjectKeyFromObject(task), func(cur *tatarav1alpha1.Task) {
+	changed := false
+	err := objbudget.FitTask(ctx, r.Client, sp, client.ObjectKeyFromObject(task), func(cur *tatarav1alpha1.Task) {
+		// Reset per invocation: FitTask may re-run this mutator on a conflict
+		// retry against a fresher copy, and the verdict must be that copy's.
+		changed = false
 		for _, ref := range cur.Status.MRRefs {
 			if ref == mrName {
 				return
 			}
 		}
 		cur.Status.MRRefs = append(cur.Status.MRRefs, mrName)
+		changed = true
 	})
+	if err != nil {
+		return false, err
+	}
+	return changed, nil
 }
 
 // bindMRToTask delegates to the shared Minter (adoptPRIntoTask's mirror-and-own

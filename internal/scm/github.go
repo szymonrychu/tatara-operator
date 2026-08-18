@@ -1330,12 +1330,17 @@ func (c *GitHub) GetMergeState(ctx context.Context, repoURL, token string, numbe
 }
 
 // ghMergeState maps GitHub's mergeable_state to a provider-neutral MergeState.
-// unstable/has_hooks mean mergeable-but-noisy (non-required checks) - not a
-// conflict - so they map to clean for the conflict-sweep decision.
+// has_hooks is a clean merge behind a pre-receive hook, so it maps to clean.
+// unstable gets its OWN value: it is mergeable-but-noisy, i.e. the merge is not
+// blocked and the checks that are red are not the ones that block it, and the
+// readiness gate needs that bit to tell a non-required scanner apart from a
+// required test. Neither is a conflict, so neither changes a merge decision.
 func ghMergeState(state string) MergeState {
 	switch state {
-	case "clean", "has_hooks", "unstable":
+	case "clean", "has_hooks":
 		return MergeStateClean
+	case "unstable":
+		return MergeStateUnstable
 	case "dirty":
 		return MergeStateDirty
 	case "behind":
@@ -1345,6 +1350,72 @@ func ghMergeState(state string) MergeState {
 	default:
 		return MergeStateUnknown
 	}
+}
+
+// ghRequiredChecksQuery asks whether ANY status context on the pull request's
+// head is required. `last: 100` is GitHub's ceiling on the connection; a PR with
+// more contexts than that could in principle hide its only required one, which
+// costs a suppression that is never taken - the fail-closed direction.
+const ghRequiredChecksQuery = `query($owner:String!,$name:String!,$number:Int!){
+  repository(owner:$owner,name:$name){
+    pullRequest(number:$number){
+      statusCheckRollup{
+        contexts(last:100){
+          nodes{
+            ... on CheckRun{ isRequired(pullRequestNumber:$number) }
+            ... on StatusContext{ isRequired(pullRequestNumber:$number) }
+          }
+        }
+      }
+    }
+  }
+}`
+
+// HasRequiredChecks reports whether the pull request carries at least one
+// REQUIRED status context (scm.RequiredCheckLister).
+//
+// IT IS GRAPHQL, NOT /branches/{branch}/protection/required_status_checks. That
+// REST endpoint is the direct answer and it needs ADMIN on the repository; the
+// operator's bot token has push. It would 403 on every repo, the caller fails
+// closed on an error, and the whole ci-red suppression would be dead code that
+// looks alive. statusCheckRollup's per-context isRequired flag needs only read
+// access, is evaluated against THIS pull request's base branch, and is the same
+// signal `gh pr checks --required` reads.
+//
+// It is ONE GraphQL call, made only on the path where CI is already red AND the
+// forge already reported `unstable` - never on a green merge request.
+func (c *GitHub) HasRequiredChecks(ctx context.Context, repoURL, token string, number int) (bool, error) {
+	owner, repo, err := ghOwnerRepo(repoURL)
+	if err != nil {
+		return false, fmt.Errorf("github: has required checks: %w", err)
+	}
+	var out struct {
+		Repository struct {
+			PullRequest struct {
+				StatusCheckRollup *struct {
+					Contexts struct {
+						Nodes []struct {
+							IsRequired bool `json:"isRequired"`
+						} `json:"nodes"`
+					} `json:"contexts"`
+				} `json:"statusCheckRollup"`
+			} `json:"pullRequest"`
+		} `json:"repository"`
+	}
+	vars := map[string]any{"owner": owner, "name": repo, "number": number}
+	if err := c.ghGraphQL(ctx, token, ghRequiredChecksQuery, vars, &out); err != nil {
+		return false, fmt.Errorf("github: has required checks %s/%s#%d: %w", owner, repo, number, err)
+	}
+	rollup := out.Repository.PullRequest.StatusCheckRollup
+	if rollup == nil {
+		return false, nil
+	}
+	for _, n := range rollup.Contexts.Nodes {
+		if n.IsRequired {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // GetCommitCIStatus returns the CI status for the given commit sha by reading

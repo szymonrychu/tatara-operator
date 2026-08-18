@@ -221,6 +221,24 @@ type ProjectReconciler struct {
 	UnparkDriveInterval time.Duration
 	lastDriveUnparks    map[string]time.Time
 
+	// ConflictSweepInterval floors how often driveConflictSweeps re-reads a
+	// Project's conflicted merge requests (G2, conflict_sweep.go). Defaults to
+	// defaultConflictSweepInterval when zero. Paced separately from
+	// UnparkDriveInterval and much slower: the sweep costs a namespace-wide
+	// Task List plus one forge read per conflicted merge request, and a
+	// conflict is resolved by an agent taking a whole turn on the branch.
+	// Keyed per project, like lastDriveUnparks beside it.
+	ConflictSweepInterval time.Duration
+	lastConflictSweeps    map[string]time.Time
+	// lastParkedConflictSweeps paces the PARKED half of that sweep separately,
+	// on MirrorCadenceParked. A parked Task can never be routed by the sweep
+	// (there is exactly one way out of a park and it is Unpark), so its live
+	// mergeability read buys a metric and a log line only - about 2000 forge
+	// calls per parked Task on the five-minute floor before the reaper collects
+	// it at ParkRetention. Same per-project keying, same serialised reconcile
+	// path, no mutex.
+	lastParkedConflictSweeps map[string]time.Time
+
 	// lastComputeProjectCounts / lastResumeNoReentryParks / lastReapTerminal pace
 	// computeProjectCounts, resumeNoReentryParks and ReapTerminal, one map each,
 	// keyed per project (like lastDriveUnparks): full-namespace-List blocks that
@@ -482,6 +500,20 @@ func (r *ProjectReconciler) doReconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, fmt.Errorf("drive unparks: %w", unparkErr)
 	}
 	requeueAfter = soonestRequeue(requeueAfter, unparkRequeue)
+
+	// THE G2 CONFLICT SWEEP. GetMergeState had two call sites before it - the
+	// merge corridor and the submit gate - so an owned merge request that went
+	// DIRTY at awaiting-review, or while its Task was parked, was invisible for
+	// as long as it stayed there (tatara-operator#625). Paced on its own, much
+	// slower floor; see conflict_sweep.go for what it deliberately does not do.
+	//
+	// It returns NO error, on purpose and structurally: it is a refinement on
+	// top of the merge corridor's own 60s re-read, and it sits above the live-pod
+	// ceiling, both park drivers and the reaper below - so a rotated
+	// scmSecretRef returned from here would take all four off the air for this
+	// Project until someone noticed. Every failure inside it is logged and
+	// counted result="error" instead.
+	requeueAfter = soonestRequeue(requeueAfter, r.driveConflictSweepsPaced(ctx, &project, time.Now()))
 
 	// The live-pod ceiling's level-triggered backstop. The webhook's
 	// LiveHasRoom check is the fast path that usually keeps a project's

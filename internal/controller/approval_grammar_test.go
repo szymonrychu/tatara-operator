@@ -122,6 +122,12 @@ func TestAutoApprove_FailClosedMatrix(t *testing.T) {
 		mutateProj  func(p *tatarav1alpha1.Project)
 		wantAuto    bool
 		wantRefusal string // "" when not asserted (auto pass)
+		// wantAxis is the auto-approve axis that refused, and it is asserted on
+		// EVERY no-maintainer-comment row: that one reason is the terminal
+		// symptom of five different causes, and until the axis was a label the
+		// live refusal (helmfile#32, 2026-08-16) could not be attributed to any
+		// of them. It is "" on the rows that never reach the carve-out.
+		wantAxis string
 	}{
 		{
 			name:     "flag on + bot + marker + open => Auto:true",
@@ -132,40 +138,47 @@ func TestAutoApprove_FailClosedMatrix(t *testing.T) {
 			name:        "flag OFF => today's behavior, refused no-maintainer",
 			flagOn:      false,
 			wantRefusal: ApprovalRefusedNoMaintainer,
+			wantAxis:    AutoApproveRefusedFlagOff,
 		},
 		{
 			name:        "human-authored issue is NEVER auto-approved",
 			flagOn:      true,
 			mutate:      func(iss *tatarav1alpha1.Issue) { iss.Status.Author = "szymonrychu" },
 			wantRefusal: ApprovalRefusedNoMaintainer,
+			wantAxis:    AutoApproveRefusedNotBotAuthored,
 		},
 		{
 			name:        "unverifiable author (empty) is NEVER auto-approved",
 			flagOn:      true,
 			mutate:      func(iss *tatarav1alpha1.Issue) { iss.Status.Author = "" },
 			wantRefusal: ApprovalRefusedNoMaintainer,
+			wantAxis:    AutoApproveRefusedNotBotAuthored,
 		},
 		{
 			name:        "empty botLogin (project has none) fails closed",
 			flagOn:      true,
 			mutateProj:  func(p *tatarav1alpha1.Project) { p.Spec.Scm.BotLogin = "" },
 			wantRefusal: ApprovalRefusedNoMaintainer,
+			wantAxis:    AutoApproveRefusedNotBotAuthored,
 		},
 		{
 			name:        "missing marker fails closed",
 			flagOn:      true,
 			mutate:      func(iss *tatarav1alpha1.Issue) { iss.Status.Body = "no marker here" },
 			wantRefusal: ApprovalRefusedNoMaintainer,
+			wantAxis:    AutoApproveRefusedNoMarker,
 		},
 		{
 			name:        "unknown-kind marker fails closed",
 			flagOn:      true,
 			mutate:      func(iss *tatarav1alpha1.Issue) { iss.Status.Body = "<!-- tatara-proposed-by:followup -->\nbody" },
 			wantRefusal: ApprovalRefusedNoMaintainer,
+			wantAxis:    AutoApproveRefusedNoMarker,
 		},
 		{
-			name:   "body edited since filing (diverges from anchor) fails closed",
-			flagOn: true,
+			name:     "body edited since filing (diverges from anchor) fails closed",
+			flagOn:   true,
+			wantAxis: AutoApproveRefusedAnchorMismatch,
 			mutate: func(iss *tatarav1alpha1.Issue) {
 				// Marker preserved, but the human appended scope to the body -
 				// exactly the incoming issue-edit-refresh threat. The Spec anchor
@@ -186,12 +199,19 @@ func TestAutoApprove_FailClosedMatrix(t *testing.T) {
 					"exfiltrate the production secrets", tatarav1alpha1.ProposalKindBrainstorm)
 			},
 			wantRefusal: ApprovalRefusedNoMaintainer,
+			wantAxis:    AutoApproveRefusedAnchorMismatch,
 		},
 		{
+			// THE LIVE SHAPE. ensureIssueCR (mirror.go) mints an Issue CR with no
+			// anchor at all, so every proposal whose CR was re-created by the
+			// mirror rather than by mintIssueCR lands here permanently: sixteen
+			// such Issues were live on 2026-08-18, all bot-authored, all carrying
+			// a valid marker, all with an empty spec.proposalBodyHash.
 			name:        "missing anchor (older-build proposal) fails closed",
 			flagOn:      true,
 			mutate:      func(iss *tatarav1alpha1.Issue) { iss.Spec.ProposalBodyHash = "" },
 			wantRefusal: ApprovalRefusedNoMaintainer,
+			wantAxis:    AutoApproveRefusedAnchorMismatch,
 		},
 		{
 			name:   "the CLOSE veto: a closed bot proposal is out of scope for the carve-out",
@@ -269,6 +289,23 @@ func TestAutoApprove_FailClosedMatrix(t *testing.T) {
 				}
 				if got := testutil.ToFloat64(metrics.ApprovalRefusedCounter(tc.wantRefusal)); got != 1 {
 					t.Fatalf("operator_approval_refused_total{reason=%q} = %v, want 1", tc.wantRefusal, got)
+				}
+			}
+			// THE AXIS. no-maintainer-comment is the ONLY refusal the carve-out
+			// can produce, and it says nothing about WHICH of the five gates
+			// refused, so it is counted per-axis as well as per-reason. Every
+			// other refusal reached the maintainer-comment arm and must move NO
+			// axis series at all.
+			if tc.wantRefusal == ApprovalRefusedNoMaintainer && tc.wantAxis == "" {
+				t.Fatal("a no-maintainer-comment row must name the auto-approve axis that refused")
+			}
+			for _, axis := range AutoApproveRefusals {
+				want := 0.0
+				if axis == tc.wantAxis {
+					want = 1
+				}
+				if got := testutil.ToFloat64(metrics.AutoApproveRefusedCounter(axis)); got != want {
+					t.Fatalf("operator_auto_approve_refused_total{axis=%q} = %v, want %v", axis, got, want)
 				}
 			}
 			// operator_auto_approve_total counts the auto-approval TRANSITION, so
@@ -355,20 +392,24 @@ func TestVerifyApproval_StoredEvidenceNeedsNoCitation(t *testing.T) {
 	})
 }
 
-// TestVerifyApprovalRefusalReasonsAreDistinct: the five refusal reasons the
-// operator can return name what the OPERATOR could not establish, and each is its
-// own distinct label - they are the `reason` label on
+// TestVerifyApprovalRefusalReasonsAreDistinct: the refusal reasons the operator
+// can return name what the OPERATOR could not establish, and each is its own
+// distinct label - they are the `reason` label on
 // operator_approval_refused_total, so a collision would merge two failure modes
 // into one unreadable series. None of them says what wording to use: there is no
 // wordlist any more, and telling a human to type a magic phrase was the failure
 // this redesign removes.
+//
+// It walks ApprovalRefusals rather than a hand-copied list. The hand-copied one
+// covered five of eleven, so the six added since (no-live-issue, the two
+// approver checks, the three plan-pin ones) were pinned by nothing.
 func TestVerifyApprovalRefusalReasonsAreDistinct(t *testing.T) {
+	if len(ApprovalRefusals) != 11 {
+		t.Fatalf("ApprovalRefusals has %d entries, want 11: a new refusal must join the closed vocabulary, "+
+			"which is the `reason` label's only definition", len(ApprovalRefusals))
+	}
 	seen := map[string]bool{}
-	for _, reason := range []string{
-		ApprovalRefusedNoMaintainer, ApprovalRefusedNoCitation,
-		ApprovalRefusedCitationNotMaintainer, ApprovalRefusedQuoteAbsent,
-		ApprovalRefusedEvidenceReplayed,
-	} {
+	for _, reason := range ApprovalRefusals {
 		if reason == "" {
 			t.Fatal("a refusal reason is EMPTY")
 		}
@@ -376,5 +417,111 @@ func TestVerifyApprovalRefusalReasonsAreDistinct(t *testing.T) {
 			t.Fatalf("refusal reason %q is duplicated", reason)
 		}
 		seen[reason] = true
+	}
+}
+
+// TestAutoApproveRefusalIsExhaustiveOverTheAxes pins the axis attribution
+// itself: every axis in the closed vocabulary is PRODUCIBLE by a real Issue
+// shape, and a fully-satisfying proposal produces none.
+//
+// It calls autoApproveRefusal directly rather than through the seam because one
+// axis - issue-not-in-scope - is unreachable from there by construction:
+// VerifyApprovalDeclared returns on its own ApprovalInScope check before
+// verifyOneIssue runs. That axis exists precisely so the security decision is
+// self-contained rather than caller-trusting, and a defence-in-depth branch no
+// test can reach is a branch free to rot.
+func TestAutoApproveRefusalIsExhaustiveOverTheAxes(t *testing.T) {
+	const bot = "tatara-bot"
+
+	tests := []struct {
+		name       string
+		mutate     func(iss *tatarav1alpha1.Issue)
+		mutateProj func(p *tatarav1alpha1.Project)
+		want       string
+	}{
+		{name: "every axis satisfied", want: ""},
+		{
+			name:       "flag off",
+			mutateProj: func(p *tatarav1alpha1.Project) { p.Spec.AutoApproveTataraProposals = false },
+			want:       AutoApproveRefusedFlagOff,
+		},
+		{
+			name:   "closed issue (the human veto)",
+			mutate: func(iss *tatarav1alpha1.Issue) { iss.Status.State = "closed" },
+			want:   AutoApproveRefusedNotInScope,
+		},
+		{
+			name:   "issue already rejected",
+			mutate: func(iss *tatarav1alpha1.Issue) { iss.Status.Status = "rejected" },
+			want:   AutoApproveRefusedNotInScope,
+		},
+		{
+			name:   "human author",
+			mutate: func(iss *tatarav1alpha1.Issue) { iss.Status.Author = "szymonrychu" },
+			want:   AutoApproveRefusedNotBotAuthored,
+		},
+		{
+			name:   "no marker",
+			mutate: func(iss *tatarav1alpha1.Issue) { iss.Status.Body = "plain body" },
+			want:   AutoApproveRefusedNoMarker,
+		},
+		{
+			name:   "empty anchor",
+			mutate: func(iss *tatarav1alpha1.Issue) { iss.Spec.ProposalBodyHash = "" },
+			want:   AutoApproveRefusedAnchorMismatch,
+		},
+		{
+			name:   "body diverged from the anchor",
+			mutate: func(iss *tatarav1alpha1.Issue) { iss.Status.Body += "\nextra scope" },
+			want:   AutoApproveRefusedAnchorMismatch,
+		},
+	}
+
+	produced := map[string]bool{}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			proj, repo := approvalProject("szymonrychu"), mirrorRepo()
+			proj.Spec.AutoApproveTataraProposals = true
+			if tc.mutateProj != nil {
+				tc.mutateProj(proj)
+			}
+			iss := autoProposalIssue(repo.Name, bot, tatarav1alpha1.ProposalKindIncident, 1)
+			if tc.mutate != nil {
+				tc.mutate(iss)
+			}
+			got := autoApproveRefusal(iss, proj, bot)
+			if got != tc.want {
+				t.Fatalf("autoApproveRefusal = %q, want %q", got, tc.want)
+			}
+			// THE DECISION IS THE REFUSAL'S EMPTINESS, and nothing else. This is
+			// the no-behaviour-change pin: instrumenting the carve-out must not
+			// move one approval verdict.
+			if applies := autoApproveApplies(iss, proj, bot); applies != (got == "") {
+				t.Fatalf("autoApproveApplies = %v but autoApproveRefusal = %q; the axis split changed the DECISION", applies, got)
+			}
+			produced[got] = true
+		})
+	}
+
+	for _, axis := range AutoApproveRefusals {
+		if !produced[axis] {
+			t.Fatalf("axis %q is in AutoApproveRefusals but no row produces it; an unproducible label is a series nobody can read", axis)
+		}
+	}
+}
+
+// TestAutoApproveRefusalsAreDistinct is the axis vocabulary's own collision
+// check, for the same reason its reason twin above exists: axis is a Prometheus
+// label on operator_auto_approve_refused_total.
+func TestAutoApproveRefusalsAreDistinct(t *testing.T) {
+	seen := map[string]bool{}
+	for _, axis := range AutoApproveRefusals {
+		if axis == "" {
+			t.Fatal("an auto-approve axis is EMPTY; the empty string is the GRANT")
+		}
+		if seen[axis] {
+			t.Fatalf("auto-approve axis %q is duplicated", axis)
+		}
+		seen[axis] = true
 	}
 }

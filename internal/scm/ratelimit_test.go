@@ -82,7 +82,11 @@ func TestDoPagedGET_HonoursRateLimitReset(t *testing.T) {
 	}
 	t.Cleanup(func() { ghRetrySleep = orig })
 
-	reset := time.Now().Add(3 * time.Second).Unix()
+	// Unix() truncates to whole seconds, so the reset instant lands up to 1s
+	// earlier than the offset asks for. The gap has to stay clear of the 1s
+	// backoff floor even after that truncation, or the bound below is a
+	// coin flip: at +3s a measured wait of 1.999839s failed a > 2s assertion.
+	reset := time.Now().Add(5 * time.Second).Unix()
 	var calls int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		calls++
@@ -103,8 +107,8 @@ func TestDoPagedGET_HonoursRateLimitReset(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 2, calls)
 	require.Len(t, sleeps, 1)
-	require.Greater(t, sleeps[0], 2*time.Second, "wait must come from X-RateLimit-Reset, not the 1s backoff floor")
-	require.LessOrEqual(t, sleeps[0], 3*time.Second)
+	require.Greater(t, sleeps[0], 3*time.Second, "wait must come from X-RateLimit-Reset, not the 1s backoff floor")
+	require.LessOrEqual(t, sleeps[0], 5*time.Second)
 }
 
 // GitHub's SECONDARY limit answers 403, NOT 429, and carries no

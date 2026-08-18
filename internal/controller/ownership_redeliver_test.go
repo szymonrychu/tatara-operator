@@ -262,7 +262,8 @@ func TestRedeliverMRComments_DrivesTakeoverReentryOnParkedAwaitingHuman(t *testi
 	incoming := []scm.IssueComment{
 		{ExternalID: "500", Author: "alice", Body: "take over!", CreatedAt: fixedTime(1)},
 	}
-	if err := d.redeliverMRComments(ctx, proj, repo, mr, incoming); err != nil {
+	logCtx, entries := kvLoggingCtx()
+	if err := d.redeliverMRComments(logCtx, proj, repo, mr, incoming); err != nil {
 		t.Fatal(err)
 	}
 
@@ -270,6 +271,20 @@ func TestRedeliverMRComments_DrivesTakeoverReentryOnParkedAwaitingHuman(t *testi
 	if got.Status.State != tatarav1alpha1.StateAwaitingReview {
 		t.Fatalf("stage = %q, want reviewing: a take-over comment delivered only via OP12 sweep convergence must still re-engage the parked review Task",
 			got.Status.State)
+	}
+	if tatarav1alpha1.Parked(got) {
+		t.Fatalf("task is still parked (%q); the redelivery must have un-parked it", got.Status.ParkReason)
+	}
+	// The un-park line has to name the reason the Task came OUT of, and that
+	// reason is DESTROYED by the time the line runs: ApplyUnpark's write-back
+	// (unpark.go) overwrites *task with the persisted object, whose clearPark
+	// already emptied ParkReason. Read after the call and the field is
+	// unconditionally "", on every redeliver_reentry line ever logged, which is
+	// exactly the one field the line exists to carry.
+	e := oneLoggedAction(t, *entries, "redeliver_reentry")
+	if got := e.field("reason_from"); got != stage.ReasonAwaitingHuman {
+		t.Fatalf("reason_from = %#v, want %q: capture the park reason BEFORE ApplyUnpark's write-back clears it",
+			got, stage.ReasonAwaitingHuman)
 	}
 }
 

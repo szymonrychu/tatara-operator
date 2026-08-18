@@ -110,9 +110,17 @@ func TestDeliverLiveTurnRefusesAtTheReviewRoundCap(t *testing.T) {
 // #511: a maintainer's take-over comment on a stood-down (Ownership==external)
 // MR must still be delivered even with the round cap spent - the cap
 // bounds ordinary review ping-pong, not a take-over request.
+//
+// The FRESH pendingEvent is load-bearing (H1-J): the bypass spends no round, so
+// an unconsumed non-bot event is the only monotonic quantity bounding it. See
+// TestDeliverLiveTurnRefusesTheStandDownBypassWithoutAFreshHumanEvent.
 func TestDeliverLiveTurnBypassesRoundCapOnExternallyOwnedMR(t *testing.T) {
 	proj, task, r := ceFixture(t, v1alpha1.StateAwaitingReview, "review", func(task *v1alpha1.Task) {
 		task.Status.HumanReviewRounds = v1alpha1.MaxHumanReviewRounds
+		task.Status.PendingEvents = []v1alpha1.TaskEvent{{
+			At: metav1.Now(), Kind: "mr_comment", Repo: "r", Number: 1,
+			Author: "szymonrychu", Body: "I am taking this over",
+		}}
 	})
 	now := time.Now()
 	mrs := []v1alpha1.MergeRequest{{Status: v1alpha1.MergeRequestStatus{Ownership: v1alpha1.OwnershipExternal}}}
@@ -126,6 +134,66 @@ func TestDeliverLiveTurnBypassesRoundCapOnExternallyOwnedMR(t *testing.T) {
 	if fresh.Status.HumanReviewRounds != v1alpha1.MaxHumanReviewRounds {
 		t.Fatalf("HumanReviewRounds = %d, want unchanged at %d (this delivery does not spend a round)",
 			fresh.Status.HumanReviewRounds, v1alpha1.MaxHumanReviewRounds)
+	}
+}
+
+// H1-J, the MIRROR of stage.Unpark's fix. This is the SECOND copy of the #511
+// stand-down bypass and both move together: an already-consumed event is no
+// longer a take-over request, so the bypass falls back to the ordinary round
+// cap instead of firing again on a trigger that has already been spent.
+func TestDeliverLiveTurnRefusesTheStandDownBypassWithoutAFreshHumanEvent(t *testing.T) {
+	consumed := metav1.Now()
+	tests := []struct {
+		name         string
+		events       []v1alpha1.TaskEvent
+		wantDelivery bool
+	}{
+		{
+			name:         "no event at all is not a take-over request",
+			events:       nil,
+			wantDelivery: false,
+		},
+		{
+			name: "an event already spent on an un-park is not a fresh one",
+			events: []v1alpha1.TaskEvent{{
+				At: metav1.Now(), Kind: "mr_comment", Repo: "r", Number: 1,
+				Author: "szymonrychu", Body: "take over", UnparkConsumedAt: &consumed,
+			}},
+			wantDelivery: false,
+		},
+		{
+			name: "the operator's own comment is not a take-over request",
+			events: []v1alpha1.TaskEvent{{
+				At: metav1.Now(), Kind: "mr_comment", Repo: "r", Number: 1,
+				Author: "tatara-bot", Body: "parked",
+			}},
+			wantDelivery: false,
+		},
+		{
+			name: "a fresh human comment still bypasses the spent cap",
+			events: []v1alpha1.TaskEvent{{
+				At: metav1.Now(), Kind: "mr_comment", Repo: "r", Number: 1,
+				Author: "szymonrychu", Body: "take over",
+			}},
+			wantDelivery: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			proj, task, r := ceFixture(t, v1alpha1.StateAwaitingReview, "review", func(task *v1alpha1.Task) {
+				task.Status.HumanReviewRounds = v1alpha1.MaxHumanReviewRounds
+				task.Status.PendingEvents = tc.events
+			})
+			mrs := []v1alpha1.MergeRequest{{Status: v1alpha1.MergeRequestStatus{Ownership: v1alpha1.OwnershipExternal}}}
+
+			delivered, decline := DeliverLiveTurn(context.Background(), r.Client, nil, r.Metrics, proj, task, mrs, time.Now())
+			if delivered != tc.wantDelivery {
+				t.Fatalf("delivered = %v (decline %q), want %v", delivered, decline, tc.wantDelivery)
+			}
+			if !tc.wantDelivery && decline != LiveEntryDeclineRoundsExhausted {
+				t.Fatalf("decline = %q, want %q", decline, LiveEntryDeclineRoundsExhausted)
+			}
+		})
 	}
 }
 

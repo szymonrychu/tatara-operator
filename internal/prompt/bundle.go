@@ -148,10 +148,17 @@ type mrView struct {
 	Mergeable           bool
 	HeadBranch, HeadSHA string
 	LastBotHeadSHA      string
-	URL                 string
-	Title, Author, Body string
-	BodyTruncated       bool
-	Comments            *commentsView
+	// LastExternalAssistSHA names a commit that came from OUTSIDE tatara and is in
+	// this branch, on a merge request the platform still owns. It has to be its own
+	// attribute because the carve-out that keeps ownership ALSO advances
+	// LastBotHeadSHA onto that commit, so after an assist last_bot_head_sha equals
+	// head_sha and this element would otherwise look exactly like a branch tatara
+	// wrote alone - to the review agent whose approval makes the operator merge it.
+	LastExternalAssistSHA string
+	URL                   string
+	Title, Author, Body   string
+	BodyTruncated         bool
+	Comments              *commentsView
 }
 
 type noteView struct {
@@ -239,7 +246,7 @@ const bundleTmpl = `{{define "bundle"}}{{if .Events}}<events count="{{.Events.Co
   </issue>
 {{- end}}
 {{- range .MRs}}
-  <merge_request repo="{{x .Repo}}" number="{{.Number}}" state="{{x .State}}" status="{{x .Status}}" ci="{{x .CI}}"{{if .CIUpdatedAt}} ci_updated_at="{{x .CIUpdatedAt}}"{{end}} mergeable="{{.Mergeable}}" head_branch="{{x .HeadBranch}}" head_sha="{{x .HeadSHA}}"{{if .LastBotHeadSHA}} last_bot_head_sha="{{x .LastBotHeadSHA}}"{{end}} url="{{x .URL}}">
+  <merge_request repo="{{x .Repo}}" number="{{.Number}}" state="{{x .State}}" status="{{x .Status}}" ci="{{x .CI}}"{{if .CIUpdatedAt}} ci_updated_at="{{x .CIUpdatedAt}}"{{end}} mergeable="{{.Mergeable}}" head_branch="{{x .HeadBranch}}" head_sha="{{x .HeadSHA}}"{{if .LastBotHeadSHA}} last_bot_head_sha="{{x .LastBotHeadSHA}}"{{end}}{{if .LastExternalAssistSHA}} last_external_assist_sha="{{x .LastExternalAssistSHA}}"{{end}} url="{{x .URL}}">
     <title>{{x .Title}}</title>
     <author>{{x .Author}}</author>
     <body{{if .BodyTruncated}} truncated="true"{{end}}>{{x .Body}}</body>
@@ -551,22 +558,23 @@ func buildView(in Input, issues []v1alpha1.Issue, mrs []v1alpha1.MergeRequest, t
 		i := len(issues) + j
 		body, trunc := truncBody(mr.Status.Body, p.bodyLimit)
 		v.MRs = append(v.MRs, mrView{
-			Repo:           mr.Spec.RepositoryRef,
-			Number:         mr.Spec.Number,
-			State:          mr.Status.State,
-			Status:         mr.Status.Status,
-			CI:             mr.Status.CIStatus,
-			CIUpdatedAt:    optStamp(mr.Status.CIUpdatedAt),
-			Mergeable:      mr.Status.Mergeable,
-			HeadBranch:     mr.Status.HeadBranch,
-			HeadSHA:        mr.Status.HeadSHA,
-			LastBotHeadSHA: mr.Status.LastBotHeadSHA,
-			URL:            mr.Spec.URL,
-			Title:          mr.Status.Title,
-			Author:         mr.Status.Author,
-			Body:           body,
-			BodyTruncated:  trunc,
-			Comments:       buildComments(threads[i], p.keep[i]),
+			Repo:                  mr.Spec.RepositoryRef,
+			Number:                mr.Spec.Number,
+			State:                 mr.Status.State,
+			Status:                mr.Status.Status,
+			CI:                    mr.Status.CIStatus,
+			CIUpdatedAt:           optStamp(mr.Status.CIUpdatedAt),
+			Mergeable:             mr.Status.Mergeable,
+			HeadBranch:            mr.Status.HeadBranch,
+			HeadSHA:               mr.Status.HeadSHA,
+			LastBotHeadSHA:        mr.Status.LastBotHeadSHA,
+			LastExternalAssistSHA: mr.Status.LastExternalAssistSHA,
+			URL:                   mr.Spec.URL,
+			Title:                 mr.Status.Title,
+			Author:                mr.Status.Author,
+			Body:                  body,
+			BodyTruncated:         trunc,
+			Comments:              buildComments(threads[i], p.keep[i]),
 		})
 	}
 

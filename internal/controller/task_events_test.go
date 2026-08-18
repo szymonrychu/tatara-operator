@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -127,14 +128,68 @@ func TestAppendAgentTaskEvent_ClampsOversizedBody(t *testing.T) {
 }
 
 // TestClampTaskEventBody_LeavesShortBodiesAlone is the negative half: a body
-// that fits must be byte-identical, marker and all - drainRenderedEvents
-// identifies a rendered event by its full value tuple (body included), so a
-// clamp that rewrote every body would break the webhook-vs-drain race guard.
+// that fits must be byte-identical, marker and all. The drain no longer reads
+// the body (eventKey is kind/repo/number/at), but a clamp that rewrote every
+// body would put a text nobody wrote in front of the agent.
 func TestClampTaskEventBody_LeavesShortBodiesAlone(t *testing.T) {
 	for _, body := range []string{"", "a short human reply", strings.Repeat("a", tatarav1alpha1.TaskEventBodyMaxBytes)} {
 		ev := tatarav1alpha1.TaskEvent{Kind: "mr_comment", Repo: "r", Number: 7, Body: body}
 		if got := clampTaskEventBody(ev); got.Body != body {
 			t.Fatalf("a %d-byte body must pass through untouched, got %d bytes", len(body), len(got.Body))
 		}
+	}
+}
+
+// TestDrainRenderedEvents_DrainsAnEventAConcurrentUnparkStamped is the
+// identity-tuple pin. The drain used to compare whole TaskEvent structs with
+// reflect.DeepEqual, and TaskEvent gained a field a SECOND writer mutates in
+// place: stage.consumeUnparkEvents stamps UnparkConsumedAt from the webhook,
+// which is not leader-elected. submitStageTurn snapshots `rendered` before
+// SubmitTurn's network round trip, so a human comment that unparks a Task while
+// that turn is in flight leaves rendered=[E{nil}] against fresh=[E{stamped}] -
+// no match, nothing drained, and the conversation follow-up branch
+// (task_stage.go, gated on len(PendingEvents) > 0) resubmits a turn on every
+// reconcile forever. Identity is (Kind, Repo, Number, At), which no second
+// writer touches.
+func TestDrainRenderedEvents_DrainsAnEventAConcurrentUnparkStamped(t *testing.T) {
+	at := metav1.NewTime(time.Date(2026, 8, 18, 10, 0, 0, 0, time.UTC))
+	rendered := []tatarav1alpha1.TaskEvent{{
+		At: at, Kind: "issue_comment", Repo: "r", Number: 7, Author: "szymonrychu", Body: "go ahead",
+	}}
+	stamped := metav1.NewTime(time.Date(2026, 8, 18, 10, 0, 5, 0, time.UTC))
+	fresh := []tatarav1alpha1.TaskEvent{{
+		At: at, Kind: "issue_comment", Repo: "r", Number: 7, Author: "szymonrychu", Body: "go ahead",
+		UnparkConsumedAt: &stamped,
+	}}
+	if got := drainRenderedEvents(fresh, rendered); got != nil {
+		t.Fatalf("a rendered event stamped by a racing unpark must still drain, got %d left", len(got))
+	}
+}
+
+// TestDrainRenderedEvents_KeepsAnEventThatRacedTheTurn is the other half of the
+// same guard and must not regress: an event appended AFTER the render was never
+// carried by any turn, so it survives the drain and rides the next one.
+func TestDrainRenderedEvents_KeepsAnEventThatRacedTheTurn(t *testing.T) {
+	at := metav1.NewTime(time.Date(2026, 8, 18, 10, 0, 0, 0, time.UTC))
+	late := metav1.NewTime(time.Date(2026, 8, 18, 10, 0, 30, 0, time.UTC))
+	rendered := []tatarav1alpha1.TaskEvent{{At: at, Kind: "issue_comment", Repo: "r", Number: 7, Body: "first"}}
+	fresh := append(append([]tatarav1alpha1.TaskEvent(nil), rendered...),
+		tatarav1alpha1.TaskEvent{At: late, Kind: "issue_comment", Repo: "r", Number: 7, Body: "second"})
+	got := drainRenderedEvents(fresh, rendered)
+	if len(got) != 1 || got[0].Body != "second" {
+		t.Fatalf("the racing event must survive, got %+v", got)
+	}
+}
+
+// TestDrainRenderedEvents_RemovesOneOccurrencePerRenderedEntry pins the MULTISET
+// semantics the key-based match must keep: two events with the identical
+// identity tuple (a duplicate webhook delivery) and one rendered copy leaves
+// exactly one behind, not zero.
+func TestDrainRenderedEvents_RemovesOneOccurrencePerRenderedEntry(t *testing.T) {
+	at := metav1.NewTime(time.Date(2026, 8, 18, 10, 0, 0, 0, time.UTC))
+	ev := tatarav1alpha1.TaskEvent{At: at, Kind: "issue_comment", Repo: "r", Number: 7, Body: "dup"}
+	got := drainRenderedEvents([]tatarav1alpha1.TaskEvent{ev, ev}, []tatarav1alpha1.TaskEvent{ev})
+	if len(got) != 1 {
+		t.Fatalf("one rendered entry drains one occurrence, got %d left", len(got))
 	}
 }

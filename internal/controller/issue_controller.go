@@ -155,10 +155,10 @@ func (r *IssueReconciler) doReconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	// Placed before the closed branch, which can delete the CR and return early.
-	// The cadence sync above does NOT feed this: syncIssueThread refreshes only
-	// Status.Comments/LastSyncedAt/conditions. Status.Body and Status.Author are
-	// written by SyncIssue on the webhook and scan intake paths, so the backfill
-	// reads whatever those last wrote.
+	// The cadence sync above does NOT feed this: syncIssueThread refreshes
+	// Status.Comments/Labels/LastSyncedAt/conditions and nothing else.
+	// Status.Body and Status.Author are written by SyncIssue on the webhook and
+	// scan intake paths, so the backfill reads whatever those last wrote.
 	if err := r.stampProposalKind(ctx, &iss, botLoginOf(&proj)); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -346,6 +346,21 @@ func (r *IssueReconciler) projectLabels(ctx context.Context, proj *tatarav1alpha
 			"action", "issue_label_projection", "resource_id", iss.Name,
 			"issue_ref", issueRef, "status", iss.Status.Status, "label", want)
 	}
+	// THE STRIP STAYS, AND IT IS LOGGED. The mirror's labels are now refreshed on
+	// the Issue cadence (syncIssueThread) instead of being frozen at mint, so this
+	// removal - which used to be all but unreachable - now fires within one
+	// MirrorCadence on a label a maintainer added by hand: tatara-approved on a
+	// rejected or done issue is stripped back off.
+	//
+	// It is kept rather than made to spare a human-added label because status.labels
+	// records SCM TRUTH and carries no author: there is no way to tell a label a
+	// human just added from one this projection wrote and has since outgrown.
+	// Skipping the removal to protect the first would also stop cleaning up the
+	// second, and a stale tatara-approved left on a rejected issue is the worse
+	// lie - the forge would display a verdict the operator does not hold, and the
+	// label means nothing to the operator either way (C.6: no label is ever read
+	// to produce status). What was genuinely wrong was doing it SILENTLY, so the
+	// contradiction is now an INFO line an operator can find.
 	for _, l2 := range []string{approved, declined} {
 		if l2 == want || !present[l2] {
 			continue
@@ -356,7 +371,11 @@ func (r *IssueReconciler) projectLabels(ctx context.Context, proj *tatarav1alpha
 		if removeErr != nil && !isPermanentTargetGone(removeErr) {
 			l.Error(removeErr, "issue: removing a projected label failed",
 				"action", "issue_label_projection", "resource_id", iss.Name, "issue_ref", issueRef, "label", l2)
+			continue
 		}
+		l.Info("issue: stripped a label the status projection does not hold",
+			"action", "issue_label_stripped", "resource_id", iss.Name,
+			"issue_ref", issueRef, "status", iss.Status.Status, "label", l2)
 	}
 	return nil
 }

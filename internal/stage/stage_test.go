@@ -853,15 +853,55 @@ func TestUnpark_AwaitingHumanWithNoOpenIssuesStaysParked(t *testing.T) {
 		Task: tk, BotLogin: "bot", LiveHasRoom: true, Now: now}))
 }
 
+// ... BUT AN OWNED MERGE REQUEST IS ONE. A cron-minted upgrade Task and a
+// nightly documentation batch own ZERO Issue CRs by construction (nobody files
+// an issue for a dependency sweep), so the issue-only refusal above made
+// submit_outcome(action=discuss) - the resumable exit those two kinds were
+// given - a PERMANENT wedge: awaiting-human is UnparkHuman, but every human
+// comment re-declined no-open-issues until the Task aged out at ParkRetention.
+// The deliverable a human is commenting on is the merge request.
+func TestUnpark_AwaitingHumanResumesAnMRBackedTaskThatOwnsNoIssues(t *testing.T) {
+	for _, kind := range []string{"upgrade", "documentation"} {
+		tk := withHumanEvent(taskOfKind(v1alpha1.StateUnderImplementation, kind))
+		require.NoError(t, stage.Park(tk, stage.ReasonAwaitingHuman, now))
+		mrs := []v1alpha1.MergeRequest{{Status: v1alpha1.MergeRequestStatus{State: "open"}}}
+		require.Equal(t, stage.DeclineNone, stage.Unpark(stage.UnparkInput{
+			Task: tk, BotLogin: "bot", MRs: mrs, LiveHasRoom: true, Now: now}), "kind %s", kind)
+		require.Empty(t, tk.Status.ParkReason, "kind %s", kind)
+		require.Equal(t, v1alpha1.StateUnderImplementation, tk.Status.State,
+			"un-park NEVER moves state")
+	}
+}
+
+// AND IT IS NOT A RESURRECTION PATH. Neither an open Issue nor an open merge
+// request left means the work is genuinely finished, and it still declines.
+func TestUnpark_AwaitingHumanDeclinesWhenNeitherIssueNorMRIsOpen(t *testing.T) {
+	for _, state := range []string{"merged", "closed"} {
+		tk := withHumanEvent(taskOfKind(v1alpha1.StateUnderImplementation, "upgrade"))
+		require.NoError(t, stage.Park(tk, stage.ReasonAwaitingHuman, now))
+		mrs := []v1alpha1.MergeRequest{{Status: v1alpha1.MergeRequestStatus{State: state}}}
+		require.Equal(t, stage.DeclineNoOpenIssues, stage.Unpark(stage.UnparkInput{
+			Task: tk, BotLogin: "bot", MRs: mrs, LiveHasRoom: true, Now: now}), "mr state %s", state)
+		require.Equal(t, stage.ReasonAwaitingHuman, tk.Status.ParkReason, "mr state %s", state)
+	}
+}
+
+// ONE FRESH COMMENT PER LAP, which is what the cap was always about: each lap
+// can spawn a review pod and a chatty MR thread must not spawn one per comment.
+// Before H1-J the loop below re-used a single event five times, because a
+// consumed event stayed eligible forever - the hot loop itself, written down as
+// a fixture.
 func TestUnpark_AwaitingHumanReviewKindBoundedByHumanReviewRounds(t *testing.T) {
-	tk := withHumanEvent(taskOfKind(v1alpha1.StateAwaitingReview, "review"))
+	tk := taskOfKind(v1alpha1.StateAwaitingReview, "review")
 	require.NoError(t, stage.Park(tk, stage.ReasonAwaitingHuman, now))
 	for lap := 1; lap <= v1alpha1.MaxHumanReviewRounds; lap++ {
+		withHumanEvent(tk)
 		require.Equal(t, stage.DeclineNone, stage.Unpark(stage.UnparkInput{
 			Task: tk, BotLogin: "bot", LiveHasRoom: true, Now: now}), "lap %d", lap)
 		require.Equal(t, lap, tk.Status.HumanReviewRounds)
 		require.NoError(t, stage.Park(tk, stage.ReasonAwaitingHuman, now))
 	}
+	withHumanEvent(tk)
 	require.Equal(t, stage.DeclineRoundsExhausted, stage.Unpark(stage.UnparkInput{
 		Task: tk, BotLogin: "bot", LiveHasRoom: true, Now: now}),
 		"STAY PARKED. Do not spawn another review pod")
@@ -1155,4 +1195,103 @@ func TestUpgradeIsMintedIntoUnderImplementationBecauseRefinedHasNoExit(t *testin
 	require.True(t, stage.LegalFor(taskOfKind(v1alpha1.StateUnderImplementation, "upgrade"), nil,
 		v1alpha1.StateUnderImplementation, v1alpha1.StateAwaitingReview),
 		"submit_outcome(kind=upgrade, action=submitted) must be able to hand the MR to review")
+}
+
+// THE UNPARK HOT LOOP (adjacent 4, mt-r-tatara-helmfile-424). The Task logged
+// action=unpark reason_from=awaiting-human every 30 seconds, indefinitely,
+// without ever running a turn: Unpark RETAINS pendingEvents by contract, the
+// only production drain runs after a turn is submitted to a pod, and a Task
+// that re-parks before a pod exists therefore never consumes its trigger. The
+// same event released the same park forever.
+//
+// UnparkConsumedAt is what terminates it: an event may release exactly ONE
+// park.
+func TestUnparkConsumesItsTriggerSoTheSameEventCannotReleaseTwice(t *testing.T) {
+	tk := task(v1alpha1.StateRefined)
+	require.NoError(t, stage.Park(tk, stage.ReasonAwaitingHuman, now))
+	tk.Status.PendingEvents = []v1alpha1.TaskEvent{{Author: "szymonrychu", Body: "have another look"}}
+
+	in := func() stage.UnparkInput {
+		return stage.UnparkInput{
+			Task: tk, BotLogin: "bot", LiveHasRoom: true, Now: now,
+			Issues: []v1alpha1.Issue{{Status: v1alpha1.IssueStatus{State: "open"}}},
+		}
+	}
+	require.Equal(t, stage.DeclineNone, stage.Unpark(in()), "the human comment releases the park once")
+
+	// The Task re-parks before any pod ever reaches the pod-time drain - the
+	// observed shape - so the event is still sitting in pendingEvents.
+	require.NoError(t, stage.Park(tk, stage.ReasonAwaitingHuman, now))
+	require.Equal(t, stage.DeclineNoHumanEvent, stage.Unpark(in()),
+		"the SAME event must not release a SECOND park: that is the 30s hot loop")
+}
+
+// Consumption is a STAMP and not a delete, because the turn-0 bundle still
+// renders the event. Only its eligibility to release another park is spent.
+func TestUnparkStillRenderableAfterConsumption(t *testing.T) {
+	tk := task(v1alpha1.StateRefined)
+	require.NoError(t, stage.Park(tk, stage.ReasonAwaitingHuman, now))
+	tk.Status.PendingEvents = []v1alpha1.TaskEvent{{Author: "szymonrychu", Body: "have another look"}}
+
+	require.Equal(t, stage.DeclineNone, stage.Unpark(stage.UnparkInput{
+		Task: tk, BotLogin: "bot", LiveHasRoom: true, Now: now,
+		Issues: []v1alpha1.Issue{{Status: v1alpha1.IssueStatus{State: "open"}}},
+	}))
+
+	require.Len(t, tk.Status.PendingEvents, 1, "the event is RETAINED for the bundle, never dropped")
+	require.Equal(t, "have another look", tk.Status.PendingEvents[0].Body)
+	require.NotNil(t, tk.Status.PendingEvents[0].UnparkConsumedAt, "it is stamped as spent")
+	require.Equal(t, now, tk.Status.PendingEvents[0].UnparkConsumedAt.UTC())
+}
+
+// A GENUINE second comment still works. This is a de-duplication, not a
+// lockout.
+func TestANewNonBotEventReleasesTheParkAgain(t *testing.T) {
+	tk := task(v1alpha1.StateRefined)
+	require.NoError(t, stage.Park(tk, stage.ReasonAwaitingHuman, now))
+	tk.Status.PendingEvents = []v1alpha1.TaskEvent{{Author: "szymonrychu", Body: "first"}}
+
+	in := func() stage.UnparkInput {
+		return stage.UnparkInput{
+			Task: tk, BotLogin: "bot", LiveHasRoom: true, Now: now,
+			Issues: []v1alpha1.Issue{{Status: v1alpha1.IssueStatus{State: "open"}}},
+		}
+	}
+	require.Equal(t, stage.DeclineNone, stage.Unpark(in()))
+	require.NoError(t, stage.Park(tk, stage.ReasonAwaitingHuman, now))
+	require.Equal(t, stage.DeclineNoHumanEvent, stage.Unpark(in()))
+
+	tk.Status.PendingEvents = append(tk.Status.PendingEvents,
+		v1alpha1.TaskEvent{Author: "szymonrychu", Body: "second"})
+	require.Equal(t, stage.DeclineNone, stage.Unpark(in()),
+		"a fresh human comment must still release the park")
+}
+
+// The #511 stand-down bypass is the loop's MOTOR: it skips the round cap and
+// spends no HumanReviewRounds, so before UnparkConsumedAt there was no
+// monotonic quantity anywhere on that path. It still spends no round - a
+// take-over request is not a review round - but it can no longer fire twice on
+// one request.
+func TestStandDownBypassFiresOncePerTakeoverRequest(t *testing.T) {
+	tk := taskOfKind(v1alpha1.StateAwaitingReview, "review")
+	tk.Status.HumanReviewRounds = v1alpha1.MaxHumanReviewRounds
+	require.NoError(t, stage.Park(tk, stage.ReasonAwaitingHuman, now))
+	tk.Status.PendingEvents = []v1alpha1.TaskEvent{{Author: "szymonrychu", Body: "I am taking this over"}}
+
+	in := func() stage.UnparkInput {
+		return stage.UnparkInput{
+			Task: tk, BotLogin: "bot", LiveHasRoom: true, Now: now,
+			MRs: []v1alpha1.MergeRequest{{Status: v1alpha1.MergeRequestStatus{
+				Ownership: v1alpha1.OwnershipExternal,
+			}}},
+		}
+	}
+	require.Equal(t, stage.DeclineNone, stage.Unpark(in()),
+		"the take-over comment bypasses the spent round cap, exactly as #511 established")
+	require.Equal(t, v1alpha1.MaxHumanReviewRounds, tk.Status.HumanReviewRounds,
+		"and it must still spend NO round")
+
+	require.NoError(t, stage.Park(tk, stage.ReasonAwaitingHuman, now))
+	require.Equal(t, stage.DeclineNoHumanEvent, stage.Unpark(in()),
+		"the bypass spends nothing, so the consumed stamp is the ONLY thing bounding it")
 }

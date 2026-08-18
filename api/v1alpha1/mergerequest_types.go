@@ -140,6 +140,31 @@ type MergeRequestStatus struct {
 	// the external-push signal.
 	// +optional
 	LastBotHeadSHA string `json:"lastBotHeadSHA,omitempty"`
+	// LastExternalAssistSHA is the head SHA of the most recent commit that landed
+	// on this merge request from OUTSIDE tatara while the platform KEPT ownership
+	// of it - ReconcileOwnership's bot-authored carve-out, where a human helping
+	// tatara's own pull request must not sever the owning Task from its work.
+	//
+	// IT EXISTS BECAUSE THE CARVE-OUT ADVANCES LastBotHeadSHA ONTO THAT COMMIT.
+	// Advancing is what makes the assist converge instead of re-firing on every
+	// reconcile for as long as the merge request is open, but it also launders the
+	// baseline: afterwards lastBotHeadSHA names a head the bot did not push, and
+	// nothing else on the mirror distinguishes "this branch is entirely tatara's
+	// commits" from "a third party's commit is in it". The review agent reads both
+	// fields out of the prompt bundle's <merge_request>, and
+	// mergeAllowedForOwnership accepts `tatara` unconditionally, so the erased
+	// fact is the difference between reviewing a branch and merging an
+	// unattributed commit into the repo that deploys the cluster.
+	//
+	// It is NOT an ownership flip and deliberately does not touch
+	// OwnershipReason/OwnershipChangedAt: those two are the flip audit trail
+	// DrainOwnershipAnnouncement keys its forge comment on, and stamping them here
+	// would announce a takeover nobody requested. This is the durable record for
+	// something that is not a flip. A SECOND assist overwrites it, and is judged
+	// against the platform's own baseline rather than against the first assister's
+	// head as if it were tatara's.
+	// +optional
+	LastExternalAssistSHA string `json:"lastExternalAssistSHA,omitempty"`
 	// +optional
 	OwnershipChangedAt *metav1.Time `json:"ownershipChangedAt,omitempty"`
 	// OwnershipReason is the audit trail for the last flip: "initial",

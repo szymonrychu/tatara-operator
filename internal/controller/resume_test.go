@@ -604,3 +604,32 @@ func TestResumeNoReentryParksPaced_ListCallsBoundedUnderRapidTriggerLoop(t *test
 	}
 	require.Equal(t, 3, cc.ListCount(), "rapid trigger loop must bound List calls to 3 runs")
 }
+
+// TestNoReentryPark_ConsumedPendingEventDoesNotResume: ONE COMMENT RELEASES ONE
+// PARK. A reply already spent releasing an awaiting-human park
+// (stage.consumeUnparkEvents stamps TaskEvent.UnparkConsumedAt) is not a second
+// reply, so a Task that later parks under an UnparkNever reason without that
+// event being drained must NOT be severed and re-minted on the strength of it.
+// hasNonBotPendingEvent is the third copy of stage.hasNonBotEvent's predicate
+// and was the one left without the conjunct.
+func TestNoReentryPark_ConsumedPendingEventDoesNotResume(t *testing.T) {
+	ctx := context.Background()
+	proj, repo, old, iss, oldName, issName := noReentryFixture(t, stage.ReasonReviewLoopExhausted, "maintainer")
+	spent := metav1.Now()
+	old.Status.PendingEvents[0].UnparkConsumedAt = &spent
+
+	c := newMirrorClient(t, proj, repo, reapSecret(), old, iss)
+	w := &resumeWriter{}
+	r := reapReconciler(c, w)
+
+	require.NoError(t, r.resumeNoReentryParks(ctx, proj, time.Now()))
+
+	still, ok := mustGetTask(t, c, oldName)
+	require.True(t, ok, "a spent event must not collect the parked task")
+	require.Equal(t, stage.ReasonReviewLoopExhausted, still.Status.ParkReason, "it must still be parked")
+	require.Equal(t, old.UID, still.UID, "no re-mint happened")
+	require.Empty(t, w.closed, "no forge write on an already-spent event")
+	owner, owned := own.ControllerOwner(mustGetIssue(t, c, issName))
+	require.True(t, owned, "the issue must NOT be severed")
+	require.Equal(t, oldName, owner)
+}

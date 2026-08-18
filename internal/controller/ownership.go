@@ -13,6 +13,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/own"
@@ -173,7 +174,29 @@ func (d *StageDriver) ReconcileOwnership(ctx context.Context, proj *tatarav1alph
 			return false, nil
 		}
 		if liveHead != mr.Status.LastBotHeadSHA {
-			return d.flipToExternal(ctx, proj, repo, mr, liveHead)
+			// ONE READ DECIDES BOTH HALVES, so the owner Task is resolved once, here:
+			// whether it is an ADOPTED dependency-upgrade Task picks the reason prefix
+			// flipToExternal stamps, and the Task itself is what the carve-out below
+			// checks the merge request against. An adopted merge request is authored
+			// by an identity the project owns (often the bot's own token), so without
+			// this it would fall into the bot-authored carve-out and lose the
+			// stand-down adoption is entitled to.
+			owner, err := d.ownerTaskOf(ctx, proj, mr)
+			if err != nil {
+				return false, err
+			}
+			adopted := owner != nil && stage.AdoptedUpgrade(owner)
+			// A HUMAN HELPING TATARA'S OWN MERGE REQUEST IS NOT A TAKEOVER OF IT.
+			// The stand-down exists so the platform cannot steamroll a merge request
+			// that is somebody else's; a commit landing on one the BOT ITSELF opened,
+			// to deliver a Task's own work, is the opposite situation, and standing
+			// down there severs the Task from work it already pushed. See
+			// tataraOwnDeliverableMR - and note it is FALSE when owner is nil, so an
+			// unresolvable owner falls into the flip rather than into the carve-out.
+			if !adopted && tataraOwnDeliverableMR(proj, mr, owner) {
+				return false, d.retainOnHumanAssist(ctx, proj, mr, liveHead)
+			}
+			return d.flipToExternal(ctx, proj, repo, mr, liveHead, adopted)
 		}
 	}
 
@@ -200,6 +223,142 @@ func (d *StageDriver) ReconcileOwnership(ctx context.Context, proj *tatarav1alph
 		}
 	}
 	return false, nil
+}
+
+// tataraOwnDeliverableMR reports whether mr is a merge request the platform
+// opened to deliver owner's OWN work - the only shape the stand-down carve-out
+// protects. It is the discriminator between the two things the drift check used
+// to conflate:
+//
+//	tatara's own deliverable - work a Task pushed from its own branch. A commit
+//	                           from anyone else is somebody HELPING: a rebase
+//	                           onto main, a credential fix, an unblock. The Task
+//	                           that opened it must keep owning it and must keep
+//	                           being able to deliver it.
+//	anything else            - a human's merge request tatara reviews, or one a
+//	                           maintainer asked it to take over, or a dependency
+//	                           engine's. A push there is the author reclaiming
+//	                           their own branch, and standing down is exactly
+//	                           right.
+//
+// THREE CLAUSES, ALL REQUIRED, matching every sibling bot-authorship gate in the
+// tree (reaper.go's reapable-MR test pairs the author with the task branch;
+// AdoptPR pairs it with the task branch AND the no-forks clause):
+//
+//	a. owner != nil          - the carve-out must NAME the Task it is protecting.
+//	b. mr.Status.Author      == Project.spec.scm.botLogin
+//	c. mr.Status.HeadBranch  == agent.TaskBranch(owner)
+//
+// (a) IS NOT A FORMALITY. The whole justification is "the Task that opened it
+// must keep being able to deliver it", so with no such Task the justification is
+// empty. An ORPHANED bot-authored mirror - zero controller refs, the state a reap
+// or a mid-handover leaves - otherwise satisfied the author test alone, so a
+// human push produced no flip, no park and no review Task, and the mirror stayed
+// `ownership: tatara`. AdoptUpgradeMR clause (h) only refuses re-adoption of an
+// `external` mirror, so that orphan stayed re-adoptable and a fresh pod would be
+// told "approving MERGES it" for a branch carrying unattributed commits. It is
+// also what makes an UNRESOLVABLE owner fail CLOSED: ownerTaskOf returns nil for
+// a NotFound or ref-less mirror, and nil lands in flipToExternal.
+//
+// (b) IS Status.Author, NOT A COMMIT AUTHOR. The forge authenticated the login
+// that opened the merge request and nothing a later push does changes it. Git
+// commit author metadata is forgeable, and this repo refuses to key a decision on
+// it in three other places (see UpgradeEngineLogins).
+//
+// (b) IS DELIBERATELY NARROWER THAN adoptableAuthor, which also accepts an
+// allowlisted upgradeEngineLogins identity. Nobody ASKS the platform to adopt a
+// dependency engine's merge request - the sweep does it automatically - so a
+// human's commit on one is not help with tatara's own work, and it keeps the
+// adopted stand-down (adoptedPushReasonPrefix) it has always had. Nor is (b)
+// enough on its own, which is why the caller ALSO requires !AdoptedUpgrade: an
+// engine may run with the bot's OWN token (upgrade_adopt.go spells this out, and
+// the adopted fixtures are authored "tatara-bot"), so the author test alone would
+// swallow those merge requests into the carve-out.
+//
+// (c) IS THE BRANCH THE OWNER ITSELF PUSHES TO. A bot-authored mirror sitting on
+// a branch its owning Task does not push to is not that Task's deliverable,
+// whatever the author says, and the carve-out's premise does not hold for it.
+//
+// AdoptPR's clause (c) - head repo == base repo, NO forks - has no counterpart
+// here because the mirror does not carry a head repo: scm.MergeRequest, which is
+// the only thing SyncMergeRequest writes from, has no HeadRepo field, so there is
+// nothing on the CR to compare. It is not a hole left open. A fork's mirror can
+// only reach this predicate by being controller-owned by a non-review, non-
+// adopted Task whose own work branch it sits on, and the two ways a Task comes to
+// controller-own a merge request both already refuse forks: the Task OPENED it
+// itself (base repo by construction - the pod pushes to TASK_BRANCH in the repo
+// it cloned), or AdoptPR bound it, and AdoptPR fails closed on an unknown or
+// foreign head repo. Mirroring HeadRepo purely to re-assert that would mean a
+// field every pre-existing mirror lacks, which - failing closed, as it must -
+// would disable the carve-out for every open merge request until its next sync.
+func tataraOwnDeliverableMR(proj *tatarav1alpha1.Project, mr *tatarav1alpha1.MergeRequest,
+	owner *tatarav1alpha1.Task) bool {
+
+	if owner == nil {
+		return false
+	}
+	bot := botLoginOf(proj)
+	if bot == "" || mr.Status.Author != bot {
+		return false
+	}
+	return mr.Status.HeadBranch != "" && mr.Status.HeadBranch == agent.TaskBranch(owner)
+}
+
+// retainOnHumanAssist records a non-bot commit on a merge request the bot
+// authored, WITHOUT flipping: ownership stays tatara, the owner Task stays
+// unparked and stays the mirror's controller owner, and no review Task is minted
+// for a merge request that already has an owner driving it.
+//
+// IT ADVANCES THE BASELINE, which is what makes the assist converge. Left alone,
+// LastBotHeadSHA still names the pre-assist commit, so the drift check fires
+// again on every reconcile of the mirror - webhook fast path and hourly sweep
+// both - for as long as the merge request stays open, logging and counting the
+// same assist forever. Advancing it says "this is the head the platform now
+// considers its branch to be at", and the NEXT drift is judged against that.
+//
+// ADVANCING IS NOT ERASING, so the assisted head is ALSO stamped on
+// Status.LastExternalAssistSHA in the same write. Without it the advance launders
+// the baseline: LastBotHeadSHA ends up naming a commit the bot never pushed, and
+// nothing else on the mirror separates "this branch is entirely tatara's commits"
+// from "a third party's commit is in it". That is not a cosmetic loss.
+// prompt/bundle.go renders lastBotHeadSHA into the <merge_request> element BOTH
+// the implement and the review agent read, so post-assist the review agent saw
+// last_bot_head_sha == head_sha - identical to a branch tatara wrote alone -
+// approved it, and mergeAllowedForOwnership accepts `tatara` unconditionally, so
+// the operator merged the foreign commit. The field is rendered beside it now.
+//
+// A SECOND ASSIST IS JUDGED AGAINST THE PLATFORM'S BASELINE, not against the
+// first assister's head as if it were tatara's: the next drift off the advanced
+// baseline lands here again and overwrites LastExternalAssistSHA with the new
+// head, so each distinct foreign head is recorded and counted rather than being
+// absorbed into its predecessor.
+//
+// It writes NEITHER OwnershipReason NOR OwnershipChangedAt, and that is not an
+// omission. Those two are the audit trail of a FLIP, and DrainOwnershipAnnouncement
+// keys its forge comment on exactly them: a changedAt with a non-"initial" reason
+// on a tatara-owned merge request renders the TAKEOVER announcement, so stamping
+// them here would post "Taking ownership of this MR at @<...>'s request" onto a
+// merge request nobody requested anything about. LastExternalAssistSHA, the log
+// line and OwnershipHumanAssistTotal are the audit trail for something that is
+// not a flip.
+func (d *StageDriver) retainOnHumanAssist(ctx context.Context, proj *tatarav1alpha1.Project,
+	mr *tatarav1alpha1.MergeRequest, liveHead string) error {
+
+	key := client.ObjectKeyFromObject(mr)
+	if err := objbudget.FitMergeRequest(ctx, d.Client, d.spiller(proj), key, func(m *tatarav1alpha1.MergeRequest) {
+		m.Status.LastBotHeadSHA = liveHead
+		m.Status.LastExternalAssistSHA = liveHead
+	}); err != nil {
+		return err
+	}
+	mr.Status.LastBotHeadSHA = liveHead
+	mr.Status.LastExternalAssistSHA = liveHead
+
+	obs.OwnershipHumanAssist(mr.Spec.RepositoryRef, mr.Spec.Number)
+	log.FromContext(ctx).Info("ownership: a commit from outside tatara landed on a merge request the bot authored; keeping ownership so the owning task can still deliver it",
+		"action", "ownership_human_assist", "resource_id", mr.Name, "head", liveHead,
+		"author", mr.Status.Author)
+	return nil
 }
 
 // resumeFlipToExternal finishes an interrupted flipToExternal's park+hand-back
@@ -244,15 +403,16 @@ func (d *StageDriver) resumeFlipToExternal(ctx context.Context, proj *tatarav1al
 // the probe cannot fire and what is left is the retention clock. Past it the
 // merge-driver is collected with the merge request still open. restapi's
 // takeover 409 remedy leans on exactly that, so the two must not drift apart.
+//
+// adopted is stage.AdoptedUpgrade applied to ownerTaskOf's answer, resolved by
+// the CALLER because that same owner also decides whether the drift is a
+// stand-down at all (see ReconcileOwnership's bot-authored carve-out). Passing it
+// keeps the two decisions on one read of one owner.
 func (d *StageDriver) flipToExternal(ctx context.Context, proj *tatarav1alpha1.Project,
-	repo *tatarav1alpha1.Repository, mr *tatarav1alpha1.MergeRequest, liveHead string) (bool, error) {
+	repo *tatarav1alpha1.Repository, mr *tatarav1alpha1.MergeRequest, liveHead string, adopted bool) (bool, error) {
 
 	now := metav1.Now()
 	prefix := externalPushReasonPrefix
-	adopted, aerr := d.ownerIsAdoptedMR(ctx, proj, mr)
-	if aerr != nil {
-		return false, aerr
-	}
 	if adopted {
 		prefix = adoptedPushReasonPrefix
 	}
@@ -282,40 +442,56 @@ func (d *StageDriver) flipToExternal(ctx context.Context, proj *tatarav1alpha1.P
 	return true, nil
 }
 
-// ownerIsAdoptedMR reports whether mr's CURRENT controller owner is an ADOPTED
-// dependency-upgrade Task (stage.AdoptedUpgrade). It is flipToExternal's only
-// discriminator, and it is keyed on the OWNER rather than on the head branch on
-// purpose: a maintainer may legitimately request a takeover of a merge request
-// that happens to sit under the adopt prefix, and that takeover keeps the
-// mergeable stand-down reason it has always had.
+// ownerTaskOf resolves mr's CURRENT controller-owning Task, or nil when there is
+// no controller ref or the Task behind it is gone. Its answer decides TWO things
+// on the drift path: whether the owner is an ADOPTED dependency-upgrade Task
+// (stage.AdoptedUpgrade), which picks flipToExternal's reason prefix, and whether
+// the bot-authored carve-out applies at all (tataraOwnDeliverableMR checks the
+// merge request against this Task's own work branch).
 //
 // stage.AdoptedUpgrade, NEVER stage.AdoptedMR: a takeover Task and a kind=review
 // Task are both minted onto a merge request and both satisfy AdoptedMR, so the
 // looser predicate would strip merge-after-stand-down from every takeover on the
-// platform.
+// platform. The adopted question is keyed on the OWNER rather than on the head
+// branch on purpose: a maintainer may legitimately request a takeover of a merge
+// request that happens to sit under the adopt prefix, and that takeover keeps the
+// mergeable stand-down reason it has always had.
 //
-// AN UNRESOLVABLE OWNER FALLS BACK TO THE TAKEOVER REASON, which is the
-// pre-existing behaviour rather than a new one. It is not reachable for an
-// adopted merge request in practice: the mint makes the adopted Task the
-// mirror's controller owner in the same call that creates the mirror, and the
-// only thing that removes that ref is the reap - which also orphans the mirror,
-// at which point there is no owner left for a flip to park.
-func (d *StageDriver) ownerIsAdoptedMR(ctx context.Context, proj *tatarav1alpha1.Project,
-	mr *tatarav1alpha1.MergeRequest) (bool, error) {
+// IT READS THROUGH THE UNCACHED APIReader (falling back to the client when none
+// is wired, as advanceAfterReview does), because this is now a DECIDING read
+// rather than a labelling one. It used to only choose the log-reason prefix - the
+// flip happened either way, so a lagging cache was fail-safe. Now the carve-out
+// is gated on it, and a stale NotFound on a freshly-minted adopted upgrade Task,
+// or a read taken inside the mid-handover / RepairZeroController window, would
+// turn an adopted engine merge request a human pushed to into an "assist": no
+// flip, no park, and - because the assist advances the baseline - the drift
+// erased for good. This is exactly the class merge.go and TaskTakenOver already
+// reserve APIReader for.
+//
+// AN UNRESOLVABLE OWNER RETURNS nil AND FAILS CLOSED into flipToExternal. That
+// inverts the previous disposition deliberately: with the carve-out in place,
+// "fall back to the takeover reason" is no longer the conservative answer, it is
+// the answer that suppresses the stand-down.
+func (d *StageDriver) ownerTaskOf(ctx context.Context, proj *tatarav1alpha1.Project,
+	mr *tatarav1alpha1.MergeRequest) (*tatarav1alpha1.Task, error) {
 
 	ownerName, ok := own.ControllerOwner(mr)
 	if !ok {
-		return false, nil
+		return nil, nil
+	}
+	reader := client.Reader(d.Client)
+	if d.APIReader != nil {
+		reader = d.APIReader
 	}
 	var task tatarav1alpha1.Task
-	err := d.Get(ctx, client.ObjectKey{Namespace: proj.Namespace, Name: ownerName}, &task)
+	err := reader.Get(ctx, client.ObjectKey{Namespace: proj.Namespace, Name: ownerName}, &task)
 	if apierrors.IsNotFound(err) {
-		return false, nil
+		return nil, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("flip: get owner task %s: %w", ownerName, err)
+		return nil, fmt.Errorf("flip: get owner task %s: %w", ownerName, err)
 	}
-	return stage.AdoptedUpgrade(&task), nil
+	return &task, nil
 }
 
 // parkAndHandBack parks mr's current controller-owning Task (if any,

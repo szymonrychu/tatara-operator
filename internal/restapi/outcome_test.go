@@ -3897,6 +3897,123 @@ func TestOutcome_Upgrade_KindMustMatchStatusAgentKind(t *testing.T) {
 	require.Contains(t, w.Body.String(), "kind does not match the task's agent kind")
 }
 
+// --- discuss on the scheduled kinds (G6) ----------------------------------
+
+// A SCHEDULED KIND NEEDS A RESUMABLE ESCAPE TOO. `discuss` used to exist only on
+// kind=implement, so an upgrade or documentation agent that hit something only a
+// human can answer had exactly ONE non-delivery terminal: declined. On upgrade
+// that parks implement-declined, which is class UnparkNever - nothing ever
+// re-enters it and the Task ages out at ParkRetention with the question
+// unanswered. That is why every live implement-declined wedge was an upgrade
+// Task. discuss parks awaiting-human instead, class UnparkHuman, and the next
+// human comment resumes the Task through the path that already exists.
+func TestOutcome_UpgradeDiscussParksAwaitingHuman(t *testing.T) {
+	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "upgrade", tatarav1alpha1.StateUnderImplementation, "upgrade"))
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"upgrade","payload":{"action":"discuss","reason":"the cilium 1.17 hop drops a CRD; a maintainer has to call it"}}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	got := e.task(t, "t1")
+	require.True(t, tatarav1alpha1.Parked(got))
+	require.Equal(t, stage.ReasonAwaitingHuman, got.Status.ParkReason)
+	require.Equal(t, tatarav1alpha1.StateUnderImplementation, got.Status.State,
+		"discuss is a PARK, not a transition: the Task resumes exactly where it stopped")
+	require.Len(t, got.Status.Notes, 1)
+	require.Equal(t, "discuss: the cilium 1.17 hop drops a CRD; a maintainer has to call it",
+		got.Status.Notes[0].Body)
+}
+
+// The documentation half of the same widening. A documentation batch that cannot
+// tell which of two contradictory behaviours is the intended one has the same
+// question and the same need to come back to it.
+func TestOutcome_DocumentationDiscussParksAwaitingHuman(t *testing.T) {
+	batch := taskV2("t1", "tatara", "documentation", tatarav1alpha1.StateUnderImplementation, "documentation")
+	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-documentation", "tatara"), batch)
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"documentation","payload":{"action":"discuss","reason":"the changelog and the design doc disagree"}}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	got := e.task(t, "t1")
+	require.True(t, tatarav1alpha1.Parked(got),
+		"a discussed documentation batch PARKS: unlike declined it is not done, it is waiting")
+	require.Equal(t, stage.ReasonAwaitingHuman, got.Status.ParkReason)
+	require.Equal(t, tatarav1alpha1.StateUnderImplementation, got.Status.State)
+	require.Len(t, got.Status.Notes, 1)
+	require.Equal(t, "discuss: the changelog and the design doc disagree", got.Status.Notes[0].Body)
+}
+
+// THE WIDENING IS EXACTLY ONE ACTION WIDE. `approved` and `rejected` are the
+// approval gate and the issue-close, and neither scheduled kind owns an
+// approvable Issue: nobody filed one for a nightly dependency sweep. Admitting
+// them here would let a scheduled agent manufacture an approval for work nobody
+// asked for.
+func TestOutcome_UpgradeApprovedIsStillRefused(t *testing.T) {
+	for _, action := range []string{"approved", "rejected"} {
+		t.Run(action, func(t *testing.T) {
+			e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+				repoV2("tatara-operator", "tatara"),
+				taskV2("t1", "tatara", "upgrade", tatarav1alpha1.StateUnderImplementation, "upgrade"))
+
+			w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+				`{"kind":"upgrade","payload":{"action":"`+action+`","reason":"r"}}`)
+			require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+			require.Contains(t, w.Body.String(), "action must be one of submitted, declined")
+
+			require.False(t, tatarav1alpha1.Parked(e.task(t, "t1")))
+		})
+	}
+}
+
+// Same for documentation, whose declined terminal is done(doc-timeout) rather
+// than a park - so a leaked `rejected` there would be a different wrong answer.
+func TestOutcome_DocumentationApprovedIsStillRefused(t *testing.T) {
+	for _, action := range []string{"approved", "rejected"} {
+		t.Run(action, func(t *testing.T) {
+			batch := taskV2("t1", "tatara", "documentation", tatarav1alpha1.StateUnderImplementation, "documentation")
+			e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+				repoV2("tatara-documentation", "tatara"), batch)
+
+			w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+				`{"kind":"documentation","payload":{"action":"`+action+`","reason":"r"}}`)
+			require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+			require.Contains(t, w.Body.String(), "action must be one of submitted, declined")
+
+			require.Equal(t, tatarav1alpha1.StateUnderImplementation, e.task(t, "t1").Status.State)
+		})
+	}
+}
+
+// The gate's own per-action legality is not bypassed by the new routing: a
+// discuss with no reason is still a 400, on the scheduled kinds too.
+func TestOutcome_UpgradeDiscussWithoutAReasonIs400(t *testing.T) {
+	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "upgrade", tatarav1alpha1.StateUnderImplementation, "upgrade"))
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"upgrade","payload":{"action":"discuss"}}`)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	require.Contains(t, w.Body.String(), "reason is required on every gate action")
+}
+
+// And the code-outcome fields stay refused on it: a discuss carrying a title and
+// a changeSignificance is a client that meant `submitted`.
+func TestOutcome_UpgradeDiscussRefusesTheCodeOutcomeFields(t *testing.T) {
+	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "upgrade", tatarav1alpha1.StateUnderImplementation, "upgrade"))
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"upgrade","payload":{"action":"discuss","reason":"r","title":"T","body":"B","changeSignificance":"patch"}}`)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	require.Contains(t, w.Body.String(), "only valid when action=submitted")
+}
+
 // TestOutcome_Commit_NotesCapEvictsOldest_WithNoteCap: commit is the single door
 // every agentNote write goes through. When notes hit MaxNotes, WithNoteCap evicts
 // the oldest down to MaxNotes. The evicted batch goes to the Spiller; Discarding

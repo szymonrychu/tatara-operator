@@ -395,17 +395,46 @@ func (s *Server) postOutcome(w http.ResponseWriter, r *http.Request) {
 		if !oc.decode(env.Payload, &p) {
 			return
 		}
-		// NEITHER KIND HAS A GATE TO DRIVE - each writes a change and opens a
-		// merge request - so neither ever reaches oc.gate, and tatara-cli gives
-		// both the SAME schema whose action enum is submitted|declined only
-		// (documentationOutcomeSchema, reused verbatim for upgrade). This arm is
-		// the operator-side half of that split.
+		// NEITHER KIND HAS AN APPROVAL GATE TO DRIVE - each writes a change and
+		// opens a merge request, and nobody filed an issue for a nightly
+		// dependency sweep for a maintainer to approve - so `approved` and
+		// `rejected` are refused here exactly as they always were: they fall to
+		// oc.implement, whose action switch answers 400 bad-action.
 		//
 		// It is also why an upgrade Task is minted STRAIGHT into
 		// under-implementation rather than triaged to refined: refined's only
 		// exit into under-implementation is submit_outcome(action=approved), and
 		// no such action exists on this schema.
-		oc.implement(p)
+		//
+		// `discuss` IS ADMITTED, and it is the only one of the three that is.
+		// Without it these kinds have exactly one non-delivery terminal -
+		// declined - which on upgrade parks implement-declined, class
+		// UnparkNever: a scheduled agent that hits a question only a human can
+		// answer had no way to ask it and come back, so every one of the live
+		// implement-declined wedges was an upgrade Task with nothing else to
+		// say. discuss parks awaiting-human, class UnparkHuman, and the next
+		// human comment resumes the Task through the path that already exists.
+		//
+		// THAT RESUMPTION IS MERGE-REQUEST-BACKED, and it had to be taught the
+		// fact: neither kind owns a single Issue CR (nobody files an issue for a
+		// nightly dependency sweep), and stage.Unpark's awaiting-human arm used to
+		// decline no-open-issues on an empty owned-Issue set alone - which made
+		// this escape a PERMANENT wedge for exactly the two kinds it was added
+		// for. It now resumes on an open owned Issue OR an open owned merge
+		// request, which is what a human is commenting on here. A Task that has
+		// opened neither yet still declines and ages out at ParkRetention, so an
+		// agent should open its merge request before it asks.
+		//
+		// oc.gate needs nothing kind-specific for it: its discuss arm parks and
+		// appends an agent note labelled with o.kind, and its pre-switch
+		// refusals reject gate-only fields a documentation or upgrade payload
+		// never carries.
+		switch p.Action {
+		case "discuss":
+			oc.gate(p)
+		default:
+			oc.implement(p)
+		}
 	case "review":
 		var p reviewPayload
 		if !oc.decode(env.Payload, &p) {
@@ -938,19 +967,21 @@ func (o *outcomeCtx) terminalNoop(states []string) {
 	writeJSON(o.w, http.StatusOK, map[string]any{"noop": true, "reason": "mr-terminal"})
 }
 
-// takenOverNoop answers a review submit_outcome whose review target a maintainer
-// took over (the parent review Task controller-owns zero MRs, its refs now owned
-// by a takeover Task) with an explicit 2xx no-op, mirroring terminalNoop: the
-// in-flight agent turn ends cleanly instead of hitting the doomed 400 that
-// respawn-looped the pod. The convergent reconciler-side finalize
-// (rejected(mr-taken-over)) is what actually retires the Task; this only stops
-// the pod re-submitting. The claim is released like any pre-execution class-B
-// path so an identical retry re-validates and no-ops again.
+// takenOverNoop answers a submit_outcome whose merge requests have all moved to
+// another Task - a maintainer's takeover of a review target, or an ownership
+// stand-down handing an implement Task's mirrors to review Tasks - with an
+// explicit 2xx no-op, mirroring terminalNoop: the in-flight agent turn ends
+// cleanly instead of hitting the doomed 400 that respawn-looped the pod. The
+// convergent reconciler-side edge is what decides the Task's fate (finalize
+// rejected(mr-taken-over) for a review Task; the ownership-lost park retained as
+// the durable merge-driver for a pushing one); this only stops the pod
+// re-submitting. The claim is released like any pre-execution class-B path so an
+// identical retry re-validates and no-ops again.
 func (o *outcomeCtx) takenOverNoop() {
 	o.release()
 	ctx := o.r.Context()
 	obs.RestOutcomeAcceptedTotal.WithLabelValues(o.kind, "mr-taken-over-noop").Inc()
-	o.s.log.InfoContext(ctx, "restapi: submit_outcome no-op: kind=review task owns zero MRs; its review target was taken over by a maintainer",
+	o.s.log.InfoContext(ctx, "restapi: submit_outcome no-op: the task controller-owns zero merge requests; every one it opened is now owned by another task",
 		append(reqLogFields(o.r), "action", "submit_outcome_noop", "task", o.task.Name,
 			"resource_id", o.task.Name, "kind", o.kind)...)
 	writeJSON(o.w, http.StatusOK, map[string]any{"noop": true, "reason": "mr-taken-over"})
@@ -1109,7 +1140,13 @@ func (o *outcomeCtx) implement(p implementPayload) {
 			o.terminalNoop(states)
 			return
 		}
-		over, err := controller.TaskTakenOver(ctx, s.c, o.task)
+		// AND SO IS THIS ONE, which the kind gate inside TaskTakenOver quietly
+		// undid: an IMPLEMENT Task whose merge requests were handed to review Tasks
+		// by an ownership stand-down fell through to the 400 below and
+		// respawn-looped on it three pods deep, with its work already pushed and
+		// green (tatara-operator#622). MRRefsHandedOver is the same predicate
+		// without the kind gate - see its doc for why finalization keeps one.
+		over, err := controller.MRRefsHandedOver(ctx, s.c, o.task)
 		if err != nil {
 			writeClientErr(o.w, err)
 			return
@@ -1152,8 +1189,13 @@ func (o *outcomeCtx) implement(p implementPayload) {
 	// three axes, why a read failure fails OPEN, and why a refusal here costs the
 	// agent nothing.
 	rd, readOK := o.evaluateReadiness(ctx, open, submitScope)
-	if readOK && o.refuseNotReady(ctx, rd, "submission") {
-		return
+	if readOK {
+		// THE CI-DECLINE EVIDENCE IS WRITTEN HERE, and this is the only place a
+		// give-up can inherit it from. See recordCIRedRefusal.
+		s.recordCIRedRefusal(ctx, o.r, o.task, mrs, ciRedRefused(rd))
+		if o.refuseNotReady(ctx, rd, "submission") {
+			return
+		}
 	}
 	// PENDING IS NOT A VERDICT, so it is not a refusal - but it is not an advance
 	// either. Handing a change whose pipeline has not answered to a review pod is
@@ -1386,6 +1428,12 @@ func (s *Server) stampDocumentedBy(ctx context.Context, proj *tatarav1alpha1.Pro
 // stampDeclineCIEvidence records WHAT CI SAID at the instant the agent gave up,
 // and WHICH CODE it said it about.
 //
+// IT COVERS THE DISCUSS VERDICT TOO, not only declined. Both are ways of giving
+// up on this turn and both carry the identical ambiguity below; discuss parks
+// awaiting-human instead of implement-declined, which changes which reason
+// controller.driveCIRecoveryUnparks matches and nothing about what the evidence
+// means.
+//
 // A decline is one of two incompatible things: a verdict on the CHANGE ("this
 // bump is wrong, superseded, unwanted"), which must stay permanent, or a verdict
 // on the INFRASTRUCTURE ("I could not submit, this endpoint answered 409 ci-red
@@ -1441,6 +1489,90 @@ func (s *Server) stampDeclineCIEvidence(ctx context.Context, r *http.Request,
 			"decline_ci", ci, "decline_heads", heads)...)
 }
 
+// ciRedRefused reports whether the readiness verdict rd refuses on the CI axis.
+// It is the ONE fact that separates "the infrastructure would not let me hand
+// this on" from "CI happens to be red at this head", and only the first of those
+// may ever license an automatic re-drive.
+func ciRedRefused(rd []mrReadiness) bool {
+	for _, r := range rd {
+		for _, b := range r.blockers {
+			if b == blockerCIRed {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// recordCIRedRefusal is the readiness path's half of the ci-decline evidence,
+// and it exists because the PARK REASON a give-up writes is not the
+// discriminator anybody thought it was.
+//
+// stampDeclineCIEvidence records what the MIRROR said at the moment the agent
+// gave up. On a decline that is enough: implement-declined is UnparkNever, so
+// the only thing that ever reads the evidence is the recovery driver, and being
+// wrong costs one re-implementation lap of a Task nothing else would ever
+// resume. On a DISCUSS it is not enough at all. discuss parks awaiting-human,
+// which controller.ciRecoverablePark accepts, and awaiting-human is written by
+// half the operator - the live-pod ceiling closing a conversation, among others.
+// A mirror that happens to read red therefore turned a question a human owes an
+// answer to into an automatic un-park as soon as the flake re-ran green.
+//
+// So the evidence is captured where the fact actually is: the operator's own
+// readiness gate answering 409 pr-not-ready on the ci-red axis. That is the
+// event the whole recovery is described in terms of ("the agent could not
+// submit, this endpoint answered 409 ci-red"), and nothing else on the Task
+// records it.
+//
+// IT CLEARS AS WELL AS WRITES, on every readiness pass that does not refuse on
+// CI. Evidence that outlives the refusal it describes is precisely the licence
+// an unrelated later park inherits.
+//
+// The ci value comes from CIDeclineEvidence, not from the live read that just
+// refused, so BOTH sides of the bound keep using exactly one aggregation and
+// cannot drift apart. A mirror that has not caught up to the red yet records
+// nothing, which fails towards refusing to re-drive.
+//
+// BEST-EFFORT, and it never touches o.w: it rides updateTaskSpec (a plain
+// non-status Update with conflict retry, which is what a metadata write needs)
+// and a failure costs the recovery, not the outcome.
+func (s *Server) recordCIRedRefusal(ctx context.Context, r *http.Request,
+	task *tatarav1alpha1.Task, mrs []tatarav1alpha1.MergeRequest, refused bool) {
+
+	ci, heads := tatarav1alpha1.CIDeclineEvidence(mrs)
+	record := refused && ci == tatarav1alpha1.CIEvidenceRed && heads != ""
+	_, hadCI := task.Annotations[tatarav1alpha1.AnnDeclineCI]
+	_, hadHeads := task.Annotations[tatarav1alpha1.AnnDeclineHeads]
+	if !record && !hadCI && !hadHeads {
+		return // nothing to write and nothing to clear: the ordinary green submission
+	}
+	err := s.updateTaskSpec(ctx, task.Name, func(t *tatarav1alpha1.Task) {
+		if !record {
+			delete(t.Annotations, tatarav1alpha1.AnnDeclineCI)
+			delete(t.Annotations, tatarav1alpha1.AnnDeclineHeads)
+			return
+		}
+		if t.Annotations == nil {
+			t.Annotations = map[string]string{}
+		}
+		t.Annotations[tatarav1alpha1.AnnDeclineCI] = tatarav1alpha1.CIEvidenceRed
+		t.Annotations[tatarav1alpha1.AnnDeclineHeads] = heads
+	})
+	if err != nil {
+		s.log.WarnContext(ctx, "restapi: ci-red refusal evidence not recorded; a give-up on this head can never be re-driven",
+			append(reqLogFields(r), "action", "decline_ci_evidence_skip", "task", task.Name, "error", err)...)
+		return
+	}
+	if record {
+		s.log.InfoContext(ctx, "restapi: recorded the ci-red refusal the agent hit",
+			append(reqLogFields(r), "action", "decline_ci_evidence", "task", task.Name,
+				"decline_ci", tatarav1alpha1.CIEvidenceRed, "decline_heads", heads)...)
+		return
+	}
+	s.log.InfoContext(ctx, "restapi: cleared stale ci-red refusal evidence: this readiness pass does not refuse on ci",
+		append(reqLogFields(r), "action", "decline_ci_evidence_cleared", "task", task.Name)...)
+}
+
 // --- review ---------------------------------------------------------------
 
 var significanceRank = map[string]int{"patch": 1, "minor": 2, "major": 3}
@@ -1488,7 +1620,10 @@ func (o *outcomeCtx) review(p reviewPayload) {
 			o.terminalNoop(states)
 			return
 		}
-		over, err := controller.TaskTakenOver(ctx, s.c, o.task)
+		// KIND-AGNOSTIC HERE TOO, for the same reason and by the same route: this
+		// site's own comment says the carve-outs are, and TaskTakenOver's kind gate
+		// meant this one still was not.
+		over, err := controller.MRRefsHandedOver(ctx, s.c, o.task)
 		if err != nil {
 			writeClientErr(o.w, err)
 			return
@@ -1788,6 +1923,20 @@ func (o *outcomeCtx) gate(p implementPayload) {
 		}) {
 			return
 		}
+		// IT STAMPS NO CI EVIDENCE OF ITS OWN, and that is the whole difference
+		// between this park and a decline. An agent that cannot submit because
+		// the readiness gate answered 409 ci-red has two honest answers - decline
+		// or ask a human - and asking is the better one, so discuss MUST be
+		// re-drivable by controller.driveCIRecoveryUnparks. But an agent asking a
+		// genuine question, with the same MR red at that head from an unrelated
+		// flake, is not giving up on CI at all, and stamping off the mirror could
+		// not tell the two apart: the flake re-running green un-parked the Task
+		// and spawned a pod with the human's answer still outstanding, which is
+		// exactly what awaiting-human exists to prevent.
+		//
+		// The discriminator is the REFUSAL, not the mirror, so it is captured
+		// where the refusal happens (recordCIRedRefusal, on the submission
+		// readiness path) and this arm simply inherits whatever is there.
 		o.ok("discuss")
 		return
 	case "rejected":

@@ -101,9 +101,15 @@ const IssueTitleMaxChars = 255
 const titleTruncatedMarker = "...(truncated)"
 
 // TruncateUTF8 cuts s to at most maxBytes BYTES on a rune boundary. A string
-// that already fits is returned byte-identical - callers compare stored values
-// (drainRenderedEvents matches a pending event by its whole value tuple, body
-// included), so an unconditional rewrite would not be free.
+// that already fits is returned byte-identical, because callers compare a
+// re-truncated value against the stored one to decide whether a write is needed
+// at all - turncallback's LastTurnFinalText is the live example, and an
+// unconditional rewrite would turn every no-op callback into a status write.
+//
+// The pending-event drain no longer depends on it: drainRenderedEvents matches
+// on the (Kind, Repo, Number, At) key, not on the whole struct, precisely
+// because a second writer (UnparkConsumedAt) now mutates entries the drain has
+// to keep recognising. Body is not in that key.
 func TruncateUTF8(s string, maxBytes int) string {
 	if len(s) <= maxBytes {
 		return s

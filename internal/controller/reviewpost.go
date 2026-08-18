@@ -504,7 +504,37 @@ func externalTerminalEdge(task *tatarav1alpha1.Task, mrs []tatarav1alpha1.MergeR
 // It reads through c (the UNCACHED APIReader in production) so a lagging cache
 // cannot make it fire on a handover the server has not committed.
 func TaskTakenOver(ctx context.Context, c client.Reader, task *tatarav1alpha1.Task) (bool, error) {
-	if task == nil || task.Spec.Kind != "review" || len(task.Status.MRRefs) == 0 {
+	if task == nil || task.Spec.Kind != "review" {
+		return false, nil
+	}
+	return MRRefsHandedOver(ctx, c, task)
+}
+
+// MRRefsHandedOver is TaskTakenOver's predicate WITHOUT the kind gate: every
+// status.mrRefs entry resolves to an existing MergeRequest that a DIFFERENT,
+// still-existing Task now controller-owns. See TaskTakenOver for why each clause
+// is the way it is; this is the same body, and the kind gate is the only thing
+// TaskTakenOver adds.
+//
+// THE TWO SURFACES DISAGREEING IS EXACTLY WHAT IT DETECTS. status.mrRefs is
+// append-only and never pruned, so it keeps naming a merge request after the
+// controller ownerRef - the source of truth for who may act on the artifact
+// (contract B.2 rule 1) - has moved elsewhere. That divergence is not a bug to
+// be reconciled away: it is the record of a hand-over, and it is the only way a
+// Task can tell "I never opened anything" (no refs) apart from "what I opened is
+// not mine any more" (refs that resolve to somebody else's). The two answer
+// different questions and only one of them is fixable by the agent.
+//
+// FINALIZATION KEEPS THE KIND GATE, DELIBERATELY. The convergent reconciler
+// edges call TaskTakenOver, not this, because a non-review Task whose merge
+// request stood down is LEFT IN PLACE parked ownership-lost as the durable
+// merge-driver DrainStandDownMerge re-drives on an approved review (see
+// flipToExternal). Retiring it here would delete the very thing that still has a
+// job. What restapi needs is narrower and needs no kind: an in-flight agent turn
+// must be told, with a 2xx, that its outcome has nowhere to attach - so it stops
+// re-submitting - and that is true for every kind.
+func MRRefsHandedOver(ctx context.Context, c client.Reader, task *tatarav1alpha1.Task) (bool, error) {
+	if task == nil || len(task.Status.MRRefs) == 0 {
 		return false, nil
 	}
 	for _, name := range task.Status.MRRefs {

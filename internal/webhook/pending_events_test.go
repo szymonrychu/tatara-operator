@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -40,18 +41,23 @@ func (s *stubSpiller) Spill(context.Context, string, string, any) (string, error
 	return "track-1", nil
 }
 
-// fakeApprovalReader is a minimal scm.SCMReader stub: only ListIssueComments
-// is exercised by SyncIssueOnDemand, everything else panics if called (there
-// is no other forge read on this path).
+// fakeApprovalReader is a minimal scm.SCMReader stub: SyncIssueOnDemand reads
+// the thread's comments and the issue's labels, and everything else panics if
+// called (there is no other forge read on this path).
 type fakeApprovalReader struct {
 	scm.SCMReader
 	comments []scm.IssueComment
+	content  scm.IssueContent
 	calls    int
 }
 
 func (r *fakeApprovalReader) ListIssueComments(context.Context, string, string, int) ([]scm.IssueComment, error) {
 	r.calls++
 	return r.comments, nil
+}
+
+func (r *fakeApprovalReader) GetIssue(context.Context, string, string, int) (scm.IssueContent, error) {
+	return r.content, nil
 }
 
 func peScheme(t *testing.T) *runtime.Scheme {
@@ -480,5 +486,54 @@ func TestDeliverPendingEvent_ParkedIdentityUnverified_BotComment_NeverSyncsOrUnp
 	gotTask := getPETask(t, c, task.Name)
 	if !tatarav1.Parked(gotTask) || len(gotTask.Status.PendingEvents) != 0 {
 		t.Fatalf("bot event must change nothing: parked=%v pendingEvents=%d", tatarav1.Parked(gotTask), len(gotTask.Status.PendingEvents))
+	}
+}
+
+// TestDeliverPendingEvent_TakeoverUnparkDoesNotAlsoDeclineTheLiveTurn is the
+// false-signal regression on the #511 take-over path.
+//
+// deliverPendingEvent used to run driveCommentUnpark and then driveLiveTurn on
+// the SAME object. ApplyUnpark writes the persisted Task back over it, carrying
+// stage.consumeUnparkEvents' UnparkConsumedAt stamp - so the fresh-event half of
+// DeliverLiveTurn's takeoverCandidate was already spent by the time it looked,
+// the cap applied again, and a request that had JUST been honoured was recorded
+// as live_entry_declined{rounds-exhausted} on exactly the path that counter
+// exists to observe.
+func TestDeliverPendingEvent_TakeoverUnparkDoesNotAlsoDeclineTheLiveTurn(t *testing.T) {
+	task := peTaskKind("t-takeover", "review", tatarav1.StateAwaitingReview, "")
+	task.Status.HumanReviewRounds = tatarav1.MaxHumanReviewRounds
+	task.Status.MRRefs = []string{tatarav1.MergeRequestName("pe-repo", 12)}
+	if err := stage.Park(task, stage.ReasonAwaitingHuman, time.Now()); err != nil {
+		t.Fatalf("park: %v", err)
+	}
+	mr := &tatarav1.MergeRequest{
+		ObjectMeta: metav1.ObjectMeta{Name: tatarav1.MergeRequestName("pe-repo", 12), Namespace: peNS},
+		Spec:       tatarav1.MergeRequestSpec{RepositoryRef: "pe-repo", Number: 12, ProjectRef: "pe-proj"},
+		Status:     tatarav1.MergeRequestStatus{State: "open", Ownership: tatarav1.OwnershipExternal},
+	}
+	iss := peIssue(7, task)
+	proj := peProject("tatara-bot", "maintainer")
+	c := peClient(t, proj, peRepo(), task, iss, mr)
+
+	reg := prometheus.NewRegistry()
+	m := obs.NewOperatorMetrics(reg)
+	s := NewServer(Config{
+		Client: c, APIReader: c, Namespace: peNS, Metrics: m,
+		Seq:     &queue.SeqSource{Client: c, Namespace: peNS},
+		Spiller: &stubSpiller{},
+	})
+
+	s.deliverPendingEvent(context.Background(), *proj, peRepo(), scm.WebhookEvent{
+		IsComment: true, IssueRef: "o/r#7", Number: 7,
+		ActorLogin: "maintainer", CommentID: 101, CommentBody: "I am taking this over",
+	})
+
+	if got := getPETask(t, c, task.Name); tatarav1.Parked(got) {
+		t.Fatalf("the take-over comment must un-park the Task, got parked(%s)", got.Status.ParkReason)
+	}
+	declined := testutil.ToFloat64(m.LiveEntryDeclinedCounter("pe-proj", controller.LiveEntryDeclineRoundsExhausted))
+	if declined != 0 {
+		t.Fatalf("operator_live_entry_declined_total{reason=%q} = %v, want 0: the take-over was HONOURED by the un-park",
+			controller.LiveEntryDeclineRoundsExhausted, declined)
 	}
 }

@@ -1,6 +1,8 @@
 package obs
 
 import (
+	"strconv"
+
 	"github.com/prometheus/client_golang/prometheus"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
@@ -40,8 +42,45 @@ var OwnershipDeclineUpgradedTotal = prometheus.NewCounter(prometheus.CounterOpts
 	Help: "Takeover Tasks whose implement-declined park was upgraded to ownership-lost by a flip to external.",
 })
 
+// OwnershipHumanAssistTotal counts the head drifts that are NOT stand-downs: a
+// commit from outside tatara landing on a merge request the platform bot itself
+// AUTHORED. That is a human helping the bot's own pull request, not a human
+// taking their own pull request back, and ReconcileOwnership retains ownership
+// instead of flipping (see its bot-authored carve-out).
+//
+// It is the observable half of a decision that is otherwise invisible: the flip
+// counter deliberately does NOT move here, so without this series a suppressed
+// stand-down looks exactly like a head drift that never happened. A rising rate
+// with stuck Tasks would mean the carve-out is too wide.
+//
+// IT CARRIES (repo, number) BECAUSE A LABEL-LESS COUNT CANNOT DRIVE AN
+// INVESTIGATION. The event this counts is a foreign commit entering a branch the
+// operator will merge unconditionally (mergeAllowedForOwnership accepts `tatara`
+// outright), so "some assist happened somewhere" is not an answer - the alert
+// that fires has to name the merge request to look at. Cardinality is bounded in
+// practice by how rare the event is: it increments once per DISTINCT assisted
+// head, on a merge request that already has a Task driving it, and the platform
+// sees a handful a week. There is no pre-seed because the label values are not
+// known until an assist happens; the series is absent, not zero, until then.
+var OwnershipHumanAssistTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "operator_mr_ownership_human_assist_total",
+	Help: "Non-bot head drifts on bot-authored merge requests, where ownership is retained instead of standing down, by repo and merge request number.",
+}, []string{"repo", "number"})
+
+// OwnershipHumanAssist increments operator_mr_ownership_human_assist_total for
+// one merge request.
+func OwnershipHumanAssist(repo string, number int) {
+	OwnershipHumanAssistTotal.WithLabelValues(repo, strconv.Itoa(number)).Inc()
+}
+
+// OwnershipHumanAssistCounter returns the counter for (repo, number) for tests.
+func OwnershipHumanAssistCounter(repo string, number int) prometheus.Counter {
+	return OwnershipHumanAssistTotal.WithLabelValues(repo, strconv.Itoa(number))
+}
+
 func init() {
-	ctrlmetrics.Registry.MustRegister(OwnershipFlipTotal, OwnershipDeclineUpgradedTotal)
+	ctrlmetrics.Registry.MustRegister(OwnershipFlipTotal, OwnershipDeclineUpgradedTotal,
+		OwnershipHumanAssistTotal)
 	// Pre-seed the two real flip label sets so a healthy operator exposes a zero
 	// baseline from startup (metric-wiring audit convention, issue #370).
 	OwnershipFlipTotal.WithLabelValues("to-tatara", "takeover")

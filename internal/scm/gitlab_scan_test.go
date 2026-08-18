@@ -78,6 +78,52 @@ func TestGitLabGetIssue(t *testing.T) {
 	}
 }
 
+// TestGitLabGetIssueLabels is the GitLab half of TestGitHubGetIssueLabels: the
+// mirror's recurring label refresh reads through GetIssue on both providers, so
+// both must populate Labels from the same field ListOpenIssues reads.
+func TestGitLabGetIssueLabels(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload map[string]any
+		want    []string
+	}{
+		{
+			name:    "labels are returned verbatim",
+			payload: map[string]any{"labels": []string{"tatara-approved", "bug"}},
+			want:    []string{"tatara-approved", "bug"},
+		},
+		{
+			name:    "an unlabelled issue reports no labels",
+			payload: map[string]any{},
+			want:    []string{},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if glTestPath(r) != "/projects/g%2Fp/issues/21" {
+					t.Fatalf("unexpected path: %q", glTestPath(r))
+				}
+				_ = json.NewEncoder(w).Encode(tc.payload)
+			}))
+			defer srv.Close()
+			c := &GitLab{apiBase: srv.URL, token: "tok"}
+			content, err := c.GetIssue(context.Background(), "g/p", "", 21)
+			if err != nil {
+				t.Fatalf("GetIssue: %v", err)
+			}
+			if len(content.Labels) != len(tc.want) {
+				t.Fatalf("Labels = %v, want %v", content.Labels, tc.want)
+			}
+			for i, w := range tc.want {
+				if content.Labels[i] != w {
+					t.Fatalf("Labels = %v, want %v", content.Labels, tc.want)
+				}
+			}
+		})
+	}
+}
+
 func TestGitLabGetIssueState(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if glTestPath(r) != "/projects/g%2Fp/issues/21" {

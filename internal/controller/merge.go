@@ -221,7 +221,16 @@ func (r *TaskReconciler) mergeAllowed(proj *tatarav1alpha1.Project, st scm.PRSta
 
 // mergePolicyAllows is the MergePolicy gate applied to the operator's own merge.
 // The receiver is unused by mergeAllowed.
-func mergePolicyAllows(proj *tatarav1alpha1.Project, st scm.PRState) bool {
+//
+// ciRedSuppressed is scm.CIRedSuppressed's answer for this merge request: the
+// forge has said the merge is not blocked and the red checks are not the ones
+// that block it. autoMergeOnGreenCI means "do not merge on a check that blocks
+// this merge", so a policy refusal there would contradict the forge and stall
+// the Task on a poll that can never change.
+func mergePolicyAllows(proj *tatarav1alpha1.Project, st scm.PRState, ciRedSuppressed bool) bool {
+	if ciRedSuppressed {
+		return true
+	}
 	var r TaskReconciler
 	return r.mergeAllowed(proj, st)
 }
@@ -347,10 +356,44 @@ func (d *StageDriver) ReconcileMerging(ctx context.Context, proj *tatarav1alpha1
 		// maxMergeReentries for ~16h of re-reading one static failure. Everything
 		// else - pending, running, no CI at all - genuinely does resolve on its own
 		// and still stalls on the 60s poll below.
+		//
+		// UNLESS THE FORGE ITSELF SAYS THE RED IS NOT WHAT BLOCKS THE MERGE.
+		// /outcome's readiness gate accepts a submission in that case, and it
+		// derives CIStatus from the IDENTICAL fold this line reads - so without the
+		// same carve-out the pass through this corridor is: submit accepted, review
+		// pod spent, verdict accepted, enterCIRed here. With a sibling in mergeOrder
+		// already merged that parks ci-blocked, which is UnparkNever: a dead Task
+		// that cost a full review cycle first. scm.CIRedSuppressed is the shared
+		// rule, and it fails CLOSED on everything it cannot determine.
+		ciRedSuppressed := false
 		if st.CIStatus == "failure" {
-			return ctrl.Result{}, enterCIRed(ctx, d.Client, d.spiller(proj), d.Metrics, task, mrs, mr, d.now())
+			redMS, msErr := writer.GetMergeState(ctx, repo.Spec.URL, token, mr.Spec.Number)
+			RecordSCM(d.Metrics, provider, "get_merge_state", msErr)
+			if msErr != nil {
+				l.Info("merge: merge state unreadable on a red head; the red stands",
+					"action", "ci_red_suppression_undetermined", "resource_id", task.Name,
+					"repo", repoRef, "pr", mr.Spec.Number, "error", msErr.Error())
+			} else {
+				var serr error
+				ciRedSuppressed, serr = scm.CIRedSuppressed(ctx, writer, repo.Spec.URL, token, mr.Spec.Number, redMS)
+				if serr != nil {
+					l.Info("merge: required-context set unreadable; the red stands",
+						"action", "ci_red_suppression_undetermined", "resource_id", task.Name,
+						"repo", repoRef, "pr", mr.Spec.Number, "error", serr.Error())
+				}
+			}
+			if !ciRedSuppressed {
+				return ctrl.Result{}, enterCIRed(ctx, d.Client, d.spiller(proj), d.Metrics, task, mrs, mr, d.now())
+			}
+			l.Info("merge: ci red suppressed; the forge reports the merge is not blocked by it",
+				"action", "ci_red_suppressed", "resource_id", task.Name, "repo", repoRef,
+				"pr", mr.Spec.Number, "merge_state", string(redMS))
 		}
-		if st.CIStatus != "success" || !mergePolicyAllows(proj, st) {
+		// The suppression has to reach THIS gate too, and the MergePolicy one with
+		// it. Suppressing only the enterCIRed above would move the wedge instead of
+		// removing it: a red-but-not-blocking head would stall "ci-not-green" every
+		// 60s until the merge budget parked the Task.
+		if (st.CIStatus != "success" && !ciRedSuppressed) || !mergePolicyAllows(proj, st, ciRedSuppressed) {
 			return d.stallMerge(ctx, proj, task, repoRef, cursor, "ci-not-green")
 		}
 		ms, err := writer.GetMergeState(ctx, repo.Spec.URL, token, mr.Spec.Number)

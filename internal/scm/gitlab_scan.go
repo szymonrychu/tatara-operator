@@ -166,19 +166,21 @@ type glNote struct {
 	System    bool      `json:"system"`
 }
 
-// GetIssue returns the title and body of an issue. The (owner, repo) pair is
-// resolved to a project id by glProjectID, accepting both the split and
-// full-path calling conventions.
+// GetIssue returns the title, body and labels of an issue. The (owner, repo)
+// pair is resolved to a project id by glProjectID, accepting both the split and
+// full-path calling conventions. GitLab reports labels as bare name strings,
+// which is already the shape ListOpenIssues puts on IssueRef.Labels.
 func (c *GitLab) GetIssue(ctx context.Context, owner, repo string, number int) (IssueContent, error) {
 	var raw struct {
-		Title       string `json:"title"`
-		Description string `json:"description"`
+		Title       string   `json:"title"`
+		Description string   `json:"description"`
+		Labels      []string `json:"labels"`
 	}
 	path := "/projects/" + url.PathEscape(glProjectID(owner, repo)) + "/issues/" + strconv.Itoa(number)
 	if err := glDo(ctx, c.base(), http.MethodGet, path, c.token, nil, &raw); err != nil {
 		return IssueContent{}, err
 	}
-	return IssueContent{Title: raw.Title, Body: raw.Description}, nil
+	return IssueContent{Title: raw.Title, Body: raw.Description, Labels: raw.Labels}, nil
 }
 
 // GetDefaultBranchHeadSHA resolves the default branch HEAD commit sha. owner

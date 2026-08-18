@@ -561,7 +561,13 @@ func ownerTaskOf(t *testing.T, ctx context.Context, mr *tatarav1alpha1.MergeRequ
 func TestReconcileOwnership_ClassifyWithoutLiveHeadDoesNotArmAFalseFlip(t *testing.T) {
 	ctx := context.Background()
 	d, proj, repo := newOwnershipDriver(t, ctx)
-	mr := seedOpenMR(t, ctx, proj, repo, 42, "tatara/feat-42", proj.Spec.Scm.BotLogin, "")
+	mr := seedOpenMR(t, ctx, proj, repo, 42, normalTaskWorkBranch(proj, repo, 42), proj.Spec.Scm.BotLogin, "")
+	// THE CARVE-OUT HAS TO BE ABLE TO NAME THE TASK IT IS PROTECTING, so the
+	// mirror carries the owner a real bot-opened merge request has. An ORPHAN
+	// mirror - zero controller refs, what a reap or a mid-handover leaves - is NOT
+	// carved out and still stands down; see
+	// TestReconcileOwnership_OrphanedBotAuthoredMRStillFlips.
+	bindNormalOwnerTask(t, ctx, proj, repo, mr, 42)
 
 	// Pass 1: the mirror has not synced a head yet. This is the classification
 	// that used to leave LastBotHeadSHA empty.
@@ -587,14 +593,27 @@ func TestReconcileOwnership_ClassifyWithoutLiveHeadDoesNotArmAFalseFlip(t *testi
 		t.Fatalf("ownership = %q (%s), want tatara", got.Status.Ownership, got.Status.OwnershipReason)
 	}
 
-	// A GENUINE external push must still flip, or the fix has just disabled the
-	// whole mechanism.
+	// A LATER UNATTRIBUTABLE HEAD ON THIS MIRROR IS AN ASSIST, NOT A STAND-DOWN,
+	// and that is a deliberate change of rule rather than the mechanism going
+	// missing (tatara-operator#622). The mirror is BOT-AUTHORED - the platform
+	// opened this merge request to deliver a Task's own work - so a commit from
+	// outside tatara is somebody helping it, and severing the Task from work it
+	// already pushed is the opposite of what helping should do. The stand-down
+	// still fires for every merge request that is somebody else's: see
+	// TestReconcileOwnership_HumanAuthoredMRStillFlips,
+	// TestReconcileOwnership_AdoptedUpgradeMROnTheBotTokenStillFlips and
+	// TestReconcileOwnership_FlipsNormalImplementOwner, all of which are
+	// non-bot-authored and all of which still flip.
 	flipped, err = d.ReconcileOwnership(ctx, proj, repo, got, "human-head", nil)
 	if err != nil {
 		t.Fatalf("drift pass: %v", err)
 	}
-	if !flipped {
-		t.Fatal("a real unattributable head must still flip to external")
+	if flipped {
+		t.Fatal("a human commit on tatara's OWN merge request must not stand it down")
+	}
+	if got = getMR(t, ctx, proj, repo, 42); got.Status.LastBotHeadSHA != "human-head" {
+		t.Fatalf("the assist must advance the baseline so it converges: lastBotHeadSHA = %q",
+			got.Status.LastBotHeadSHA)
 	}
 }
 

@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -37,6 +38,12 @@ type fakeForge struct {
 	state map[int]scm.PRState
 	// mergeState is the live mergeability per number.
 	mergeState map[int]scm.MergeState
+	// requiredChecks is whether the PR carries at least one REQUIRED status
+	// context. It defaults to FALSE - an unprotected repo - so the ci-red
+	// suppression is off unless a test asks for it, which is the fail-closed
+	// direction. requiredChecksErr is what the read returns instead when set.
+	requiredChecks    map[int]bool
+	requiredChecksErr error
 
 	// reviews is what ListReviews returns per number: the FORGE IS THE LEDGER.
 	reviews map[int][]scm.Review
@@ -112,13 +119,14 @@ func (f *fakeForge) EnsureLabel(_ context.Context, _, _, name, color string) err
 
 func newFakeForge(t *testing.T) *fakeForge {
 	return &fakeForge{
-		t:          t,
-		head:       map[int]string{},
-		state:      map[int]scm.PRState{},
-		mergeState: map[int]scm.MergeState{},
-		reviews:    map[int][]scm.Review{},
-		comments:   map[string][]scm.PostedComment{},
-		thread:     map[int][]scm.IssueComment{},
+		t:              t,
+		head:           map[int]string{},
+		state:          map[int]scm.PRState{},
+		mergeState:     map[int]scm.MergeState{},
+		requiredChecks: map[int]bool{},
+		reviews:        map[int][]scm.Review{},
+		comments:       map[string][]scm.PostedComment{},
+		thread:         map[int][]scm.IssueComment{},
 	}
 }
 
@@ -144,6 +152,13 @@ func (f *fakeForge) GetMergeState(_ context.Context, _, _ string, number int) (s
 		return scm.MergeStateClean, nil
 	}
 	return ms, nil
+}
+
+func (f *fakeForge) HasRequiredChecks(_ context.Context, _, _ string, number int) (bool, error) {
+	if f.requiredChecksErr != nil {
+		return false, f.requiredChecksErr
+	}
+	return f.requiredChecks[number], nil
 }
 
 func (f *fakeForge) ListReviews(_ context.Context, _, _ string, number int) ([]scm.Review, error) {
@@ -497,6 +512,121 @@ func TestMergeSingleRepoMerges(t *testing.T) {
 	}
 	if gm := mdGetMR(t, c, mr.Name); gm.Status.State != "merged" || gm.Status.MergedAt == nil {
 		t.Fatalf("mr state = %q mergedAt = %v, want merged/set", gm.Status.State, gm.Status.MergedAt)
+	}
+}
+
+// THE TWO SIDES OF THE ci-red SUPPRESSION HAVE TO AGREE (review finding 1).
+//
+// /outcome's readiness gate lets a submission through when the forge reports
+// `unstable` on a repo with required contexts - the tatara-helmfile#424 shape.
+// The merge corridor derives CIStatus from the IDENTICAL fold, so without the
+// same carve-out here the sequence was: submit accepted, review pod runs, verdict
+// accepted, merge corridor reads CIStatus=="failure" and calls enterCIRed - which,
+// with a sibling already merged, parks the Task ci-blocked, and ci-blocked is
+// UnparkNever. A full review cycle burned, then a dead Task: strictly worse than
+// refusing at submit.
+//
+// The suppression covers BOTH gates in this corridor. Suppressing only the
+// enterCIRed one would move the wedge again: the very next line demands
+// CIStatus=="success" and would stall "ci-not-green" every 60s until the merge
+// budget parked the Task.
+func TestMergingMergesWhenTheForgeSaysTheRedChecksDoNotBlockIt(t *testing.T) {
+	task := mdTask("t1", "implement", tatarav1alpha1.StateMerged)
+	task.Spec.MergeOrder = []string{"tatara-operator"}
+	mr := mdMR(task, "tatara-operator", 7)
+	mr.Status.ReviewedSHA = "sha-a"
+	mr.Status.Status = "approved"
+	c := newMirrorClient(t, mdProject(), mdSecret(), mdRepo("tatara-operator"), task, mr)
+
+	f := newFakeForge(t)
+	f.head[7] = "sha-a"
+	// #424 EXACTLY: a non-required scanner is red, the sole required context is
+	// green, and GitHub therefore reports the merge as unstable, not blocked.
+	f.state[7] = scm.PRState{CIStatus: "failure", HeadSHA: "sha-a"}
+	f.mergeState[7] = scm.MergeStateUnstable
+	f.requiredChecks[7] = true
+	d := mdNewDriver(t, f, c)
+
+	if _, err := d.ReconcileMerging(context.Background(), mdProject(), task); err != nil {
+		t.Fatalf("ReconcileMerging: %v", err)
+	}
+	if f.mergeCalls != 1 {
+		t.Fatalf("merge calls = %d, want 1: the forge itself says this merge is not blocked", f.mergeCalls)
+	}
+	got := mdGetTask(t, c, "t1")
+	if got.Status.State != tatarav1alpha1.StateDeployed {
+		t.Fatalf("stage = %q(%q), want deployed", got.Status.State, got.Status.ParkReason)
+	}
+	if got.Status.CIRedReentries != 0 {
+		t.Fatalf("ciRedReentries = %d, want 0: a suppressed red is not a ci-red exit", got.Status.CIRedReentries)
+	}
+}
+
+// AND IT FAILS CLOSED, on every axis, exactly as the readiness gate does.
+// `unstable` is ALSO what a repo with NO required contexts reports for a fully
+// red PR (review finding 2), so without the required-context condition an
+// unprotected repo would merge on red CI - from the one component in the
+// platform that is allowed to merge at all.
+func TestMergingStillLeavesOnRedCIWhenTheSuppressionDoesNotApply(t *testing.T) {
+	cases := []struct {
+		name  string
+		forge func(*fakeForge)
+	}{
+		{
+			name:  "an unprotected repo: unstable with NO required context",
+			forge: func(f *fakeForge) { f.mergeState[7] = scm.MergeStateUnstable },
+		},
+		{
+			name: "an unreadable required-context set",
+			forge: func(f *fakeForge) {
+				f.mergeState[7] = scm.MergeStateUnstable
+				f.requiredChecks[7] = true
+				f.requiredChecksErr = errors.New("403 from the forge")
+			},
+		},
+		{
+			name: "blocked is a red REQUIRED check",
+			forge: func(f *fakeForge) {
+				f.mergeState[7] = scm.MergeStateBlocked
+				f.requiredChecks[7] = true
+			},
+		},
+		{
+			name: "clean is the gitlab shape: can_be_merged with a red pipeline",
+			forge: func(f *fakeForge) {
+				f.mergeState[7] = scm.MergeStateClean
+				f.requiredChecks[7] = true
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			task := mdTask("t1", "implement", tatarav1alpha1.StateMerged)
+			task.Spec.MergeOrder = []string{"tatara-operator"}
+			mr := mdMR(task, "tatara-operator", 7)
+			mr.Status.ReviewedSHA = "sha-a"
+			mr.Status.Status = "approved"
+			c := newMirrorClient(t, mdProject(), mdSecret(), mdRepo("tatara-operator"), task, mr)
+
+			f := newFakeForge(t)
+			f.head[7] = "sha-a"
+			f.state[7] = scm.PRState{CIStatus: "failure", HeadSHA: "sha-a"}
+			tc.forge(f)
+			d := mdNewDriver(t, f, c)
+
+			if _, err := d.ReconcileMerging(context.Background(), mdProject(), task); err != nil {
+				t.Fatalf("ReconcileMerging: %v", err)
+			}
+			if f.mergeCalls != 0 {
+				t.Fatalf("merge calls = %d, want 0", f.mergeCalls)
+			}
+			got := mdGetTask(t, c, "t1")
+			if got.Status.State != tatarav1alpha1.StateUnderImplementation ||
+				got.Status.StateReason != stage.ReasonCIRed {
+				t.Fatalf("stage = %q(%q), want under-implementation(ci-red)",
+					got.Status.State, got.Status.StateReason)
+			}
+		})
 	}
 }
 

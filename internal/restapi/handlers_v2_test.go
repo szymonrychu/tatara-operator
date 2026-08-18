@@ -1586,20 +1586,136 @@ func TestMRWrite_Open_StillKeysOnTheTaskBranchForAnOrdinaryTask(t *testing.T) {
 	require.Empty(t, forge.openedURLs)
 }
 
-// REFUSED 409 when the Task already owns a MERGED MR for that repo (fix 2).
-// This is the structural stop on the duplicate-PR path after a partial merge.
-func TestMRWrite_Open_RefusedAfterAMerge(t *testing.T) {
+// A MERGED MR no longer forecloses the repo (H1-C). The refusal it replaced was
+// per-repo and state-based: any merged owned MR for repo R refused every later
+// open, for the rest of the Task's life. The observed shape is a Task owning
+// helmfile#27 and #32 that shipped #27 across three merged MRs and then had a
+// tested, pushed commit for #32 and nowhere to put it.
+func TestMROpen_SecondMRAfterMergeIsAllowedWhenAnOpenIssueIsUncovered(t *testing.T) {
+	forge := newRecordingForge()
 	merged := mrV2("tatara-cli", 80, "t1", func(m *tatarav1alpha1.MergeRequest) {
 		m.Status.State = "merged"
 	})
-	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+	e := buildV2(t, v2Opts{writer: forge}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-cli", "tatara"),
-		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"), merged)
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
+		merged, issueV2("tatara-cli", 32, "t1"))
 
 	w := e.do(t, http.MethodPost, "/projects/tatara/scm/mr-write",
 		`{"task":"t1","action":"open","repo":"tatara-cli","title":"T","body":"B"}`)
-	require.Equal(t, http.StatusConflict, w.Code)
-	require.Contains(t, w.Body.String(), "task already merged an MR for this repo")
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.Contains(t, w.Body.String(), `"existing":false`)
+	require.Len(t, forge.openedURLs, 1)
+
+	// The branch is NOT renamed or suffixed per generation: the second MR opens
+	// from the same push branch, which is what keeps the idempotency clause, the
+	// reaper's TaskBranch comparison and the 63-char truncation intact.
+	mr := e.mr(t, tatarav1alpha1.MergeRequestName("tatara-cli", 101))
+	require.Equal(t, taskBranchV2("t1"), mr.Status.HeadBranch)
+}
+
+// ... but only while the Task actually owes work this repo can carry. This is
+// the gate that keeps the relaxation above from being a licence to open one MR
+// per turn, and it supersedes the old blanket "task already merged an MR for
+// this repo" refusal (fix 2) that this case used to pin.
+func TestMROpen_SecondMRAfterMergeIsRefusedWhenNothingIsOutstanding(t *testing.T) {
+	tests := []struct {
+		name  string
+		issue func() *tatarav1alpha1.Issue
+	}{
+		{"the task owns no issue at all", nil},
+		{"the issue is closed on the forge", func() *tatarav1alpha1.Issue {
+			return issueV2("tatara-cli", 32, "t1", func(i *tatarav1alpha1.Issue) { i.Status.State = "closed" })
+		}},
+		{"the platform is done with the issue", func() *tatarav1alpha1.Issue {
+			return issueV2("tatara-cli", 32, "t1", func(i *tatarav1alpha1.Issue) { i.Status.Status = "done" })
+		}},
+		{"the platform rejected the issue", func() *tatarav1alpha1.Issue {
+			return issueV2("tatara-cli", 32, "t1", func(i *tatarav1alpha1.Issue) { i.Status.Status = "rejected" })
+		}},
+		{"the only open issue belongs to another repo", func() *tatarav1alpha1.Issue {
+			return issueV2("charts", 32, "t1")
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			objs := []client.Object{
+				projectV2("tatara"), scmSecretV2(),
+				repoV2("tatara-cli", "tatara"), repoV2("charts", "tatara"),
+				taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
+				mrV2("tatara-cli", 80, "t1", func(m *tatarav1alpha1.MergeRequest) { m.Status.State = "merged" }),
+			}
+			if tc.issue != nil {
+				objs = append(objs, tc.issue())
+			}
+			e := buildV2(t, v2Opts{writer: panicForge{}}, objs...)
+
+			before := testutil.ToFloat64(obs.RestOwnershipRefusedTotal.WithLabelValues("mr-surface-spent"))
+			w := e.do(t, http.MethodPost, "/projects/tatara/scm/mr-write",
+				`{"task":"t1","action":"open","repo":"tatara-cli","title":"T","body":"B"}`)
+			require.Equal(t, http.StatusConflict, w.Code, w.Body.String())
+			require.Contains(t, w.Body.String(),
+				"task has no open issue for this repo that an open merge request does not already cover")
+			require.Equal(t, before+1,
+				testutil.ToFloat64(obs.RestOwnershipRefusedTotal.WithLabelValues("mr-surface-spent")))
+		})
+	}
+}
+
+// The FIRST open for a repo is ungated. The outstanding-work gate is about
+// duplicates, and an Issue CR is not universal: an upgrade Task adopted from a
+// renovate PR owns a merge request and no issue at all, so gating its first
+// open would refuse every one of them.
+func TestMROpen_FirstOpenIsUngatedForATaskThatOwnsNoIssue(t *testing.T) {
+	forge := newRecordingForge()
+	e := buildV2(t, v2Opts{writer: forge}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-cli", "tatara"),
+		taskV2("t1", "tatara", "upgrade", tatarav1alpha1.StateUnderImplementation, "upgrade"))
+
+	w := e.do(t, http.MethodPost, "/projects/tatara/scm/mr-write",
+		`{"task":"t1","action":"open","repo":"tatara-cli","title":"T","body":"B"}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.Contains(t, w.Body.String(), `"existing":false`)
+	require.Len(t, forge.openedURLs, 1)
+}
+
+// The idempotent path is reached BEFORE the outstanding-work gate: a TTL-stopped
+// pod whose MR is already open gets "existing" even when the Task owes nothing,
+// because the answer it needs is the number of the MR it already has.
+func TestMROpen_ExistingOpenMROnTheSameHeadIsStillIdempotent(t *testing.T) {
+	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-cli", "tatara"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
+		mrV2("tatara-cli", 80, "t1"),
+		issueV2("tatara-cli", 32, "t1", func(i *tatarav1alpha1.Issue) { i.Status.Status = "done" }))
+
+	w := e.do(t, http.MethodPost, "/projects/tatara/scm/mr-write",
+		`{"task":"t1","action":"open","repo":"tatara-cli","title":"T","body":"B"}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.Contains(t, w.Body.String(), `"existing":true`)
+	require.Contains(t, w.Body.String(), `"number":80`)
+}
+
+// An OPEN owned MR for the repo is the surface: it covers whatever the agent
+// commits next, because a Task pushes every repo-R commit to ONE branch. So a
+// second open is refused while it lives, even with an open issue outstanding -
+// this is the structural refusal that survives H1-C.
+func TestMROpen_ExistingOpenMROnADifferentHeadIsStillRefused(t *testing.T) {
+	forge := newRecordingForge()
+	other := mrV2("tatara-cli", 80, "t1", func(m *tatarav1alpha1.MergeRequest) {
+		m.Status.HeadBranch = "someone-elses/branch"
+	})
+	e := buildV2(t, v2Opts{writer: forge}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-cli", "tatara"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
+		other, issueV2("tatara-cli", 32, "t1"))
+
+	w := e.do(t, http.MethodPost, "/projects/tatara/scm/mr-write",
+		`{"task":"t1","action":"open","repo":"tatara-cli","title":"T","body":"B"}`)
+	require.Equal(t, http.StatusConflict, w.Code, w.Body.String())
+	require.Contains(t, w.Body.String(),
+		"task has no open issue for this repo that an open merge request does not already cover")
+	require.Empty(t, forge.openedURLs)
 }
 
 // mr_write has exactly three actions. A hallucinated merge call has nowhere to
