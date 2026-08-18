@@ -181,8 +181,40 @@ func (o *outcomeCtx) evaluateReadiness(ctx context.Context,
 		}
 		r := mrReadiness{repo: mr.Spec.RepositoryRef, number: mr.Spec.Number, headSHA: st.HeadSHA}
 		var details []string
+		// GetMergeState is a SECOND call and it is worth it: PRState carries no
+		// mergeability at all (see its doc comment - GitHub's mergeable_state is
+		// deliberately not part of it), so without this the conflict axis does not
+		// exist. A failure here is NOT fatal to the other two axes: an unknown
+		// merge state is the forge saying "still computing", which is the answer
+		// on any PR pushed seconds ago. It is read BEFORE the CI switch because
+		// the CI axis needs it too - see the "failure" arm.
+		ms, msErr := writer.GetMergeState(ctx, repo.Spec.URL, token, mr.Spec.Number)
 		switch st.CIStatus {
 		case "failure":
+			// THE FORGE, NOT THE CHECK LIST, DECIDES - but `unstable` alone is NOT
+			// the forge saying that. scm.CIRedSuppressed carries the full rule and
+			// is shared verbatim with the merge corridor, because the two derive
+			// CIStatus from the identical fold: a submission accepted here and then
+			// met by an enterCIRed park in merging is a dead Task that burned a
+			// whole review cycle first, which is worse than refusing right now.
+			// It fails CLOSED on an unreadable merge state, an unreadable
+			// required-context set, and a provider that cannot answer.
+			suppressed := false
+			if msErr == nil {
+				var serr error
+				suppressed, serr = scm.CIRedSuppressed(ctx, writer, repo.Spec.URL, token, mr.Spec.Number, ms)
+				if serr != nil {
+					s.log.WarnContext(ctx, "restapi: pr readiness: required-context set unreadable; ci red is NOT suppressed",
+						"action", "ci_red_suppression_undetermined", "task", o.task.Name,
+						"repo", mr.Spec.RepositoryRef, "number", mr.Spec.Number, "error", serr)
+				}
+			}
+			if suppressed {
+				s.log.InfoContext(ctx, "restapi: pr readiness: ci red suppressed; the forge reports the merge is not blocked by it",
+					"action", "ci_red_suppressed", "task", o.task.Name, "repo", mr.Spec.RepositoryRef,
+					"number", mr.Spec.Number, "merge_state", string(ms))
+				break
+			}
 			r.blockers = append(r.blockers, blockerCIRed)
 			details = append(details, fmt.Sprintf(
 				"CI is RED at the pushed head %s: read the failing job (`scm_read(kind=\"ci\", repo=%q, number=%d)`), fix it, push, and submit again",
@@ -190,18 +222,11 @@ func (o *outcomeCtx) evaluateReadiness(ctx context.Context,
 		case "pending":
 			r.ciPending = true
 		}
-		// GetMergeState is a SECOND call and it is worth it: PRState carries no
-		// mergeability at all (see its doc comment - GitHub's mergeable_state is
-		// deliberately not part of it), so without this the conflict axis does not
-		// exist. A failure here is NOT fatal to the other two axes: an unknown
-		// merge state is the forge saying "still computing", which is the answer
-		// on any PR pushed seconds ago.
-		ms, err := writer.GetMergeState(ctx, repo.Spec.URL, token, mr.Spec.Number)
 		switch {
-		case err != nil:
+		case msErr != nil:
 			s.log.WarnContext(ctx, "restapi: pr readiness: merge state unreadable; the conflict axis is skipped for this MR",
 				"action", "pr_readiness_merge_state_failed", "task", o.task.Name,
-				"mr", mr.Name, "error", err)
+				"mr", mr.Name, "error", msErr)
 		case ms == scm.MergeStateDirty:
 			r.blockers = append(r.blockers, blockerConflict)
 			details = append(details, fmt.Sprintf(

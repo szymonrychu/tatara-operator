@@ -1,15 +1,15 @@
 package webhook_test
 
-// Task 18 / contract Section I: the two pendingEvents properties that need a
-// REAL API server, not a fake client:
+// Task 18 / contract Section I: the pendingEvents property that needs a REAL
+// API server, not a fake client - "the Go-side drop-oldest cap never lets the
+// API-server MaxItems 422 fire". The fake client does not enforce CRD
+// validation (MaxItems) at all, so the property is vacuously true against it.
 //
-//   - "the Go-side drop-oldest cap never lets the API-server MaxItems 422
-//     fire" - the fake client does not enforce CRD validation (MaxItems) at
-//     all, so this property is vacuously true against it.
-//   - "a webhook arriving between render and clear is NOT dropped" - this
-//     must be a REAL CONCURRENT test (goroutines + envtest client), not a
-//     sequential simulation, per the plan. A blind nil-assign is the
-//     2026-07-11 "blind Status.WorkItems clobber" in new clothes.
+// The render-vs-clear race test that used to live here went with the
+// webhook-side clear helper it exercised (H1-J): that helper had zero non-test
+// callers, so the race it guarded was a race between a test and itself. The ONE
+// production drain is controller.submitStageTurn, whose drainRenderedEvents
+// carries the same guard and its own unit tests.
 //
 // This file owns the package's one TestMain (shared by every *_test.go file
 // under internal/webhook, whichever of the two co-located test packages -
@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sync"
 	"testing"
 	"time"
 
@@ -36,7 +35,6 @@ import (
 
 	tatarav1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/controller"
-	"github.com/szymonrychu/tatara-operator/internal/webhook"
 )
 
 var (
@@ -113,10 +111,10 @@ func getPETaskEnvtest(t *testing.T, name string) *tatarav1.Task {
 	return &tk
 }
 
-// peEv builds a distinct TaskEvent for index i. The eventKey the clear step
-// diffs on is (Kind, Repo, Number, At) with At truncated to SECOND precision
-// (the API server's own round-trip precision) - so Number, not a timestamp
-// offset, is what must vary across a batch built within the same second.
+// peEv builds a distinct TaskEvent for index i. Number, not a timestamp
+// offset, is what varies across a batch: At is truncated to SECOND precision
+// (the API server's own round-trip precision), so a batch built within the same
+// second would otherwise be indistinguishable.
 func peEv(i int) tatarav1.TaskEvent {
 	return tatarav1.TaskEvent{
 		At:   metav1.NewTime(time.Now().UTC().Truncate(time.Second)),
@@ -163,108 +161,5 @@ func TestAppendTaskEvent_CapNeverTripsBackstop422(t *testing.T) {
 	}
 	if got.Status.PendingEvents[19].Author != "user29" {
 		t.Fatalf("newest survivor author = %q, want user29", got.Status.PendingEvents[19].Author)
-	}
-}
-
-// blockingStatusClient wraps a real client.Client and lets a test synchronize
-// on the FIRST Status().Update call it makes for a Task - the exact moment
-// ClearDeliveredEvents has already Get'd the object and is about to write.
-type blockingStatusClient struct {
-	client.Client
-	once          sync.Once
-	onFirstUpdate func()
-}
-
-func (b *blockingStatusClient) Status() client.SubResourceWriter {
-	return &blockingStatusWriter{SubResourceWriter: b.Client.Status(), parent: b}
-}
-
-type blockingStatusWriter struct {
-	client.SubResourceWriter
-	parent *blockingStatusClient
-}
-
-func (w *blockingStatusWriter) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
-	if _, ok := obj.(*tatarav1.Task); ok {
-		w.parent.once.Do(func() {
-			if w.parent.onFirstUpdate != nil {
-				w.parent.onFirstUpdate()
-			}
-		})
-	}
-	return w.SubResourceWriter.Update(ctx, obj, opts...)
-}
-
-// TestClearDeliveredEvents_ConcurrentAppendSurvives is THE race test: a
-// webhook event (AppendTaskEvent) arrives on the REAL API server WHILE
-// ClearDeliveredEvents' RetryOnConflict is between its Get and its first
-// Update attempt. A blind `PendingEvents = nil` would drop the concurrently-
-// appended event; the set-difference-inside-RetryOnConflict implementation
-// must not.
-func TestClearDeliveredEvents_ConcurrentAppendSurvives(t *testing.T) {
-	ctx := context.Background()
-	task := mkPETask(t, "pe-race")
-
-	// Seed two "already delivered" events - what a render just bundled up.
-	delivered := []tatarav1.TaskEvent{peEv(1), peEv(2)}
-	for _, ev := range delivered {
-		if err := controller.AppendTaskEvent(ctx, peK8sClient, task, ev); err != nil {
-			t.Fatalf("seed delivered event: %v", err)
-		}
-	}
-
-	ready := make(chan struct{})
-	proceed := make(chan struct{})
-	blocking := &blockingStatusClient{
-		Client: peK8sClient,
-		onFirstUpdate: func() {
-			close(ready)
-			<-proceed
-		},
-	}
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-	var clearErr error
-	go func() {
-		defer wg.Done()
-		clearTask := &tatarav1.Task{ObjectMeta: metav1.ObjectMeta{Name: task.Name, Namespace: ns}}
-		clearErr = webhook.ClearDeliveredEvents(ctx, blocking, clearTask, delivered)
-	}()
-
-	// Wait until Clear has Get'd the task and is blocked right before its
-	// first Update - the exact "between render and clear" window.
-	<-ready
-
-	// A NEW webhook event arrives concurrently, on the REAL unblocked client.
-	arriving := peEv(3)
-	if err := controller.AppendTaskEvent(ctx, peK8sClient, task, arriving); err != nil {
-		t.Fatalf("concurrent AppendTaskEvent: %v", err)
-	}
-
-	// Let Clear's first Update proceed - it now races against a resourceVersion
-	// bump from the concurrent append and MUST conflict-retry.
-	close(proceed)
-	wg.Wait()
-
-	if clearErr != nil {
-		t.Fatalf("ClearDeliveredEvents: %v", clearErr)
-	}
-
-	final := getPETaskEnvtest(t, task.Name)
-	foundArriving := false
-	for _, ev := range final.Status.PendingEvents {
-		if ev.Author == arriving.Author && ev.Body == arriving.Body {
-			foundArriving = true
-		}
-		if ev.Author == delivered[0].Author && ev.Body == delivered[0].Body {
-			t.Fatalf("a DELIVERED event survived the clear: %+v", ev)
-		}
-		if ev.Author == delivered[1].Author && ev.Body == delivered[1].Body {
-			t.Fatalf("a DELIVERED event survived the clear: %+v", ev)
-		}
-	}
-	if !foundArriving {
-		t.Fatalf("the event that arrived BETWEEN render and clear was DROPPED - pendingEvents = %+v", final.Status.PendingEvents)
 	}
 }

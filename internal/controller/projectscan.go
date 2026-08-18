@@ -671,6 +671,19 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 			r.Metrics.SetOpenProposals(slug, float64(byRepoRef[repos[i].Name]))
 		}
 	}
+	// The STUCK SET, published from the same list the control law just counted.
+	// An anchorless proposal is invisible to every other signal here: it is not in
+	// `pending` (effectiveProposalKind refuses it), it never reaches
+	// autoApproveApplies with a grant, and its Task simply parks awaiting a human.
+	// Written every pass INCLUDING the zero, so a project that clears the class
+	// does not latch its last nonzero value forever.
+	stuck := anchorlessProposals(issues, botLogin)
+	obs.AnchorlessProposals.WithLabelValues(proj.Name).Set(float64(len(stuck)))
+	if len(stuck) > 0 {
+		l.Info("brainstorm: bot-authored proposals carry no auto-approve anchor and can never be granted autonomously",
+			"action", "anchorless_proposals", "resource_id", proj.Name,
+			"count", len(stuck), "issues", strings.Join(stuck, ","))
+	}
 
 	// The in-flight guard doubles as the read-your-writes ledger: a reconcile
 	// storm between "Task created" and "issues filed" sees inflight == 1 and

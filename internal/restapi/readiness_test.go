@@ -1,6 +1,7 @@
 package restapi_test
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -132,6 +133,169 @@ func TestOutcome_ImplementSubmit_RefusesADirtyPR(t *testing.T) {
 			require.Nil(t, tatarav1alpha1.OutcomeCondition(got),
 				"an unclaimed refusal must leave no idempotency claim behind")
 			require.Empty(t, got.Spec.MergeOrder, "nothing downstream of the claim may have run")
+		})
+	}
+}
+
+// protectedForge is a recordingForge that ALSO answers the required-context
+// question - the GitHub shape on a repo with branch protection. A bare
+// recordingForge deliberately does not implement scm.RequiredCheckLister at all:
+// that is the GitLab shape, and it must never suppress.
+type protectedForge struct {
+	*recordingForge
+	required bool
+	err      error
+}
+
+func (f *protectedForge) HasRequiredChecks(context.Context, string, string, int) (bool, error) {
+	return f.required, f.err
+}
+
+// THE FORGE, NOT THE CHECK LIST, DECIDES WHETHER RED CI BLOCKS. GitHub's
+// `unstable` means precisely "this merge is not blocked, and the checks that are
+// red are not the ones that block it". tatara-helmfile#424 is the shape: the
+// `GitGuardian Security Checks` app was FAILURE, `helmfile-diff` - the only
+// required context - was SUCCESS, mergeable_state was `unstable`, and the
+// submit was refused with ci-red anyway, so the Task could never leave
+// under-implementation.
+//
+// Every other merge state keeps today's fail-closed behaviour, and `clean` is
+// the one that matters most: GitLab reports can_be_merged with a RED pipeline,
+// so suppressing on clean would silently stop honouring red CI on every GitLab
+// merge request.
+//
+// Every case here has a required context; the axis that says whether one EXISTS
+// is TestOutcome_ImplementSubmit_RedCIIsNotSuppressedWithoutARequiredContext.
+func TestOutcome_ImplementSubmit_RedCIIsSuppressedOnlyWhenTheForgeSaysUnstable(t *testing.T) {
+	tests := []struct {
+		name    string
+		forge   func(*recordingForge)
+		wantRed bool
+	}{
+		{
+			name:    "unstable is the forge saying the red checks are not required",
+			forge:   func(f *recordingForge) { f.mergeStates[295] = scm.MergeStateUnstable },
+			wantRed: false,
+		},
+		{
+			name:    "blocked is a red REQUIRED check and still blocks",
+			forge:   func(f *recordingForge) { f.mergeStates[295] = scm.MergeStateBlocked },
+			wantRed: true,
+		},
+		{
+			name:    "clean is the gitlab shape (can_be_merged with a red pipeline) and still blocks",
+			forge:   func(f *recordingForge) { f.mergeStates[295] = scm.MergeStateClean },
+			wantRed: true,
+		},
+		{
+			name:    "behind still blocks",
+			forge:   func(f *recordingForge) { f.mergeStates[295] = scm.MergeStateBehind },
+			wantRed: true,
+		},
+		{
+			name:    "unknown still blocks",
+			forge:   func(f *recordingForge) { f.mergeStates[295] = scm.MergeStateUnknown },
+			wantRed: true,
+		},
+		{
+			name:    "an unreadable merge state fails CLOSED on the suppression",
+			forge:   func(f *recordingForge) { f.mergeStateErr = errForgeDown },
+			wantRed: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			forge := newRecordingForge()
+			forge.heads["295"] = "live-295"
+			forge.ciStatuses[295] = "failure"
+			tc.forge(forge)
+			e := buildV2(t, v2Opts{writer: &protectedForge{recordingForge: forge, required: true}},
+				projectV2("tatara"), scmSecretV2(),
+				repoV2("tatara-operator", "tatara"),
+				taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
+				mrV2("tatara-operator", 295, "t1"))
+
+			w := e.do(t, http.MethodPost, "/tasks/t1/outcome", submitImplement)
+			if tc.wantRed {
+				require.Equal(t, http.StatusConflict, w.Code)
+				require.Equal(t, []string{"ci-red"}, decodeNotReady(t, w.Body.Bytes()).Blocked[0].Blockers)
+				require.Equal(t, tatarav1alpha1.StateUnderImplementation, e.task(t, "t1").Status.State)
+				return
+			}
+			require.Equal(t, http.StatusOK, w.Code,
+				"the forge says this merge is not blocked by the red checks; refusing it strands the task")
+			got := e.task(t, "t1")
+			require.Equal(t, tatarav1alpha1.StateAwaitingReview, got.Status.State)
+			require.Nil(t, got.Status.CIWaitSince,
+				"suppressed ci-red is not a pending hold either: the submit is fully accepted")
+		})
+	}
+}
+
+// `unstable` IS ALSO WHAT A REPO WITH NO REQUIRED CHECKS REPORTS. GitHub says
+// `blocked` when a REQUIRED check fails and `unstable` when only non-required
+// ones do - so on a repo with no branch protection, or protection with zero
+// required status contexts, EVERY red PR is `unstable`. A suppression keyed on
+// the merge state alone therefore deletes the whole ci-red axis on every
+// unprotected repo, and an agent could submit fully red CI there.
+//
+// The suppression is gated on the PR actually carrying a required context, and
+// it FAILS CLOSED: an unreadable required-context set, and a provider that
+// cannot answer the question at all (GitLab), both keep refusing.
+func TestOutcome_ImplementSubmit_RedCIIsNotSuppressedWithoutARequiredContext(t *testing.T) {
+	tests := []struct {
+		name    string
+		writer  func(*recordingForge) scm.SCMWriter
+		wantRed bool
+	}{
+		{
+			name: "a required context exists and is green: the #424 shape",
+			writer: func(f *recordingForge) scm.SCMWriter {
+				return &protectedForge{recordingForge: f, required: true}
+			},
+			wantRed: false,
+		},
+		{
+			name: "an UNPROTECTED repo reports unstable for a fully red PR and must still refuse",
+			writer: func(f *recordingForge) scm.SCMWriter {
+				return &protectedForge{recordingForge: f, required: false}
+			},
+			wantRed: true,
+		},
+		{
+			name: "an unreadable required-context set fails CLOSED",
+			writer: func(f *recordingForge) scm.SCMWriter {
+				return &protectedForge{recordingForge: f, required: true, err: errForgeDown}
+			},
+			wantRed: true,
+		},
+		{
+			name:    "a forge that cannot answer the question at all (gitlab) fails CLOSED",
+			writer:  func(f *recordingForge) scm.SCMWriter { return f },
+			wantRed: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			forge := newRecordingForge()
+			forge.heads["295"] = "live-295"
+			forge.ciStatuses[295] = "failure"
+			forge.mergeStates[295] = scm.MergeStateUnstable
+			e := buildV2(t, v2Opts{writer: tc.writer(forge)}, projectV2("tatara"), scmSecretV2(),
+				repoV2("tatara-operator", "tatara"),
+				taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
+				mrV2("tatara-operator", 295, "t1"))
+
+			w := e.do(t, http.MethodPost, "/tasks/t1/outcome", submitImplement)
+			if tc.wantRed {
+				require.Equal(t, http.StatusConflict, w.Code,
+					"nothing gates this merge, so nothing suppresses the red either")
+				require.Equal(t, []string{"ci-red"}, decodeNotReady(t, w.Body.Bytes()).Blocked[0].Blockers)
+				require.Equal(t, tatarav1alpha1.StateUnderImplementation, e.task(t, "t1").Status.State)
+				return
+			}
+			require.Equal(t, http.StatusOK, w.Code)
+			require.Equal(t, tatarav1alpha1.StateAwaitingReview, e.task(t, "t1").Status.State)
 		})
 	}
 }

@@ -542,8 +542,20 @@ func AppendCommentToMirror(ctx context.Context, c client.Client, sp objbudget.Sp
 }
 
 // syncIssueThread re-reads ONE issue thread from the forge and merges it into
-// the mirror. It is the single-forge-read path shared by the Issue reconciler's
-// cadence sync and by SyncIssueOnDemand.
+// the mirror. It is the shared path for the Issue reconciler's cadence sync and
+// SyncIssueOnDemand, and it makes TWO forge reads: the comments, and the issue
+// itself for its labels.
+//
+// The second read is what fixes adjacent bug 3. Status.Labels used to be written
+// at MINT only (SyncIssue), so a label the forge gained afterwards never reached
+// the mirror - iss-tatara-operator-622 and iss-helmfile-32 both reported
+// labels: [] against a forge carrying tatara-approved. ListIssueComments carries
+// no labels and ListOpenIssues is a repo-wide scan this cadence does not run, so
+// GetIssue is the only per-issue source there is.
+//
+// The refresh records SCM TRUTH and nothing else. Labels remain a ONE-WAY
+// projection of Issue.Status.Status (C.6): no read of a label here, or anywhere
+// downstream of here, moves that field.
 func syncIssueThread(ctx context.Context, c client.Client, sp objbudget.Spiller, reader scm.SCMReader,
 	proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, iss *tatarav1alpha1.Issue) error {
 	owner, name, err := scm.OwnerRepo(repo.Spec.URL)
@@ -555,11 +567,27 @@ func syncIssueThread(ctx context.Context, c client.Client, sp objbudget.Spiller,
 		recordMirrorSyncFailure(ctx, "Issue", err)
 		return fmt.Errorf("mirror: list comments for %s: %w", IssueKey(repo.Name, iss.Spec.Number), err)
 	}
+	// Best-effort: a failed label read leaves the mirror's existing labels alone
+	// and does NOT fail the sync. The comments are what the C.6 citation check
+	// verifies an approval against, and losing them to a label read would trade a
+	// stale label for a stalled Task.
+	content, cerr := reader.GetIssue(ctx, owner, name, iss.Spec.Number)
+	if cerr != nil {
+		log.FromContext(ctx).Info("mirror: label refresh failed; kept the mirror's existing labels",
+			"action", "mirror_label_refresh_failed", "kind", "Issue", "resource_id", iss.Name,
+			"repo", repo.Name, "number", iss.Spec.Number, "err", cerr.Error())
+	}
 	incoming := mirrorComments("Issue", proj, comments)
 	now := metav1.Now()
 	key := client.ObjectKeyFromObject(iss)
 	if err := objbudget.FitIssue(ctx, c, sp, key, func(cur *tatarav1alpha1.Issue) {
 		cur.Status.Comments = mergeComments(cur.Status.Comments, incoming, cur.Status.CommentsRetainedFrom)
+		if cerr == nil {
+			// An empty forge list CLEARS the mirror: a removed label is as much
+			// SCM truth as an added one, and a mirror that only ever grows is the
+			// stale-label bug in the other direction.
+			cur.Status.Labels = content.Labels
+		}
 		cur.Status.LastSyncedAt = &now
 		meta.SetStatusCondition(&cur.Status.Conditions, syncedCondition())
 	}); err != nil {
@@ -569,7 +597,8 @@ func syncIssueThread(ctx context.Context, c client.Client, sp objbudget.Spiller,
 	obs.MirrorSyncTotal.WithLabelValues("Issue", "ok").Inc()
 	log.FromContext(ctx).Info("mirror: synced issue thread",
 		"action", "mirror_sync_thread", "kind", "Issue", "resource_id", key.Name,
-		"repo", repo.Name, "number", iss.Spec.Number, "comments", len(incoming))
+		"repo", repo.Name, "number", iss.Spec.Number, "comments", len(incoming),
+		"labels", len(content.Labels), "labels_refreshed", cerr == nil)
 	return nil
 }
 

@@ -539,11 +539,20 @@ func UnparkForMRTerminal(t *v1alpha1.Task, to, reason string) error {
 // reason change, and StageElapsedCarrySeconds PRESERVED - so the 24h residency
 // dead-man switch stays cumulative across the migration and a Task that had
 // already burned 20 hours does not buy a fresh day by being un-parked.
-// UnparkCIRecovered releases a parked(implement-declined) Task whose decline was
-// a verdict on the INFRASTRUCTURE rather than on the change: the agent could not
-// hand the work on because the operator's own submission gate answered 409
-// ci-red, the blocker has since cleared, and the merge request tatara owns end
-// to end is green at the very head the agent gave up at.
+// UnparkCIRecovered releases a Task whose give-up was a verdict on the
+// INFRASTRUCTURE rather than on the change: the agent could not hand the work on
+// because the operator's own submission gate answered 409 ci-red, the blocker
+// has since cleared, and the merge request tatara owns end to end is green at the
+// very head the agent gave up at.
+//
+// TWO PARK REASONS, because there are two ways to give up on a red head:
+// implement-declined from the decline verdict, and awaiting-human from the
+// discuss verdict, which is the BETTER answer and was the one this primitive
+// used to refuse. Neither reason authorises anything on its own - both have far
+// more common causes that have nothing to do with CI - and the caller,
+// controller.driveCIRecoveryUnparks, is what supplies the discriminator: the
+// decline-time evidence annotations, which only those two commits ever write.
+// This function stays a guard, not the decision.
 //
 // IT IS A DRIVER'S PRIMITIVE, NOT A RE-ENTRY RULE, and the distinction is the
 // whole safety argument. implement-declined stays UnparkNever: stage.Unpark has
@@ -571,9 +580,9 @@ func UnparkForMRTerminal(t *v1alpha1.Task, to, reason string) error {
 // agent finds its own pushed work and a green pipeline, and the submission that
 // was refused goes through.
 func UnparkCIRecovered(t *v1alpha1.Task, now time.Time) error {
-	if t.Status.ParkReason != ReasonImplementDeclined {
-		return fmt.Errorf("ci-recovery un-park requires parkReason=%s, got %q",
-			ReasonImplementDeclined, t.Status.ParkReason)
+	if t.Status.ParkReason != ReasonImplementDeclined && t.Status.ParkReason != ReasonAwaitingHuman {
+		return fmt.Errorf("ci-recovery un-park requires parkReason=%s or %s, got %q",
+			ReasonImplementDeclined, ReasonAwaitingHuman, t.Status.ParkReason)
 	}
 	if t.Spec.Kind == kindTakeover {
 		return fmt.Errorf("ci-recovery un-park is never for a takeover: implement-declined there names a human push")

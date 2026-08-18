@@ -57,7 +57,11 @@ Run the repo's REAL test suite, not just a build. A build that succeeds while th
 
 Declare the merge order whenever you change more than one repo, in publish-dependency order. There is no default: getting it backwards ships a chart against an image tag that never published.
 
-End with `+"`submit_outcome(action=submitted, ...)`"+` or `+"`submit_outcome(action=declined, decline_reason=...)`"+`. declined is a correct and common answer.`,
+End with one of three outcomes:
+
+- `+"`submit_outcome(action=submitted, ...)`"+` when the change is complete and pushed.
+- `+"`submit_outcome(action=declined, decline_reason=...)`"+` when you judge this unit should not be taken. declined is a correct and common answer.
+- `+"`submit_outcome(action=discuss, reason=...)`"+` when you are blocked on something you cannot resolve yourself and a human decision is genuinely needed. discuss parks the Task at awaiting-human and resumes it on the next human comment, provided you have already opened your merge request; declined does not.`,
 		strings.Join(repoSlugs, ", "), engine, strategy, age)
 }
 

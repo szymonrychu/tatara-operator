@@ -181,6 +181,53 @@ func TestGitHubGetIssue(t *testing.T) {
 	}
 }
 
+// TestGitHubGetIssueLabels pins that GetIssue carries the forge's labels, not
+// just title/body. The Issue mirror's recurring sync has no other per-issue
+// label source: ListOpenIssues is a repo-wide scan the mirror cadence does not
+// run, so without this the mirror keeps whatever labels it was minted with.
+func TestGitHubGetIssueLabels(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload map[string]any
+		want    []string
+	}{
+		{
+			name:    "labels are returned by name",
+			payload: map[string]any{"labels": []map[string]any{{"name": "tatara-approved"}, {"name": "bug"}}},
+			want:    []string{"tatara-approved", "bug"},
+		},
+		{
+			name:    "an unlabelled issue reports no labels",
+			payload: map[string]any{},
+			want:    []string{},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/repos/o/r/issues/21" {
+					t.Fatalf("unexpected path: %q", r.URL.Path)
+				}
+				_ = json.NewEncoder(w).Encode(tc.payload)
+			}))
+			defer srv.Close()
+			c := &GitHub{apiBase: srv.URL}
+			content, err := c.GetIssue(context.Background(), "o", "r", 21)
+			if err != nil {
+				t.Fatalf("GetIssue: %v", err)
+			}
+			if len(content.Labels) != len(tc.want) {
+				t.Fatalf("Labels = %v, want %v", content.Labels, tc.want)
+			}
+			for i, w := range tc.want {
+				if content.Labels[i] != w {
+					t.Fatalf("Labels = %v, want %v", content.Labels, tc.want)
+				}
+			}
+		})
+	}
+}
+
 func TestGitHubGetIssueState(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/repos/o/r/issues/21" {

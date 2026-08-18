@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -99,6 +100,11 @@ type mirrorReader struct {
 	headSHAErr    error
 	headSHACalls  int
 	headSHAArgs   string
+	// content/contentErr and getIssueCalls cover the label refresh: the thread
+	// sync reads labels through GetIssue because ListIssueComments carries none.
+	content       scm.IssueContent
+	contentErr    error
+	getIssueCalls int
 }
 
 func (m *mirrorReader) ListIssueComments(context.Context, string, string, int) ([]scm.IssueComment, error) {
@@ -115,6 +121,14 @@ func (m *mirrorReader) ListPRComments(context.Context, string, string, int) ([]s
 		return nil, m.prCommentsErr
 	}
 	return m.prComments, nil
+}
+
+func (m *mirrorReader) GetIssue(context.Context, string, string, int) (scm.IssueContent, error) {
+	m.getIssueCalls++
+	if m.contentErr != nil {
+		return scm.IssueContent{}, m.contentErr
+	}
+	return m.content, nil
 }
 
 func (m *mirrorReader) GetDefaultBranchHeadSHA(_ context.Context, owner, repo string) (string, error) {
@@ -615,6 +629,107 @@ func TestSyncIssueOnDemand(t *testing.T) {
 	}
 	if got.Status.LastSyncedAt == nil || !got.Status.LastSyncedAt.After(dayOld.Time) {
 		t.Fatalf("lastSyncedAt was not advanced by the on-demand sync")
+	}
+}
+
+// TestSyncIssueThreadRefreshesLabels is adjacent bug 3. Issue.Status.Labels was
+// written at MINT only (SyncIssue), so a label the forge gained afterwards -
+// "tatara-approved" on iss-tatara-operator-622 and iss-helmfile-32 - never
+// reached the mirror, which kept reporting labels: []. The recurring thread sync
+// now refreshes them on the mirror cadence.
+//
+// The refresh is strictly a record of SCM TRUTH. Every case here also pins that
+// Status.Status does not move, because C.6 makes labels a ONE-WAY projection OF
+// that field: reading a label to produce a status is the violation this test
+// exists to make loud.
+func TestSyncIssueThreadRefreshesLabels(t *testing.T) {
+	tests := []struct {
+		name       string
+		mirrored   []string
+		content    scm.IssueContent
+		contentErr error
+		want       []string
+	}{
+		{
+			name:     "a label the forge gained after mint reaches the mirror",
+			mirrored: []string{"tatara"},
+			content:  scm.IssueContent{Labels: []string{"tatara", "tatara-approved"}},
+			want:     []string{"tatara", "tatara-approved"},
+		},
+		{
+			name:     "an empty forge label list clears the mirror",
+			mirrored: []string{"tatara-approved"},
+			content:  scm.IssueContent{},
+			want:     nil,
+		},
+		{
+			name:       "a failed label read keeps the labels the mirror already has",
+			mirrored:   []string{"tatara-approved"},
+			contentErr: errors.New("forge: 500"),
+			want:       []string{"tatara-approved"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			proj, repo := mirrorProject("tatara-bot"), mirrorRepo()
+
+			hourOld := metav1.NewTime(time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Second))
+			iss := &tatarav1alpha1.Issue{
+				ObjectMeta: metav1.ObjectMeta{Name: tatarav1alpha1.IssueName(repo.Name, 622), Namespace: testNS},
+				Spec: tatarav1alpha1.IssueSpec{
+					RepositoryRef: repo.Name, Number: 622, ProjectRef: proj.Name,
+					URL: "https://github.com/szymonrychu/tatara-operator/issues/622",
+				},
+				Status: tatarav1alpha1.IssueStatus{
+					Status:       "new",
+					Labels:       tc.mirrored,
+					LastSyncedAt: &hourOld,
+					Comments: []tatarav1alpha1.Comment{
+						{ExternalID: "1", Author: "tatara-bot", Body: "proposal", CreatedAt: hourOld, IsBot: true},
+					},
+					CommentCount: 1,
+				},
+			}
+			c := newMirrorClient(t, proj, repo, iss)
+
+			rd := &mirrorReader{
+				comments: []scm.IssueComment{
+					{ExternalID: "1", Author: "tatara-bot", Body: "proposal", CreatedAt: hourOld.Time},
+					{ExternalID: "2", Author: "szymonrychu", Body: "approved", CreatedAt: time.Now().UTC().Truncate(time.Second)},
+				},
+				content:    tc.content,
+				contentErr: tc.contentErr,
+			}
+
+			if err := syncIssueThread(ctx, c, &mirrorSpiller{}, rd, proj, repo, iss); err != nil {
+				t.Fatalf("syncIssueThread: %v", err)
+			}
+			if rd.getIssueCalls != 1 {
+				t.Fatalf("GetIssue calls = %d, want EXACTLY 1 (labels ride one extra read, never a per-label one)", rd.getIssueCalls)
+			}
+
+			got := getIssueCR(t, c, iss.Name)
+			if len(got.Status.Labels) != len(tc.want) {
+				t.Fatalf("labels = %v, want %v", got.Status.Labels, tc.want)
+			}
+			for i, w := range tc.want {
+				if got.Status.Labels[i] != w {
+					t.Fatalf("labels = %v, want %v", got.Status.Labels, tc.want)
+				}
+			}
+			// The comments/LastSyncedAt behaviour the label refresh rides on is
+			// unchanged, including when the label read failed.
+			if len(got.Status.Comments) != 2 {
+				t.Fatalf("comments = %d, want 2", len(got.Status.Comments))
+			}
+			if got.Status.LastSyncedAt == nil || !got.Status.LastSyncedAt.After(hourOld.Time) {
+				t.Fatalf("lastSyncedAt was not advanced")
+			}
+			if got.Status.Status != "new" {
+				t.Fatalf("status = %q, want %q: a label must NEVER move status (C.6)", got.Status.Status, "new")
+			}
+		})
 	}
 }
 

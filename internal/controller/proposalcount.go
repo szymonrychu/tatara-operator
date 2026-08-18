@@ -107,6 +107,34 @@ func proposalPending(iss *tatarav1alpha1.Issue, botLogin string) bool {
 	return true
 }
 
+// anchorlessProposals names the Issue CRs that read as tatara proposals from the
+// forge side - open, bot-authored, valid tatara-proposed-by marker - but carry NO
+// Spec.ProposalBodyHash. It is a pure predicate over the list the caller already
+// holds; see obs.AnchorlessProposals for why the class matters and why nothing
+// repairs it.
+//
+// It keys on the ANCHOR and not on Spec.ProposalKind, because the two are written
+// together and the reconciler backfill (issue_controller.go) itself refuses to
+// stamp a kind onto an anchorless Issue. An empty anchor is therefore the whole
+// signature, and it is the exact field autoApproveApplies fails closed on.
+func anchorlessProposals(issues []tatarav1alpha1.Issue, botLogin string) []string {
+	var out []string
+	for i := range issues {
+		iss := &issues[i]
+		if iss.Status.State != "open" || iss.Spec.ProposalBodyHash != "" {
+			continue
+		}
+		if !issueAuthoredByBot(iss, botLogin) {
+			continue
+		}
+		if tatarav1alpha1.ProposalKindFromBody(iss.Status.Body) == "" {
+			continue
+		}
+		out = append(out, iss.Name)
+	}
+	return out
+}
+
 // proposalDisplayStatus derives the THREE display statuses the <proposal_history>
 // block renders. Issue.Status.Status alone cannot distinguish "discarded" from
 // "never triaged", so a closed-and-not-approved issue reads as declined: a

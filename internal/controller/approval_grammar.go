@@ -146,6 +146,62 @@ var ApprovalRefusals = []string{
 	ApprovalRefusedPlanHashMismatch,
 }
 
+// The AUTO-APPROVE AXES. autoApproveApplies is fail-closed on five gates and
+// every one of them collapses into the single ApprovalRefusedNoMaintainer
+// reason, so the refusal names the SYMPTOM ("no maintainer commented") and never
+// the CAUSE. These are the causes, and they are the `axis` label on
+// operator_auto_approve_refused_total plus the `axis` field of the
+// action=auto_approve_refused INFO log. Like ApprovalRefusals they are a CLOSED,
+// Prometheus-label-safe vocabulary; the empty string is the GRANT.
+const (
+	// AutoApproveRefusedFlagOff: the Project has autoApproveTataraProposals
+	// false, which is the default and is exactly the pre-carve-out behaviour.
+	// The remedy is a Project config change, and it is the only axis whose
+	// remedy is a decision rather than a repair.
+	AutoApproveRefusedFlagOff = "flag-off"
+	// AutoApproveRefusedNotInScope: the Issue is closed, done or rejected. On
+	// the production path this is UNREACHABLE - VerifyApprovalDeclared returns
+	// on the same predicate first - and it is kept because autoApproveApplies
+	// must not trust its caller for a decision that removes the last human gate.
+	// A human's CLOSE is that human's veto.
+	AutoApproveRefusedNotInScope = "issue-not-in-scope"
+	// AutoApproveRefusedNotBotAuthored: Status.Author is not the project's
+	// botLogin, or either of the two is empty. It covers a genuinely
+	// human-authored issue (correct refusal), a project with no botLogin
+	// configured, and a mirror that has not yet learned the author.
+	AutoApproveRefusedNotBotAuthored = "not-bot-authored"
+	// AutoApproveRefusedNoMarker: the body carries no valid tatara-proposed-by
+	// marker. The usual cause is not tampering but PROVENANCE THAT WAS NEVER
+	// CLAIMED: an issue filed through the generic issue_write action=create path
+	// declares no proposalKind, deliberately (handlers_v2.go argues the
+	// prompt-injection case), so it is not a tatara proposal and never
+	// auto-approves. The remedy is to give the filer a declared kind, NEVER to
+	// sniff the marker out of an agent-written body.
+	AutoApproveRefusedNoMarker = "no-proposal-marker"
+	// AutoApproveRefusedAnchorMismatch: the body no longer matches
+	// Spec.ProposalBodyHash, INCLUDING the empty-anchor case
+	// (ProposalBodyMatchesAnchor fails closed on ""). Two very different causes
+	// share it, and telling them apart needs the CR: a body that diverged is the
+	// tamper guard doing its job, while an EMPTY anchor is a proposal whose
+	// Issue CR was minted by ensureIssueCR (the mirror path, which writes no
+	// anchor) rather than by mintIssueCR - re-created after its filing Task was
+	// reaped, or filed by a build older than the anchor. The empty-anchor shape
+	// is permanent: nothing ever back-fills the anchor, and nothing may, since
+	// an anchor derived from the mirrored body would anchor the body to itself
+	// and delete the tamper guard entirely.
+	AutoApproveRefusedAnchorMismatch = "anchor-mismatch"
+)
+
+// AutoApproveRefusals is the CLOSED axis vocabulary, in the order
+// autoApproveRefusal evaluates them.
+var AutoApproveRefusals = []string{
+	AutoApproveRefusedFlagOff,
+	AutoApproveRefusedNotInScope,
+	AutoApproveRefusedNotBotAuthored,
+	AutoApproveRefusedNoMarker,
+	AutoApproveRefusedAnchorMismatch,
+}
+
 // ApprovalInScope is C.6 clause (2), narrowed to LIVE issues (fix L3-14): a
 // human closing one issue of a multi-issue Task must not make approval require a
 // citation on a CLOSED thread, forever.
@@ -424,19 +480,48 @@ func verifyOneIssue(iss *tatarav1alpha1.Issue, proj *tatarav1alpha1.Project,
 // so any post-filing body change (scope edit, marker forgery) diverges from the
 // anchor and refuses. Fail-closed on a missing anchor (older-build proposal) too.
 func autoApproveApplies(iss *tatarav1alpha1.Issue, proj *tatarav1alpha1.Project, botLogin string) bool {
+	return autoApproveRefusal(iss, proj, botLogin) == ""
+}
+
+// autoApproveRefusal is autoApproveApplies with its verdict SPELLED OUT: it
+// returns the axis that refused, or "" for a grant. The decision is byte-
+// identical - autoApproveApplies is now defined as this function's emptiness -
+// and the only new thing is that the refusal has a name.
+//
+// IT EXISTS BECAUSE THE REFUSAL WAS UNATTRIBUTABLE IN PRODUCTION. Every failing
+// axis collapses into the single ApprovalRefusedNoMaintainer reason, which reads
+// as "no maintainer has commented" - true, but not the cause. On 2026-08-16 an
+// implement agent on task mt-i-helmfile-27 was refused exactly that on
+// iss-helmfile-32, could not tell which of the five gates had closed, concluded
+// it needed a maintainer comment it had no way to obtain, and spent its turn on
+// action=discuss instead. The Task parked awaiting-human and delivery stalled
+// for a day. The five causes have five different remedies - a project flag, a
+// human's close, a botLogin config, a filer that declared no proposalKind, an
+// anchor that was never written - and no amount of reading the grammar
+// distinguishes them after the fact, because the Issue CR the verdict was about
+// is routinely reaped before anyone looks.
+//
+// THE AXES ARE ORDERED CHEAPEST-AND-MOST-STRUCTURAL FIRST, so the reported axis
+// is the most actionable one: a project with the flag off is reported as
+// flag-off even if its issue is also anchorless, because turning the flag on is
+// the thing to do first.
+func autoApproveRefusal(iss *tatarav1alpha1.Issue, proj *tatarav1alpha1.Project, botLogin string) string {
 	if !proj.Spec.AutoApproveTataraProposals {
-		return false
+		return AutoApproveRefusedFlagOff
 	}
 	if !ApprovalInScope(iss) {
-		return false
+		return AutoApproveRefusedNotInScope
 	}
 	if botLogin == "" || iss.Status.Author == "" || iss.Status.Author != botLogin {
-		return false
+		return AutoApproveRefusedNotBotAuthored
 	}
 	if tatarav1alpha1.ProposalKindFromBody(iss.Status.Body) == "" {
-		return false
+		return AutoApproveRefusedNoMarker
 	}
-	return tatarav1alpha1.ProposalBodyMatchesAnchor(iss.Status.Body, iss.Spec.ProposalBodyHash)
+	if !tatarav1alpha1.ProposalBodyMatchesAnchor(iss.Status.Body, iss.Spec.ProposalBodyHash) {
+		return AutoApproveRefusedAnchorMismatch
+	}
+	return ""
 }
 
 // autoApprovalEvidence is the ApprovalEvidence the carve-out records: Auto=true,
@@ -489,6 +574,20 @@ func (g *GrammarVerifier) VerifyApprovalDeclared(ctx context.Context, proj *tata
 	repo := approvalRepo(ctx, g.Client, iss)
 	ev, reason := verifyOneIssue(iss, proj, repo, botLogin, citations, declared)
 	if reason != "" {
+		// WHICH AUTO-APPROVE AXIS REFUSED, and only on the one reason the
+		// carve-out can produce: no-maintainer-comment is emitted BOTH when a
+		// thread genuinely has no maintainer comment and when the carve-out
+		// declined to stand in for one, and those are different failures with
+		// different remedies. The axis is RECOMPUTED here rather than threaded
+		// out of verifyOneIssue because that function is pure, holds no metrics
+		// handle, and is called from nowhere else - recomputing costs one hash
+		// of a body already in memory and buys no signature churn.
+		if reason == ApprovalRefusedNoMaintainer {
+			axis := autoApproveRefusal(iss, proj, botLogin)
+			log.FromContext(ctx).Info("auto-approve carve-out refused",
+				"action", "auto_approve_refused", "issue", iss.Name, "axis", axis)
+			g.Metrics.AutoApproveRefused(axis)
+		}
 		log.FromContext(ctx).Info("approval refused",
 			"action", "approval_refused", "issue", iss.Name, "reason", reason, "declared", declared)
 		g.Metrics.ApprovalRefused(reason)

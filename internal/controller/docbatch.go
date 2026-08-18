@@ -311,14 +311,42 @@ func docBatchingConfigured(proj *tatarav1alpha1.Project) bool {
 
 // docBatchInFlight returns the name of a documentation batch that has not settled
 // yet, or "".
+//
+// A PARK IS SETTLED ONLY IF NOTHING CAN RE-ENTER IT, and "parked" alone does not
+// answer that. submit_outcome(action=discuss) - the resumable exit a
+// documentation batch was given so it can ask a question instead of only
+// declining - parks awaiting-human, which is class UnparkHuman: the next human
+// comment wakes the batch and it goes on to open its docs PR. Skipping it here
+// let the next cron tick mint a SECOND batch, and the first one waking up
+// afterwards is two doc pods pushing two PRs at the same docs repo and two
+// release trains - the exact collision this guard exists to prevent.
+//
+// COUNTING IT IN FLIGHT IS THE FIX, NOT A "batch attempted" MARKER. The marker
+// is already written: reapOne calls ResolveDocBatch on every parked batch, and a
+// batch that ran a pod (podRuns > 0, which a batch that submitted an outcome
+// always has) stamps documentedBy on its members within one reap interval - so
+// the covered set does NOT re-mint over the identical sources, and a second
+// marker would only duplicate that. What is left unguarded is the RACE, and only
+// an in-flight answer closes it.
+//
+// It is bounded exactly like every other awaiting-human park: the batch is reaped
+// at ParkRetention and the next night mints freely. A park NOTHING can re-enter
+// (UnparkNever - implement-declined, stage-deadline, operator-error, ...) stays
+// settled and must, or one wedged batch would block documentation for seven days.
 func docBatchInFlight(tasks []tatarav1alpha1.Task, project string) string {
 	for i := range tasks {
 		t := &tasks[i]
 		if t.Spec.ProjectRef != project || t.Spec.Kind != DocBatchKind || len(t.Spec.DocumentsTasks) == 0 {
 			continue
 		}
-		if t.Status.State == "" || tatarav1alpha1.TaskDone(t) || tatarav1alpha1.Parked(t) {
+		if t.Status.State == "" || tatarav1alpha1.TaskDone(t) {
 			continue
+		}
+		if tatarav1alpha1.Parked(t) {
+			class, ok := stage.UnparkClassFor(t.Status.ParkReason)
+			if !ok || class == stage.UnparkNever {
+				continue
+			}
 		}
 		return t.Name
 	}

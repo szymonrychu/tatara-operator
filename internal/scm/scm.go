@@ -205,7 +205,72 @@ const (
 	MergeStateDirty   MergeState = "dirty"   // conflict with the base branch
 	MergeStateBlocked MergeState = "blocked" // mergeable-blocked (draft, failing required checks)
 	MergeStateBehind  MergeState = "behind"  // behind base; needs an update but no conflict
+
+	// MergeStateUnstable is the forge saying MERGEABLE WITH RED CHECKS: the
+	// merge is not blocked, and the checks that are red are not the ones that
+	// block it. GitHub's `unstable`. GitLab has no equivalent and never returns
+	// this, so every GitLab merge request keeps today's fail-closed behaviour.
+	//
+	// IT IS NOT SUFFICIENT ON ITS OWN to conclude a red check is harmless: see
+	// CIRedSuppressed, which is the only thing that may make that call.
+	MergeStateUnstable MergeState = "unstable"
 )
+
+// RequiredCheckLister is an OPTIONAL SCMWriter capability: report whether a
+// pull/merge request carries at least one REQUIRED status context.
+//
+// It is optional for the same reason PRCommentLister and DeployWatcher are -
+// only one provider can answer it. It is deliberately NOT on SCMWriter: a
+// mandatory method would force every adapter to invent an answer, and the only
+// safe invented answer is "no", which is exactly what a missing implementation
+// already means here.
+type RequiredCheckLister interface {
+	// HasRequiredChecks reports whether the pull/merge request has at least one
+	// status context that its base branch's protection makes REQUIRED. An error
+	// means UNDETERMINED, never "no".
+	HasRequiredChecks(ctx context.Context, repoURL, token string, number int) (bool, error)
+}
+
+// CIRedSuppressed reports whether a RED CI verdict on this merge request may be
+// ignored because the FORGE ITSELF says the red checks are not what blocks the
+// merge. It is the single decision both gates that judge red CI consult - the
+// /outcome readiness gate and the operator's merge corridor - because the two
+// derive CIStatus from the identical fold, and a carve-out on one side only
+// moves the wedge rather than removing it: a submission the readiness gate lets
+// through would be met by an enterCIRed park one whole review cycle later.
+//
+// IT IS TWO CONDITIONS, AND THAT IS THE WHOLE POINT.
+//
+//  1. The forge reports `unstable`. GitHub says `blocked` when a REQUIRED check
+//     fails and `unstable` when only non-required ones do (tatara-helmfile#424:
+//     GitGuardian red, helmfile-diff - the sole required context - green).
+//  2. The merge request actually HAS a required context. `unstable` is also what
+//     a repo with NO branch protection, or protection with zero required status
+//     contexts, reports for EVERY red pull request - so condition 1 alone
+//     silently deletes the entire ci-red axis on every unprotected repo, and
+//     lets an agent submit, and the operator merge, on fully red CI.
+//
+// IT FAILS CLOSED, on every axis: any other merge state, an unreadable
+// required-context set, and a provider that cannot answer the question at all
+// all return false. That is the opposite of the readiness gate's fail-OPEN
+// behaviour on an unreadable forge, and deliberately so: failing open there
+// costs one accepted submission, failing open HERE would stop honouring red CI
+// entirely. A non-nil error is returned for the caller to log; the bool is
+// always false with it.
+func CIRedSuppressed(ctx context.Context, w SCMWriter, repoURL, token string, number int, ms MergeState) (bool, error) {
+	if ms != MergeStateUnstable {
+		return false, nil
+	}
+	lister, ok := w.(RequiredCheckLister)
+	if !ok {
+		return false, nil
+	}
+	required, err := lister.HasRequiredChecks(ctx, repoURL, token, number)
+	if err != nil {
+		return false, err
+	}
+	return required, nil
+}
 
 // Suggestion is one inline code suggestion on a PR/MR.
 type Suggestion struct {
@@ -322,10 +387,16 @@ type IssueComment struct {
 	CreatedAt  time.Time
 }
 
-// IssueContent holds the title and body of an issue fetched from the SCM.
+// IssueContent holds the title, body and labels of an issue fetched from the SCM.
 type IssueContent struct {
 	Title string
 	Body  string
+	// Labels are the forge's labels on the issue, normalised to bare names the
+	// same way ListOpenIssues normalises IssueRef.Labels so the two sources
+	// cannot disagree. It is the only per-issue label source the Issue mirror's
+	// recurring sync has: ListIssueComments carries none and ListOpenIssues is a
+	// repo-wide scan the mirror cadence does not run.
+	Labels []string
 }
 
 // SCMReader lists open work for the cron scan loop; *GitHub and *GitLab satisfy it.

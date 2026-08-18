@@ -395,11 +395,53 @@ func ParkTask(ctx context.Context, c client.Client, sp objbudget.Spiller, m *obs
 		return fmt.Errorf("stage: clear turn annotations on parked task %s: %w", key.Name, err)
 	}
 
+	// STEP 2c: the ci-decline evidence is scoped to the ONE refusal that wrote it,
+	// and this park is not that refusal. See clearDeclineCIAnnotations.
+	if err := clearDeclineCIAnnotations(ctx, c, task); err != nil {
+		return fmt.Errorf("stage: clear decline ci evidence on parked task %s: %w", key.Name, err)
+	}
+
 	l.Info("task parked",
 		"action", "task_parked", "resource_id", task.Name, "task", task.Name,
 		"state", from, "park_reason", reason, "kind", task.Spec.Kind)
 	m.TaskParked(from, reason)
 	return nil
+}
+
+// clearDeclineCIAnnotations retires the ci-decline evidence on a park that is
+// not the refusal the evidence describes.
+//
+// AnnDeclineCI and AnnDeclineHeads describe ONE 409 pr-not-ready the readiness
+// gate answered on the ci-red axis, at ONE head (restapi.recordCIRedRefusal is
+// their only writer). driveCIRecoveryUnparks reads their presence as a LICENCE
+// to un-park, so evidence that outlives its refusal is a licence some later,
+// unrelated park inherits: the live-pod eviction (livepods.go), admission
+// starvation and the podwatch failure paths all park a Task that never refused
+// anything, and a flake re-running green at the same head then released them.
+//
+// THE CLEAR HAS TO BE A METADATA WRITE AND IT HAS TO BE HERE. Doing it in
+// internal/stage's re-arm would be a false safety net: stage is a status-only
+// mutator, and every persist path behind it (ApplyUnpark, applyCIRecoveryUnpark,
+// applyRetiredUnpark, objbudget.FitTask) ends in Status().Update, which does not
+// persist metadata. It would compile, pass an in-memory test, and do nothing.
+//
+// IT CANNOT RACE THE GIVE-UP THAT NEEDS THE EVIDENCE. The discuss and declined
+// verdicts park through restapi/outcome.go's o.commit, which is
+// objbudget.FitTask plus stage.Park and never routes through ParkTask - that is
+// exactly why commit carries its own TaskParked() emit and its own
+// agent.DeleteWrapper. So this clear never runs between the refusal and the
+// give-up that inherits it.
+func clearDeclineCIAnnotations(ctx context.Context, c client.Client, task *tatarav1alpha1.Task) error {
+	return patchTaskAnnotations(ctx, c, task, func(fresh *tatarav1alpha1.Task) bool {
+		_, hadCI := fresh.Annotations[tatarav1alpha1.AnnDeclineCI]
+		_, hadHeads := fresh.Annotations[tatarav1alpha1.AnnDeclineHeads]
+		if !hadCI && !hadHeads {
+			return false // nothing to clear: skip the write entirely
+		}
+		delete(fresh.Annotations, tatarav1alpha1.AnnDeclineCI)
+		delete(fresh.Annotations, tatarav1alpha1.AnnDeclineHeads)
+		return true
+	})
 }
 
 // UpgradeDeclinedTakeoverPark is the write half of

@@ -492,10 +492,22 @@ func forgeItemFromMirror(iss *tatarav1alpha1.Issue) ForgeItem {
 	}}
 }
 
-// hasNonBotPendingEvent reports whether t carries a HUMAN pending event.
+// hasNonBotPendingEvent reports whether t carries an UNSPENT human pending
+// event - the THIRD copy of stage.hasNonBotEvent's predicate (livepods.go's
+// hasFreshNonBotEvent is the second), and it carries the same UnparkConsumedAt
+// conjunct for the same reason: one comment releases exactly one park. Without
+// it a reply already spent releasing an awaiting-human park could still trigger
+// resumeNoReentryParks' sever-and-re-mint if the Task later parked under an
+// UnparkNever reason without the event being drained.
+//
+// strand.go's strandedCandidate reads the same predicate INVERTED, and the
+// conjunct keeps the two complementary rather than splitting them: an event this
+// one now treats as spent is one resumeNoReentryParks will not act on, so the
+// stranded-park driver is exactly the thing that must pick that Task up.
 func hasNonBotPendingEvent(t *tatarav1alpha1.Task, botLogin string) bool {
 	for i := range t.Status.PendingEvents {
-		if t.Status.PendingEvents[i].Author != botLogin {
+		if t.Status.PendingEvents[i].Author != botLogin &&
+			t.Status.PendingEvents[i].UnparkConsumedAt == nil {
 			return true
 		}
 	}

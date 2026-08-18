@@ -44,6 +44,7 @@ type OperatorMetrics struct {
 	memoryProvisionDuration       prometheus.Histogram
 	memoryStacks                  *prometheus.GaugeVec
 	autoApproveTotal              *prometheus.CounterVec
+	autoApproveRefusedTotal       *prometheus.CounterVec
 	approvalRefusedTotal          *prometheus.CounterVec
 	tasksInflightKind             *prometheus.GaugeVec
 	agentBootRaceRequeue          prometheus.Counter
@@ -156,6 +157,20 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_auto_approve_total",
 			Help: "Auto-approve releases (item 4a) by proposal kind (brainstorm|incident|refine).",
 		}, []string{"kind"}),
+		// The CAUSE behind operator_approval_refused_total{reason="no-maintainer-comment"},
+		// which is the terminal symptom of five different fail-closed gates and
+		// names none of them. Without this series a live refusal cannot be
+		// attributed at all: the Issue CR the verdict was about is routinely
+		// reaped before anyone looks, and the five causes (flag off, a human's
+		// close, a botLogin problem, a filer that declared no proposalKind, an
+		// Issue CR minted by the mirror instead of by the proposal filer so it
+		// carries no integrity anchor) have five different remedies. It fires
+		// ONLY on that one reason, so it is strictly a decomposition of it and
+		// never exceeds it.
+		autoApproveRefusedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_auto_approve_refused_total",
+			Help: "Auto-approve carve-out refusals by the AXIS that fail-closed (flag-off|issue-not-in-scope|not-bot-authored|no-proposal-marker|anchor-mismatch). Decomposes operator_approval_refused_total{reason=\"no-maintainer-comment\"}, which names the symptom and not the cause.",
+		}, []string{"axis"}),
 		approvalRefusedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_approval_refused_total",
 			Help: "Approval verifications the operator refused, by structural reason.",
@@ -525,6 +540,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.memoryProvisionDuration,
 		m.memoryStacks,
 		m.autoApproveTotal,
+		m.autoApproveRefusedTotal,
 		m.approvalRefusedTotal,
 		m.tasksInflightKind,
 		m.agentBootRaceRequeue,
@@ -920,6 +936,21 @@ func (m *OperatorMetrics) ApprovalRefused(reason string) {
 		return
 	}
 	m.approvalRefusedTotal.WithLabelValues(reason).Inc()
+}
+
+// AutoApproveRefused increments operator_auto_approve_refused_total for the axis
+// the carve-out fail-closed on. axis is never empty at the call site: the empty
+// string is the GRANT, and a grant reaches no refusal path.
+func (m *OperatorMetrics) AutoApproveRefused(axis string) {
+	if m == nil {
+		return
+	}
+	m.autoApproveRefusedTotal.WithLabelValues(axis).Inc()
+}
+
+// AutoApproveRefusedCounter returns the counter for axis for test assertions.
+func (m *OperatorMetrics) AutoApproveRefusedCounter(axis string) prometheus.Counter {
+	return m.autoApproveRefusedTotal.WithLabelValues(axis)
 }
 
 // ApprovalRefusedCounter returns the counter for reason for test assertions.

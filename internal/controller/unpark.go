@@ -519,19 +519,53 @@ func (r *ProjectReconciler) applyRetiredUnpark(ctx context.Context, t *tatarav1a
 // so the discriminator is captured at decline time (AnnDeclineCI) and only
 // CIEvidenceRed - the one value the submission gate actually refuses on - counts.
 //
-// FIVE CONDITIONS, ALL REQUIRED, and each one closes a way of getting this
-// wrong: the park is implement-declined on a non-takeover Task; the decline-time
+// SIX CONDITIONS, ALL REQUIRED, and each one closes a way of getting this
+// wrong: the park is one of the two a red pipeline produces - implement-declined
+// from the decline verdict, awaiting-human from the discuss verdict, see
+// ciRecoverablePark - on a non-takeover Task; the decline-time
 // evidence says CI was RED; the merge requests tatara may act on are green NOW;
 // their heads still fingerprint to what the decline was made against (so the
 // green is about THE SAME CODE, and a merge request that has since closed,
-// merged or flipped to `external` drops out of the set and can never match); and
-// the bound has room.
+// merged or flipped to `external` drops out of the set and can never match); the
+// bound has room; and THE PROJECT HAS A LIVE-POD SLOT.
+//
+// The last one is not decoration. UnparkCIRecovered re-arms the LIVE state the
+// Task parked in, so the next reconcile mints an agent pod - and this driver was
+// the ONE un-park path that never asked the ceiling's question, which every
+// other one does (stage.Unpark's liveRoomDecline, the reaper's unparkFires
+// probe, ownership_redeliver). A refusal here spends NOTHING: no lap of the
+// absolute bound, no head latch, and the next pass retries - which is the same
+// treatment DeclineNoLiveRoom gets, and for the same reason.
 func (r *ProjectReconciler) driveCIRecoveryUnparks(ctx context.Context, proj *tatarav1alpha1.Project, now time.Time) error {
 	var tl tatarav1alpha1.TaskList
 	if err := r.List(ctx, &tl, client.InNamespace(proj.Namespace)); err != nil {
 		return fmt.Errorf("unpark: list tasks for the ci recovery: %w", err)
 	}
 	l := log.FromContext(ctx)
+
+	// HOISTED, once per pass - the same reasoning as driveUnparks' identical
+	// hoist (tatara-operator#368: countLive is an unindexed namespace List and
+	// this loop runs over every Task in the project). It is a BUDGET, not a
+	// boolean: a batch of recoveries that all fired off one "yes" would admit the
+	// whole batch past a ceiling of one. It is computed only if this batch holds
+	// a candidate that would resume a live state, and a List error degrades to
+	// "no room", which is always the safe direction.
+	liveRoomBudget := 0
+	for i := range tl.Items {
+		t := &tl.Items[i]
+		if t.Spec.ProjectRef == proj.Name && tatarav1alpha1.Parked(t) &&
+			ciRecoverablePark(t.Status.ParkReason) && stage.Live(t.Status.State) {
+			live, listErr := countLive(ctx, r.Client, proj)
+			if listErr != nil {
+				l.Error(listErr, "unpark: live capacity check failed; treating this ci-recovery pass as no room",
+					"action", "ci_recovery_live_room_error", "project", proj.Name)
+			} else if ceiling := tatarav1alpha1.MaxLivePods(proj); ceiling > len(live) {
+				liveRoomBudget = ceiling - len(live)
+			}
+			break
+		}
+	}
+
 	var firstErr error
 	for i := range tl.Items {
 		if ctx.Err() != nil {
@@ -541,7 +575,7 @@ func (r *ProjectReconciler) driveCIRecoveryUnparks(ctx context.Context, proj *ta
 		if t.Spec.ProjectRef != proj.Name || !tatarav1alpha1.Parked(t) {
 			continue
 		}
-		if t.Status.ParkReason != stage.ReasonImplementDeclined || t.Spec.Kind == stage.KindTakeover {
+		if !ciRecoverablePark(t.Status.ParkReason) || t.Spec.Kind == stage.KindTakeover {
 			continue
 		}
 		declineCI := t.Annotations[tatarav1alpha1.AnnDeclineCI]
@@ -569,6 +603,16 @@ func (r *ProjectReconciler) driveCIRecoveryUnparks(ctx context.Context, proj *ta
 		if t.Annotations[tatarav1alpha1.AnnCIRecoveryHeads] == heads {
 			continue // this head has had its one lap
 		}
+		// BEFORE the bound is charged, deliberately: a Task refused for capacity
+		// has not had its recovery, so charging it a lap would spend the whole
+		// bound on a busy project without ever running a pod.
+		wasLive := stage.Live(t.Status.State)
+		if wasLive && liveRoomBudget <= 0 {
+			l.Info("ci recovery deferred: the project is at its live-pod ceiling; the next pass retries",
+				"action", "ci_recovery_no_live_room", "resource_id", t.Name,
+				"park_reason", t.Status.ParkReason, "project", proj.Name)
+			continue
+		}
 		spent := ciRecoveryUnparks(t)
 		if spent >= tatarav1alpha1.MaxCIRecoveryUnparks {
 			// LAST, deliberately: reaching this line means every other condition
@@ -593,20 +637,47 @@ func (r *ProjectReconciler) driveCIRecoveryUnparks(ctx context.Context, proj *ta
 			}
 			continue
 		}
+		// READ BEFORE THE RELEASE. applyCIRecoveryUnpark writes the un-parked
+		// object back over t, and the un-park clears parkReason - so a label read
+		// after it is unconditionally empty, which is exactly the bug
+		// ownership_redeliver.go carried for a release.
+		fromReason := t.Status.ParkReason
 		if err := r.applyCIRecoveryUnpark(ctx, t, now); err != nil {
-			l.Error(err, "unpark: release a ci-blocked decline",
+			l.Error(err, "unpark: release a ci-blocked give-up",
 				"action", "ci_recovery_error", "resource_id", t.Name)
 			if firstErr == nil {
 				firstErr = err
 			}
 			continue
 		}
-		l.Info("released a decline the infrastructure caused: ci is green again at the head it was declined at",
+		if wasLive {
+			// SPEND the budget: this Task now occupies one of the slots the room
+			// check above answered for, and the next candidate in this same loop
+			// must see the remaining room, not the room this pass STARTED with.
+			liveRoomBudget--
+		}
+		l.Info("released a give-up the infrastructure caused: ci is green again at the head it was given up at",
 			"action", "ci_recovery_unparked", "resource_id", t.Name, "state", t.Status.State,
-			"kind", t.Spec.Kind, "heads", heads, "unparks", spent+1, "project", proj.Name)
-		r.Metrics.TaskUnparked(stage.ReasonImplementDeclined, obs.UnparkClassCIRecovered)
+			"park_reason", fromReason, "kind", t.Spec.Kind, "heads", heads,
+			"unparks", spent+1, "project", proj.Name)
+		r.Metrics.TaskUnparked(fromReason, obs.UnparkClassCIRecovered)
 	}
 	return firstErr
+}
+
+// ciRecoverablePark names the two parks a red pipeline can produce, and it is
+// deliberately a list rather than a class: both reasons have other, far more
+// common causes, so the reason alone never authorises anything here. It is
+// conditions 3-5 - the decline-time evidence, the live re-derivation to green
+// and the head fingerprint - that decide, and only the decline and discuss
+// commits ever write that evidence.
+//
+// awaiting-human is the discuss half. An agent that cannot submit because the
+// readiness gate answered 409 ci-red may decline or may ask a human, and asking
+// is the better answer; before this it was also the only one that could never be
+// re-driven.
+func ciRecoverablePark(reason string) bool {
+	return reason == stage.ReasonImplementDeclined || reason == stage.ReasonAwaitingHuman
 }
 
 // ciRecoveryUnparks reads the spent-lap count. An unparsable value reads as the
@@ -656,7 +727,7 @@ func (r *ProjectReconciler) applyCIRecoveryUnpark(ctx context.Context, t *tatara
 		if err := getter.Get(ctx, key, fresh); err != nil {
 			return err
 		}
-		if !tatarav1alpha1.Parked(fresh) || fresh.Status.ParkReason != stage.ReasonImplementDeclined {
+		if !tatarav1alpha1.Parked(fresh) || !ciRecoverablePark(fresh.Status.ParkReason) {
 			return nil // raced past this park; the bound is stamped, so never retried
 		}
 		if err := stage.UnparkCIRecovered(fresh, now); err != nil {

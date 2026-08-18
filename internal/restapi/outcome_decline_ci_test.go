@@ -85,6 +85,92 @@ func TestOutcome_Implement_ASecondDeclineOverwritesTheEvidence(t *testing.T) {
 	require.NotContains(t, got.Annotations, tatarav1alpha1.AnnDeclineHeads)
 }
 
+// DISCUSS IS THE SAME AMBIGUITY WEARING A DIFFERENT VERDICT - but only when the
+// agent actually hit the wall. discuss parks awaiting-human, which the CI
+// recovery driver accepts, so stamping it off the MIRROR alone made every
+// genuine question asked while an unrelated flake happened to be red into a
+// licence to un-park a Task with the human's answer still outstanding. Asking a
+// question is NOT giving up on a red pipeline, and nothing in the mirror can
+// tell the two apart.
+func TestDiscussAloneNeverStampsTheCIEvidence(t *testing.T) {
+	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
+		mrV2("tatara-operator", 295, "t1", func(mr *tatarav1alpha1.MergeRequest) {
+			mr.Status.Ownership = tatarav1alpha1.OwnershipTatara
+			mr.Status.CIStatus = "red"
+			mr.Status.HeadSHA = "4c11cad2"
+		}))
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"implement","payload":{"action":"discuss","reason":"which of the two migrations do you want"}}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	got := e.task(t, "t1")
+	require.NotContains(t, got.Annotations, tatarav1alpha1.AnnDeclineCI,
+		"a question a human owes an answer to must never be auto-un-parked by the ci recovery")
+	require.NotContains(t, got.Annotations, tatarav1alpha1.AnnDeclineHeads)
+}
+
+// WHAT DOES record it is the refusal itself: the operator's own readiness gate
+// answering 409 pr-not-ready on the ci-red axis IS the "I could not hand this
+// on because the infrastructure said no" fact the recovery is keyed to. A
+// discuss (or a decline) that follows it inherits the evidence unchanged.
+func TestACIRedRefusalRecordsTheEvidenceAndADiscussInheritsIt(t *testing.T) {
+	forge := newRecordingForge()
+	forge.heads["295"] = "4c11cad2"
+	forge.ciStatuses[295] = "failure"
+	e := buildV2(t, v2Opts{writer: forge}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
+		mrV2("tatara-operator", 295, "t1", func(mr *tatarav1alpha1.MergeRequest) {
+			mr.Status.Ownership = tatarav1alpha1.OwnershipTatara
+			mr.Status.CIStatus = "red"
+			mr.Status.HeadSHA = "4c11cad2"
+		}))
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", submitImplement)
+	require.Equal(t, http.StatusConflict, w.Code, w.Body.String())
+
+	got := e.task(t, "t1")
+	require.Equal(t, tatarav1alpha1.CIEvidenceRed, got.Annotations[tatarav1alpha1.AnnDeclineCI])
+	require.Equal(t, tatarav1alpha1.MergeRequestName("tatara-operator", 295)+"@4c11cad2",
+		got.Annotations[tatarav1alpha1.AnnDeclineHeads])
+
+	w = e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"implement","payload":{"action":"discuss","reason":"ci is red at 4c11cad2 and it is not my change"}}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	got = e.task(t, "t1")
+	require.Equal(t, tatarav1alpha1.CIEvidenceRed, got.Annotations[tatarav1alpha1.AnnDeclineCI],
+		"the refusal is the writer; the give-up that follows it neither re-derives nor drops it")
+}
+
+// AND A CLEAN READINESS PASS VOIDS IT. Evidence that outlives the refusal it
+// describes is a licence an unrelated later park inherits - the shape the whole
+// narrowing exists to prevent.
+func TestACleanSubmissionClearsStaleCIRefusalEvidence(t *testing.T) {
+	forge := newRecordingForge()
+	forge.heads["295"] = "4c11cad2"
+	e := buildV2(t, v2Opts{writer: forge}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
+		mrV2("tatara-operator", 295, "t1", func(mr *tatarav1alpha1.MergeRequest) {
+			mr.Status.Ownership = tatarav1alpha1.OwnershipTatara
+			mr.Status.HeadSHA = "4c11cad2"
+		}))
+	tk := e.task(t, "t1")
+	tk.Annotations = map[string]string{
+		tatarav1alpha1.AnnDeclineCI:    tatarav1alpha1.CIEvidenceRed,
+		tatarav1alpha1.AnnDeclineHeads: tatarav1alpha1.MergeRequestName("tatara-operator", 295) + "@4c11cad2",
+	}
+	require.NoError(t, e.c.Update(context.Background(), tk))
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", submitImplement)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	got := e.task(t, "t1")
+	require.NotContains(t, got.Annotations, tatarav1alpha1.AnnDeclineCI)
+	require.NotContains(t, got.Annotations, tatarav1alpha1.AnnDeclineHeads)
+}
+
 // A Task that owns no merge request at all - the ordinary "I looked and there is
 // nothing to do" decline - records nothing and is therefore never re-driven.
 func TestOutcome_Implement_DeclineWithNoOwnedMRStampsNothing(t *testing.T) {

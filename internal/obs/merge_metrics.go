@@ -100,6 +100,39 @@ var MergeConflictExitTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Help: "Tasks routed off a DIRTY tatara-owned merge request at the merge gate, by repo and target stage.",
 }, []string{"repo", "to"})
 
+// ConflictSweepTotal counts what the G2 conflict sweep DID to each owned merge
+// request it confirmed against the forge, one increment per confirmed
+// candidate. It exists because GetMergeState had exactly two call sites before
+// the sweep - the merge corridor, reachable only from `merged`, and the submit
+// gate - so a merge request that went DIRTY anywhere else was invisible for as
+// long as the Task stayed there (tatara-operator#625: CONFLICTING for days
+// behind a parked Task, cleared by a human merging main in by hand).
+//
+// The vocabulary is exhaustive over one pass's outcomes for ONE merge request:
+//
+//	clean   the MIRROR said not-mergeable and the LIVE read disagreed. The
+//	        mirror is written on MirrorCadence and is routinely minutes stale,
+//	        so this is the EXPECTED steady state, not an anomaly.
+//	dirty   confirmed DIRTY and deliberately not acted on: the Task is parked
+//	        (there is exactly one way out of a park and this sweep is not it),
+//	        or the rebase edge is not reachable from its state.
+//	routed  confirmed DIRTY and handed to an agent at under-implementation.
+//	capped  confirmed DIRTY and the conflict cycle ended at a PARK - the
+//	        re-entry budget spent (merge-blocked), or part of mergeOrder
+//	        already landed (merge-conflict).
+//	error   the pass could not reach a verdict: the live read failed, or the
+//	        forge credentials would not resolve, or a Task/MergeRequest List or
+//	        the Repository lookup behind it failed, or the routing write did.
+//	        The sweep FAILS OPEN and skips - one merge request on the per-item
+//	        failures, the whole pass on the credential and List ones.
+//
+// There is no `repo` label: this counts sweep BEHAVIOUR, and the per-repo
+// conflict story is already MergeConflictExitTotal's.
+var ConflictSweepTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "operator_conflict_sweep_total",
+	Help: "Owned merge requests the G2 conflict sweep confirmed against the forge, by result (clean|dirty|routed|capped|error).",
+}, []string{"result"})
+
 // ClearMergeCursorStalled deletes every MergeCursorStalledSeconds series for a
 // Task. Called when the Task leaves merging, for any reason.
 func ClearMergeCursorStalled(task string) {
@@ -108,5 +141,6 @@ func ClearMergeCursorStalled(task string) {
 
 func init() {
 	ctrlmetrics.Registry.MustRegister(UnexpectedMergeTotal, MergeCursorStalledSeconds,
-		ReviewPostTotal, reviewFindingDegradedTotal, CIRedExitTotal, MergeConflictExitTotal)
+		ReviewPostTotal, reviewFindingDegradedTotal, CIRedExitTotal, MergeConflictExitTotal,
+		ConflictSweepTotal)
 }

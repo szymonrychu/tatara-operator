@@ -327,13 +327,14 @@ type xIssue struct {
 }
 
 type xMergeRequest struct {
-	Repo           string     `xml:"repo,attr"`
-	Status         string     `xml:"status,attr"`
-	HeadBranch     string     `xml:"head_branch,attr"`
-	LastBotHeadSHA string     `xml:"last_bot_head_sha,attr"`
-	Attrs          []xml.Attr `xml:",any,attr"`
-	Body           xBody      `xml:"body"`
-	Comments       *xComments `xml:"comments"`
+	Repo                  string     `xml:"repo,attr"`
+	Status                string     `xml:"status,attr"`
+	HeadBranch            string     `xml:"head_branch,attr"`
+	LastBotHeadSHA        string     `xml:"last_bot_head_sha,attr"`
+	LastExternalAssistSHA string     `xml:"last_external_assist_sha,attr"`
+	Attrs                 []xml.Attr `xml:",any,attr"`
+	Body                  xBody      `xml:"body"`
+	Comments              *xComments `xml:"comments"`
 }
 
 type xRawEvent struct {
@@ -959,6 +960,39 @@ func TestRender_MergeRequest_OmitsLastBotHeadSHAWhenEmpty(t *testing.T) {
 	}
 	if strings.Contains(got, "last_bot_head_sha") {
 		t.Fatalf("last_bot_head_sha attribute present though LastBotHeadSHA is empty:\n%s", got)
+	}
+}
+
+// A HUMAN ASSIST ADVANCES last_bot_head_sha ONTO A COMMIT THE BOT DID NOT PUSH.
+// ReconcileOwnership's bot-authored carve-out keeps ownership and moves the
+// baseline so the assist converges, which leaves last_bot_head_sha == head_sha -
+// indistinguishable, to the review agent reading this element, from a branch
+// tatara wrote alone. The assisted head is therefore rendered in its own
+// attribute: a review agent that is about to approve a merge the operator will
+// perform unconditionally can see a third party's commit is in the branch.
+func TestRender_MergeRequest_CarriesLastExternalAssistSHAWhenSet(t *testing.T) {
+	in := canonicalInput(t)
+	in.MergeRequests[0].Status.LastBotHeadSHA = "assist-sha-1"
+	in.MergeRequests[0].Status.LastExternalAssistSHA = "assist-sha-1"
+	got, err := prompt.Render(in)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	tc := parseBundle(t, got)
+	if tc.MRs[0].LastExternalAssistSHA != "assist-sha-1" {
+		t.Fatalf("last_external_assist_sha = %q, want %q", tc.MRs[0].LastExternalAssistSHA, "assist-sha-1")
+	}
+}
+
+func TestRender_MergeRequest_OmitsLastExternalAssistSHAWhenEmpty(t *testing.T) {
+	in := canonicalInput(t)
+	in.MergeRequests[0].Status.LastExternalAssistSHA = ""
+	got, err := prompt.Render(in)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if strings.Contains(got, "last_external_assist_sha") {
+		t.Fatalf("last_external_assist_sha present though LastExternalAssistSHA is empty:\n%s", got)
 	}
 }
 

@@ -320,14 +320,15 @@ func (c *GitHub) ListPRComments(ctx context.Context, owner, repo string, number 
 	return c.ListIssueComments(ctx, owner, repo, number)
 }
 
-// GetIssue returns the title and body of an issue.
+// GetIssue returns the title, body and labels of an issue. Labels go through
+// ghLabelNames, the same normalisation ListOpenIssues applies to IssueRef.Labels.
 func (c *GitHub) GetIssue(ctx context.Context, owner, repo string, number int) (IssueContent, error) {
 	var raw ghIssueItem
 	path := fmt.Sprintf("/repos/%s/%s/issues/%d", owner, repo, number)
 	if err := ghDo(ctx, c.base(), http.MethodGet, path, c.token, nil, &raw); err != nil {
 		return IssueContent{}, err
 	}
-	return IssueContent{Title: raw.Title, Body: raw.Body}, nil
+	return IssueContent{Title: raw.Title, Body: raw.Body, Labels: ghLabelNames(raw.Labels)}, nil
 }
 
 // GetDefaultBranchHeadSHA resolves the default branch HEAD commit sha for owner/repo.

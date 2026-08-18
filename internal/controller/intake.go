@@ -223,7 +223,7 @@ func (m *Minter) MintForItem(ctx context.Context, proj *tatarav1alpha1.Project,
 		obs.MintOutcomeTotal.WithLabelValues(SweepIssueKind, string(MintNotOwed)).Inc()
 		return nil, MintNotOwed, nil
 	}
-	stg, reason := MintStage(proj, repo, item.Issue, webhookOriginated)
+	stg, reason := MintStage(proj, repo, item.Issue, cr, webhookOriginated)
 	return m.MintIssueTask(ctx, proj, repo, item.Issue, stg, reason, sp)
 }
 

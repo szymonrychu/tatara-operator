@@ -950,9 +950,12 @@ func LiveEntryEligible(state string) bool { return stage.Live(state) }
 // It returns (false, reason) - never an error - for the ordinary steady-state
 // refusals, and the caller falls back to queueing the event and nothing else.
 //
-// Entry from awaiting-review increments humanReviewRounds and is capped by it,
-// exactly like the awaiting-human re-entry and for the same reason: each lap can
-// spawn a pod, and a chatty MR thread must not spawn one per comment.
+// Entry from awaiting-review is CAPPED by humanReviewRounds - each lap can spawn
+// a pod, and a chatty MR thread must not spawn one per comment - but it does NOT
+// increment it. It cannot: this function writes nothing at all, and the only
+// writer of that counter is stage.Unpark's awaiting-human arm, which the
+// un-park path reaches instead. The doc used to claim the increment; a reader
+// who believed it would look for a bound this function does not itself maintain.
 func DeliverLiveTurn(ctx context.Context, c client.Client, sp objbudget.Spiller, m *obs.OperatorMetrics,
 	proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task, mrs []tatarav1alpha1.MergeRequest,
 	now time.Time) (bool, string) {
@@ -970,8 +973,14 @@ func DeliverLiveTurn(ctx context.Context, c client.Client, sp objbudget.Spiller,
 	// maintainer's "take over" comment can arrive in. The round cap bounds
 	// ordinary review ping-pong; it must not swallow a take-over request, so
 	// this entry is exempted from the cap and does not spend a round.
+	//
+	// A FRESH HUMAN EVENT IS PART OF THE CANDIDATE (H1-J). The bypass spends no
+	// round, so an unconsumed non-bot pendingEvent is the only monotonic
+	// quantity bounding it - see stage.consumeUnparkEvents, whose stamp this
+	// reads. A bot-authored event was never a take-over request, and one already
+	// spent releasing a park is not a second one.
 	fromReview := task.Status.State == tatarav1alpha1.StateAwaitingReview
-	takeoverCandidate := anyExternallyOwnedMR(mrs)
+	takeoverCandidate := anyExternallyOwnedMR(mrs) && hasFreshNonBotEvent(task, botLoginOf(proj))
 	if fromReview && !takeoverCandidate && task.Status.HumanReviewRounds >= tatarav1alpha1.MaxHumanReviewRounds {
 		log.FromContext(ctx).Info("live turn refused: the human review round cap is spent",
 			"action", "live_entry_declined", "resource_id", task.Name,
@@ -988,9 +997,34 @@ func DeliverLiveTurn(ctx context.Context, c client.Client, sp objbudget.Spiller,
 // Ownership==external - see stage.go's identically-purposed anyExternallyOwned
 // (#511). Duplicated rather than shared: this package cannot import the
 // unexported helper from internal/stage, and the check is a two-line loop.
+//
+// THE TWO COPIES OF THE BYPASS MOVE TOGETHER (H1-J). stage.Unpark's arm is the
+// un-park path and this one is the live-turn path; they encode the same #511
+// rule, and a fix applied to one of them alone leaves the other unbounded. The
+// fresh-event conjunct at the call site above is the current example.
+//
+// THE FRESH-EVENT PREDICATE ITSELF HAS THREE COPIES, not two: stage.hasNonBotEvent,
+// hasFreshNonBotEvent below, and resume.go's hasNonBotPendingEvent (read
+// inverted by strand.go). All three carry the UnparkConsumedAt conjunct; the
+// bypass above is the two-copy thing, the predicate under it is the three-copy
+// thing, and conflating them is how the third copy was missed once already.
 func anyExternallyOwnedMR(mrs []tatarav1alpha1.MergeRequest) bool {
 	for i := range mrs {
 		if mrs[i].Status.Ownership == tatarav1alpha1.OwnershipExternal {
+			return true
+		}
+	}
+	return false
+}
+
+// hasFreshNonBotEvent is stage.hasNonBotEvent's twin, and duplicated for the
+// same reason as anyExternallyOwnedMR: the stage helper is unexported and the
+// check is a four-line loop. Fresh means a HUMAN wrote it and no un-park has
+// spent it yet (TaskEvent.UnparkConsumedAt).
+func hasFreshNonBotEvent(task *tatarav1alpha1.Task, botLogin string) bool {
+	for i := range task.Status.PendingEvents {
+		if task.Status.PendingEvents[i].Author != botLogin &&
+			task.Status.PendingEvents[i].UnparkConsumedAt == nil {
 			return true
 		}
 	}

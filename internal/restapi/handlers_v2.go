@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
@@ -139,6 +140,21 @@ func (s *Server) ownedIssues(ctx context.Context, task *tatarav1alpha1.Task) ([]
 }
 
 // ownedMRs returns every MergeRequest CR this Task controller-owns.
+//
+// THE CONTROLLER ownerRef IS THE SOURCE OF TRUTH FOR THIS RELATION, and
+// Task.status.mrRefs is not. The ownerRef is what authorizes every SCM write
+// against the artifact (contract B.2 rule 1), what the API server enforces at
+// admission (exactly one controller=true), and what a hand-over moves
+// atomically. status.mrRefs is an append-only AUDIT TRAIL of what this Task
+// opened or was bound to; nothing prunes it, so it keeps naming a merge request
+// after ownership has moved. The two are therefore ALLOWED to disagree, and when
+// they do the ownerRef wins - a Task listed in mrRefs but not owning the CR may
+// no longer act on it.
+//
+// The disagreement is READ, not repaired: it is precisely how the endpoint tells
+// "this Task opened nothing" (no refs, a mint/binding fault a retry can clear)
+// apart from "what this Task opened is not its any more" (refs owned elsewhere,
+// which no retry can clear). See controller.MRRefsHandedOver.
 func (s *Server) ownedMRs(ctx context.Context, task *tatarav1alpha1.Task) ([]tatarav1alpha1.MergeRequest, error) {
 	var list tatarav1alpha1.MergeRequestList
 	if err := s.c.List(ctx, &list, client.InNamespace(s.ns)); err != nil {
@@ -1198,18 +1214,96 @@ func (s *Server) mintIssueCR(ctx context.Context, proj *tatarav1alpha1.Project,
 		return err
 	}
 	if err := s.c.Create(ctx, iss); err != nil {
-		return fmt.Errorf("create issue CR %s: %w", name, err)
+		if !apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("create issue CR %s: %w", name, err)
+		}
+		if err := s.adoptFiledIssueCR(ctx, iss, spec, task); err != nil {
+			return err
+		}
 	}
 	now := metav1.NewTime(s.now())
-	iss.Status = tatarav1alpha1.IssueStatus{
-		Title: title, Body: truncateValidUTF8(body, tatarav1alpha1.IssueBodyMaxBytes),
-		Author: botLogin(proj), State: "open", Status: "new",
-		CreatedAt: &now, UpdatedAt: &now, LastSyncedAt: &now,
+	iss.Status.Title = title
+	iss.Status.Body = truncateValidUTF8(body, tatarav1alpha1.IssueBodyMaxBytes)
+	iss.Status.Author = botLogin(proj)
+	iss.Status.State = "open"
+	if iss.Status.Status == "" {
+		// Only on a mirror that has no verdict yet. An adopted stub a lifecycle
+		// write already decided must not be reset to untriaged by a re-filing.
+		iss.Status.Status = "new"
 	}
+	if iss.Status.CreatedAt == nil {
+		iss.Status.CreatedAt = &now
+	}
+	iss.Status.UpdatedAt, iss.Status.LastSyncedAt = &now, &now
 	if err := s.c.Status().Update(ctx, iss); err != nil {
 		return fmt.Errorf("seed issue CR status %s: %w", name, err)
 	}
 	return s.appendTaskRef(ctx, proj, task.Name, name, "")
+}
+
+// adoptFiledIssueCR is mintIssueCR's AlreadyExists branch: it reconciles an Issue
+// CR that already holds the natural key onto `want` and leaves iss holding the
+// live object, so the status seed above lands on the real resourceVersion.
+//
+// IT EXISTS BECAUSE THE ANCHOR HAS EXACTLY ONE WRITER AND ONE CHANCE. The forge
+// issue is posted BEFORE the CR is written, and several operator paths mint the
+// bare mirror stub for a number the moment they see it - most sharply the gate
+// Task's own triage (controller.mintIssueCRs), which fires on the Task that
+// mintGateTask creates ONE STATEMENT before this call. Whichever of them takes
+// the key first, Create came back AlreadyExists, mintIssueCR returned the error,
+// and the stub stayed anchorless forever: ensureIssueCR writes no Spec
+// provenance, nothing else ever writes the anchor, and nothing may back-fill it
+// from the MIRRORED body - a body anchored to itself is not a tamper guard. The
+// proposal then fails autoApproveApplies closed for the rest of its life and
+// parks awaiting a human that may never come.
+//
+// This is the only moment at which the repair is honest: the operator still
+// holds the body it POSTED, not the body the forge reports back. Anchoring to
+// that keeps the guard exactly as strong as a winning Create would have - a
+// later forge-side edit still diverges from it.
+//
+// IT WIDENS NOTHING. It stamps provenance ONLY when this caller declared a kind
+// (the generic agent-bodied issue_write path declares none and still gets none),
+// only onto a CR that carries NO anchor yet (an incumbent anchor is the integrity
+// record of an earlier filing and is immutable), and it never takes a controller
+// ref away from another Task - a foreign-owned mirror still fails the filing,
+// exactly as it did before.
+func (s *Server) adoptFiledIssueCR(ctx context.Context, iss *tatarav1alpha1.Issue,
+	want tatarav1alpha1.IssueSpec, task *tatarav1alpha1.Task) error {
+
+	key := types.NamespacedName{Namespace: iss.Namespace, Name: iss.Name}
+	wantLabels := iss.Labels
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var fresh tatarav1alpha1.Issue
+		if err := s.c.Get(ctx, key, &fresh); err != nil {
+			return fmt.Errorf("adopt issue CR %s: %w", key.Name, err)
+		}
+		if ctrl, owned := own.ControllerOwner(&fresh); owned && ctrl != task.Name {
+			return fmt.Errorf("issue CR %s is controller-owned by task %s", key.Name, ctrl)
+		}
+		if want.ProposalKind != "" && fresh.Spec.ProposalKind == "" && fresh.Spec.ProposalBodyHash == "" {
+			fresh.Spec.ProposalKind, fresh.Spec.ProposalBodyHash = want.ProposalKind, want.ProposalBodyHash
+		}
+		// The incident tracker's rule/group keys (O4/O5) are metadata the mirror
+		// stub never carries, and the suppression lookup reads them by label.
+		for k, v := range wantLabels {
+			if fresh.Labels == nil {
+				fresh.Labels = map[string]string{}
+			}
+			if _, ok := fresh.Labels[k]; !ok {
+				fresh.Labels[k] = v
+			}
+		}
+		own.AddPlainOwner(&fresh, task)
+		if err := own.HandOverController(&fresh, nil, task); err != nil {
+			return err
+		}
+		if err := s.c.Update(ctx, &fresh); err != nil {
+			return err
+		}
+		*iss = fresh
+		return nil
+	})
 }
 
 // appendTaskRef appends an issue / MR CR name to the Task's ref list.
@@ -1479,7 +1573,8 @@ func (s *Server) mrWrite(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// mrOpen is SYNCHRONOUS, IDEMPOTENT, and REFUSED after a merge (C.2.13).
+// mrOpen is SYNCHRONOUS, IDEMPOTENT, and REFUSED once this repo's delivery
+// surface is genuinely spent (C.2.13, relaxed by H1-C - see taskOwesOpenWork).
 func (s *Server) mrOpen(w http.ResponseWriter, r *http.Request, proj *tatarav1alpha1.Project,
 	repo *tatarav1alpha1.Repository, task *tatarav1alpha1.Task, req mrWriteReq) {
 	ctx := r.Context()
@@ -1510,18 +1605,35 @@ func (s *Server) mrOpen(w http.ResponseWriter, r *http.Request, proj *tatarav1al
 		writeClientErr(w, err)
 		return
 	}
+	// The issues are read here rather than at the close-directive allowlist
+	// below because the outstanding-work gate needs them BEFORE any forge
+	// credential is resolved: refusing an open the Task is not owed must not
+	// depend on the SCM secret being readable.
+	issues, err := s.ownedIssues(ctx, task)
+	if err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	// followOn is "this Task already has a merge request here", which is what
+	// makes the open below a SECOND one and puts it behind the gate.
+	followOn := false
 	for i := range mrs {
 		mr := &mrs[i]
 		if mr.Spec.RepositoryRef != repo.Name {
 			continue
 		}
-		// REFUSED when the Task already merged an MR for this repo (fix 2).
-		// This is the structural stop on the duplicate-PR path after a partial
-		// merge.
+		followOn = true
+		// A MERGED MR is NOT a refusal (H1-C). Its branch is merged, and both
+		// forges accept a fresh merge request from the same head to the same
+		// base once no OPEN one exists for that pair - the 422 the idempotency
+		// clause below guards against only fires while an open one does. The
+		// refusal this replaced was per-repo and state-based, so one merge
+		// foreclosed the repo for the rest of the Task's life: a Task that
+		// shipped its first issue across three merged MRs had a tested, pushed
+		// commit for its second issue and nowhere to put it. What still gates a
+		// second open is taskOwesOpenWork, after this loop.
 		if mr.Status.State == "merged" {
-			obs.RestOwnershipRefusedTotal.WithLabelValues("mr-merged").Inc()
-			writeError(w, http.StatusConflict, "task already merged an MR for this repo")
-			return
+			continue
 		}
 		// IDEMPOTENT (fix 13): a second open 422s on GitHub, and a TTL-stopped
 		// implement pod that already opened its MR must have a way forward.
@@ -1535,17 +1647,27 @@ func (s *Server) mrOpen(w http.ResponseWriter, r *http.Request, proj *tatarav1al
 		}
 	}
 
+	// A FOLLOW-ON open must still owe something this repo can carry. Without
+	// this the relaxation above is a licence to open one merge request per turn.
+	// The FIRST open for a repo is ungated on purpose: there is nothing to
+	// duplicate yet, and not every Task kind owns an Issue CR at all - an
+	// adopted upgrade Task owns a merge request and no issue.
+	if followOn && !taskOwesOpenWork(issues, mrs, repo.Name) {
+		obs.RestOwnershipRefusedTotal.WithLabelValues("mr-surface-spent").Inc()
+		s.log.InfoContext(ctx, "restapi: MR open refused, this repo owes no uncovered work",
+			append(reqLogFields(r), "action", "mr_write_open_refused", "task", task.Name,
+				"repo", repo.Name, "reason", "mr-surface-spent")...)
+		writeError(w, http.StatusConflict,
+			"task has no open issue for this repo that an open merge request does not already cover")
+		return
+	}
+
 	writer, token, ok := s.projectSCMWriterAndToken(w, r, proj)
 	if !ok {
 		return
 	}
 	// The body passes through the C.7 close-directive ALLOWLIST: only the
 	// issues this Task controller-owns may be auto-closed by the MR.
-	issues, err := s.ownedIssues(ctx, task)
-	if err != nil {
-		writeClientErr(w, err)
-		return
-	}
 	// ... and, under the C.1 CLOSE INVARIANT, only while no SIBLING PR of this
 	// Task is still live: the forge auto-closes on the FIRST merge, which would
 	// beat the invariant before any operator-side guard could see it.
@@ -1584,6 +1706,37 @@ func (s *Server) mrOpen(w http.ResponseWriter, r *http.Request, proj *tatarav1al
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status": "ok", "repo": repo.Name, "number": number, "url": url, "existing": false,
 	})
+}
+
+// taskOwesOpenWork answers the one question a follow-on merge request has to
+// pass: does this Task still owe work on repoRef that no open merge request is
+// already carrying?
+//
+// COVERAGE IS PER-REPO, NOT PER-ISSUE. A Task pushes every commit for a repo to
+// ONE branch (agent.PushBranch), so a single open owned merge request for that
+// repo already carries whatever the agent commits next, whichever issue it is
+// for - and a second open against the same base while it lives is the duplicate
+// -PR shape the original refusal existed to stop. Matching close directives in
+// the MR body instead would make the gate depend on prose an agent writes, for
+// a surface that is per-repo by construction.
+//
+// An Issue is OWED while the forge still has it open and the platform has not
+// finished with it: done and rejected are the two verdicts that end one.
+func taskOwesOpenWork(issues []tatarav1alpha1.Issue, mrs []tatarav1alpha1.MergeRequest, repoRef string) bool {
+	for i := range mrs {
+		mr := &mrs[i]
+		if mr.Spec.RepositoryRef == repoRef && (mr.Status.State == "" || mr.Status.State == "open") {
+			return false
+		}
+	}
+	for i := range issues {
+		iss := &issues[i]
+		if iss.Spec.RepositoryRef == repoRef && iss.Status.State == "open" &&
+			iss.Status.Status != "done" && iss.Status.Status != "rejected" {
+			return true
+		}
+	}
+	return false
 }
 
 func repoSlug(repo *tatarav1alpha1.Repository) string {

@@ -1337,7 +1337,11 @@ const (
 	// is at its live-pod ceiling. The pendingEvent is RETAINED and the next pass
 	// retries; nothing is dropped.
 	DeclineNoLiveRoom = "no-live-room"
-	// DeclineNoOpenIssues: the empty owned-Issue set is not a licence (fix V6-3).
+	// DeclineNoOpenIssues: the empty owned-Issue set is not a licence (fix V6-3),
+	// and neither is an owned merge request that has left the flow. The label
+	// value keeps its name - it is on a metric allow-list and mirrored by
+	// internal/controller - but the condition it now reports is "no open owned
+	// Issue AND no open owned merge request".
 	DeclineNoOpenIssues = "no-open-issues"
 	// DeclineMergedMR: re-entry would spawn a pod against an already-merged MR.
 	DeclineMergedMR = "merged-mr"
@@ -1394,7 +1398,72 @@ var UnparkDeclines = []string{
 // other return the Task is UNTOUCHED except where a re-park is explicitly
 // documented, it stays parked, and its pendingEvents are RETAINED, never
 // dropped.
+//
+// RETENTION IS STILL THE CONTRACT, and UnparkConsumedAt does not change it:
+// nothing here removes a pendingEvent, the turn-0 bundle still renders every
+// one of them, and the pod-time drain (controller.submitStageTurn) is still the
+// only thing that removes any. What a consumed event loses is its ELIGIBILITY
+// to release a SECOND park - see consumeUnparkEvents.
 func Unpark(in UnparkInput) (decline string) {
+	reason := in.Task.Status.ParkReason
+	decline = unparkRule(in)
+	if decline != DeclineNone {
+		return decline
+	}
+	// Only the UnparkHuman class consumes anything: it is the one class whose
+	// release was GATED on hasNonBotEvent, so it is the one class whose events
+	// were actually spent. A timer-class release (merge-timeout, deploy-timeout,
+	// no-outcome) is driven by its own bounded counter and reads no event at
+	// all - stamping there would silently burn a human comment that was never
+	// the trigger, and the next genuine awaiting-human park would find nothing
+	// left to release it.
+	if class, ok := UnparkClassFor(reason); ok && class == UnparkHuman {
+		consumeUnparkEvents(in.Task, in.BotLogin, unparkNow(in))
+	}
+	return DeclineNone
+}
+
+// unparkNow is the clock Unpark and unparkRule must agree on.
+func unparkNow(in UnparkInput) time.Time {
+	if in.Now.IsZero() {
+		return time.Now()
+	}
+	return in.Now
+}
+
+// consumeUnparkEvents SPENDS every event that just released this park.
+//
+// THE LOOP IT KILLS (adjacent 4, mt-r-tatara-helmfile-424). Un-park retains
+// pendingEvents by contract; the ONLY production drain runs after a turn is
+// actually submitted to a pod (controller.submitStageTurn). A Task that
+// re-parks before a pod ever exists therefore never consumed its trigger, and
+// the identical event released the identical park on every 30s
+// defaultUnparkDriveInterval tick, forever, with no monotonic quantity anywhere
+// to stop it - the stand-down bypass below being the worst case, since it
+// deliberately spends no HumanReviewRounds either.
+//
+// A STAMP, NOT A DELETE. Deleting would lose the event before the turn-0 bundle
+// renders it, which is the whole reason Unpark retains them.
+//
+// Bot-authored events are skipped because they were never eligible in the first
+// place (hasNonBotEvent), so stamping them would only make the field lie.
+func consumeUnparkEvents(t *v1alpha1.Task, botLogin string, now time.Time) {
+	stamp := metav1.NewTime(now)
+	for i := range t.Status.PendingEvents {
+		if t.Status.PendingEvents[i].Author == botLogin {
+			continue
+		}
+		if t.Status.PendingEvents[i].UnparkConsumedAt != nil {
+			continue
+		}
+		t.Status.PendingEvents[i].UnparkConsumedAt = &stamp
+	}
+}
+
+// unparkRule is Unpark's decision. It is split out so the consumption stamp can
+// run after it on DeclineNone, against the park reason it released - reArm has
+// already cleared Status.ParkReason by then.
+func unparkRule(in UnparkInput) (decline string) {
 	t := in.Task
 	now := in.Now
 	if now.IsZero() {
@@ -1497,7 +1566,23 @@ func Unpark(in UnparkInput) (decline string) {
 		// straight into an implement pod on ANY human comment, because
 		// all([]) == true; that promotion is gone with the target derivation, but
 		// the empty-set refusal it taught is kept.
-		if len(openIssues(in.Issues)) == 0 {
+		//
+		// AN OPEN OWNED MERGE REQUEST IS THE SECOND WAY TO HAVE SOMETHING LEFT TO
+		// TALK ABOUT, and without it this refusal was a permanent wedge for the
+		// exact two kinds submit_outcome(action=discuss) was added for. A
+		// cron-minted upgrade Task owns ZERO Issue CRs (nobody files an issue for
+		// a nightly dependency sweep) and so does a documentation batch: they are
+		// minted from a QueuedEvent payload with no issue refs. discuss parks
+		// awaiting-human, class UnparkHuman - "the next human comment resumes it"
+		// - and the issue-only test re-declined every one of those comments until
+		// the Task aged out at ParkRetention, which for documentation is strictly
+		// worse than declining, since that reaches a clean done. Their deliverable
+		// IS the merge request, and it is what a human is commenting on.
+		//
+		// BOTH EMPTY STILL DECLINES, so this is not a resurrection path: a Task
+		// with no open Issue and no open merge request is genuinely finished, and
+		// resuming it is the pod-with-no-thread this arm has always refused.
+		if len(openIssues(in.Issues)) == 0 && len(openMRs(in.MRs)) == 0 {
 			return DeclineNoOpenIssues
 		}
 		if d := liveRoomDecline(t, in); d != DeclineNone {
@@ -1643,13 +1728,19 @@ func reArm(t *v1alpha1.Task, now time.Time) {
 	}
 }
 
-// hasNonBotEvent reports whether a HUMAN commented. The E.3 enqueue filter
-// already drops bot events, but the operator's own park comment must never be
-// able to un-park the Task it parked, so the check is repeated here where the
-// decision is actually made.
+// hasNonBotEvent reports whether a HUMAN commented AND that comment has not
+// already been spent releasing a park. The E.3 enqueue filter already drops bot
+// events, but the operator's own park comment must never be able to un-park the
+// Task it parked, so the check is repeated here where the decision is actually
+// made.
+//
+// UnparkConsumedAt is the second half of the same idea: one comment, one
+// release. Without it a retained event re-triggered the same un-park every 30s
+// forever (see consumeUnparkEvents).
 func hasNonBotEvent(t *v1alpha1.Task, botLogin string) bool {
 	for i := range t.Status.PendingEvents {
-		if t.Status.PendingEvents[i].Author != botLogin {
+		if t.Status.PendingEvents[i].Author != botLogin &&
+			t.Status.PendingEvents[i].UnparkConsumedAt == nil {
 			return true
 		}
 	}
@@ -1661,6 +1752,20 @@ func openIssues(issues []v1alpha1.Issue) []v1alpha1.Issue {
 	for i := range issues {
 		if issues[i].Status.State == "open" {
 			out = append(out, issues[i])
+		}
+	}
+	return out
+}
+
+// openMRs filters to the merge requests still in flight. It is MRTerminal's
+// complement, which is what keeps "open" meaning the same thing here as it does
+// in restapi's openMRs: the open set is {"", "open"} and a blank state is a
+// mirror minted before its first forge sync, not a terminal one.
+func openMRs(mrs []v1alpha1.MergeRequest) []v1alpha1.MergeRequest {
+	out := make([]v1alpha1.MergeRequest, 0, len(mrs))
+	for i := range mrs {
+		if !MRTerminal(mrs[i]) {
+			out = append(out, mrs[i])
 		}
 	}
 	return out

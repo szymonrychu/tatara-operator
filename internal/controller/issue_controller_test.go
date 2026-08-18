@@ -517,3 +517,37 @@ func TestIssueReconcile_GoneThreadDoesNotWedgeThePendingDrain(t *testing.T) {
 		t.Fatalf("pending intents = %d, want the intent retained for the next cadence", len(got.Status.PendingComments))
 	}
 }
+
+// TestProjectLabels_StrippingAHumanAddedLabelIsLogged: the mirror's labels are
+// refreshed on the Issue cadence now (syncIssueThread), so this removal - which
+// used to be all but unreachable, status.labels being frozen at mint - fires on
+// a label a maintainer added by hand within one MirrorCadence. The projection
+// stays strictly one-way and the label is stripped; what must not happen is it
+// happening SILENTLY, with an outbound forge write contradicting a human action
+// and nothing in the log to find afterwards.
+func TestProjectLabels_StrippingAHumanAddedLabelIsLogged(t *testing.T) {
+	ctx, entries := kvLoggingCtx()
+	proj, repo := mirrorProject("tatara-bot"), mirrorRepo()
+	task := taskAtStage(tatarav1alpha1.StateRefined, "")
+	iss := ownedIssue(tatarav1alpha1.IssueName(repo.Name, 1), 1, task, tatarav1alpha1.IssueStatus{
+		State: "open", Status: "rejected",
+		// A maintainer added tatara-approved on the forge and the cadence sync
+		// mirrored it.
+		Labels: []string{"tatara-approved", "tatara-declined"},
+	})
+	c := newMirrorClient(t, proj, repo, task, iss, scmSecret())
+	w := &mirrorWriter{}
+	r := newIssueReconciler(c, w, nil)
+
+	if err := r.projectLabels(ctx, proj, repo, iss); err != nil {
+		t.Fatalf("projectLabels: %v", err)
+	}
+
+	if len(w.removed) != 1 || w.removed[0] != "tatara-approved" {
+		t.Fatalf("removed = %v, want [tatara-approved]: the projection is one-way", w.removed)
+	}
+	got := oneLoggedAction(t, *entries, "issue_label_stripped")
+	if got.field("label") != "tatara-approved" {
+		t.Fatalf("issue_label_stripped label = %v, want tatara-approved", got.field("label"))
+	}
+}

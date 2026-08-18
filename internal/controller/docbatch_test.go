@@ -618,3 +618,30 @@ func TestDocBatchMint_StampsPodName(t *testing.T) {
 		t.Fatalf("PodName = %q, want the stamped descriptive name", n)
 	}
 }
+
+// A DISCUSS-PARKED BATCH IS STILL IN FLIGHT. submit_outcome(action=discuss)
+// parks the batch awaiting-human, which is class UnparkHuman: the next human
+// comment wakes it and it goes on to open its docs PR. Treating that as settled
+// let the next cron tick mint a SECOND batch that can race the first at the same
+// docs repo.
+func TestDocBatchInFlight_CountsAResumableParkAsInFlight(t *testing.T) {
+	b := reapTask("docp", "batch-discuss", DocBatchKind,
+		tatarav1alpha1.StateUnderImplementation, stage.ReasonAwaitingHuman, time.Now())
+	b.Spec.DocumentsTasks = []string{"task-a"}
+	if got := docBatchInFlight([]tatarav1alpha1.Task{*b}, "docp"); got != b.Name {
+		t.Fatalf("docBatchInFlight = %q, want %q: a discuss park is UnparkHuman and can still wake", got, b.Name)
+	}
+}
+
+// ... and a park NOTHING can re-enter is settled, so it must NOT block the next
+// night's mint for the whole seven days of ParkRetention.
+func TestDocBatchInFlight_ANonResumableParkIsSettled(t *testing.T) {
+	for _, reason := range []string{stage.ReasonImplementDeclined, stage.ReasonStageDeadline, stage.ReasonOperatorError} {
+		b := reapTask("docp", "batch-dead", DocBatchKind,
+			tatarav1alpha1.StateUnderImplementation, reason, time.Now())
+		b.Spec.DocumentsTasks = []string{"task-a"}
+		if got := docBatchInFlight([]tatarav1alpha1.Task{*b}, "docp"); got != "" {
+			t.Fatalf("docBatchInFlight = %q for park reason %s, want \"\"", got, reason)
+		}
+	}
+}

@@ -3,7 +3,8 @@ package controller
 import (
 	"context"
 	"fmt"
-	"reflect"
+	"strconv"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
@@ -149,9 +150,10 @@ const taskEventTruncatedMarker = "\n...(truncated by tatara; full comment on the
 
 // clampTaskEventBody fits ev.Body inside TaskEvent.Body's CRD MaxLength,
 // cutting on a RUNE boundary and marking the cut. A body that already fits is
-// returned byte-identical: drainRenderedEvents matches a rendered event by its
-// whole value tuple, body included, so an unconditional rewrite would break the
-// webhook-vs-drain race guard.
+// returned byte-identical, so the event a caller enqueues is the event the forge
+// comment says it is - the drain's identity tuple (eventKey) no longer reads the
+// body at all, but a clamp that rewrote every body would still put a text nobody
+// wrote in front of an agent.
 //
 // A byte-slice of a UTF-8 string cuts mid-rune and the API server's JSON
 // encoder rejects invalid UTF-8, so the rune boundary is load-bearing, exactly
@@ -193,9 +195,20 @@ func appendEventCapped(events []tatarav1alpha1.TaskEvent, ev tatarav1alpha1.Task
 // land in status.pendingEvents while it is in flight. Unconditionally nil-ing
 // pendingEvents in the drain would silently erase that comment - it was never
 // rendered into any turn, and nothing would ever resend it. current has no
-// unique event id, so identity is the full value tuple (at/kind/repo/number/
-// author/body), which is what a real webhook-originated event is unique on in
-// practice.
+// unique event id, so identity is eventKey's tuple (kind/repo/number/at), which
+// is what a real webhook-originated event is unique on in practice.
+//
+// IDENTITY IS THAT TUPLE AND NOT THE WHOLE STRUCT, and the distinction is
+// load-bearing. This used to be a reflect.DeepEqual over the entire TaskEvent,
+// which silently made EVERY field of it part of the drain's identity - including
+// UnparkConsumedAt, which a SECOND writer mutates in place
+// (stage.consumeUnparkEvents, reached from the webhook, which is not
+// leader-elected). A Task unparked by a human comment while a turn was in flight
+// then held fresh=[E{stamped}] against rendered=[E{nil}]: nothing matched,
+// nothing drained, and the conversation follow-up branch (task_stage.go, gated
+// on nothing but len(PendingEvents) > 0) resubmitted a turn on every reconcile
+// forever - the unbounded-loop class this drain exists to kill, relocated. The
+// tuple is the four fields nothing but the original append ever writes.
 //
 // current is also NOT assumed to hold rendered as a strict prefix: the
 // maxPendingEvents cap (drop-oldest) can in principle evict an already-
@@ -206,25 +219,38 @@ func drainRenderedEvents(current, rendered []tatarav1alpha1.TaskEvent) []tatarav
 	if len(rendered) == 0 || len(current) == 0 {
 		return current
 	}
-	toRemove := make([]tatarav1alpha1.TaskEvent, len(rendered))
-	copy(toRemove, rendered)
+	// A COUNT per key, not a set: two deliveries of the same comment share a key,
+	// and one rendered entry must drain exactly one occurrence of it.
+	toRemove := make(map[[4]string]int, len(rendered))
+	for _, r := range rendered {
+		toRemove[eventKey(r)]++
+	}
 
 	out := make([]tatarav1alpha1.TaskEvent, 0, len(current))
 	for _, ev := range current {
-		matched := false
-		for i, r := range toRemove {
-			if reflect.DeepEqual(ev, r) {
-				toRemove = append(toRemove[:i], toRemove[i+1:]...)
-				matched = true
-				break
-			}
+		k := eventKey(ev)
+		if toRemove[k] > 0 {
+			toRemove[k]--
+			continue
 		}
-		if !matched {
-			out = append(out, ev)
-		}
+		out = append(out, ev)
 	}
 	if len(out) == 0 {
 		return nil
 	}
 	return out
+}
+
+// eventKey is the delivery identity: (Kind, Repo, Number, At). At is normalized
+// through Rfc3339Copy - the second-precision truncation the API server itself
+// applies on a real round-trip - so a key computed from a freshly-constructed
+// TaskEvent matches the same event read back after being persisted.
+//
+// It came back from internal/webhook/pending_events.go, where it keyed the
+// delivered-event subtraction this drain replaced. Deleting it along with that
+// subtraction is what left the drain on reflect.DeepEqual and put a
+// second-writer field (UnparkConsumedAt) inside the drain's identity. The four
+// fields here are exactly the ones only the original append ever writes.
+func eventKey(ev tatarav1alpha1.TaskEvent) [4]string {
+	return [4]string{ev.Kind, ev.Repo, strconv.Itoa(ev.Number), ev.At.Rfc3339Copy().UTC().Format(time.RFC3339)}
 }

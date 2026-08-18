@@ -1,8 +1,10 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -119,11 +121,26 @@ func humanComment(id, author, body string, at time.Time) scm.IssueComment {
 // allocate the per-project sequence number.
 func runSweep(t *testing.T, c client.Client, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, rd scm.SCMReader) {
 	t.Helper()
-	r := &ProjectReconciler{
+	sweepOnce(t, context.Background(), newSweepReconciler(c), proj, repo, rd)
+}
+
+// newSweepReconciler builds the reconciler runSweep drives, so a test that needs
+// the same one across SEVERAL passes (or wants to call one of its methods
+// directly) does not rebuild it - and cannot accidentally build a different one.
+func newSweepReconciler(c client.Client) *ProjectReconciler {
+	return &ProjectReconciler{
 		Client: c, Scheme: c.Scheme(), Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry()),
 		Seq: &queue.SeqSource{Client: c, Namespace: testNS},
 	}
-	if _, err := r.SweepProject(context.Background(), proj, rd, []tatarav1alpha1.Repository{*repo}, nil, SweepActivity); err != nil {
+}
+
+// sweepOnce is runSweep's ctx-taking form: a test asserting on the sweep's OWN
+// log output has to supply the context the logger rides in on.
+func sweepOnce(t *testing.T, ctx context.Context, r *ProjectReconciler,
+	proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, rd scm.SCMReader) {
+
+	t.Helper()
+	if _, err := r.SweepProject(ctx, proj, rd, []tatarav1alpha1.Repository{*repo}, nil, SweepActivity); err != nil {
 		t.Fatalf("SweepProject: %v", err)
 	}
 }
@@ -273,10 +290,23 @@ func TestMintStage(t *testing.T) {
 
 	t0 := time.Now().Add(-time.Hour)
 
+	// approvedMirror is the C.6 FIELD, not a label: Issue.status.status is the
+	// only thing MintStage is allowed to read for a verdict. The EVIDENCE travels
+	// with it - verifyOneIssue (approval_grammar.go) short-circuits on
+	// status=="approved" AND Approval!=nil, so a mirror carrying only the status
+	// is not what a real grant leaves behind.
+	approvedMirror := func() *tatarav1alpha1.Issue {
+		return &tatarav1alpha1.Issue{Status: tatarav1alpha1.IssueStatus{
+			State: "open", Status: "approved",
+			Approval: &tatarav1alpha1.ApprovalEvidence{Login: "alice", CommentID: "c1", Phrase: "go ahead"},
+		}}
+	}
+
 	tests := map[string]struct {
 		proj       *tatarav1alpha1.Project
 		repo       *tatarav1alpha1.Repository
 		iss        scm.Issue
+		cr         *tatarav1alpha1.Issue
 		webhook    bool
 		wantStage  string
 		wantReason string
@@ -384,6 +414,54 @@ func TestMintStage(t *testing.T) {
 		// before this change: no webhook, no comments -> PARKED.
 		"a BOT-authored orphan issue is NOT a trusted human and does not mint ACTIVE": {
 			iss:        scm.Issue{Number: 1, State: "open", Author: "tatara-bot"},
+			cr:         nil,
+			wantStage:  tatarav1alpha1.StateNew,
+			wantReason: stage.ReasonBacklogSweep,
+		},
+
+		// --- the approval clause (adjacent 2) ---
+		// A RE-MINT DOES NOT LOSE AN APPROVAL. The trusted-author clause keys on
+		// the issue AUTHOR alone, so a bot-authored issue a maintainer already
+		// approved came back new + backlog-sweep on every re-mint and sat parked
+		// with botRounds=0 until a human commented again (ccw#173: approved
+		// 2026-08-16, re-minted 2026-08-17). The verdict is durable on the mirror;
+		// this clause reads it.
+		"a bot-authored issue whose mirror is APPROVED mints ACTIVE": {
+			iss:       scm.Issue{Number: 1, State: "open", Author: "tatara-bot"},
+			cr:        approvedMirror(),
+			wantStage: tatarav1alpha1.StateNew,
+		},
+		"PRECEDENCE: tatara-parked BEATS an APPROVED mirror": {
+			iss:        scm.Issue{Number: 1, State: "open", Author: "tatara-bot", Labels: []string{TataraParkedLabel}},
+			cr:         approvedMirror(),
+			wantStage:  tatarav1alpha1.StateNew,
+			wantReason: stage.ReasonBacklogSweep,
+		},
+		// THE FIELD, NEVER THE LABEL (C.6, issue_controller.go:290-291). The
+		// approved label is a ONE-WAY PROJECTION of status.status; reading it back
+		// would re-create the label -> status path C.6 deleted. An issue carrying
+		// the forge label whose mirror has not been moved is NOT approved.
+		// An APPROVER-LESS approval is not an approval MintStage may act on: the
+		// gate downstream (verifyOneIssue) refuses to short-circuit on it and runs
+		// the full citation grammar instead, so minting ACTIVE here would be two
+		// readings of "is this approved" disagreeing.
+		"an APPROVED status with no evidence does not mint ACTIVE": {
+			iss: scm.Issue{Number: 1, State: "open", Author: "tatara-bot"},
+			cr: &tatarav1alpha1.Issue{Status: tatarav1alpha1.IssueStatus{
+				State: "open", Status: "approved", Approval: nil,
+			}},
+			wantStage:  tatarav1alpha1.StateNew,
+			wantReason: stage.ReasonBacklogSweep,
+		},
+		"the tatara-approved LABEL alone does not mint ACTIVE": {
+			iss:        scm.Issue{Number: 1, State: "open", Author: "tatara-bot", Labels: []string{"tatara-approved"}},
+			cr:         &tatarav1alpha1.Issue{Status: tatarav1alpha1.IssueStatus{State: "open", Status: "new"}},
+			wantStage:  tatarav1alpha1.StateNew,
+			wantReason: stage.ReasonBacklogSweep,
+		},
+		"a nil mirror keeps the pre-approval default: PARKED": {
+			iss:        scm.Issue{Number: 1, State: "open", Author: "tatara-bot", Labels: []string{"tatara-approved"}},
+			cr:         nil,
 			wantStage:  tatarav1alpha1.StateNew,
 			wantReason: stage.ReasonBacklogSweep,
 		},
@@ -398,7 +476,7 @@ func TestMintStage(t *testing.T) {
 			if r == nil {
 				r = repo
 			}
-			gotStage, gotReason := MintStage(proj, r, tc.iss, tc.webhook)
+			gotStage, gotReason := MintStage(proj, r, tc.iss, tc.cr, tc.webhook)
 			if gotStage != tc.wantStage || gotReason != tc.wantReason {
 				t.Fatalf("MintStage = (%q, %q), want (%q, %q)", gotStage, gotReason, tc.wantStage, tc.wantReason)
 			}
@@ -797,6 +875,86 @@ func TestSweepAdoptsBotPRIntoOwningTask(t *testing.T) {
 	}
 	if len(fresh.Status.MRRefs) != 1 || fresh.Status.MRRefs[0] != mr.Name {
 		t.Fatalf("task mrRefs = %v, want [%s]", fresh.Status.MRRefs, mr.Name)
+	}
+}
+
+// adoptFixture builds the one shape both adoption-idempotence tests need: a
+// live Task and a bot PR on that Task's own branch, i.e. ClassifyPR -> PRAdopt.
+func adoptFixture(t *testing.T, name string) (*tatarav1alpha1.Project, *tatarav1alpha1.Repository,
+	*tatarav1alpha1.Task, client.Client, *sweepReader, scm.PRRef) {
+
+	t.Helper()
+	proj := sweepProject(name)
+	repo := sweepRepo(name)
+	owner := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: name + "-clarify-x", Namespace: testNS},
+		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: proj.Name, Kind: "clarify", Goal: "g"},
+	}
+	owner.Status.State = tatarav1alpha1.StateUnderImplementation
+	c := newMirrorClient(t, proj, repo, owner)
+	pr := scm.PRRef{
+		Repo: "szymonrychu/tatara-operator", HeadRepo: "szymonrychu/tatara-operator",
+		Number: 11, Author: "tatara-bot", HeadBranch: agent.TaskBranch(owner), HeadSHA: "deadbeef",
+	}
+	return proj, repo, owner, c, &sweepReader{prs: []scm.PRRef{pr}}, pr
+}
+
+// TestAdoptPRStillAdoptsAFreshPR is the regression pin for the change below it:
+// making the adopt log conditional must not make the ADOPTION conditional. A
+// never-adopted PR still reports a real transition and still lands in mrRefs.
+func TestAdoptPRStillAdoptsAFreshPR(t *testing.T) {
+	proj, repo, owner, c, _, pr := adoptFixture(t, "adopt-fresh")
+	r := newSweepReconciler(c)
+
+	changed, err := r.adoptPRIntoTask(context.Background(), proj, repo, pr, owner, nil)
+	if err != nil {
+		t.Fatalf("adoptPRIntoTask: %v", err)
+	}
+	if !changed {
+		t.Fatal("adoptPRIntoTask(fresh PR) reported changed=false, want true")
+	}
+	mrName := tatarav1alpha1.MergeRequestName(repo.Name, pr.Number)
+	var fresh tatarav1alpha1.Task
+	if gerr := c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: owner.Name}, &fresh); gerr != nil {
+		t.Fatalf("get task: %v", gerr)
+	}
+	if len(fresh.Status.MRRefs) != 1 || fresh.Status.MRRefs[0] != mrName {
+		t.Fatalf("task mrRefs = %v, want [%s]", fresh.Status.MRRefs, mrName)
+	}
+}
+
+// TestAdoptPRLogsOnceAcrossRepeatedSweeps: adoption is IDEMPOTENT, so PRAdopt is
+// the disposition on every pass for as long as the PR stays open - correctly, and
+// ClassifyPR is not the thing to change. What was wrong was the REPORTING: the arm
+// logged action=sweep_adopt_pr unconditionally, so a single adoption showed up as
+// one adoption per sweep pass forever, which is exactly the signal an operator
+// reads to find an adoption LOOP. The sibling PRAdoptUpgrade arm already had this
+// right (it logs only when EnqueueEvent reports created).
+func TestAdoptPRLogsOnceAcrossRepeatedSweeps(t *testing.T) {
+	proj, repo, owner, c, rd, pr := adoptFixture(t, "adopt-once")
+	r := newSweepReconciler(c)
+
+	var buf bytes.Buffer
+	ctx := captureLogger(&buf)
+	sweepOnce(t, ctx, r, proj, repo, rd)
+	sweepOnce(t, ctx, r, proj, repo, rd)
+
+	if n := strings.Count(buf.String(), "sweep_adopt_pr"); n != 1 {
+		t.Fatalf("action=sweep_adopt_pr lines across two passes = %d, want 1", n)
+	}
+	changed, err := r.adoptPRIntoTask(ctx, proj, repo, pr, owner, nil)
+	if err != nil {
+		t.Fatalf("adoptPRIntoTask (repeat): %v", err)
+	}
+	if changed {
+		t.Fatal("adoptPRIntoTask(already-adopted PR) reported changed=true, want false")
+	}
+	var fresh tatarav1alpha1.Task
+	if gerr := c.Get(ctx, types.NamespacedName{Namespace: testNS, Name: owner.Name}, &fresh); gerr != nil {
+		t.Fatalf("get task: %v", gerr)
+	}
+	if len(fresh.Status.MRRefs) != 1 {
+		t.Fatalf("task mrRefs = %v, want exactly one ref (adoption is idempotent)", fresh.Status.MRRefs)
 	}
 }
 

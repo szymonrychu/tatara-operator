@@ -173,6 +173,13 @@ func (d *StageDriver) driveOwnerReentry(ctx context.Context, proj *tatarav1alpha
 			liveRoom = room
 		}
 	}
+	// CAPTURED BEFORE THE CALL, because ApplyUnpark DESTROYS it: on a successful
+	// un-park it write-backs *task = *persisted, and the persisted object is the
+	// one clearPark already emptied ParkReason on. Read after the call and the
+	// field is unconditionally "" - and it is only reachable when unparked ==
+	// true, so the reason_from field of every redeliver_reentry line ever logged
+	// was empty. ApplyUnpark itself captures its own copy the same way.
+	fromReason := task.Status.ParkReason
 	unparked, decline, err := ApplyUnpark(ctx, d.Client, d.APIReader, proj, &task, active, maxOpen, liveRoom, time.Now())
 	if err != nil {
 		log.FromContext(ctx).Error(err, "redeliver: comment-driven unpark failed",
@@ -187,5 +194,5 @@ func (d *StageDriver) driveOwnerReentry(ctx context.Context, proj *tatarav1alpha
 	}
 	log.FromContext(ctx).Info("redeliver: unparked task on sweep-delivered comment",
 		"action", "redeliver_reentry", "resource_id", ownerName, "state", task.Status.State,
-		"reason_from", task.Status.ParkReason)
+		"reason_from", fromReason)
 }

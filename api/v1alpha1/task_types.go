@@ -484,6 +484,15 @@ type TaskEvent struct {
 	// writer MUST clamp. AppendTaskEvent does it for all of them (issue #495).
 	// +kubebuilder:validation:MaxLength=4096
 	Body string `json:"body"`
+	// UnparkConsumedAt is when this event was SPENT releasing a park. An event
+	// may release exactly one park: without the stamp a retained event
+	// (stage.Unpark keeps pendingEvents by contract) re-triggers the same unpark
+	// every 30s forever whenever the Task re-parks before a pod ever reaches the
+	// pod-time drain. It is a stamp and not a delete because the turn-0 bundle
+	// still renders the event; only its ELIGIBILITY to release another park is
+	// spent.
+	// +optional
+	UnparkConsumedAt *metav1.Time `json:"unparkConsumedAt,omitempty"`
 }
 
 // TaskStatus defines the observed state of a Task.
