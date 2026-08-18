@@ -428,7 +428,7 @@ func terminalMREdge(task *tatarav1alpha1.Task, mrs []tatarav1alpha1.MergeRequest
 	return stage.Edge{To: tatarav1alpha1.StateRejected, Reason: stage.ReasonMRClosedExternally}, true
 }
 
-// ownMRsShippedEdge is the NON-REVIEW sibling of terminalMREdge, for the shape
+// OwnMRsShippedEdge is the NON-REVIEW sibling of terminalMREdge, for the shape
 // that burned Task mt-i-mtg-decks-22 (#578): a kind=issue Task sitting in
 // awaiting-review whose own MR was merged out of band by a human.
 //
@@ -452,12 +452,31 @@ func terminalMREdge(task *tatarav1alpha1.Task, mrs []tatarav1alpha1.MergeRequest
 // so it advances the cursor per repo and enters `deployed` without re-merging
 // anything.
 //
+// IT IS EXPORTED FOR ONE MORE CALLER, AND ONLY ONE: restapi's
+// submit_outcome(action=submitted) handler, which faces the identical fact one
+// state earlier. A Task at under-implementation whose every owned merge request
+// already merged reaches this endpoint, not the awaiting-review finalize sites -
+// and the endpoint used to answer a 2xx no-op there, which neither advances the
+// Task nor parks it, so the Task had no reachable terminal and respawned a pod
+// every ~80s (upgrade-qe-e4016501fd9107d9: 127 pods, 119 turns, one bot round).
+// Sharing the resolution is the point: the endpoint and the two reconciler sites
+// must never disagree about what "every owned merge request is terminal" means.
+//
+// NO LEVEL-TRIGGERED SWEEP AT under-implementation, deliberately, which is why
+// the endpoint is the caller rather than a fourth reconciler site. Arriving at
+// awaiting-review IS the agent declaring its work complete, so AllMRsTerminal
+// over the owned set is total there. At under-implementation it is not: a
+// multi-repo implement Task whose FIRST merge request a human merged early has
+// every merge request it has opened SO FAR terminal while still owing the next
+// one, and a sweep would finalize it mid-work. Only submit_outcome says "that
+// was everything".
+//
 // A NON-NIL pendingReview REFUSES THE MERGED BRANCH. It is LegalFor GUARD 2's
 // condition (reviewGateOpen), so firing through it would only produce an
 // IllegalTransitionError, and a review owed to the forge means the ordinary
 // drain -> advanceAfterReview path is alive and owns the decision. The rejected
 // branch is ungated and needs no such check.
-func ownMRsShippedEdge(task *tatarav1alpha1.Task, mrs []tatarav1alpha1.MergeRequest) (stage.Edge, bool) {
+func OwnMRsShippedEdge(task *tatarav1alpha1.Task, mrs []tatarav1alpha1.MergeRequest) (stage.Edge, bool) {
 	if task == nil || task.Spec.Kind == "review" || !stage.AllMRsTerminal(mrs) {
 		return stage.Edge{}, false
 	}
@@ -473,14 +492,14 @@ func ownMRsShippedEdge(task *tatarav1alpha1.Task, mrs []tatarav1alpha1.MergeRequ
 }
 
 // externalTerminalEdge is the ONE resolution both convergent finalize sites call:
-// terminalMREdge for a kind=review Task, ownMRsShippedEdge for every other kind.
+// terminalMREdge for a kind=review Task, OwnMRsShippedEdge for every other kind.
 // The two are mutually exclusive by construction (each refuses the other's kind),
 // so the order is documentation, not precedence.
 func externalTerminalEdge(task *tatarav1alpha1.Task, mrs []tatarav1alpha1.MergeRequest) (stage.Edge, bool) {
 	if edge, ok := terminalMREdge(task, mrs); ok {
 		return edge, true
 	}
-	return ownMRsShippedEdge(task, mrs)
+	return OwnMRsShippedEdge(task, mrs)
 }
 
 // TaskTakenOver reports whether task is a kind=review Task in reviewing whose

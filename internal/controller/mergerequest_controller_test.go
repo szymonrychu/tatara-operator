@@ -267,7 +267,7 @@ func TestReconcile_TerminalMirrorIsNotThreadRead(t *testing.T) {
 // TestReconcile_MergedMirrorIsNeverMarkedClosed is tatara-operator#621.
 // MergeRequest.Status.State is not mirror-local: "merged" -> "closed" makes
 // stage.AllMRsMerged false while AllMRsTerminal stays true, so terminalMREdge
-// / ownMRsShippedEdge (reviewpost.go:421-429, :463-465) finalize the owner Task
+// / OwnMRsShippedEdge (reviewpost.go:421-429, :463-465) finalize the owner Task
 // rejected(mr-closed-externally) with a public terminal comment on the driving
 // issue, instead of done. A forge 404 may stop work; it may not rewrite a merge
 // that already happened.

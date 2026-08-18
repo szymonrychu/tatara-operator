@@ -324,6 +324,7 @@ var Transitions = map[string][]Edge{
 
 	v1alpha1.StateUnderImplementation: {
 		{To: v1alpha1.StateAwaitingReview, Trigger: "submit_outcome(action=submitted) and >= 1 owned MR is open"},
+		{To: v1alpha1.StateMerged, Trigger: "submit_outcome(action=submitted) and EVERY owned merge request has ALREADY MERGED on the forge: the work shipped out of band, so there is nothing left to open, nothing to review and nothing to merge. GUARD 7 makes AllMRsMerged the edge's own precondition, so this is not a door around review - it is the same fact OwnMRsShippedEdge already finalizes from awaiting-review, recognised one state earlier"},
 		{To: v1alpha1.StateRefined, Trigger: "the plan pinned at grant no longer matches the plan note (plan-hash-mismatch): the CHEAP path out, back to the gate, never a park"},
 		{To: v1alpha1.StateDone, Trigger: "the nightly documentation batch declined or its budget elapsed: done(doc-timeout), no MR opened"},
 		{To: v1alpha1.StateRejected, Trigger: "a human closed the driving issue mid-flight"},
@@ -445,6 +446,17 @@ func Legal(from, to string) bool { return legalPairs[[2]string{from, to}] }
 // mint_routing_test.go holds only the Create-edge pin, which is a claim about
 // the transition table itself.
 //
+// GUARD 7. under-implementation -> merged requires that EVERY owned merge
+// request has already MERGED on the forge (AllMRsMerged, which is false on an
+// empty set). That is the whole content of the edge: the work shipped out of
+// band, so there is nothing left to review and nothing left to merge, and
+// ReconcileMerging walks straight through its idempotent already-merged branch
+// into `deployed`. Without the guard the edge would be a door past review from
+// the state where code is written, which is the hole GUARDS 3-6 close for their
+// own edges. Note that AllMRsMerged is strictly stronger than AllMRsTerminal: a
+// merge request CLOSED unmerged is terminal and is NOT a delivery, so it does
+// not open this edge.
+//
 // GUARDS 4, 5 AND 6 WERE CALLER-GATED UNTIL #521's REVIEW (GUARD 6 slipped past
 // that same review and was only caught in the round after). The table's own
 // Trigger prose named the kind in every case and only triageTarget and the
@@ -484,6 +496,9 @@ func LegalFor(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, from, to string) bo
 		if t == nil || !refinedDoneKinds[t.Spec.Kind] {
 			return false
 		}
+	}
+	if from == v1alpha1.StateUnderImplementation && to == v1alpha1.StateMerged && !AllMRsMerged(mrs) {
+		return false
 	}
 	return true
 }
@@ -700,6 +715,12 @@ func stampEnter(t *v1alpha1.Task, to, reason string, now time.Time) {
 	t.Status.LastTurnFailedRepos = nil
 	t.Status.LastTurnReposTurnID = ""
 	t.Status.Stats.PodRecreations = 0
+	// The agent-stop streak belongs to ONE state occupancy: a transition is a
+	// change of circumstance, so the next state's agent starts with a full
+	// continuation budget. Same write as the state, for the reason
+	// enterMergeConflict persists its counter that way - a crash between two
+	// writes must not be able to lose the bound or double it.
+	t.Status.Stats.AgentStops = 0
 	t.Status.StageElapsedCarrySeconds = 0
 	if Live(to) {
 		t.Status.ConversationLastEventAt = &stamp
@@ -1723,6 +1744,11 @@ func reArm(t *v1alpha1.Task, now time.Time) {
 	t.Status.PodStartedAt = nil
 	t.Status.StateWorkStartedAt = nil
 	t.Status.Stats.PodRecreations = 0
+	// An un-park RE-DRIVES the state, so it is a change of circumstance too.
+	// Without this a Task parked at the agent-stop cap would come back already
+	// exhausted and re-park on the same reconcile pass, spending every re-entry
+	// lap in milliseconds - the #513 shape, exactly.
+	t.Status.Stats.AgentStops = 0
 	if Live(t.Status.State) {
 		t.Status.ConversationLastEventAt = &stamp
 	}

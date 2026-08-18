@@ -131,6 +131,32 @@ const (
 	// literal assertion in project_types_test.go (TestOperatorConstants),
 	// which asserts this equals 5 minutes.
 	PodReadyTimeout = 5 * time.Minute
+	// AgentStopReArmCap bounds the AGENT-REQUESTED-STOP re-arm cycle: the
+	// number of consecutive agent-requested stops one state occupancy may
+	// re-arm a replacement pod for. Past it the Task parks no-outcome and
+	// spawns NOTHING.
+	//
+	// It is the bound the comment on PodReadyTimeout above claimed already
+	// existed and did not. That comment says a pod loop is "bounded only by
+	// ResidencyCapAll and made visible by the
+	// operator_pod_recreations_total{reason=BootTimeout} churn alert"; BOTH
+	// halves failed for this shape. ResidencyCapAll is 24h measured from
+	// stateEnteredAt, which the loop does not reset - ~900 more pods for
+	// upgrade-qe-e4016501fd9107d9 - and it additionally requires
+	// stateWorkStartedAt != nil, which the agent-requested stop NILS on every
+	// lap, so the dead-man switch was armed for roughly 55 seconds of each
+	// 80-second cycle. The churn metric never saw it at all: a stop-and-respawn
+	// through normal admission recorded no recreation, so
+	// operator_pod_recreations_total had ZERO series for the whole incident.
+	//
+	// WHY THREE, AND NOT ONE. The FIRST re-arm is the legitimate continuation
+	// handoff - an agent that ran out of context mid-implementation writes its
+	// note and the next pod carries on - and the operator cannot tell that apart
+	// from "I have nothing to do" without a wire-contract field the wrapper does
+	// not send. Three leaves a long job room and still turns 127 pods into 3.
+	// It is a CONSTANT for the same reason ResidencyCapAll is: a CRD field can
+	// be silently pruned, and the failure mode of a pruned bound is no bound.
+	AgentStopReArmCap = 3
 	// MaxMergeReentries bounds the merging<->reviewing re-entry cycle (fix H7).
 	MaxMergeReentries = 3
 	// MaxDeployReentries bounds the deploying re-entry cycle (fix H7).
