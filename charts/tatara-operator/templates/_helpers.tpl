@@ -130,6 +130,11 @@ TOKEN_BUDGET_EMERGENCY_PERCENT: {{ .Values.tokenBudgetEmergencyPercent | quote }
 TOKEN_BUDGET_RESET_SCHEDULE: {{ .Values.tokenBudgetResetSchedule | quote }}
 TOKEN_BUDGET_WINDOW: {{ .Values.tokenBudgetWindow | quote }}
 TOKEN_BUDGET_TOKEN_LIMIT: {{ .Values.tokenBudgetTokenLimit | quote }}
+TOKEN_BUDGET_FIVE_HOUR_PROACTIVE_PERCENT: {{ .Values.tokenBudgetFiveHourProactivePercent | quote }}
+TOKEN_BUDGET_FIVE_HOUR_EMERGENCY_PERCENT: {{ .Values.tokenBudgetFiveHourEmergencyPercent | quote }}
+TOKEN_BUDGET_WEEKLY_PROACTIVE_PERCENT: {{ .Values.tokenBudgetWeeklyProactivePercent | quote }}
+TOKEN_BUDGET_WEEKLY_EMERGENCY_PERCENT: {{ .Values.tokenBudgetWeeklyEmergencyPercent | quote }}
+TOKEN_BUDGET_MAX_SNAPSHOT_AGE: {{ .Values.tokenBudgetMaxSnapshotAge | quote }}
 {{/* Claude account-usage poller (claudeSubscription gate): off until usageEnabled. */}}
 USAGE_ENABLED: {{ .Values.usageEnabled | quote }}
 USAGE_AUTH_MODE: {{ .Values.usageAuthMode | quote }}

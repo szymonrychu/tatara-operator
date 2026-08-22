@@ -30,6 +30,10 @@ func TestBudgetDefaultsOff(t *testing.T) {
 		Mode:             budget.ModeCustomWindow,
 		ProactivePercent: budget.DefaultProactivePercent,
 		EmergencyPercent: budget.DefaultEmergencyPercent,
+		// Unset TOKEN_BUDGET_MAX_SNAPSHOT_AGE inherits the package default rather
+		// than 0: 0 would DISABLE the staleness bound, which is the opposite of
+		// the safe reading of "not configured".
+		MaxSnapshotAge: budget.DefaultMaxSnapshotAge,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("defaults:\n got  %+v\n want %+v", got, want)
@@ -85,6 +89,7 @@ func TestBudgetDefaultsFromEnv(t *testing.T) {
 		ResetSchedule:    "0 * * * *",
 		WindowDuration:   5 * time.Hour,
 		TokenLimit:       1000000,
+		MaxSnapshotAge:   budget.DefaultMaxSnapshotAge,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("from env:\n got  %+v\n want %+v", got, want)

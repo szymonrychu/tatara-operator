@@ -6167,6 +6167,30 @@ spec:
                       Enabled turns the gate on for this project. When the block is present this
                       field is authoritative (it is NOT inherited from the operator-wide default).
                     type: boolean
+                  fiveHourEmergencyPercent:
+                    maximum: 100
+                    minimum: 0
+                    type: integer
+                  fiveHourProactivePercent:
+                    description: |-
+                      FiveHourProactivePercent / FiveHourEmergencyPercent /
+                      WeeklyProactivePercent / WeeklyEmergencyPercent gate each Claude
+                      subscription window against its OWN thresholds (claudeSubscription mode).
+                      Unset (0) inherits ProactivePercent/EmergencyPercent, so a Project that
+                      sets none of these decides exactly as it does today.
+
+                      There is deliberately no per-Project maxSnapshotAge counterpart: the
+                      Claude subscription is one account shared by every Project, so snapshot
+                      staleness is fleet-wide and only the operator-wide
+                      TOKEN_BUDGET_MAX_SNAPSHOT_AGE sets it.
+
+                      NO CEL RULES HERE, deliberately: SpawnCeilingByKind's two XValidation
+                      rules plus MaxProperties=12 exist because envtest's apiserver rejects a
+                      CRD whose CEL cost estimate exceeds budget. Plain Minimum/Maximum markers
+                      are free; CEL here could break the entire envtest suite.
+                    maximum: 100
+                    minimum: 0
+                    type: integer
                   mode:
                     default: customWindow
                     description: |-
@@ -6223,6 +6247,14 @@ spec:
                     description: TokenLimit is the absolute total-token budget per
                       window (customWindow mode).
                     format: int64
+                    type: integer
+                  weeklyEmergencyPercent:
+                    maximum: 100
+                    minimum: 0
+                    type: integer
+                  weeklyProactivePercent:
+                    maximum: 100
+                    minimum: 0
                     type: integer
                   windowDuration:
                     description: |-

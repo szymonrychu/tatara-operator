@@ -38,6 +38,27 @@ const (
 	DefaultEmergencyPercent = 80
 )
 
+// Window names one Claude subscription usage window. The values match the
+// tatara_account_usage_utilization{window} label values, so a threshold and its
+// gauge always name the same thing.
+type Window string
+
+const (
+	WindowFiveHour Window = "five_hour"
+	WindowWeekly   Window = "seven_day"
+)
+
+// DefaultMaxSnapshotAge is how long a subscription usage snapshot keeps
+// governing admission after it was observed.
+//
+// 90 minutes: an agent turn runs for minutes to tens of minutes and every
+// pod-TTL and turn-timeout bound in the platform is well under an hour, so any
+// fleet that has run a turn in the last 90 minutes has a fresh snapshot. It is
+// roughly 3x the longest healthy inter-turn gap, and short relative to the 5h
+// window it governs, so an expiring snapshot can never have missed more than
+// about 30% of a 5h window's worth of unobserved burn.
+const DefaultMaxSnapshotAge = 90 * time.Minute
+
 // Config is a project's resolved token-budget configuration. The zero value has
 // Enabled=false, leaving admission unchanged (backwards-compatible default).
 type Config struct {
@@ -56,6 +77,33 @@ type Config struct {
 	// percent. Kinds absent from the map are not per-kind gated (they fall through
 	// to the pool-class proactive/emergency thresholds). Ignored in customWindow mode.
 	SpawnCeilingByKind map[string]int
+
+	// Per-window thresholds (claudeSubscription mode). Each window is checked
+	// against its OWN pair; ProactiveBlocked/EmergencyBlocked are OR'd across
+	// windows. A non-positive value inherits ProactivePercent/EmergencyPercent,
+	// so a Config that sets none of these produces exactly the decision the
+	// single-pair implementation produced.
+	FiveHourProactivePercent int
+	FiveHourEmergencyPercent int
+	WeeklyProactivePercent   int
+	WeeklyEmergencyPercent   int
+
+	// MaxSnapshotAge stops a subscription snapshot governing once it is older
+	// than this. Non-positive disables the check.
+	//
+	// It closes the F7 de-scope recorded in MEMORY.md 2026-07-04: before it,
+	// budget.active() was the ONLY staleness gate, so a snapshot that simply
+	// stopped being refreshed kept governing until its last-reported resets_at
+	// and only then failed open.
+	//
+	// EXPIRY FAILS OPEN, matching active()'s existing direction and avoiding
+	// wedging the platform on a broken feed. That is only defensible because a
+	// dead feed is now alertable (tatara_account_usage_gate_ready). It is also
+	// structurally incapable of deadlock: holding all work means no turns run,
+	// which means no fresh snapshots, which means the snapshot ages out and the
+	// gate re-opens, which means turns run and a fresh snapshot arrives and the
+	// gate re-engages. Self-correcting oscillation, not a wedge.
+	MaxSnapshotAge time.Duration
 }
 
 // WindowState is the persisted custom-window accumulator (carried on Project
@@ -77,6 +125,12 @@ type Subscription struct {
 	WeeklyPercent   float64
 	WeeklyReset     time.Time
 
+	// ObservedAt is when this snapshot was observed. ZERO MEANS UNKNOWN, and
+	// unknown is treated as FRESH - that is the poller's path and every
+	// pre-upgrade snapshot, and treating it as stale would silently disable the
+	// gate for them.
+	ObservedAt time.Time
+
 	// Carried for metrics only; not used by the gate in v1.
 	OpusPercent    float64
 	OpusReset      time.Time
@@ -90,12 +144,30 @@ type Subscription struct {
 type Decision struct {
 	// UsedPercent is the governing usage percentage (0..100+; custom-window mode
 	// may exceed 100 if spend overran the limit).
+	//
+	// In claudeSubscription mode with per-window thresholds there is no single
+	// scalar the two windows share, so "governing" is DEFINED as: the window
+	// with the highest ratio of its own percent to its OWN proactive threshold,
+	// reported as that window's raw percent. Selecting by relative pressure is
+	// what makes "worse off" meaningful across windows with different
+	// thresholds; reporting the raw percent is what keeps this gauge comparable
+	// to the proactive/emergency threshold gauges, which carry that same
+	// window's pair.
 	UsedPercent float64
 	// ProactiveBlocked pauses the normal pool (brainstorm, implement, review, ...).
 	// EmergencyBlocked pauses the alert pool (incidents). EmergencyBlocked implies
 	// ProactiveBlocked because EmergencyPercent is ordered >= ProactivePercent.
 	ProactiveBlocked bool
 	EmergencyBlocked bool
+
+	// GoverningWindow is the window UsedPercent came from, empty in customWindow
+	// mode and when no window is active or fresh. GoverningProactivePercent and
+	// GoverningEmergencyPercent are ITS thresholds, so the
+	// operator_token_budget_used_ratio scope="used"/"proactive"/"emergency"
+	// triple always describes one coherent window.
+	GoverningWindow           Window
+	GoverningProactivePercent int
+	GoverningEmergencyPercent int
 }
 
 // ParseSchedule parses a 5-field cron schedule (robfig ParseStandard), the same
@@ -153,26 +225,69 @@ func Evaluate(cfg Config, state WindowState, sub Subscription, now time.Time) De
 	if !cfg.Enabled {
 		return Decision{}
 	}
+	if cfg.Mode == ModeClaudeSubscription {
+		return subscriptionDecision(cfg, sub, now)
+	}
 	proactive, emergency := ResolvePercents(cfg)
-	used := usedPercent(cfg, state, sub, now)
+	used := usedPercent(cfg, state, now)
 	return Decision{
-		UsedPercent:      used,
-		ProactiveBlocked: used >= float64(proactive),
-		EmergencyBlocked: used >= float64(emergency),
+		UsedPercent:               used,
+		ProactiveBlocked:          used >= float64(proactive),
+		EmergencyBlocked:          used >= float64(emergency),
+		GoverningProactivePercent: proactive,
+		GoverningEmergencyPercent: emergency,
 	}
 }
 
-func usedPercent(cfg Config, state WindowState, sub Subscription, now time.Time) float64 {
-	switch cfg.Mode {
-	case ModeClaudeSubscription:
-		return subscriptionUsedPercent(sub, now)
-	default: // ModeCustomWindow (and unset, for forward-compat)
-		if cfg.TokenLimit <= 0 {
-			return 0
-		}
-		rolled := Roll(cfg, state, now, 0)
-		return float64(rolled.WindowTokens) / float64(cfg.TokenLimit) * 100
+// subscriptionDecision checks EACH window against its OWN threshold pair and
+// ORs the blocks across windows. A window contributes only while its reset is
+// known and still in the future (active) and the snapshot itself is fresh
+// (SnapshotFresh); everything else fails open, exactly as before.
+func subscriptionDecision(cfg Config, sub Subscription, now time.Time) Decision {
+	d := Decision{}
+	if !SnapshotFresh(cfg, sub.ObservedAt, now) {
+		return d
 	}
+	worst := -1.0
+	for _, w := range []struct {
+		name    Window
+		percent float64
+		reset   time.Time
+	}{
+		{WindowFiveHour, sub.FiveHourPercent, sub.FiveHourReset},
+		{WindowWeekly, sub.WeeklyPercent, sub.WeeklyReset},
+	} {
+		if !active(w.reset, now) {
+			continue
+		}
+		proactive, emergency := ResolveWindowPercents(cfg, w.name)
+		if w.percent >= float64(proactive) {
+			d.ProactiveBlocked = true
+		}
+		if w.percent >= float64(emergency) {
+			d.EmergencyBlocked = true
+		}
+		if ratio := w.percent / float64(proactive); ratio > worst {
+			worst = ratio
+			d.UsedPercent = w.percent
+			d.GoverningWindow = w.name
+			d.GoverningProactivePercent = proactive
+			d.GoverningEmergencyPercent = emergency
+		}
+	}
+	return d
+}
+
+// usedPercent meters ModeCustomWindow (and an unset mode, for forward-compat).
+// ModeClaudeSubscription no longer reaches here: Evaluate short-circuits to
+// subscriptionDecision, because one scalar cannot carry two windows checked
+// against two different threshold pairs.
+func usedPercent(cfg Config, state WindowState, now time.Time) float64 {
+	if cfg.TokenLimit <= 0 {
+		return 0
+	}
+	rolled := Roll(cfg, state, now, 0)
+	return float64(rolled.WindowTokens) / float64(cfg.TokenLimit) * 100
 }
 
 func subscriptionUsedPercent(sub Subscription, now time.Time) float64 {
@@ -190,6 +305,13 @@ func subscriptionUsedPercent(sub Subscription, now time.Time) float64 {
 // account subscription usage. It applies only in claudeSubscription mode with a
 // configured per-kind ceiling; every other case returns false so the caller's
 // pool-class Decision remains authoritative.
+//
+// SCOPE BOUNDARY, deliberate: it keeps the max()-across-windows collapse even
+// though Evaluate moved to per-window thresholds, and it ignores
+// Config.MaxSnapshotAge. SpawnCeilingByKind is a graduated "how much account
+// headroom is left" ladder, nothing configures it in prod today, and changing
+// both surfaces at once widens blast radius for no benefit. Its only caller is
+// queue_controller.go's per-event decision.
 func KindBlocked(cfg Config, sub Subscription, kind string, now time.Time) bool {
 	if !cfg.Enabled || cfg.Mode != ModeClaudeSubscription {
 		return false
@@ -224,6 +346,42 @@ func ResolvePercents(cfg Config) (proactive, emergency int) {
 		emergency = proactive
 	}
 	return proactive, emergency
+}
+
+// ResolveWindowPercents returns the (proactive, emergency) pair governing one
+// window: the per-window override when set, else the mode-wide pair, else the
+// package defaults. It delegates the fallback and the emergency >= proactive
+// ordering to ResolvePercents so both paths order identically.
+func ResolveWindowPercents(cfg Config, w Window) (proactive, emergency int) {
+	scoped := cfg
+	switch w {
+	case WindowFiveHour:
+		if cfg.FiveHourProactivePercent > 0 {
+			scoped.ProactivePercent = cfg.FiveHourProactivePercent
+		}
+		if cfg.FiveHourEmergencyPercent > 0 {
+			scoped.EmergencyPercent = cfg.FiveHourEmergencyPercent
+		}
+	case WindowWeekly:
+		if cfg.WeeklyProactivePercent > 0 {
+			scoped.ProactivePercent = cfg.WeeklyProactivePercent
+		}
+		if cfg.WeeklyEmergencyPercent > 0 {
+			scoped.EmergencyPercent = cfg.WeeklyEmergencyPercent
+		}
+	}
+	return ResolvePercents(scoped)
+}
+
+// SnapshotFresh reports whether a snapshot observed at observedAt still governs
+// at now. A zero observedAt is UNKNOWN and treated as fresh; a non-positive
+// MaxSnapshotAge disables the check. See Config.MaxSnapshotAge for the
+// fail-open rationale.
+func SnapshotFresh(cfg Config, observedAt, now time.Time) bool {
+	if cfg.MaxSnapshotAge <= 0 || observedAt.IsZero() {
+		return true
+	}
+	return now.Sub(observedAt) <= cfg.MaxSnapshotAge
 }
 
 // Validate checks an enabled config is self-consistent. Disabled configs always

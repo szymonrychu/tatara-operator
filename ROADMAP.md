@@ -17,6 +17,27 @@ Planned work not yet started. One line per item; link to plans for detail.
   `mr.Status.Ownership == "external"`, so a tatara-owned merge request whose comment webhook is lost
   has no path back into `pendingEvents`; and **`restapi.unresumableTakeoverPark`**, whose 409 body
   now under-describes the remedy (see MEMORY.md 2026-08-22).
+- [x] **THE CLAUDE SUBSCRIPTION USAGE-GATE FEED. Landed 2026-08-22
+  (`docs/superpowers/plans/2026-08-22-claude-subscription-usage-gate-feed.md`, workbench tatara-new).
+  MINOR.** The claudeSubscription admission gate had been enabled in prod with NO data feed, so it
+  evaluated 0% forever and admitted everything, and no alert watched it. It now has one: each agent
+  pod's `cc-statusline` forwards Claude Code's `rate_limits` block to the wrapper, the wrapper
+  attaches the newest snapshot to its turn-complete callback, the per-replica handler writes it onto
+  that Task's `status.accountUsage`, and the leader-only `AccountUsageFeedReconciler` plus
+  `accountUsageGaugeRunnable` fold it newest-wins into the one fleet-wide `accountusage.Store` and
+  seed that store at leader start. Shipped with it: per-window (proactive, emergency) pairs on
+  `TokenBudgetSpec`, the operator-wide `TOKEN_BUDGET_MAX_SNAPSHOT_AGE` staleness bound (default 90m,
+  fails OPEN) which closes the 2026-07-04 F7 de-scope, `tatara_account_usage_snapshot_age_seconds`
+  and `tatara_account_usage_gate_ready`, and the `TataraAccountUsageFeedDead` alert that is the
+  compensating control for the fail-open. Unset per-window thresholds decide byte-for-byte as
+  before. **Two deliberate leftovers.** (1) The `/api/oauth/usage` poller stays OFF: the fleet's
+  shared `claude setup-token` lacks the `user:profile` scope it needs (403), and turning it on
+  requires an interactive `claude login` plus a sops secret. (2) The deprecated subscription fields
+  on `TokenBudgetStatus` and `Project.BudgetSubscription()` are superseded in claudeSubscription
+  mode (`doReconcile` overwrites the projection with `r.Usage.Get().Subscription()`) and nothing
+  writes them any more, but removing them is a CRD deprecation with its own
+  `change_significance: major`, not part of this one.
+
 - [x] **QUEUED UPGRADE ADOPTION replaces the pulled-forward sweep marker below, landed 2026-08-16
   (`docs/superpowers/sdd/2026-08-16-queued-upgrade-adoption-plan.md`, workbench tatara-new). PATCH.**
   An adoptable dependency merge request's webhook delivery now becomes a durable `QueuedEvent` that

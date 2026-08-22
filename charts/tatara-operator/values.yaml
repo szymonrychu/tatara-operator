@@ -164,6 +164,19 @@ tokenBudgetEnabled: false
 tokenBudgetMode: "customWindow"
 tokenBudgetProactivePercent: 50
 tokenBudgetEmergencyPercent: 80
+# Per-window thresholds for claudeSubscription mode: each Claude usage window is
+# checked against its OWN pair, and the pool-class holds are OR'd across windows.
+# 0 inherits tokenBudgetProactivePercent/tokenBudgetEmergencyPercent, so the
+# chart default decides exactly as it did before these knobs existed.
+tokenBudgetFiveHourProactivePercent: 0
+tokenBudgetFiveHourEmergencyPercent: 0
+tokenBudgetWeeklyProactivePercent: 0
+tokenBudgetWeeklyEmergencyPercent: 0
+# tokenBudgetMaxSnapshotAge is how long a Claude usage snapshot keeps governing
+# admission after it was observed. Past it the gate FAILS OPEN, which is why
+# TataraAccountUsageFeedDead exists. Fleet-wide, so there is no per-Project
+# override: the account is shared by every Project.
+tokenBudgetMaxSnapshotAge: "90m"
 # tokenBudgetResetSchedule is a 5-field cron marking each window reset boundary;
 # tokenBudgetWindow is the declared window length as a Go duration (e.g. "5h",
 # "168h") and bounds the reset search. Both are customWindow-mode inputs.

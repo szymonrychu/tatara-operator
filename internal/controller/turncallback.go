@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"slices"
 	"strconv"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -119,12 +121,110 @@ type turnCompletePayload struct {
 	// module between the two repos - this is a wire contract, not an import).
 	// Empty/absent when the turn reported nothing.
 	InternalIssues []InternalIssueReport `json:"internalIssues,omitempty"`
-	// rateLimit was the per-turn Claude usage snapshot the wrapper reported for
-	// the claudeSubscription budget mode (issue #189). Retired: subscription
-	// state now lives only in the fleet-wide account-usage poller/store (issue
-	// #189 follow-up). The field is deliberately not declared here so an
-	// incoming "rateLimit" key from an older wrapper is silently ignored by
-	// json.Unmarshal (wire compatibility) instead of being persisted.
+	// AccountUsage is the account-wide Claude subscription usage snapshot the
+	// wrapper's statusline observed. JSON tags mirror
+	// tatara-claude-code-wrapper's cmd/wrapper.accountUsagePayload exactly -
+	// there is no shared Go module between the two repos.
+	//
+	// The old "rateLimit" key (#189, retired in dd40ee4) is still deliberately
+	// NOT declared, so an ancient wrapper's rateLimit is silently ignored by
+	// json.Unmarshal - which does NOT use DisallowUnknownFields here - rather
+	// than colliding with this field.
+	AccountUsage *turnAccountUsage `json:"accountUsage,omitempty"`
+}
+
+// turnAccountUsage is the wire shape of the statusline-reported snapshot.
+// Percents are float64 on the wire (Claude reports a possibly-fractional
+// used_percentage, 0..100) and resets are unix epoch SECONDS, which is what the
+// statusline payload carries - not the RFC3339 string /api/oauth/usage uses.
+// Both are converted at the persistence boundary in recordAccountUsage.
+//
+// The feed is subscriber-only: agent pods authenticate with a
+// CLAUDE_CODE_OAUTH_TOKEN so they qualify, but a pod running on a plain
+// ANTHROPIC_API_KEY would never report one, and that is not a fault.
+type turnAccountUsage struct {
+	ObservedAt        time.Time `json:"observedAt"`
+	FiveHourPercent   float64   `json:"fiveHourPercent"`
+	FiveHourResetUnix int64     `json:"fiveHourResetUnix,omitempty"`
+	WeeklyPercent     float64   `json:"weeklyPercent"`
+	WeeklyResetUnix   int64     `json:"weeklyResetUnix,omitempty"`
+}
+
+// recordAccountUsage parks the account-wide usage snapshot on this Task's own
+// status. EVERY replica runs this handler (callbackRunnable is deliberately not
+// leader-elected, cmd/manager/wire.go), and each request concerns a DIFFERENT
+// Task, so this write is replica-safe. Writing into the in-process
+// accountusage.Store here would NOT be: that store is per-process, the
+// dispatcher that reads it is leader-only, and roughly 2/3 of callbacks land on
+// a non-leader, where the value would be silently discarded with no error and
+// no log.
+//
+// It is its own status write rather than a rider on an existing one:
+// recordResult does a metadata Update (not Status), stampLastTurn returns early
+// on a content-free payload (precisely the failed-turn case whose snapshot is
+// most worth having), and recordUsage runs only when usage JSON is present.
+// Turns are minutes apart, so the extra small write is not a hot path.
+//
+// Guards: newest-wins on ObservedAt, and never on a terminal Task. A nil
+// snapshot or a zero ObservedAt writes NOTHING - the statusline reports nothing
+// until a session's first API response, and persisting a zero-valued snapshot
+// would read to the gate as "0% used", the exact silent failure this feed
+// exists to fix. There is deliberately NO annCurrentTurn stale guard - unlike
+// turn-scoped state, an account-wide observation from a superseded turn is
+// still valid data.
+func (s *CallbackServer) recordAccountUsage(ctx context.Context, task *tatarav1alpha1.Task, u *turnAccountUsage) error {
+	if u == nil || u.ObservedAt.IsZero() {
+		return nil
+	}
+	obs := metav1.NewTime(u.ObservedAt.UTC())
+	next := &tatarav1alpha1.TaskAccountUsage{
+		ObservedAt:      obs,
+		FiveHourPercent: clampPercent(u.FiveHourPercent),
+		FiveHourReset:   unixToTimePtr(u.FiveHourResetUnix),
+		WeeklyPercent:   clampPercent(u.WeeklyPercent),
+		WeeklyReset:     unixToTimePtr(u.WeeklyResetUnix),
+	}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := s.Client.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
+			return fmt.Errorf("reload task for account usage: %w", err)
+		}
+		if tatarav1alpha1.TaskDone(fresh) {
+			return nil
+		}
+		if cur := fresh.Status.AccountUsage; cur != nil && !next.ObservedAt.After(cur.ObservedAt.Time) {
+			return nil
+		}
+		fresh.Status.AccountUsage = next
+		return s.Client.Status().Update(ctx, fresh)
+	})
+}
+
+// clampPercent rounds a wire percent to whole percent and clamps it into the
+// CRD's declared 0..100 range. The rounding is lossless with respect to the
+// decision: every threshold the gate compares against is an integer percent.
+// An out-of-range value must cost this field, not the whole status write (an
+// apiserver 422 would drop the turn's other state).
+func clampPercent(p float64) int32 {
+	v := int32(math.Round(p))
+	if v < 0 {
+		return 0
+	}
+	if v > 100 {
+		return 100
+	}
+	return v
+}
+
+// unixToTimePtr converts the wire's unix EPOCH SECONDS reset into a
+// *metav1.Time. A non-positive value means the window's reset is unknown and
+// stays nil, so the gate treats it as inactive rather than long expired.
+func unixToTimePtr(sec int64) *metav1.Time {
+	if sec <= 0 {
+		return nil
+	}
+	t := metav1.NewTime(time.Unix(sec, 0).UTC())
+	return &t
 }
 
 // turnUsage mirrors the usage object the wrapper posts in the turn-complete
@@ -230,6 +330,11 @@ func (s *CallbackServer) handleTurnComplete(w http.ResponseWriter, r *http.Reque
 	// window every other guarded status write on this turn uses. The Task's
 	// continuation state has to be durable before anything can act on the turn
 	// being finished - including a TTL stop racing this callback (#527).
+	// Best-effort: an account-usage bookkeeping failure never fails the turn.
+	if err := s.recordAccountUsage(r.Context(), task, p.AccountUsage); err != nil {
+		l.Error(err, "record account usage (non-fatal)", "turn_id", p.TurnID)
+	}
+
 	if err := s.stampLastTurn(r.Context(), task, p.TurnID, p.FinalText, p.PushedRepos, p.FailedRepos, true); err != nil {
 		l.Error(err, "persist last-turn continuation state (non-fatal)", "turn_id", p.TurnID)
 	}
