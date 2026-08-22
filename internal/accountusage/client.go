@@ -100,7 +100,7 @@ func (c *Client) Fetch(ctx context.Context) (Snapshot, error) {
 	if ur.FiveHour == nil && ur.SevenDay == nil {
 		return Snapshot{}, fmt.Errorf("accountusage: schema drift: no five_hour/seven_day fields")
 	}
-	snap := Snapshot{Healthy: true, UpdatedAt: time.Now()}
+	snap := Snapshot{Healthy: true, UpdatedAt: time.Now(), Source: SourcePoller}
 	snap.FiveHour = toWindow(ur.FiveHour)
 	snap.Weekly = toWindow(ur.SevenDay)
 	snap.Opus = toWindow(ur.Opus)

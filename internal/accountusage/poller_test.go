@@ -56,3 +56,25 @@ func TestConsecutiveFailuresMarkStaleAfterThreshold(t *testing.T) {
 		t.Fatal("stale snapshot must retain last-known windows")
 	}
 }
+
+// TestPollOnceStampsPollerSource locks the invariant that every snapshot in the
+// store names the feed that produced it: without it the poller's snapshot would
+// land in tatara_account_usage_snapshot_age_seconds under an empty source label
+// and nobody could tell which feed had gone quiet. The stale path keeps the
+// source it already carried, since it keeps the last-known windows too.
+func TestPollOnceStampsPollerSource(t *testing.T) {
+	f := &fakeFetcher{
+		snaps: []Snapshot{{FiveHour: Window{Percent: 33}}},
+		errs:  []error{nil, errors.New("x")},
+	}
+	st := &Store{}
+	p := &Poller{Fetcher: f, Store: st, FailureThreshold: 1, Now: time.Now}
+	p.pollOnce(context.Background())
+	if got := st.Get().Source; got != SourcePoller {
+		t.Fatalf("Source = %q after a successful poll, want %q", got, SourcePoller)
+	}
+	p.pollOnce(context.Background())
+	if got := st.Get().Source; got != SourcePoller {
+		t.Fatalf("Source = %q after a failing poll, want %q retained", got, SourcePoller)
+	}
+}

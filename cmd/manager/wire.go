@@ -610,6 +610,34 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 			"action", "usage_poller_disabled")
 	}
 
+	// Wrapper-reported account usage feed. Independent of the poller: it works
+	// whether or not USAGE_ENABLED is set, and it is what makes
+	// claudeSubscription mode non-inert on a fleet whose setup-token lacks the
+	// user:profile scope /api/oauth/usage needs.
+	//
+	// Both halves are LEADER-ONLY. usageStore is plain in-process memory and the
+	// dispatcher that reads it is leader-elected, so a write from any other
+	// replica is silently discarded. Controllers built with
+	// ctrl.NewControllerManagedBy are leader-elected by default; the gauge
+	// runnable declares it explicitly.
+	if err := (&controller.AccountUsageFeedReconciler{
+		Client:    mgr.GetClient(),
+		Store:     usageStore,
+		Namespace: cfg.Namespace,
+	}).SetupWithManager(mgr); err != nil {
+		return nil, fmt.Errorf("setup AccountUsageFeedReconciler: %w", err)
+	}
+	if err := mgr.Add(accountUsageGaugeRunnable{
+		reader:    mgr.GetClient(),
+		store:     usageStore,
+		metrics:   metrics,
+		namespace: cfg.Namespace,
+		interval:  accountUsageGaugeInterval,
+		defaults:  cfg.BudgetDefaults(),
+	}); err != nil {
+		return nil, fmt.Errorf("add account usage gauges: %w", err)
+	}
+
 	// BackstopEvents is the leader-only admission backstop's output channel
 	// (issue #395): DispatcherReconciler is otherwise purely watch-driven, so a
 	// QueuedEvent left queued across a rollout/leader-handoff window with no

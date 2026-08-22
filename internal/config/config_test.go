@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/szymonrychu/tatara-operator/internal/budget"
 	"github.com/szymonrychu/tatara-operator/internal/config"
 )
 
@@ -809,5 +810,68 @@ func TestLoad_MCPSchedulingUnknownField(t *testing.T) {
 	t.Setenv("MCP_SCHEDULING", `{"bogusField":{"a":"b"}}`)
 	if _, err := config.Load(); err == nil {
 		t.Fatal("expected error for unknown field in MCP_SCHEDULING, got nil")
+	}
+}
+
+// TestLoad_BudgetDefaultsPerWindow asserts the per-window threshold env vars and
+// TOKEN_BUDGET_MAX_SNAPSHOT_AGE reach budget.Config. Unset per-window percents
+// MUST stay 0 so budget.ResolveWindowPercents falls through to the mode-wide
+// pair: an operator with no per-window configuration has to decide exactly as it
+// did before these knobs existed.
+func TestLoad_BudgetDefaultsPerWindow(t *testing.T) {
+	cases := []struct {
+		name       string
+		env        map[string]string
+		wantFiveP  int
+		wantFiveE  int
+		wantWeekP  int
+		wantWeekE  int
+		wantMaxAge time.Duration
+	}{
+		{
+			name:       "unset inherits mode-wide and the package max age",
+			wantMaxAge: budget.DefaultMaxSnapshotAge,
+		},
+		{
+			name: "per-window and max age are parsed",
+			env: map[string]string{
+				"TOKEN_BUDGET_FIVE_HOUR_PROACTIVE_PERCENT": "80",
+				"TOKEN_BUDGET_FIVE_HOUR_EMERGENCY_PERCENT": "92",
+				"TOKEN_BUDGET_WEEKLY_PROACTIVE_PERCENT":    "75",
+				"TOKEN_BUDGET_WEEKLY_EMERGENCY_PERCENT":    "88",
+				"TOKEN_BUDGET_MAX_SNAPSHOT_AGE":            "45m",
+			},
+			wantFiveP:  80,
+			wantFiveE:  92,
+			wantWeekP:  75,
+			wantWeekE:  88,
+			wantMaxAge: 45 * time.Minute,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+			t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+			t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			cfg, err := config.Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			d := cfg.BudgetDefaults()
+			if d.FiveHourProactivePercent != tc.wantFiveP || d.FiveHourEmergencyPercent != tc.wantFiveE {
+				t.Fatalf("five-hour pair = %d/%d, want %d/%d",
+					d.FiveHourProactivePercent, d.FiveHourEmergencyPercent, tc.wantFiveP, tc.wantFiveE)
+			}
+			if d.WeeklyProactivePercent != tc.wantWeekP || d.WeeklyEmergencyPercent != tc.wantWeekE {
+				t.Fatalf("weekly pair = %d/%d, want %d/%d",
+					d.WeeklyProactivePercent, d.WeeklyEmergencyPercent, tc.wantWeekP, tc.wantWeekE)
+			}
+			if d.MaxSnapshotAge != tc.wantMaxAge {
+				t.Fatalf("MaxSnapshotAge = %v, want %v", d.MaxSnapshotAge, tc.wantMaxAge)
+			}
+		})
 	}
 }

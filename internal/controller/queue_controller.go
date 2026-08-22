@@ -1135,14 +1135,26 @@ func (r *DispatcherReconciler) doReconcile(ctx context.Context, req ctrl.Request
 	// to gate admission and to drive the boundary-aware requeue below.
 	budgetCfg := proj.BudgetConfig(r.BudgetDefaults)
 	sub := proj.BudgetSubscription()
-	// claudeSubscription mode reads the fleet store's last-known snapshot even when
-	// the poll has gone stale (Store.Healthy=false). The spec's "fall back to
-	// customWindow when stale" is deliberately NOT implemented (F7): a
-	// claudeSubscription Project has no customWindow inputs (TokenLimit/
-	// ResetSchedule) to fall back to. Staleness is instead governed by
-	// budget.active() - each window fails open once its own reset passes - made
-	// visible by tatara_account_usage_poll_health (F3), with the wrapper's OTel 429
-	// floor as the hard backstop. See MEMORY.md 2026-07-04.
+	// claudeSubscription mode reads the fleet store's snapshot, which is fed by
+	// the agent pods' statusline reports (see AccountUsageFeedReconciler) and,
+	// when USAGE_ENABLED is set, by the /api/oauth/usage poller. It reads the
+	// last-known snapshot even when the poll has gone stale (Store.Healthy=false).
+	//
+	// The spec's "fall back to customWindow when stale" is still deliberately
+	// NOT implemented (F7): a claudeSubscription Project has no customWindow
+	// inputs (TokenLimit/ResetSchedule) to fall back to. Staleness is governed
+	// by TWO gates now, not one: budget.active() expires each window at its own
+	// reset, and budget.Config.MaxSnapshotAge expires the whole snapshot once it
+	// stops being refreshed. The second closes the F7 de-scope recorded in
+	// MEMORY.md 2026-07-04, where active() alone let an un-refreshed snapshot
+	// keep governing until its last-reported reset.
+	//
+	// Both gates FAIL OPEN: past max age the snapshot stops governing and
+	// admission goes back to admitting everything. That is deliberate (a broken
+	// feed must not wedge the platform) and is only defensible because
+	// TataraAccountUsageFeedDead is the compensating control - it alerts on
+	// tatara_account_usage_gate_ready == 0. The wrapper's OTel 429 floor is the
+	// hard backstop underneath both.
 	if budgetCfg.Mode == budget.ModeClaudeSubscription && r.Usage != nil {
 		sub = r.Usage.Get().Subscription()
 	}
@@ -1172,9 +1184,12 @@ func (r *DispatcherReconciler) doReconcile(ctx context.Context, req ctrl.Request
 		// when the budget is enabled, so disabled projects create no series.
 		if budgetCfg.Enabled {
 			r.Metrics.SetTokenBudgetUsedRatio(proj.Name, "used", decision.UsedPercent/100)
-			pro, emg := budget.ResolvePercents(budgetCfg)
-			r.Metrics.SetTokenBudgetUsedRatio(proj.Name, "proactive", float64(pro)/100)
-			r.Metrics.SetTokenBudgetUsedRatio(proj.Name, "emergency", float64(emg)/100)
+			// The thresholds are the GOVERNING window's own pair (per-window
+			// thresholds mean there is no single mode-wide pair to plot
+			// against), so the used/proactive/emergency triple always describes
+			// one coherent window. Decision fills them for customWindow mode too.
+			r.Metrics.SetTokenBudgetUsedRatio(proj.Name, "proactive", float64(decision.GoverningProactivePercent)/100)
+			r.Metrics.SetTokenBudgetUsedRatio(proj.Name, "emergency", float64(decision.GoverningEmergencyPercent)/100)
 		}
 	}
 	// Pool-full hold: does any pool have waiting (Queued/empty-state) work while

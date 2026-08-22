@@ -224,6 +224,52 @@ spec:
           status:
             description: TaskStatus defines the observed state of a Task.
             properties:
+              accountUsage:
+                description: |-
+                  AccountUsage is the newest Claude subscription usage snapshot this Task's
+                  agent pod reported (via the wrapper's statusline feed). It is ACCOUNT-WIDE
+                  data parked on a per-Task object: the subscription is shared by the whole
+                  fleet, and the leader folds the newest snapshot across ALL Tasks into one
+                  in-process fleet store (internal/controller/accountusage_feed.go).
+
+                  WHY NOT ON THE PROJECT: that was the #225 design, retired in dd40ee4. A
+                  per-Project snapshot goes stale for any Project that falls quiet while its
+                  neighbours keep burning the same shared windows, and admission then has no
+                  single "the" snapshot to read. Newest-across-all-Tasks is fleet-wide and
+                  correctly ordered regardless of which Project's turn landed last. DO NOT
+                  "fix" this back onto the Project.
+                properties:
+                  fiveHourPercent:
+                    format: int32
+                    maximum: 100
+                    minimum: 0
+                    type: integer
+                  fiveHourReset:
+                    description: |-
+                      A nil reset means UNKNOWN, not "epoch". Each window is individually
+                      optional in the statusline payload, so an absent reset must stay absent
+                      rather than becoming a long-expired timestamp.
+                    format: date-time
+                    type: string
+                  observedAt:
+                    description: |-
+                      ObservedAt is when the agent pod observed this snapshot. It is the
+                      newest-wins ordering key, both for this field and for the fleet store.
+                    format: date-time
+                    type: string
+                  weeklyPercent:
+                    format: int32
+                    maximum: 100
+                    minimum: 0
+                    type: integer
+                  weeklyReset:
+                    format: date-time
+                    type: string
+                required:
+                - fiveHourPercent
+                - observedAt
+                - weeklyPercent
+                type: object
               agentKind:
                 enum:
                 - brainstorm

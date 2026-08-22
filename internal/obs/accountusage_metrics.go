@@ -7,6 +7,8 @@ import "github.com/prometheus/client_golang/prometheus"
 type accountUsageMetrics struct {
 	accountUsageUtil          *prometheus.GaugeVec
 	accountUsageReset         *prometheus.GaugeVec
+	accountUsageSnapshotAge   *prometheus.GaugeVec
+	accountUsageGateReady     *prometheus.GaugeVec
 	accountUsagePollHealth    prometheus.Gauge
 	accountUsagePollerEnabled prometheus.Gauge
 	accountUsagePollFailures  prometheus.Counter
@@ -29,6 +31,35 @@ func newAccountUsageMetrics(reg prometheus.Registerer) *accountUsageMetrics {
 			Name: "tatara_account_usage_resets_at_seconds",
 			Help: "Unix time each usage window resets.",
 		}, []string{"window"}),
+		// Snapshot age, labelled by which feed produced the governing snapshot
+		// ("poller" | "wrapper"). A dead feed is directly visible here.
+		//
+		// The source label lives HERE and deliberately NOT on
+		// tatara_account_usage_utilization / _resets_at_seconds: both feeds stay
+		// wired, so the question is real, but relabelling those established
+		// series would break every dashboard query and recording rule already
+		// reading them. This gauge answers "which feed is current" without
+		// touching them.
+		accountUsageSnapshotAge: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "tatara_account_usage_snapshot_age_seconds",
+			Help: "Age in seconds of the account usage snapshot currently governing admission, by feed source.",
+		}, []string{"source"}),
+		// 1 when the claudeSubscription gate is enabled AND a fresh snapshot is
+		// governing; 0 when it is enabled but has none.
+		//
+		// A label-less GaugeVec rather than a Gauge, deliberately: a registered
+		// Gauge renders 0 from process start, and TataraAccountUsageFeedDead
+		// alerts on == 0. The vec's child is created on first Set, so an
+		// operator with the budget gate off produces NO series and cannot fire.
+		//
+		// THIS IS THE ALERT THE OUTAGE NEEDED. The gate ran inert for weeks
+		// because the only budget rule watched operator_admission_blocked_total,
+		// a derived counter that by construction never increments while the gate
+		// evaluates 0%.
+		accountUsageGateReady: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "tatara_account_usage_gate_ready",
+			Help: "1 when the claudeSubscription gate has a fresh usage snapshot, 0 when it is enabled but has none.",
+		}, nil),
 		accountUsagePollHealth: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "tatara_account_usage_poll_health",
 			Help: "1 when the usage poll is healthy, 0 when stale.",
@@ -65,6 +96,8 @@ func newAccountUsageMetrics(reg prometheus.Registerer) *accountUsageMetrics {
 	reg.MustRegister(
 		m.accountUsageUtil,
 		m.accountUsageReset,
+		m.accountUsageSnapshotAge,
+		m.accountUsageGateReady,
 		m.accountUsagePollHealth,
 		m.accountUsagePollerEnabled,
 		m.accountUsagePollFailures,
@@ -85,6 +118,25 @@ func (m *accountUsageMetrics) SetAccountUsage(window string, percent float64) {
 // window to the Unix time it resets.
 func (m *accountUsageMetrics) SetAccountUsageReset(window string, unix float64) {
 	m.accountUsageReset.WithLabelValues(window).Set(unix)
+}
+
+// SetAccountUsageSnapshotAge sets tatara_account_usage_snapshot_age_seconds for
+// one feed source ("poller" | "wrapper") to the age in seconds of the snapshot
+// currently governing admission.
+func (m *accountUsageMetrics) SetAccountUsageSnapshotAge(source string, seconds float64) {
+	m.accountUsageSnapshotAge.WithLabelValues(source).Set(seconds)
+}
+
+// SetAccountUsageGateReady sets tatara_account_usage_gate_ready to 1 when the
+// claudeSubscription gate has a fresh snapshot governing admission, 0 when it is
+// enabled but has none. Calling it is what CREATES the series, so a disabled
+// gate must never call it.
+func (m *accountUsageMetrics) SetAccountUsageGateReady(ready bool) {
+	v := 0.0
+	if ready {
+		v = 1.0
+	}
+	m.accountUsageGateReady.WithLabelValues().Set(v)
 }
 
 // SetAccountUsagePollHealth sets tatara_account_usage_poll_health to 1 when the

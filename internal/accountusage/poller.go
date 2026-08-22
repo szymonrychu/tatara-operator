@@ -93,6 +93,9 @@ func (p *Poller) pollOnce(ctx context.Context) {
 	p.failures = 0
 	snap.Healthy = true
 	snap.UpdatedAt = p.Now()
+	// Every stored snapshot names its own feed, so the snapshot-age gauge can
+	// say which one went quiet.
+	snap.Source = SourcePoller
 	p.Store.Set(snap)
 	slog.Info("accountusage poll ok", "five_hour_pct", snap.FiveHour.Percent, "weekly_pct", snap.Weekly.Percent)
 	if p.Metrics != nil {

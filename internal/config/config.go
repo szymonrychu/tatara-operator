@@ -198,6 +198,19 @@ type Config struct {
 	TokenBudgetWindowDuration   time.Duration
 	TokenBudgetTokenLimit       int64
 
+	// Per-window thresholds for claudeSubscription mode: each Claude usage
+	// window is checked against its OWN pair. Zero inherits
+	// TokenBudgetProactivePercent/TokenBudgetEmergencyPercent, so an operator
+	// that sets none of these decides exactly as it did before they existed.
+	TokenBudgetFiveHourProactivePercent int
+	TokenBudgetFiveHourEmergencyPercent int
+	TokenBudgetWeeklyProactivePercent   int
+	TokenBudgetWeeklyEmergencyPercent   int
+	// TokenBudgetMaxSnapshotAge stops a Claude usage snapshot governing
+	// admission once it is older than this. Operator-wide only, deliberately:
+	// see BudgetDefaults.
+	TokenBudgetMaxSnapshotAge time.Duration
+
 	// Claude account usage poller (claudeSubscription mode). UsageAuthMode
 	// selects the /api/oauth/usage auth header ("bearer" default or
 	// "x-api-key", per the Task 0 spike). UsagePollInterval is clamped up to
@@ -261,15 +274,28 @@ type Config struct {
 // budget.Config. A Project with no spec.tokenBudget inherits this verbatim; a
 // Project that sets the block overrides these per project (see
 // Project.BudgetConfig).
+//
+// ASYMMETRY, deliberate: the four per-window percents ARE per-Project
+// overridable (a Project may reasonably want to stop earlier than the fleet),
+// but MaxSnapshotAge is NOT on TokenBudgetSpec at all. The Claude subscription
+// is one account shared by every Project, so the snapshot is fleet-wide by
+// construction and a per-Project staleness bound would have no meaning: it
+// would let one Project's setting decide whether an observation made by another
+// Project's pod still counts.
 func (c Config) BudgetDefaults() budget.Config {
 	return budget.Config{
-		Enabled:          c.TokenBudgetEnabled,
-		Mode:             budget.Mode(c.TokenBudgetMode),
-		ProactivePercent: c.TokenBudgetProactivePercent,
-		EmergencyPercent: c.TokenBudgetEmergencyPercent,
-		ResetSchedule:    c.TokenBudgetResetSchedule,
-		WindowDuration:   c.TokenBudgetWindowDuration,
-		TokenLimit:       c.TokenBudgetTokenLimit,
+		Enabled:                  c.TokenBudgetEnabled,
+		Mode:                     budget.Mode(c.TokenBudgetMode),
+		ProactivePercent:         c.TokenBudgetProactivePercent,
+		EmergencyPercent:         c.TokenBudgetEmergencyPercent,
+		ResetSchedule:            c.TokenBudgetResetSchedule,
+		WindowDuration:           c.TokenBudgetWindowDuration,
+		TokenLimit:               c.TokenBudgetTokenLimit,
+		FiveHourProactivePercent: c.TokenBudgetFiveHourProactivePercent,
+		FiveHourEmergencyPercent: c.TokenBudgetFiveHourEmergencyPercent,
+		WeeklyProactivePercent:   c.TokenBudgetWeeklyProactivePercent,
+		WeeklyEmergencyPercent:   c.TokenBudgetWeeklyEmergencyPercent,
+		MaxSnapshotAge:           c.TokenBudgetMaxSnapshotAge,
 	}
 }
 
@@ -534,6 +560,30 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	// Per-window thresholds default to 0, which budget.ResolveWindowPercents
+	// reads as "inherit the mode-wide pair". Defaulting them to the package
+	// constants instead would silently override the mode-wide pair for anyone
+	// who never set them.
+	tokenBudgetFiveHourProactive, err := getIntDefault("TOKEN_BUDGET_FIVE_HOUR_PROACTIVE_PERCENT", 0)
+	if err != nil {
+		return Config{}, err
+	}
+	tokenBudgetFiveHourEmergency, err := getIntDefault("TOKEN_BUDGET_FIVE_HOUR_EMERGENCY_PERCENT", 0)
+	if err != nil {
+		return Config{}, err
+	}
+	tokenBudgetWeeklyProactive, err := getIntDefault("TOKEN_BUDGET_WEEKLY_PROACTIVE_PERCENT", 0)
+	if err != nil {
+		return Config{}, err
+	}
+	tokenBudgetWeeklyEmergency, err := getIntDefault("TOKEN_BUDGET_WEEKLY_EMERGENCY_PERCENT", 0)
+	if err != nil {
+		return Config{}, err
+	}
+	tokenBudgetMaxSnapshotAge, err := getDurationDefault("TOKEN_BUDGET_MAX_SNAPSHOT_AGE", budget.DefaultMaxSnapshotAge)
+	if err != nil {
+		return Config{}, err
+	}
 	tokenBudgetLimit, err := getInt64Default("TOKEN_BUDGET_TOKEN_LIMIT", 0)
 	if err != nil {
 		return Config{}, err
@@ -635,6 +685,12 @@ func Load() (Config, error) {
 		TokenBudgetResetSchedule:    os.Getenv("TOKEN_BUDGET_RESET_SCHEDULE"),
 		TokenBudgetWindowDuration:   tokenBudgetWindow,
 		TokenBudgetTokenLimit:       tokenBudgetLimit,
+
+		TokenBudgetFiveHourProactivePercent: tokenBudgetFiveHourProactive,
+		TokenBudgetFiveHourEmergencyPercent: tokenBudgetFiveHourEmergency,
+		TokenBudgetWeeklyProactivePercent:   tokenBudgetWeeklyProactive,
+		TokenBudgetWeeklyEmergencyPercent:   tokenBudgetWeeklyEmergency,
+		TokenBudgetMaxSnapshotAge:           tokenBudgetMaxSnapshotAge,
 
 		UsageEnabled:      usageEnabled,
 		UsageAuthMode:     getDefault("USAGE_AUTH_MODE", "bearer"),

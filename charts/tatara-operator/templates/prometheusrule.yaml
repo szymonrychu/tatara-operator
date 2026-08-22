@@ -257,6 +257,27 @@ spec:
           annotations:
             summary: "a project is paused on its token budget"
             description: "operator_admission_blocked_total{reason=\"token_budget\"} has been increasing for 15m (the project and pool class are in the series labels): the token-budget gate is holding proactive work (class=\"normal\") - or, at the emergency threshold, incident work (class=\"alert\") - until the usage window resets (issue #189). Expected when a window is genuinely exhausted; investigate if unexpected (a mis-set tokenBudget percent/limit/schedule, or runaway token spend). Current usage vs the 50%/80% thresholds is on operator_token_budget_used_ratio."
+        # TataraTokenBudgetBlocked above cannot detect an INERT gate: it watches a
+        # counter that only the gate holding something increments, so a gate
+        # evaluating 0% forever is indistinguishable from a healthy idle one. That
+        # is exactly how the claudeSubscription gate ran with no data feed at all
+        # for weeks. This rule watches the FEED instead of its consequences.
+        #
+        # tatara_account_usage_gate_ready is emitted by the LEADER only, and only
+        # while the gate is enabled in claudeSubscription mode - it is a label-less
+        # GaugeVec whose child is created on first Set, so a disabled gate, a
+        # customWindow-mode gate and every non-leader replica produce NO SERIES and
+        # `== 0` matches nothing. Do not "simplify" it to a plain Gauge or add an
+        # `or vector(0)`: either one makes this fire on every operator that never
+        # turned the gate on.
+        - alert: TataraAccountUsageFeedDead
+          expr: tatara_account_usage_gate_ready == 0
+          for: 30m
+          labels:
+            severity: {{ .Values.prometheusRule.severityLabel | quote }}
+          annotations:
+            summary: "the Claude subscription usage gate is enabled but has no fresh snapshot"
+            description: "tatara_account_usage_gate_ready has been 0 for 30m: tokenBudget is enabled in claudeSubscription mode but no usage snapshot newer than tokenBudgetMaxSnapshotAge is governing admission, so the gate FAILS OPEN and admits everything regardless of how much of the shared Claude subscription is burnt. THIS IS THE ALERT WHOSE ABSENCE LET THE GATE SIT INERT FOR WEEKS - TataraTokenBudgetBlocked watches operator_admission_blocked_total{reason=\"token_budget\"}, a derived counter that by construction never increments while the gate evaluates 0%. Check tatara_account_usage_snapshot_age_seconds for which feed (source=\"wrapper\"|\"poller\") went quiet and how long ago. For the wrapper feed: agent pods report via their statusline (cc-statusline) on the turn-complete callback, so a 0 here with turns still completing means the statusline is not firing in the pods (check ccw_statusline_reports_total on the pushed wrapper metrics) or the operator is not persisting Task status.accountUsage. The series is absent entirely when the gate is disabled, so a disabled gate never fires this."
         # ---- Class C: latency / saturation (the one histogram_quantile alert; traffic-gated so idle windows stay NaN-safe) ----
         # histogram_quantile over an all-zero bucket rate returns NaN; an un-gated quantile rule false-fires on
         # every idle window (issue #143). The "and sum(rate(..._count[15m])) > 0" gate means the quantile only

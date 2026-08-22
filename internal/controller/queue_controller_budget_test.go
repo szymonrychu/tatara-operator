@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -9,8 +10,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/accountusage"
 	"github.com/szymonrychu/tatara-operator/internal/budget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 )
@@ -179,4 +183,131 @@ func TestBudgetRequeueAfter(t *testing.T) {
 	if got := budgetRequeueAfter(budget.Config{ResetSchedule: "* * * * *"}, now); got <= 0 || got > time.Minute {
 		t.Fatalf("per-minute wait = %v, want (0, 1m]", got)
 	}
+}
+
+// budgetRatio reads operator_token_budget_used_ratio{project,scope} out of reg.
+func budgetRatio(t *testing.T, reg *prometheus.Registry, project, scope string) (float64, bool) {
+	t.Helper()
+	fams, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, f := range fams {
+		if f.GetName() != "operator_token_budget_used_ratio" {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			lbl := map[string]string{}
+			for _, l := range m.GetLabel() {
+				lbl[l.GetName()] = l.GetValue()
+			}
+			if lbl["project"] == project && lbl["scope"] == scope {
+				return m.GetGauge().GetValue(), true
+			}
+		}
+	}
+	return 0, false
+}
+
+// TestDoReconcile_BudgetGaugesUseGoverningWindowThresholds locks that the
+// used/proactive/emergency triple always describes ONE window. With per-window
+// thresholds there is no single mode-wide pair to plot against, so plotting
+// ResolvePercents beside a per-window used% would draw a threshold line the
+// decision never used. The rollout check reads exactly this: proactive=0.8 while
+// the 5h window governs, 0.75 while the weekly window does.
+func TestDoReconcile_BudgetGaugesUseGoverningWindowThresholds(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+	spec := func() *tatarav1alpha1.TokenBudgetSpec {
+		return &tatarav1alpha1.TokenBudgetSpec{
+			Enabled: true, Mode: "claudeSubscription",
+			ProactivePercent: 50, EmergencyPercent: 80,
+			FiveHourProactivePercent: 80, FiveHourEmergencyPercent: 92,
+			WeeklyProactivePercent: 75, WeeklyEmergencyPercent: 88,
+		}
+	}
+	cases := []struct {
+		name                           string
+		empty                          bool
+		fiveHourPct, weeklyPct         float64
+		wantUsed, wantProac, wantEmerg float64
+	}{
+		// 60/80 = 0.75 relative pressure beats 20/75 = 0.27, so the 5h window
+		// governs and its own 80/92 pair is what gets plotted.
+		{"five hour governs", false, 60, 20, 0.60, 0.80, 0.92},
+		// 70/75 = 0.93 beats 10/80 = 0.125: the weekly window governs even
+		// though its raw percent is checked against a LOWER threshold.
+		{"weekly governs", false, 10, 70, 0.70, 0.75, 0.88},
+		// No snapshot at all: no window governs, so the whole triple is 0 and
+		// stays internally consistent rather than plotting a threshold line for
+		// a window the decision never looked at. tatara_account_usage_gate_ready
+		// is the signal that this state is the outage, not an idle account.
+		{"nothing governs without a snapshot", true, 0, 0, 0, 0, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := prometheus.NewRegistry()
+			metrics := obs.NewOperatorMetrics(reg)
+			name := "p-gw-" + strings.ReplaceAll(tc.name, " ", "-")
+			proj, nQE, _ := mkBudgetPools(t, ctx, name, spec())
+			store := &accountusage.Store{}
+			if !tc.empty {
+				store.Set(accountusage.Snapshot{
+					FiveHour:  accountusage.Window{Percent: tc.fiveHourPct, Reset: now.Add(2 * time.Hour)},
+					Weekly:    accountusage.Window{Percent: tc.weeklyPct, Reset: now.Add(48 * time.Hour)},
+					UpdatedAt: now,
+					Source:    accountusage.SourceWrapper,
+				})
+			}
+			r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Metrics: metrics, Usage: store}
+			if _, err := r.doReconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(nQE)}); err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range []struct {
+				scope string
+				value float64
+			}{
+				{"used", tc.wantUsed},
+				{"proactive", tc.wantProac},
+				{"emergency", tc.wantEmerg},
+			} {
+				got, ok := budgetRatio(t, reg, proj.Name, want.scope)
+				if !ok {
+					t.Fatalf("no operator_token_budget_used_ratio{project=%q,scope=%q}", proj.Name, want.scope)
+				}
+				if math.Abs(got-want.value) > 1e-9 {
+					t.Fatalf("scope=%s ratio = %v, want %v", want.scope, got, want.value)
+				}
+			}
+		})
+	}
+}
+
+// TestDoReconcile_StaleSnapshotFailsOpen locks the second staleness gate end to
+// end: a snapshot at 99% of the 5h window that stopped being refreshed longer
+// ago than MaxSnapshotAge stops governing, so the held pool re-opens. FAILING
+// OPEN is deliberate (a dead feed must not wedge the platform) and is only
+// defensible because tatara_account_usage_gate_ready alerts on it. Without the
+// UpdatedAt -> ObservedAt projection this test cannot fail, because
+// budget.SnapshotFresh would see a zero ObservedAt and call it fresh forever.
+func TestDoReconcile_StaleSnapshotFailsOpen(t *testing.T) {
+	ctx := context.Background()
+	spec := &tatarav1alpha1.TokenBudgetSpec{
+		Enabled: true, Mode: "claudeSubscription", ProactivePercent: 50, EmergencyPercent: 80,
+	}
+	_, nQE, _ := mkBudgetPools(t, ctx, "p-stale-open", spec)
+	store := &accountusage.Store{}
+	store.Set(accountusage.Snapshot{
+		FiveHour:  accountusage.Window{Percent: 99, Reset: time.Now().Add(2 * time.Hour)},
+		UpdatedAt: time.Now().Add(-2 * budget.DefaultMaxSnapshotAge),
+		Source:    accountusage.SourceWrapper,
+	})
+	r := &DispatcherReconciler{
+		Client: k8sClient, Scheme: k8sClient.Scheme(), Usage: store,
+		BudgetDefaults: budget.Config{MaxSnapshotAge: budget.DefaultMaxSnapshotAge},
+	}
+	if _, err := r.doReconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(nQE)}); err != nil {
+		t.Fatal(err)
+	}
+	assertQEAdmitted(t, ctx, nQE, true)
 }
