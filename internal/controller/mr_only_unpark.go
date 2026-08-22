@@ -242,7 +242,9 @@ func (r *ProjectReconciler) refuseMROnlyUnpark(ctx context.Context, proj *tatara
 		// the CACHED client, so a reconcile pass that runs before THIS Task's own
 		// annotateTask write has reached this reconciler's informer cache takes
 		// the branch again, finds the notice already present via
-		// FitMergeRequest's live GET (posted counts presence, deliberately, so a
+		// FitMergeRequest's read through r.Client, the CACHED client - the race
+		// is cross-object staleness between the Task and MergeRequest informers,
+		// not a live GET (posted counts presence, deliberately, so a
 		// retry after a crash between enqueue and latch can still finish the
 		// latch it interrupted instead of finding posted==0 forever), and
 		// increments a second time for the SAME park. The notice itself never

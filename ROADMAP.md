@@ -2,6 +2,21 @@
 
 Planned work not yet started. One line per item; link to plans for detail.
 
+- [x] **A MAINTAINER COMMENT UN-PARKS AN MR-ONLY TASK, landed 2026-08-22
+  (`docs/superpowers/specs/2026-08-22-mr-only-park-maintainer-unpark-plan.md`, workbench
+  tatara-new). MINOR: additive behaviour, no CRD change.** A parked Task owning ZERO Issue
+  mirrors and at least one MergeRequest mirror is now released IN PLACE by one unspent non-bot
+  `pendingEvent` (`stage.UnparkMaintainerComment`), instead of being swallowed by `resumeOne`'s
+  no-Issue bail and left to the 7-day `ParkRetention` reap. A MERGE-STAGE park is refused and
+  answered with a one-shot notice on the merge request (`AnnMROnlyUnparkRefused`), never released.
+  New series `operator_mr_only_unpark_total{project,parkReason,outcome}`. Still open, and named in
+  the design's own out-of-scope section: **the TIMER path** - `driveOneStrandedPark` still returns
+  `nil` at its zero-Issue arm, so after an outage this population waits on a comment or the reaper,
+  and closing it needs `MaxAutoReentries` moved off the Issue mirror onto the MR mirror; **the MR
+  comment redelivery gap** - `ownership.go` only replays comments when
+  `mr.Status.Ownership == "external"`, so a tatara-owned merge request whose comment webhook is lost
+  has no path back into `pendingEvents`; and **`restapi.unresumableTakeoverPark`**, whose 409 body
+  now under-describes the remedy (see MEMORY.md 2026-08-22).
 - [x] **QUEUED UPGRADE ADOPTION replaces the pulled-forward sweep marker below, landed 2026-08-16
   (`docs/superpowers/sdd/2026-08-16-queued-upgrade-adoption-plan.md`, workbench tatara-new). PATCH.**
   An adoptable dependency merge request's webhook delivery now becomes a durable `QueuedEvent` that
