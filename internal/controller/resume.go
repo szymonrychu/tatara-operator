@@ -129,6 +129,40 @@ func (r *ProjectReconciler) resumeNoReentryParks(ctx context.Context, proj *tata
 			// resume the Task it parked, so authorship is the whole test here.
 			continue
 		}
+
+		// MR-ONLY: THE POPULATION resumeOne STRUCTURALLY CANNOT SERVE. Its whole
+		// mechanism is sever-the-Issues-and-re-mint, so a Task owning no Issue
+		// mirror takes its unconditional bail below and the maintainer's comment
+		// is SWALLOWED - no side effect, no log line. An adopted upgrade Task owns
+		// no Issue BY CONSTRUCTION (MintAdoptedUpgradeTask binds a MergeRequest
+		// and never an Issue), so for that whole shape the one-reply guarantee did
+		// not exist at all. Measured on containers!1300, 2026-08-22.
+		//
+		// It is a TRUE UN-PARK here, not a sever-and-re-mint, and driveMROnlyUnpark
+		// says why the UnparkNever cap argument does not bind this population.
+		// Sever-and-re-mint is additionally UNSAFE here: on a cron-authored upgrade
+		// Task ourMR is true, so closeTaskBotMRs would close the merge request and
+		// nothing would re-mint it - there is no Issue and no adopt prefix.
+		mrs, mrOnly, err := r.mrOnlyUnparkOwnership(ctx, t)
+		if err != nil {
+			log.FromContext(ctx).Error(err, "resume: mr-only ownership read failed",
+				"action", "resume_error", "resource_id", t.Name, "reason", t.Status.ParkReason)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if mrOnly {
+			if err := r.driveMROnlyUnpark(ctx, proj, t, mrs, now); err != nil {
+				log.FromContext(ctx).Error(err, "resume: mr-only park resume failed",
+					"action", "mr_only_unpark_error", "resource_id", t.Name, "reason", t.Status.ParkReason)
+				if firstErr == nil {
+					firstErr = err
+				}
+			}
+			continue
+		}
+
 		if err := r.resumeOne(ctx, proj, t, live, resumeTriggerHumanReply); err != nil {
 			log.FromContext(ctx).Error(err, "resume: no-re-entry park resume failed",
 				"action", "resume_error", "resource_id", t.Name, "reason", t.Status.ParkReason)
