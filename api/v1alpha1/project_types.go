@@ -1312,6 +1312,37 @@ type TokenBudgetSpec struct {
 	// +kubebuilder:default=80
 	// +optional
 	EmergencyPercent int `json:"emergencyPercent,omitempty"`
+	// FiveHourProactivePercent / FiveHourEmergencyPercent /
+	// WeeklyProactivePercent / WeeklyEmergencyPercent gate each Claude
+	// subscription window against its OWN thresholds (claudeSubscription mode).
+	// Unset (0) inherits ProactivePercent/EmergencyPercent, so a Project that
+	// sets none of these decides exactly as it does today.
+	//
+	// There is deliberately no per-Project maxSnapshotAge counterpart: the
+	// Claude subscription is one account shared by every Project, so snapshot
+	// staleness is fleet-wide and only the operator-wide
+	// TOKEN_BUDGET_MAX_SNAPSHOT_AGE sets it.
+	//
+	// NO CEL RULES HERE, deliberately: SpawnCeilingByKind's two XValidation
+	// rules plus MaxProperties=12 exist because envtest's apiserver rejects a
+	// CRD whose CEL cost estimate exceeds budget. Plain Minimum/Maximum markers
+	// are free; CEL here could break the entire envtest suite.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
+	// +optional
+	FiveHourProactivePercent int `json:"fiveHourProactivePercent,omitempty"`
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
+	// +optional
+	FiveHourEmergencyPercent int `json:"fiveHourEmergencyPercent,omitempty"`
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
+	// +optional
+	WeeklyProactivePercent int `json:"weeklyProactivePercent,omitempty"`
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
+	// +optional
+	WeeklyEmergencyPercent int `json:"weeklyEmergencyPercent,omitempty"`
 	// ResetSchedule is a 5-field cron (robfig ParseStandard) marking each window
 	// reset boundary (customWindow mode). Empty disables the custom window.
 	// +kubebuilder:validation:Pattern=`^$|^(\S+\s+){4}\S+$`
@@ -1363,6 +1394,18 @@ func (p *Project) BudgetConfig(defaults budget.Config) budget.Config {
 	}
 	if s.EmergencyPercent > 0 {
 		cfg.EmergencyPercent = s.EmergencyPercent
+	}
+	if s.FiveHourProactivePercent > 0 {
+		cfg.FiveHourProactivePercent = s.FiveHourProactivePercent
+	}
+	if s.FiveHourEmergencyPercent > 0 {
+		cfg.FiveHourEmergencyPercent = s.FiveHourEmergencyPercent
+	}
+	if s.WeeklyProactivePercent > 0 {
+		cfg.WeeklyProactivePercent = s.WeeklyProactivePercent
+	}
+	if s.WeeklyEmergencyPercent > 0 {
+		cfg.WeeklyEmergencyPercent = s.WeeklyEmergencyPercent
 	}
 	if s.ResetSchedule != "" {
 		cfg.ResetSchedule = s.ResetSchedule

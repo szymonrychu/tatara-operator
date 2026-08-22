@@ -522,6 +522,33 @@ type TaskEvent struct {
 	UnparkConsumedAt *metav1.Time `json:"unparkConsumedAt,omitempty"`
 }
 
+// TaskAccountUsage is one observation of the shared Claude subscription's usage
+// windows, reported by an agent pod's statusline.
+//
+// Percents are WHOLE percent (0..100), rounded from the fractional value the
+// wire carries: every threshold the gate compares against is an integer
+// percent, so the rounding cannot change a decision, and no CRD in this repo
+// declares a float field (apimachinery JSON round-trip makes floats a hazard in
+// structural schemas).
+type TaskAccountUsage struct {
+	// ObservedAt is when the agent pod observed this snapshot. It is the
+	// newest-wins ordering key, both for this field and for the fleet store.
+	ObservedAt metav1.Time `json:"observedAt"`
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
+	FiveHourPercent int32 `json:"fiveHourPercent"`
+	// A nil reset means UNKNOWN, not "epoch". Each window is individually
+	// optional in the statusline payload, so an absent reset must stay absent
+	// rather than becoming a long-expired timestamp.
+	// +optional
+	FiveHourReset *metav1.Time `json:"fiveHourReset,omitempty"`
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
+	WeeklyPercent int32 `json:"weeklyPercent"`
+	// +optional
+	WeeklyReset *metav1.Time `json:"weeklyReset,omitempty"`
+}
+
 // TaskStatus defines the observed state of a Task.
 type TaskStatus struct {
 	// +optional
@@ -617,6 +644,20 @@ type TaskStatus struct {
 	PendingEvents []TaskEvent `json:"pendingEvents,omitempty"`
 	// +optional
 	Stats TaskStats `json:"stats,omitempty"`
+	// AccountUsage is the newest Claude subscription usage snapshot this Task's
+	// agent pod reported (via the wrapper's statusline feed). It is ACCOUNT-WIDE
+	// data parked on a per-Task object: the subscription is shared by the whole
+	// fleet, and the leader folds the newest snapshot across ALL Tasks into one
+	// in-process fleet store (internal/controller/accountusage_feed.go).
+	//
+	// WHY NOT ON THE PROJECT: that was the #225 design, retired in dd40ee4. A
+	// per-Project snapshot goes stale for any Project that falls quiet while its
+	// neighbours keep burning the same shared windows, and admission then has no
+	// single "the" snapshot to read. Newest-across-all-Tasks is fleet-wide and
+	// correctly ordered regardless of which Project's turn landed last. DO NOT
+	// "fix" this back onto the Project.
+	// +optional
+	AccountUsage *TaskAccountUsage `json:"accountUsage,omitempty"`
 	// +optional
 	DeliveredAt *metav1.Time `json:"deliveredAt,omitempty"`
 	// DocumentedBy is the NIGHTLY BATCH documentation Task that covered this

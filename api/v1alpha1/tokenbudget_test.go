@@ -118,3 +118,74 @@ func TestBudgetSubscriptionMapping(t *testing.T) {
 		t.Fatalf("weekly mapping wrong: %+v", sub)
 	}
 }
+
+// TestBudgetConfigPerWindowOverrides locks the per-window percent layering: a
+// set field overrides the operator-wide default, an unset (zero) field inherits
+// it rather than zeroing it, and MaxSnapshotAge always survives untouched
+// because TokenBudgetSpec deliberately carries no per-Project equivalent (the
+// Claude account is shared fleet-wide).
+func TestBudgetConfigPerWindowOverrides(t *testing.T) {
+	defaults := budget.Config{
+		Mode:                     budget.ModeClaudeSubscription,
+		ProactivePercent:         50,
+		EmergencyPercent:         80,
+		FiveHourProactivePercent: 70,
+		FiveHourEmergencyPercent: 90,
+		WeeklyProactivePercent:   60,
+		WeeklyEmergencyPercent:   85,
+		MaxSnapshotAge:           90 * time.Minute,
+	}
+	cases := []struct {
+		name string
+		spec *TokenBudgetSpec
+		want budget.Config
+	}{
+		{
+			name: "all four override",
+			spec: &TokenBudgetSpec{
+				Enabled:                  true,
+				FiveHourProactivePercent: 75,
+				FiveHourEmergencyPercent: 92,
+				WeeklyProactivePercent:   65,
+				WeeklyEmergencyPercent:   88,
+			},
+			want: func() budget.Config {
+				c := defaults
+				c.Enabled = true
+				c.FiveHourProactivePercent = 75
+				c.FiveHourEmergencyPercent = 92
+				c.WeeklyProactivePercent = 65
+				c.WeeklyEmergencyPercent = 88
+				return c
+			}(),
+		},
+		{
+			name: "unset per-window fields inherit the defaults",
+			spec: &TokenBudgetSpec{Enabled: true},
+			want: func() budget.Config {
+				c := defaults
+				c.Enabled = true
+				return c
+			}(),
+		},
+		{
+			name: "one window overridden leaves the other inherited",
+			spec: &TokenBudgetSpec{Enabled: true, WeeklyProactivePercent: 40},
+			want: func() budget.Config {
+				c := defaults
+				c.Enabled = true
+				c.WeeklyProactivePercent = 40
+				return c
+			}(),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &Project{Spec: ProjectSpec{TokenBudget: tc.spec}}
+			got := p.BudgetConfig(defaults)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("per-window layering mismatch:\n got  %+v\n want %+v", got, tc.want)
+			}
+		})
+	}
+}
