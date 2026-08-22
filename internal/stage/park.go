@@ -294,7 +294,8 @@ func Park(t *v1alpha1.Task, reason string, now time.Time) error {
 }
 
 // clearPark is the ONLY assignment that empties ParkReason. It is unexported on
-// purpose: Unpark, UnparkTakeover, UnparkMaintainerComment and repark are its
+// purpose: repark, UnparkTakeover, UnparkMaintainerComment, UnparkForMRTerminal
+// and reArm (itself called by UnparkCIRecovered and UnparkRetiredPark) are its
 // only callers.
 //
 // RetryNextAt goes with the park because it is a schedule FOR that park, and a
@@ -720,7 +721,7 @@ func UnparkTakeover(t *v1alpha1.Task, to string, now time.Time) error {
 	return nil
 }
 
-// UnparkMaintainerComment is the FOURTH exception to "there is exactly one way
+// UnparkMaintainerComment is the THIRD exception to "there is exactly one way
 // out of a park and it is Unpark", beside UnparkTakeover and UnparkForMRTerminal,
 // and unlike either of those it moves State not at all: park is orthogonal to
 // state (#521), so clearing the flag drops the Task straight back into the live
@@ -737,11 +738,14 @@ func UnparkTakeover(t *v1alpha1.Task, to string, now time.Time) error {
 // 2026-08-22: the mr_comment event was queued, resumeNoReentryParks evaluated the
 // Task dozens of times, and nothing happened and nothing was logged.
 //
-// THE BOUND IS THE COMMENT ITSELF, which is exactly the UnparkHuman contract
-// applied to a population that was misclassified as unreachable rather than as
-// human-releasable. One unspent non-bot event releases one park, enforced by the
-// UnparkConsumedAt stamp that already exists - so this is bounded by a monotonic
-// quantity, not by a counter that a re-entry could refund.
+// THIS FUNCTION DOES NOT GATE ON A COMMENT EXISTING. It releases any park it is
+// allowed to touch unconditionally the moment it is called; deciding whether a
+// qualifying maintainer comment justifies calling it at all is the CALLER's job
+// (Task 3's controller wiring), which reads PendingEvents before ever reaching
+// here. What happens to PendingEvents in THIS function is bookkeeping, not a
+// bound: consumeUnparkEvents spends EVERY unspent non-bot event in one call, so
+// a Task carrying three unanswered comments has all three stamped by one
+// release - N comments per release, never one comment per release.
 //
 // THREE GUARDS, EACH LOAD-BEARING:
 //
@@ -766,8 +770,38 @@ func UnparkTakeover(t *v1alpha1.Task, to string, now time.Time) error {
 // that judgement, so this function carries no kind filter and no
 // ownership-lost exclusion.
 //
-// THE STAMPS ARE reArm's MINUS TWO, and the subtraction is deliberate rather
-// than an oversight, so do not "unify" this with reArm:
+// stageElapsedCarrySeconds IS ZEROED, WHERE reArm PRESERVES IT ALWAYS - this is
+// the one place this function must NOT imitate reArm, and it is a DELIBERATE
+// DIVERGENCE, not a missed unification. Park folds the parked state's elapsed
+// residency into the carry (park.go:290), and for the two headline reasons this
+// release exists for, that carry is not merely at risk of the residency cap, it
+// is already PAST it by construction: stage-deadline is written BY
+// ResidencyExceeded itself (task_stage.go), so its carry already exceeds
+// ResidencyCapAll (24h = 86400s) the moment Park folds it; admission-starved
+// fires at AdmissionStarvedBudget (24h) measured from stateEnteredAt, so Park
+// folds >= 86400s into its carry too. reArm's preservation is correct for ITS
+// own callers - UnparkCIRecovered and UnparkRetiredPark resume a Task still
+// mid the SAME lifecycle occupancy, where a bound cumulative across the round
+// trip is the entire point (#480, #513) - but every earlier exit from these two
+// reasons was a RE-MINT (a fresh Task, a fresh carry): this is the FIRST
+// in-place release either reason has ever had, so there is no prior cumulative
+// residency here for preservation to be continuous WITH. Preserving the carry
+// on this path would not make residency cumulative, it would make the release
+// VOID: re-stamping stateEnteredAt buys nothing when StateElapsedSeconds adds a
+// carry that is already over the cap on its own, so the very next reconcile
+// that stamps stateWorkStartedAt (podwatch, at pod-Ready) finds
+// ResidencyExceeded true and re-parks stage-deadline with the pod deleted
+// mid-turn - one dead park spending an admission slot and a pod to become a
+// different dead park. internal/controller/unpark.go's applyRetryLaneMigration
+// hit the identical arithmetic from the other direction (a reclassification
+// that must NOT gain a fresh carry, so it restores the two residency fields
+// around its Repark) for the mirror-image reason this function zeroes one of
+// them: a maintainer's comment is authorising a FRESH residency budget for a
+// Task about to run its first pod under this park's release, not a
+// continuation of a multi-day wait nobody was measuring progress against.
+//
+// THE REMAINING STAMPS ARE reArm's MINUS THREE, and the omission is deliberate
+// rather than an oversight, so do not "unify" this with reArm either:
 //
 //   - stateEnteredAt = now is the one that makes this a release instead of a
 //     no-op that looks like one. Clock 1 measures from it against
@@ -782,13 +816,15 @@ func UnparkTakeover(t *v1alpha1.Task, to string, now time.Time) error {
 //     authorised caller: without it the one release that ends an escalation is
 //     also the one that guarantees the next technical park re-escalates
 //     instantly, with zero laps in between.
-//   - stats.podRecreations and stats.agentStops are NOT reset, and
-//     stageElapsedCarrySeconds is preserved. This population ran no pod, so both
-//     counters are zero for it anyway; for the reasons where a pod DID run
-//     (implement-declined, operator-error) leaving them alone is what keeps the
-//     churn alert's input and the absolute residency dead-man switch cumulative
-//     across a release a human asked for. A human's comment buys a pod, not a
-//     laundered budget.
+//   - stats.podRecreations, stats.agentStops and conversationLastEventAt are the
+//     three stamps reArm sets that this function does NOT touch. The first two
+//     are zero for this population anyway (it ran no pod); for the reasons
+//     where a pod DID run before this release (implement-declined,
+//     operator-error) leaving them alone is what keeps the churn alert's input
+//     honest across a release a human asked for. conversationLastEventAt is
+//     left for the same reason ReArmAfterPodLoss leaves it: the idle clock is
+//     not armed while podStartedAt is nil, and it re-bases off the replacement
+//     pod's stateWorkStartedAt at pod-ready.
 //
 // It consumes the events LAST, after every mutation has landed, so a caller that
 // persists the whole status in one write can never spend a comment for a release
@@ -814,6 +850,7 @@ func UnparkMaintainerComment(t *v1alpha1.Task, botLogin string, now time.Time) e
 	t.Status.StateEnteredAt = &stamp
 	t.Status.PodStartedAt = nil
 	t.Status.StateWorkStartedAt = nil
+	t.Status.StageElapsedCarrySeconds = 0
 	ResetRetryBudget(t)
 	consumeUnparkEvents(t, botLogin, now)
 	return nil
@@ -845,9 +882,9 @@ var mrTerminalReasons = map[string]bool{
 	ReasonMRTakenOver:        true,
 }
 
-// UnparkForMRTerminal is the THIRD of the FOUR exceptions to "there is exactly
-// one way out of a park and it is Unpark" (the fourth is
-// UnparkMaintainerComment), and it is the narrowest of them.
+// UnparkForMRTerminal is the SECOND of the THREE exceptions to "there is
+// exactly one way out of a park and it is Unpark" (the other two are
+// UnparkTakeover and UnparkMaintainerComment), and it is the narrowest of them.
 //
 // WHY A PARK MUST NOT SURVIVE THIS. A park stops a Task making stage PROGRESS
 // while it waits on something - a human's answer, a retry clock, a ceiling. An

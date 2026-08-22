@@ -659,14 +659,23 @@ var mrOnlyEligibleReasons = []string{
 	stage.ReasonPodRecreationExhausted,
 }
 
-// TestUnparkMaintainerCommentReleasesEveryEligibleReason pins the FOUR stamps
-// that make this a release rather than a no-op that looks like one.
+// TestUnparkMaintainerCommentReleasesEveryEligibleReason pins the FIVE stamps
+// that make this a release rather than a no-op that looks like one - or worse,
+// a release that quietly re-parks itself on the very next reconcile.
 //
-// stateEnteredAt IS THE LOAD-BEARING ONE. Clock 1 measures from it against
-// AdmissionStarvedBudget, so a Task released with a stale value re-elapses on
-// the very next pass and re-parks admission-starved - #513's "a retry that
-// provides no retry", and for the measured population (no pod ever ran, 24h of
-// admission starvation) it is the failure this whole change is about.
+// stateEnteredAt and stageElapsedCarrySeconds are BOTH load-bearing, and for
+// the SAME clock: ResidencyExceeded reads StateElapsedSeconds, which is
+// now - stateEnteredAt + stageElapsedCarrySeconds (liveness.go, stage.go).
+// Re-stamping stateEnteredAt alone is not enough, because Park already folded
+// a carry that is, for the two headline reasons, already PAST ResidencyCapAll
+// (24h = 86400s) by construction before this release ever runs: stage-deadline
+// is written BY the residency check itself, and admission-starved fires at
+// AdmissionStarvedBudget (24h) measured from stateEnteredAt. A release that
+// leaves that carry standing is void even with a fresh stateEnteredAt: the pod
+// this release just admitted gets stateWorkStartedAt stamped at pod-Ready,
+// ResidencyExceeded reads true on the very next reconcile, and the Task
+// re-parks stage-deadline with the pod deleted mid-turn - one dead park spending
+// an admission slot and a pod to become a different dead park.
 func TestUnparkMaintainerCommentReleasesEveryEligibleReason(t *testing.T) {
 	later := now.Add(30 * time.Hour)
 	for _, reason := range mrOnlyEligibleReasons {
@@ -674,6 +683,7 @@ func TestUnparkMaintainerCommentReleasesEveryEligibleReason(t *testing.T) {
 			tk := taskOfKind(v1alpha1.StateAwaitingReview, "upgrade")
 			tk.Status.PodStartedAt = ptrTime(now)
 			tk.Status.StateWorkStartedAt = ptrTime(now)
+			tk.Status.StageElapsedCarrySeconds = 100000 // > ResidencyCapAll; must not survive the release
 			tk.Status.PendingEvents = []v1alpha1.TaskEvent{
 				{Kind: "mr_comment", Author: "maintainer", Body: "continue!"},
 				{Kind: "mr_comment", Author: "tatara-bot", Body: "parked"},
@@ -689,6 +699,9 @@ func TestUnparkMaintainerCommentReleasesEveryEligibleReason(t *testing.T) {
 			require.NotNil(t, tk.Status.StateEnteredAt)
 			require.Equal(t, later, tk.Status.StateEnteredAt.Time,
 				"clock 1 measures from stateEnteredAt; a stale value re-parks admission-starved next pass")
+			require.Zero(t, tk.Status.StageElapsedCarrySeconds,
+				"a carry already past ResidencyCapAll would re-park stage-deadline on the very next reconcile, "+
+					"voiding the release stateEnteredAt alone looked like it made")
 			require.Nil(t, tk.Status.PodStartedAt, "clock 1 re-arms only with the pod clocks nil")
 			require.Nil(t, tk.Status.StateWorkStartedAt)
 			require.NotNil(t, tk.Status.PendingEvents[0].UnparkConsumedAt,
@@ -768,17 +781,24 @@ func TestUnparkMaintainerCommentRefusalIsTheMergeStageGuardNotTheClassGuard(t *t
 // answers ONLY the population nothing else owns. A human-, timer- or
 // retry-class park already has a driver (driveUnparks), and releasing one here
 // would double-drive it.
+//
+// Together with mrOnlyEligibleReasons (UnparkNever/UnparkRetired) and
+// mergeStage (the merge-stage subset of UnparkNever), the reasons below cover
+// every remaining ParkReasons member - UnparkHuman, UnparkTimer and
+// UnparkRetry - so the three tables jointly account for the whole enum.
 func TestUnparkMaintainerCommentRefusesAParkThatIsSomebodyElsesLane(t *testing.T) {
 	tests := []struct {
-		name         string
-		reason       string
-		wantUnparked bool
+		name   string
+		reason string
 	}{
-		{"awaiting-human belongs to driveUnparks", stage.ReasonAwaitingHuman, false},
-		{"backlog-sweep belongs to driveUnparks", stage.ReasonBacklogSweep, false},
-		{"retry-exhausted belongs to driveUnparks", stage.ReasonRetryExhausted, false},
-		{"no-outcome is a bounded timer lane", stage.ReasonNoOutcome, false},
-		{"ci-pending is the backed-off retry lane", stage.ReasonCIPending, false},
+		{"awaiting-human belongs to driveUnparks", stage.ReasonAwaitingHuman},
+		{"backlog-sweep belongs to driveUnparks", stage.ReasonBacklogSweep},
+		{"identity-unverified belongs to driveUnparks", stage.ReasonIdentityUnverified},
+		{"handoff-stalled belongs to driveUnparks", stage.ReasonHandoffStalled},
+		{"retry-exhausted belongs to driveUnparks", stage.ReasonRetryExhausted},
+		{"no-outcome is a bounded timer lane", stage.ReasonNoOutcome},
+		{"ci-pending is the backed-off retry lane", stage.ReasonCIPending},
+		{"mr-surface-spent is the backed-off retry lane", stage.ReasonMRSurfaceSpent},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
