@@ -130,6 +130,30 @@ func (r *ProjectReconciler) resumeNoReentryParks(ctx context.Context, proj *tata
 			continue
 		}
 
+		// AnnResumeReleasing FIRST, BEFORE ASKING mrOnlyUnparkOwnership AT ALL.
+		// That annotation marks a resumeOne severance already in flight (see its
+		// own doc, resume.go:19-27): once step 3 has severed the Task's last
+		// owned Issue, the very candidacy test this branch runs - zero owned
+		// Issues, at least one owned MR - reads identically to a Task that was
+		// ALWAYS MR-only. Routing a mid-flight release into driveMROnlyUnpark
+		// would spend the maintainer's still-unconsumed comment reviving a Task
+		// that is committed to collection: closeTaskBotMRs already ran (it only
+		// annotates AnnTerminalClosed, the MR mirror and forge PR are untouched
+		// by the mirror), so the resumed agent would work against a merge
+		// request resumeOne is about to close. A Task carrying the marker falls
+		// through to resumeOne, which is written to finish (or safely re-drive)
+		// the interrupted release.
+		if t.Annotations[AnnResumeReleasing] == "true" {
+			if err := r.resumeOne(ctx, proj, t, live, resumeTriggerHumanReply); err != nil {
+				log.FromContext(ctx).Error(err, "resume: no-re-entry park resume failed",
+					"action", "resume_error", "resource_id", t.Name, "reason", t.Status.ParkReason)
+				if firstErr == nil {
+					firstErr = err
+				}
+			}
+			continue
+		}
+
 		// MR-ONLY: THE POPULATION resumeOne STRUCTURALLY CANNOT SERVE. Its whole
 		// mechanism is sever-the-Issues-and-re-mint, so a Task owning no Issue
 		// mirror takes its unconditional bail below and the maintainer's comment
@@ -146,7 +170,7 @@ func (r *ProjectReconciler) resumeNoReentryParks(ctx context.Context, proj *tata
 		mrs, mrOnly, err := r.mrOnlyUnparkOwnership(ctx, t)
 		if err != nil {
 			log.FromContext(ctx).Error(err, "resume: mr-only ownership read failed",
-				"action", "resume_error", "resource_id", t.Name, "reason", t.Status.ParkReason)
+				"action", "mr_only_ownership_error", "resource_id", t.Name, "reason", t.Status.ParkReason)
 			if firstErr == nil {
 				firstErr = err
 			}

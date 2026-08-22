@@ -61,6 +61,8 @@ func TestMROnlyUnpark_MaintainerCommentReleasesTheParkInPlace(t *testing.T) {
 	r := reapReconciler(c, w)
 	before := testutil.ToFloat64(r.Metrics.MROnlyUnparkCounter(
 		proj.Name, stage.ReasonAdmissionStarved, obs.MROnlyUnparkReleased))
+	unparkedBefore := testutil.ToFloat64(r.Metrics.TaskUnparkedCounter(
+		stage.ReasonAdmissionStarved, obs.UnparkClassMROnly))
 
 	now := time.Now()
 	require.NoError(t, r.resumeNoReentryParks(ctx, proj, now))
@@ -87,6 +89,15 @@ func TestMROnlyUnpark_MaintainerCommentReleasesTheParkInPlace(t *testing.T) {
 
 	require.Equal(t, before+1, testutil.ToFloat64(r.Metrics.MROnlyUnparkCounter(
 		proj.Name, stage.ReasonAdmissionStarved, obs.MROnlyUnparkReleased)))
+
+	// The release also feeds the shared "every park release" series, under
+	// class=mr-only, exactly as driveRetiredUnparks/driveCIRecoveryUnparks feed
+	// it under their own class. A release that never touched this series would
+	// be an observability blind spot on the one metric that answers "how many
+	// parks were released, and by what" - see ci_recovery_unpark_test.go's
+	// equivalent assertion.
+	require.Equal(t, unparkedBefore+1, testutil.ToFloat64(r.Metrics.TaskUnparkedCounter(
+		stage.ReasonAdmissionStarved, obs.UnparkClassMROnly)))
 }
 
 // TestMROnlyUnpark_EveryEligibleReasonIsReleased walks the reasons the design's
@@ -191,4 +202,45 @@ func TestMROnlyUnpark_TaskOwningNeitherIsLeftToTheReaper(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, stage.ReasonStageDeadline, still.Status.ParkReason,
 		"nothing to release against and nothing to tell; the reaper's clock still owns it")
+}
+
+// TestMROnlyUnpark_ResumeReleasingInFlightDefersToResumeOne is the fix for the
+// AnnResumeReleasing race the round-1 review found. resumeOne step 3 severs the
+// Task's OWNED Issues before step 4 collects it; a crash or an error between
+// steps 3 and 4 leaves a Task that is, from this point on, indistinguishable
+// from a Task that was MR-only from the start - zero owned Issues, one or more
+// owned MRs, still parked, still carrying the unspent comment (resumeOne never
+// consumes pendingEvents). Without the AnnResumeReleasing check that Task would
+// be routed into driveMROnlyUnpark, which would spend the maintainer's comment
+// reviving a Task that is already committed to collection, and closeTaskBotMRs
+// had already run for it - the resumed agent would work against a merge
+// request resumeOne is in the middle of closing.
+//
+// The marker means resumeOne owns finishing this release, so the assertion is
+// that driveMROnlyUnpark's own signature - the MROnlyUnpark metric and the
+// pending event's UnparkConsumedAt stamp - never fires, and resumeOne's own
+// collection (deleteReapedTask) completes instead: the Task is gone, not
+// released in place with a stale park.
+func TestMROnlyUnpark_ResumeReleasingInFlightDefersToResumeOne(t *testing.T) {
+	ctx := context.Background()
+	proj, repo, task, mr, taskName, _ := mrOnlyFixture(t, stage.ReasonStageDeadline, "maintainer")
+	task.Annotations = map[string]string{AnnResumeReleasing: "true"}
+	c := newMirrorClient(t, proj, repo, reapSecret(), task, mr)
+	w := &resumeWriter{}
+	r := reapReconciler(c, w)
+	before := testutil.ToFloat64(r.Metrics.MROnlyUnparkCounter(
+		proj.Name, stage.ReasonStageDeadline, obs.MROnlyUnparkReleased))
+
+	require.NoError(t, r.resumeNoReentryParks(ctx, proj, time.Now()))
+
+	// driveMROnlyUnpark never ran: no release-in-place metric, and the comment
+	// that would have been spent releasing it was never touched.
+	require.Equal(t, before, testutil.ToFloat64(r.Metrics.MROnlyUnparkCounter(
+		proj.Name, stage.ReasonStageDeadline, obs.MROnlyUnparkReleased)))
+
+	// resumeOne finished the interrupted release: the old Task, already
+	// committed to collection, is gone rather than left released-in-place with
+	// a live park that a resumed agent could act against.
+	_, ok := mustGetTask(t, c, taskName)
+	require.False(t, ok, "resumeOne must finish the collection it already committed to, not resurrect the Task in place")
 }
