@@ -635,3 +635,204 @@ func TestStrandRetryLaneRefusesEverythingItDoesNotOwn(t *testing.T) {
 		})
 	}
 }
+
+// mrOnlyEligibleReasons is the population the MR-only un-park exists for: every
+// UnparkNever reason that is NOT merge-stage, plus the three UnparkRetired
+// migration reasons. It is spelled out rather than derived from unparkClasses
+// because a derived list would silently follow a future reclassification into
+// releasing something this change never argued for.
+var mrOnlyEligibleReasons = []string{
+	stage.ReasonStageDeadline,
+	stage.ReasonAdmissionStarved,
+	stage.ReasonImplementDeclined,
+	stage.ReasonOperatorError,
+	stage.ReasonObjectTooLarge,
+	stage.ReasonTriageStalled,
+	stage.ReasonCIBlocked,
+	stage.ReasonAgentContractMismatch,
+	stage.ReasonOwnershipLost,
+	stage.ReasonNameTooLong,
+	stage.ReasonReviewPostRefused,
+	stage.ReasonFoldAdoptionUnverified,
+	stage.ReasonTurnBudgetExhausted,
+	stage.ReasonReviewLoopExhausted,
+	stage.ReasonPodRecreationExhausted,
+}
+
+// TestUnparkMaintainerCommentReleasesEveryEligibleReason pins the FOUR stamps
+// that make this a release rather than a no-op that looks like one.
+//
+// stateEnteredAt IS THE LOAD-BEARING ONE. Clock 1 measures from it against
+// AdmissionStarvedBudget, so a Task released with a stale value re-elapses on
+// the very next pass and re-parks admission-starved - #513's "a retry that
+// provides no retry", and for the measured population (no pod ever ran, 24h of
+// admission starvation) it is the failure this whole change is about.
+func TestUnparkMaintainerCommentReleasesEveryEligibleReason(t *testing.T) {
+	later := now.Add(30 * time.Hour)
+	for _, reason := range mrOnlyEligibleReasons {
+		t.Run(reason, func(t *testing.T) {
+			tk := taskOfKind(v1alpha1.StateAwaitingReview, "upgrade")
+			tk.Status.PodStartedAt = ptrTime(now)
+			tk.Status.StateWorkStartedAt = ptrTime(now)
+			tk.Status.PendingEvents = []v1alpha1.TaskEvent{
+				{Kind: "mr_comment", Author: "maintainer", Body: "continue!"},
+				{Kind: "mr_comment", Author: "tatara-bot", Body: "parked"},
+			}
+			require.NoError(t, stage.Park(tk, reason, now))
+
+			require.NoError(t, stage.UnparkMaintainerComment(tk, "tatara-bot", later))
+
+			require.Empty(t, tk.Status.ParkReason, "the park flag must be cleared")
+			require.Nil(t, tk.Status.ParkedAt)
+			require.Equal(t, v1alpha1.StateAwaitingReview, tk.Status.State,
+				"park is orthogonal to state: the Task resumes WHERE IT STOPPED")
+			require.NotNil(t, tk.Status.StateEnteredAt)
+			require.Equal(t, later, tk.Status.StateEnteredAt.Time,
+				"clock 1 measures from stateEnteredAt; a stale value re-parks admission-starved next pass")
+			require.Nil(t, tk.Status.PodStartedAt, "clock 1 re-arms only with the pod clocks nil")
+			require.Nil(t, tk.Status.StateWorkStartedAt)
+			require.NotNil(t, tk.Status.PendingEvents[0].UnparkConsumedAt,
+				"one comment releases exactly ONE park")
+			require.Nil(t, tk.Status.PendingEvents[1].UnparkConsumedAt,
+				"a bot event was never eligible, so stamping it would only make the field lie")
+		})
+	}
+}
+
+// TestUnparkMaintainerCommentRefusesEveryMergeStagePark is the SAFETY BOUNDARY,
+// not tidiness. Issue #597 recorded a Task parked merge-auth-refused re-entering
+// ReconcileMerging and issuing live forge merges, and park.go makes the same
+// argument for the retry lane: retrying a merge that may have partially
+// succeeded is how a double-merge happens.
+//
+// The four rows marked below are refused by the CLASS guard before the
+// merge-stage guard is ever reached (merge-timeout and deploy-timeout are
+// UnparkTimer; ci-failed and merge-conflict-retry are UnparkRetry). They are in
+// the table anyway, for the reason mergeStageParks itself gives about its own
+// inert entries: the day one of them is reclassified, the refusal is already
+// correct instead of having to be remembered.
+func TestUnparkMaintainerCommentRefusesEveryMergeStagePark(t *testing.T) {
+	mergeStage := []string{
+		stage.ReasonMergeBlocked,
+		stage.ReasonMergeAuthRefused,
+		stage.ReasonMergeOrderMissing,
+		stage.ReasonHeadMoving,
+		stage.ReasonCIRed,
+		stage.ReasonMergeConflict,
+		stage.ReasonDeployBlocked,
+		stage.ReasonMergeTimeout,       // refused by class first
+		stage.ReasonDeployTimeout,      // refused by class first
+		stage.ReasonCIFailed,           // refused by class first
+		stage.ReasonMergeConflictRetry, // refused by class first
+	}
+	for _, reason := range mergeStage {
+		t.Run(reason, func(t *testing.T) {
+			require.True(t, stage.IsMergeStagePark(reason), "the fixture must be a merge-stage park")
+			tk := task(v1alpha1.StateMerged)
+			tk.Status.PendingEvents = []v1alpha1.TaskEvent{{Kind: "mr_comment", Author: "maintainer"}}
+			require.NoError(t, stage.Park(tk, reason, now))
+			entered := tk.Status.StateEnteredAt.Time
+
+			require.Error(t, stage.UnparkMaintainerComment(tk, "tatara-bot", now.Add(time.Hour)))
+
+			require.Equal(t, reason, tk.Status.ParkReason, "a REFUSED un-park leaves the park standing")
+			require.Equal(t, entered, tk.Status.StateEnteredAt.Time, "and touches no clock")
+			require.Nil(t, tk.Status.PendingEvents[0].UnparkConsumedAt,
+				"a refusal inside this package spends nothing; the CALLER decides what the comment bought")
+		})
+	}
+}
+
+// TestUnparkMaintainerCommentRefusalIsTheMergeStageGuardNotTheClassGuard pins
+// which guard does the work for the seven reasons that would otherwise sail
+// past. Without this, deleting the merge-stage guard leaves the table above
+// green and the double-merge hazard wide open.
+func TestUnparkMaintainerCommentRefusalIsTheMergeStageGuardNotTheClassGuard(t *testing.T) {
+	for _, reason := range []string{
+		stage.ReasonMergeBlocked, stage.ReasonMergeAuthRefused, stage.ReasonMergeOrderMissing,
+		stage.ReasonHeadMoving, stage.ReasonCIRed, stage.ReasonMergeConflict, stage.ReasonDeployBlocked,
+	} {
+		t.Run(reason, func(t *testing.T) {
+			class, ok := stage.UnparkClassFor(reason)
+			require.True(t, ok)
+			require.Equal(t, stage.UnparkNever, class,
+				"this reason PASSES the class guard, so only the merge-stage guard can refuse it")
+			tk := task(v1alpha1.StateMerged)
+			require.NoError(t, stage.Park(tk, reason, now))
+			require.Error(t, stage.UnparkMaintainerComment(tk, "tatara-bot", now))
+		})
+	}
+}
+
+// TestUnparkMaintainerCommentRefusesAParkThatIsSomebodyElsesLane: this driver
+// answers ONLY the population nothing else owns. A human-, timer- or
+// retry-class park already has a driver (driveUnparks), and releasing one here
+// would double-drive it.
+func TestUnparkMaintainerCommentRefusesAParkThatIsSomebodyElsesLane(t *testing.T) {
+	tests := []struct {
+		name         string
+		reason       string
+		wantUnparked bool
+	}{
+		{"awaiting-human belongs to driveUnparks", stage.ReasonAwaitingHuman, false},
+		{"backlog-sweep belongs to driveUnparks", stage.ReasonBacklogSweep, false},
+		{"retry-exhausted belongs to driveUnparks", stage.ReasonRetryExhausted, false},
+		{"no-outcome is a bounded timer lane", stage.ReasonNoOutcome, false},
+		{"ci-pending is the backed-off retry lane", stage.ReasonCIPending, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tk := task(v1alpha1.StateAwaitingReview)
+			require.NoError(t, stage.Park(tk, tc.reason, now))
+			require.Error(t, stage.UnparkMaintainerComment(tk, "tatara-bot", now))
+			require.Equal(t, tc.reason, tk.Status.ParkReason)
+		})
+	}
+
+	// A Task that is not parked at all is a CALLER BUG, not a decline, and it
+	// gets the same typed error every other un-park primitive returns for it.
+	unparked := task(v1alpha1.StateAwaitingReview)
+	require.ErrorAs(t, stage.UnparkMaintainerComment(unparked, "tatara-bot", now), new(*stage.NotParkedError))
+}
+
+// TestUnparkMaintainerCommentResetsTheRetryBudget: park.go's ResetRetryBudget
+// already names "the UnparkHuman release (a human answered)" as an authorised
+// caller, and this IS that release for a population that was misclassified as
+// unreachable. Without it the one release that ends an escalation is also the
+// one that guarantees the next technical park re-escalates instantly.
+func TestUnparkMaintainerCommentResetsTheRetryBudget(t *testing.T) {
+	tk := task(v1alpha1.StateAwaitingReview)
+	tk.Status.RetryAttempts = 5
+	tk.Status.RetryBlocker = stage.ReasonCIFailed
+	tk.Status.RetryNextAt = ptrTime(now.Add(time.Hour))
+	require.NoError(t, stage.Park(tk, stage.ReasonStageDeadline, now))
+
+	require.NoError(t, stage.UnparkMaintainerComment(tk, "tatara-bot", now.Add(time.Hour)))
+	require.Zero(t, tk.Status.RetryAttempts)
+	require.Empty(t, tk.Status.RetryBlocker)
+	require.Nil(t, tk.Status.RetryNextAt)
+}
+
+// TestConsumeUnparkEventsSpendsOnlyUnspentHumanEvents covers the exported
+// wrapper the REFUSAL arm needs: the comment is answered, so it is spent, but
+// nothing is released.
+func TestConsumeUnparkEventsSpendsOnlyUnspentHumanEvents(t *testing.T) {
+	already := ptrTime(now.Add(-time.Hour))
+	tk := task(v1alpha1.StateMerged)
+	tk.Status.PendingEvents = []v1alpha1.TaskEvent{
+		{Kind: "mr_comment", Author: "maintainer"},
+		{Kind: "mr_comment", Author: "tatara-bot"},
+		{Kind: "mr_comment", Author: "maintainer", UnparkConsumedAt: already},
+	}
+	require.NoError(t, stage.Park(tk, stage.ReasonMergeBlocked, now))
+
+	stage.ConsumeUnparkEvents(tk, "tatara-bot", now.Add(time.Hour))
+
+	require.NotNil(t, tk.Status.PendingEvents[0].UnparkConsumedAt)
+	require.Equal(t, now.Add(time.Hour), tk.Status.PendingEvents[0].UnparkConsumedAt.Time)
+	require.Nil(t, tk.Status.PendingEvents[1].UnparkConsumedAt, "a bot event is never eligible")
+	require.Equal(t, already.Time, tk.Status.PendingEvents[2].UnparkConsumedAt.Time,
+		"an already-spent stamp is never rewritten")
+	require.Equal(t, stage.ReasonMergeBlocked, tk.Status.ParkReason,
+		"consuming spends the comment; it does NOT release the park")
+}

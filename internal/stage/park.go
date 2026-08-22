@@ -239,7 +239,8 @@ func IsDoneReason(r string) bool { return doneReasonSet[r] }
 // Task's state without un-parking it first. It exists because `parkReason` is a
 // stringly flag, and a stringly flag a writer can forget to clear is a new
 // silent wedge in the same genre as #521. There is exactly one way out of a
-// park and it is Unpark (or UnparkTakeover, the one documented exception).
+// park and it is Unpark, plus the three documented exceptions named on
+// UnparkTakeover, UnparkForMRTerminal and UnparkMaintainerComment.
 type StillParkedError struct {
 	State      string
 	ParkReason string
@@ -293,7 +294,8 @@ func Park(t *v1alpha1.Task, reason string, now time.Time) error {
 }
 
 // clearPark is the ONLY assignment that empties ParkReason. It is unexported on
-// purpose: Unpark, UnparkTakeover and repark are its only callers.
+// purpose: Unpark, UnparkTakeover, UnparkMaintainerComment and repark are its
+// only callers.
 //
 // RetryNextAt goes with the park because it is a schedule FOR that park, and a
 // stale one would let the next retry park be released on a timer somebody else
@@ -718,6 +720,121 @@ func UnparkTakeover(t *v1alpha1.Task, to string, now time.Time) error {
 	return nil
 }
 
+// UnparkMaintainerComment is the FOURTH exception to "there is exactly one way
+// out of a park and it is Unpark", beside UnparkTakeover and UnparkForMRTerminal,
+// and unlike either of those it moves State not at all: park is orthogonal to
+// state (#521), so clearing the flag drops the Task straight back into the live
+// state it was working in, where it takes the ordinary admission ticket.
+//
+// WHO IT IS FOR, AND WHY THE CLASS ARGUMENT DOES NOT BIND THEM. unparkClasses
+// puts these reasons in UnparkNever because "re-entering one would escape its
+// own cap one lap at a time". That is an argument about a Task that has SPENT
+// laps. The population this exists for has spent none: an adopted upgrade Task
+// owns no Issue mirror by construction (MintAdoptedUpgradeTask, upgrade_adopt.go,
+// binds a MergeRequest and never an Issue), so controller.resumeOne - whose whole
+// mechanism is sever-the-Issues-and-re-mint - bails unconditionally on it and the
+// maintainer's comment is SWALLOWED. Measured live on containers!1300,
+// 2026-08-22: the mr_comment event was queued, resumeNoReentryParks evaluated the
+// Task dozens of times, and nothing happened and nothing was logged.
+//
+// THE BOUND IS THE COMMENT ITSELF, which is exactly the UnparkHuman contract
+// applied to a population that was misclassified as unreachable rather than as
+// human-releasable. One unspent non-bot event releases one park, enforced by the
+// UnparkConsumedAt stamp that already exists - so this is bounded by a monotonic
+// quantity, not by a counter that a re-entry could refund.
+//
+// THREE GUARDS, EACH LOAD-BEARING:
+//
+//   - PARKED. A caller that could point this at an un-parked Task would be
+//     re-arming clocks on a live Task for no reason, so it is a caller bug and
+//     gets the typed error, not a quiet no-op.
+//   - UnparkNever OR UnparkRetired ONLY. Every other class already has a driver
+//     (driveUnparks), and a second release path for a park somebody else owns is
+//     a double-drive, not a rescue.
+//   - NOT A MERGE-STAGE PARK. This is the safety boundary. Issue #597 records a
+//     Task parked merge-auth-refused "re-entering ReconcileMerging and issuing
+//     live GitLab merges", and unparkClasses makes the same argument for the
+//     retry lane: retrying a merge that may have partially succeeded is how a
+//     double-merge happens. It reuses IsMergeStagePark rather than listing the
+//     reasons again, so the boundary is one tested predicate and not a second
+//     list to keep true.
+//
+// ownership-lost IS eligible for release here, and deliberately so: a
+// maintainer commenting under an externally-owned merge request is asking
+// tatara to look at it, and whether to take ownership back is the IMPLEMENT
+// AGENT's judgement call, not the operator's. Deciding it here would pre-empt
+// that judgement, so this function carries no kind filter and no
+// ownership-lost exclusion.
+//
+// THE STAMPS ARE reArm's MINUS TWO, and the subtraction is deliberate rather
+// than an oversight, so do not "unify" this with reArm:
+//
+//   - stateEnteredAt = now is the one that makes this a release instead of a
+//     no-op that looks like one. Clock 1 measures from it against
+//     AdmissionStarvedBudget (stage.go's ClockAdmission arm), so leaving it
+//     stale re-elapses on the very next pass and re-parks admission-starved -
+//     #513's "a retry that provides no retry", and the exact reason the measured
+//     population parked in the first place.
+//   - podStartedAt / stateWorkStartedAt to nil re-arm clock 1 so the next
+//     reconcile admits a replacement pod, the same three stamps ReArmAfterPodLoss
+//     makes and for the same reason.
+//   - ResetRetryBudget, because park.go already names the human release as an
+//     authorised caller: without it the one release that ends an escalation is
+//     also the one that guarantees the next technical park re-escalates
+//     instantly, with zero laps in between.
+//   - stats.podRecreations and stats.agentStops are NOT reset, and
+//     stageElapsedCarrySeconds is preserved. This population ran no pod, so both
+//     counters are zero for it anyway; for the reasons where a pod DID run
+//     (implement-declined, operator-error) leaving them alone is what keeps the
+//     churn alert's input and the absolute residency dead-man switch cumulative
+//     across a release a human asked for. A human's comment buys a pod, not a
+//     laundered budget.
+//
+// It consumes the events LAST, after every mutation has landed, so a caller that
+// persists the whole status in one write can never spend a comment for a release
+// it did not also record.
+func UnparkMaintainerComment(t *v1alpha1.Task, botLogin string, now time.Time) error {
+	if t.Status.ParkReason == "" {
+		return &NotParkedError{State: t.Status.State}
+	}
+	class, ok := UnparkClassFor(t.Status.ParkReason)
+	if !ok || (class != UnparkNever && class != UnparkRetired) {
+		return fmt.Errorf("stage: maintainer un-park requires an UnparkNever or UnparkRetired park, got %q",
+			t.Status.ParkReason)
+	}
+	if IsMergeStagePark(t.Status.ParkReason) {
+		return fmt.Errorf("stage: maintainer un-park refuses the merge-stage park %q: the work is finished and reviewed, and re-driving the merge is how a double-merge happens",
+			t.Status.ParkReason)
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	clearPark(t)
+	stamp := metav1.NewTime(now)
+	t.Status.StateEnteredAt = &stamp
+	t.Status.PodStartedAt = nil
+	t.Status.StateWorkStartedAt = nil
+	ResetRetryBudget(t)
+	consumeUnparkEvents(t, botLogin, now)
+	return nil
+}
+
+// ConsumeUnparkEvents is consumeUnparkEvents for the ONE caller outside this
+// package that SPENDS a maintainer comment without releasing anything:
+// controller.refuseMROnlyUnpark, which answers a merge-stage park with an
+// explanation on the merge request instead of an un-park.
+//
+// Exporting the spend rather than duplicating it is the same call Repark makes
+// one function up: one comment gets one answer, and a second copy of "which
+// events count" would not error when it drifted, it would silently stop
+// matching - the lesson CIDeclineEvidence is in api/v1alpha1 for.
+func ConsumeUnparkEvents(t *v1alpha1.Task, botLogin string, now time.Time) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	consumeUnparkEvents(t, botLogin, now)
+}
+
 // mrTerminalReasons is UnparkForMRTerminal's allow-list: the three stateReasons
 // that mean THE WORLD MOVED ON, not that the Task made progress. Every one of
 // them is written by externalTerminalEdge or the takeover finalize, off a forge
@@ -728,8 +845,9 @@ var mrTerminalReasons = map[string]bool{
 	ReasonMRTakenOver:        true,
 }
 
-// UnparkForMRTerminal is the THIRD and last exception to "there is exactly one
-// way out of a park and it is Unpark", and it is the narrowest of them.
+// UnparkForMRTerminal is the THIRD of the FOUR exceptions to "there is exactly
+// one way out of a park and it is Unpark" (the fourth is
+// UnparkMaintainerComment), and it is the narrowest of them.
 //
 // WHY A PARK MUST NOT SURVIVE THIS. A park stops a Task making stage PROGRESS
 // while it waits on something - a human's answer, a retry clock, a ceiling. An
