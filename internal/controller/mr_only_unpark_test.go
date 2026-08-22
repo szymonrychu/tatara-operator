@@ -4,6 +4,8 @@ package controller
 
 import (
 	"context"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
@@ -458,4 +461,78 @@ func TestMROnlyUnpark_RefusalReachesAMergedMergeRequest(t *testing.T) {
 		"MINOR-6: the notice must say the merge already happened, not invite a merge by hand")
 	require.Equal(t, before+1, testutil.ToFloat64(r.Metrics.MROnlyUnparkCounter(
 		proj.Name, stage.ReasonDeployBlocked, obs.MROnlyUnparkRefused)))
+}
+
+// TestMROnlyUnpark_CapCrossedBetweenTheTwoMutateCallsPostsNothingAndSpendsNothing
+// pins the per-invocation reset of `present` inside refuseMROnlyUnpark's
+// FitMergeRequest closure.
+//
+// FitMergeRequest calls that closure TWICE - once on the candidate it sizes,
+// once on the fresh copy inside its RetryOnConflict - and only the second call
+// is the one that persists. This fixture makes the mirror cross
+// mrOnlyRefusalPendingCap BETWEEN those two reads: the candidate read sees
+// cap-1 pending comments and appends the notice, the retry read sees the cap
+// and declines. With `present` declared outside the closure and never reset,
+// the first call's true survived the second call's decline, `posted` counted a
+// notice that was never written, and the driver went on to latch the refusal
+// AND spend the maintainer's comment with nothing queued on the merge request -
+// the same swallowed-comment defect this whole branch exists to remove, one
+// level down.
+//
+// refuseMROnlyUnpark is called DIRECTLY rather than through
+// resumeNoReentryParks on purpose: the interceptor keys off the MergeRequest
+// Get COUNT, and going through the driver adds ownedMRs' own Get in front of
+// FitMergeRequest's two, which would pad the candidate read as well and make
+// the fixture pass with or without the fix.
+func TestMROnlyUnpark_CapCrossedBetweenTheTwoMutateCallsPostsNothingAndSpendsNothing(t *testing.T) {
+	ctx := context.Background()
+	proj, repo, task, mr, taskName, mrName := mrOnlyFixture(t, stage.ReasonMergeBlocked, "maintainer")
+	for i := 0; i < mrOnlyRefusalPendingCap-1; i++ {
+		mr.Status.PendingComments = append(mr.Status.PendingComments,
+			tatarav1alpha1.PendingComment{RequestID: "filler-" + strconv.Itoa(i), Action: "comment", Body: "x"})
+	}
+
+	mrGets := 0
+	c := newMirrorClientIntercepted(t, interceptor.Funcs{
+		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey,
+			obj client.Object, opts ...client.GetOption) error {
+
+			if err := cl.Get(ctx, key, obj, opts...); err != nil {
+				return err
+			}
+			got, ok := obj.(*tatarav1alpha1.MergeRequest)
+			if !ok {
+				return nil
+			}
+			mrGets++
+			if mrGets >= 2 {
+				// Everything from FitMergeRequest's RETRY read onwards sees the
+				// cap-th pending comment another writer landed in between.
+				got.Status.PendingComments = append(got.Status.PendingComments,
+					tatarav1alpha1.PendingComment{RequestID: "filler-late", Action: "comment", Body: "x"})
+			}
+			return nil
+		},
+	}, proj, repo, reapSecret(), task, mr)
+	r := reapReconciler(c, &resumeWriter{})
+	before := testutil.ToFloat64(r.Metrics.MROnlyUnparkCounter(
+		proj.Name, stage.ReasonMergeBlocked, obs.MROnlyUnparkRefused))
+
+	require.NoError(t, r.refuseMROnlyUnpark(ctx, proj, task,
+		[]tatarav1alpha1.MergeRequest{*mr}, time.Now()))
+
+	for _, pc := range mustGetMR(t, c, mrName).Status.PendingComments {
+		require.False(t, strings.HasPrefix(pc.RequestID, "mr-only-unpark-refused"),
+			"the retry read hit the cap, so no notice was ever persisted")
+	}
+
+	still, ok := mustGetTask(t, c, taskName)
+	require.True(t, ok)
+	require.Empty(t, still.Annotations[tatarav1alpha1.AnnMROnlyUnparkRefused],
+		"nothing was queued, so the refusal must NOT be latched - the next pass has to be free to answer again")
+	require.Nil(t, still.Status.PendingEvents[0].UnparkConsumedAt,
+		"nothing was queued, so the maintainer's comment must NOT be spent")
+	require.Equal(t, before, testutil.ToFloat64(r.Metrics.MROnlyUnparkCounter(
+		proj.Name, stage.ReasonMergeBlocked, obs.MROnlyUnparkRefused)),
+		"a refusal that reached nobody is not a refusal")
 }

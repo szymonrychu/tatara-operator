@@ -4,6 +4,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -183,8 +184,44 @@ const mrOnlyRefusalPendingCap = 20
 //
 // IT DOES NOT CLOSE, LABEL OR TOUCH THE MERGE REQUEST. That is the whole point:
 // the work is finished and reviewed, and the blocker is outside the code.
+//
+// IT LIVE-READS THE TASK FIRST, through the UNCACHED APIReader, exactly as
+// applyMROnlyUnpark does before its release and for a strictly larger stake.
+// The park this arm is about to describe OUT LOUD on a merge request came off
+// resumeNoReentryParks' List snapshot, and stage.UnparkForMRTerminal clears a
+// merge-stage park the moment the MR reaches a terminal forge state. Refusing
+// off a stale snapshot posts a PUBLIC notice claiming the task "stopped at the
+// MERGE with <reason>" on an MR that is no longer in that state, and spends the
+// maintainer's comment against it. A forge comment is the most expensive thing
+// this driver does, so it gets the freshest read available, not the stalest.
 func (r *ProjectReconciler) refuseMROnlyUnpark(ctx context.Context, proj *tatarav1alpha1.Project,
 	t *tatarav1alpha1.Task, mrs []tatarav1alpha1.MergeRequest, now time.Time) error {
+
+	getter := client.Reader(r.APIReader)
+	if getter == nil {
+		getter = r.Client
+	}
+	taskKey := client.ObjectKeyFromObject(t)
+	want := t.Status.ParkReason
+	fresh := &tatarav1alpha1.Task{}
+	if err := getter.Get(ctx, taskKey, fresh); err != nil {
+		return fmt.Errorf("resume: live-read %s before refusing the mr-only un-park: %w", taskKey.Name, err)
+	}
+	if !tatarav1alpha1.Parked(fresh) || fresh.Status.ParkReason != want ||
+		!hasNonBotPendingEvent(fresh, botLoginOf(proj)) {
+		// The Task drifted between the List and this read - the park was released
+		// (UnparkForMRTerminal on an MR that just reached a terminal forge state
+		// is the realistic writer), re-parked under a different reason, or the
+		// comment was already spent by another writer. Nothing was posted and
+		// nothing is owed: the next pass re-reads and routes the comment to
+		// whichever arm is correct then. Symmetric with applyMROnlyUnpark's own
+		// drifted-Task return, which is likewise silent and uncounted.
+		return nil
+	}
+	// From here on the LIVE copy is the one every decision reads: the refusal
+	// latch lives in metadata, and a cached annotation map that has not yet seen
+	// this Task's own annotateTask write is how the same park gets answered twice.
+	*t = *fresh
 
 	reason := t.Status.ParkReason
 	latch := parkedAt(t).UTC().Format(time.RFC3339)
@@ -208,6 +245,17 @@ func (r *ProjectReconciler) refuseMROnlyUnpark(ctx context.Context, proj *tatara
 			present := false
 			if err := objbudget.FitMergeRequest(ctx, r.Client, r.spillerFor(proj), key,
 				func(cur *tatarav1alpha1.MergeRequest) {
+					// RESET PER INVOCATION, for applyMROnlyUnpark's exact reason -
+					// its own retry closure opens with released = false. This
+					// closure is called TWICE by FitMergeRequest: once on the
+					// candidate it sizes, once on the fresh copy inside its retry,
+					// and only the second call is the one that persists. A present
+					// left sticky from the first call survives a second call that
+					// returned early at the cap, so posted counts a notice that was
+					// never written: the latch is stamped and the maintainer's
+					// comment is spent with nothing queued on this MR. That is
+					// precisely the swallow the posted==0 gate below exists to stop.
+					present = false
 					for _, pc := range cur.Status.PendingComments {
 						if pc.RequestID == requestID {
 							present = true
@@ -221,6 +269,27 @@ func (r *ProjectReconciler) refuseMROnlyUnpark(ctx context.Context, proj *tatara
 						tatarav1alpha1.PendingComment{RequestID: requestID, Action: "comment", Body: body})
 					present = true
 				}); err != nil {
+				if errors.Is(err, objbudget.ErrObjectTooLarge) {
+					// PERMANENT, and dropped ON PURPOSE rather than propagated. A
+					// mirror that cannot be fitted under the byte budget fails this
+					// way on EVERY retry, and this driver runs from the project
+					// reconcile AHEAD of driveStrandedParksPaced and
+					// ReapTerminalPaced - an error returned here short-circuits both
+					// of them for the whole Project, on every pass, forever. One fat
+					// MR mirror must not take the reaper off the air: a refusal
+					// notice is best-effort, the reaper is not.
+					//
+					// ONLY this class is dropped. Every other enqueue failure is
+					// transient, so it still propagates and the posted==0 gate
+					// leaves the comment unspent for the next pass to answer
+					// properly - dropping those too would silently forfeit the one
+					// notice on a blip. The release path (applyMROnlyUnpark) is
+					// untouched and still propagates everything it fails on.
+					log.FromContext(ctx).Error(err, "resume: the mr-only refusal notice does not fit on this merge request mirror",
+						"action", "mr_only_unpark_refusal_dropped", "resource_id", t.Name,
+						"merge_request", key.Name, "park_reason", reason, "project", proj.Name)
+					continue
+				}
 				return fmt.Errorf("resume: queue the mr-only refusal notice on %s: %w", key.Name, err)
 			}
 			if present {
@@ -228,31 +297,27 @@ func (r *ProjectReconciler) refuseMROnlyUnpark(ctx context.Context, proj *tatara
 			}
 		}
 		if posted == 0 {
-			// Nothing was told: every owned MR was closed, or already at the
-			// pending-comments cap. Latching or spending here would answer a
-			// comment that received no answer anywhere - leave both alone so the
-			// next pass tries again.
+			// Nothing was told: every owned MR was closed, already at the
+			// pending-comments cap, or too large to fit the notice at all.
+			// Latching or spending here would answer a comment that received no
+			// answer anywhere - leave both alone so the next pass tries again.
 			return nil
 		}
 		if err := r.annotateTask(ctx, t, tatarav1alpha1.AnnMROnlyUnparkRefused, latch); err != nil {
 			return fmt.Errorf("resume: latch the mr-only refusal on %s: %w", t.Name, err)
 		}
-		// operator_mr_only_unpark_total{outcome=refused} can overcount by one in
-		// a narrow race: the "already answered" check just above reads t through
-		// the CACHED client, so a reconcile pass that runs before THIS Task's own
-		// annotateTask write has reached this reconciler's informer cache takes
-		// the branch again, finds the notice already present via
-		// FitMergeRequest's read through r.Client, the CACHED client - the race
-		// is cross-object staleness between the Task and MergeRequest informers,
-		// not a live GET (posted counts presence, deliberately, so a
-		// retry after a crash between enqueue and latch can still finish the
-		// latch it interrupted instead of finding posted==0 forever), and
-		// increments a second time for the SAME park. The notice itself never
-		// double-posts - the requestId dedup above is exact, and
-		// DrainPendingComments dedups again on the forge thread - so the bound
-		// this series actually carries is "at least one refusal per merge-stage
-		// park it answers", not "exactly one". The maintainer-facing guarantee
-		// (one notice) is unaffected; only this counter's exactness is.
+		// operator_mr_only_unpark_total{outcome=refused} can still overcount by
+		// one, in a window the live read at the top of this function narrows but
+		// does not close: a CRASH between the FitMergeRequest enqueue and the
+		// annotateTask latch. The next pass live-reads a Task with no latch, finds
+		// the notice already present on the mirror (posted counts presence,
+		// deliberately, so exactly that interrupted retry can finish the latch
+		// instead of finding posted==0 forever), and increments a second time for
+		// the SAME park. The notice itself never double-posts - the requestId
+		// dedup above is exact, and DrainPendingComments dedups again on the forge
+		// thread - so the bound this series carries is "at least one refusal per
+		// merge-stage park it answers", not "exactly one". The maintainer-facing
+		// guarantee (one notice) is unaffected; only this counter's exactness is.
 		r.Metrics.MROnlyUnpark(proj.Name, reason, obs.MROnlyUnparkRefused)
 		log.FromContext(ctx).Info("refusing an mr-only un-park: the park was written at or after the merge",
 			"action", "mr_only_unpark_refused", "resource_id", t.Name, "park_reason", reason,
@@ -319,6 +384,13 @@ func (r *ProjectReconciler) spendMaintainerComment(ctx context.Context, proj *ta
 // hand" would be false for exactly the reasons finding-1's fix newly reaches -
 // a merged merge request is not waiting to be merged, and there is nothing
 // left to merge by hand.
+//
+// ReasonDeployTimeout IS INTENTIONALLY UNREACHABLE HERE and stays in the
+// condition anyway: deploy-timeout is UnparkTimer, so resume.go's class filter
+// drops it before this driver ever sees it. It is belt and braces against that
+// classification moving - a post-merge reason that fell through to the
+// pre-merge sentence would tell a maintainer to "merge it by hand" on a merge
+// request that is already merged. Do not "simplify" it away.
 func mrOnlyUnparkRefusalComment(t *tatarav1alpha1.Task) string {
 	reason := t.Status.ParkReason
 	if reason == stage.ReasonDeployTimeout || reason == stage.ReasonDeployBlocked {
