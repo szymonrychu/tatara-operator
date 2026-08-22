@@ -12,6 +12,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
@@ -142,8 +143,125 @@ func (r *ProjectReconciler) applyMROnlyUnpark(ctx context.Context, proj *tatarav
 	return released, nil
 }
 
-// refuseMROnlyUnpark is implemented in the refusal arm.
-func (r *ProjectReconciler) refuseMROnlyUnpark(_ context.Context, _ *tatarav1alpha1.Project,
-	_ *tatarav1alpha1.Task, _ []tatarav1alpha1.MergeRequest, _ time.Time) error {
+// mrOnlyRefusalPendingCap bounds status.pendingComments on a merge request
+// mirror the same way restapi's pendingCommentsCap and the deploy-timeout
+// enqueue do. It is a literal rather than a shared constant because the
+// restapi copy is unexported and hoisting it into api/v1alpha1 to be read
+// twice is the abstraction hard rule 2 says not to build.
+const mrOnlyRefusalPendingCap = 20
+
+// refuseMROnlyUnpark is the arm that says NO, out loud. A merge-stage park plus
+// a maintainer comment gets one notice on each OPEN owned merge request naming
+// the blocker, a latch so it stays one, and the comment SPENT - because one
+// comment gets one answer, and an explanation is an answer.
+//
+// THE ORDER IS enqueue, latch, spend, and every step of it fails in the harmless
+// direction. The enqueue is idempotent twice over (the requestId is already in
+// the pending list, and DrainPendingComments dedups the same id on the forge
+// thread), so latching AFTER it costs at worst a duplicate entry the mirror
+// drops, and never a lost notice - the direction AnnRetryExhaustedCommented
+// picks, and the opposite of driveRetiredUnparks' latch, which guards a
+// TOKEN-BURNING loop rather than a comment. Spending last means a crash before
+// it leaves the comment unspent and the notice latched, so the next pass is a
+// no-op that has already said its piece.
+//
+// IT DOES NOT CLOSE, LABEL OR TOUCH THE MERGE REQUEST. That is the whole point:
+// the work is finished and reviewed, and the blocker is outside the code.
+func (r *ProjectReconciler) refuseMROnlyUnpark(ctx context.Context, proj *tatarav1alpha1.Project,
+	t *tatarav1alpha1.Task, mrs []tatarav1alpha1.MergeRequest, now time.Time) error {
+
+	reason := t.Status.ParkReason
+	latch := parkedAt(t).UTC().Format(time.RFC3339)
+	if t.Annotations[tatarav1alpha1.AnnMROnlyUnparkRefused] == latch {
+		return nil // this park has already had its one answer
+	}
+	body := mrOnlyUnparkRefusalComment(t)
+	requestID := fmt.Sprintf("mr-only-unpark-refused-%s-%s", t.Name, latch)
+	for i := range mrs {
+		mr := &mrs[i]
+		if mr.Status.State != "open" {
+			continue // a closed merge request has no thread worth writing to
+		}
+		key := client.ObjectKeyFromObject(mr)
+		if err := objbudget.FitMergeRequest(ctx, r.Client, r.spillerFor(proj), key,
+			func(cur *tatarav1alpha1.MergeRequest) {
+				for _, pc := range cur.Status.PendingComments {
+					if pc.RequestID == requestID {
+						return
+					}
+				}
+				if len(cur.Status.PendingComments) >= mrOnlyRefusalPendingCap {
+					return
+				}
+				cur.Status.PendingComments = append(cur.Status.PendingComments,
+					tatarav1alpha1.PendingComment{RequestID: requestID, Action: "comment", Body: body})
+			}); err != nil {
+			return fmt.Errorf("resume: queue the mr-only refusal notice on %s: %w", key.Name, err)
+		}
+	}
+	if err := r.annotateTask(ctx, t, tatarav1alpha1.AnnMROnlyUnparkRefused, latch); err != nil {
+		return fmt.Errorf("resume: latch the mr-only refusal on %s: %w", t.Name, err)
+	}
+	if err := r.spendMaintainerComment(ctx, proj, t, now); err != nil {
+		return err
+	}
+	r.Metrics.MROnlyUnpark(proj.Name, reason, obs.MROnlyUnparkRefused)
+	log.FromContext(ctx).Info("refusing an mr-only un-park: the park was written at or after the merge",
+		"action", "mr_only_unpark_refused", "resource_id", t.Name, "park_reason", reason,
+		"kind", t.Spec.Kind, "state", t.Status.State, "project", proj.Name)
 	return nil
+}
+
+// spendMaintainerComment stamps UnparkConsumedAt on every unspent non-bot
+// pendingEvent WITHOUT releasing anything. It is what makes the refusal an
+// ANSWER rather than a Task that re-evaluates the same comment every 60s
+// forever - the loop consumeUnparkEvents' own doc was written to kill.
+//
+// Live-read and re-checked under the retry, like applyMROnlyUnpark: a stamp
+// another writer just landed must be visible, or this spends nothing twice.
+func (r *ProjectReconciler) spendMaintainerComment(ctx context.Context, proj *tatarav1alpha1.Project,
+	t *tatarav1alpha1.Task, now time.Time) error {
+
+	getter := client.Reader(r.APIReader)
+	if getter == nil {
+		getter = r.Client
+	}
+	key := client.ObjectKeyFromObject(t)
+	bot := botLoginOf(proj)
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := getter.Get(ctx, key, fresh); err != nil {
+			return err
+		}
+		if !hasNonBotPendingEvent(fresh, bot) {
+			return nil
+		}
+		stage.ConsumeUnparkEvents(fresh, bot, now)
+		if err := r.Status().Update(ctx, fresh); err != nil {
+			return err
+		}
+		*t = *fresh
+		return nil
+	}); err != nil {
+		return fmt.Errorf("resume: spend the maintainer comment on %s: %w", key.Name, err)
+	}
+	return nil
+}
+
+// mrOnlyUnparkRefusalComment tells the maintainer the three things that separate
+// this stop from every other one: the implementation is FINISHED, the merge
+// request is still there and untouched, and a reply will not restart anything.
+// It is mergeStageParkComment's sibling on the merge request instead of the
+// issue, and it deliberately does NOT invite a reply: there is no Issue to
+// re-mint from, so the only remedy is a human clearing the blocker.
+func mrOnlyUnparkRefusalComment(t *tatarav1alpha1.Task) string {
+	return fmt.Sprintf(
+		"tatara read the comment and is NOT restarting task `%s`: the implementation finished and was "+
+			"reviewed, and the task then stopped at the MERGE with `%s`.\n\n"+
+			"That blocker is outside the code - a credential, a protected branch, a sibling repo that "+
+			"already landed, or somebody else pushing to this branch - so re-running the agent cannot "+
+			"clear it, and re-driving a merge that may have partially succeeded is how a double-merge "+
+			"happens. This merge request is therefore left exactly as it is.\n\n"+
+			"Clear the blocker and merge it by hand. Further comments here will not restart the task.",
+		t.Name, t.Status.ParkReason)
 }

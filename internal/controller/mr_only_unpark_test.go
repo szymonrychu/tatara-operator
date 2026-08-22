@@ -10,6 +10,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
@@ -243,4 +244,123 @@ func TestMROnlyUnpark_ResumeReleasingInFlightDefersToResumeOne(t *testing.T) {
 	// a live park that a resumed agent could act against.
 	_, ok := mustGetTask(t, c, taskName)
 	require.False(t, ok, "resumeOne must finish the collection it already committed to, not resurrect the Task in place")
+}
+
+// mrPendingBodies returns the bodies of the comment intents queued on an MR
+// mirror, which is where the operator posts to a merge request: the mirror's
+// own reconciler drains them to the forge with requestId-keyed dedup.
+func mrPendingBodies(t *testing.T, c client.Client, name string) []string {
+	t.Helper()
+	mr := mustGetMR(t, c, name)
+	out := make([]string, 0, len(mr.Status.PendingComments))
+	for _, pc := range mr.Status.PendingComments {
+		out = append(out, pc.Body)
+	}
+	return out
+}
+
+// TestMROnlyUnpark_MergeStageParkPostsItsRefusalExactlyOnce. Without an answer,
+// ansible!19 stays silent in exactly the way containers!1300 did - which is the
+// failure mode being fixed - and WITH an automatic release it re-enters
+// ReconcileMerging and issues live forge merges (#597). So: refuse, say so once,
+// and spend the comment.
+func TestMROnlyUnpark_MergeStageParkPostsItsRefusalExactlyOnce(t *testing.T) {
+	ctx := context.Background()
+	proj, repo, task, mr, taskName, mrName := mrOnlyFixture(t, stage.ReasonMergeAuthRefused, "maintainer")
+	c := newMirrorClient(t, proj, repo, reapSecret(), task, mr)
+	r := reapReconciler(c, &resumeWriter{})
+	before := testutil.ToFloat64(r.Metrics.MROnlyUnparkCounter(
+		proj.Name, stage.ReasonMergeAuthRefused, obs.MROnlyUnparkRefused))
+
+	require.NoError(t, r.resumeNoReentryParks(ctx, proj, time.Now()))
+
+	still, ok := mustGetTask(t, c, taskName)
+	require.True(t, ok)
+	require.Equal(t, stage.ReasonMergeAuthRefused, still.Status.ParkReason,
+		"a merge-stage park is NEVER released here")
+	require.NotNil(t, still.Status.PendingEvents[0].UnparkConsumedAt,
+		"the comment got its one answer, so it is spent")
+	require.NotEmpty(t, still.Annotations[tatarav1alpha1.AnnMROnlyUnparkRefused],
+		"the notice is latched against the park it answered")
+
+	bodies := mrPendingBodies(t, c, mrName)
+	require.Len(t, bodies, 1, "exactly one notice")
+	require.Contains(t, bodies[0], stage.ReasonMergeAuthRefused, "it names the blocker")
+	require.Equal(t, before+1, testutil.ToFloat64(r.Metrics.MROnlyUnparkCounter(
+		proj.Name, stage.ReasonMergeAuthRefused, obs.MROnlyUnparkRefused)))
+
+	// SECOND PASS, same park: the latch holds and nothing is queued twice.
+	require.NoError(t, r.resumeNoReentryParks(ctx, proj, time.Now()))
+	require.Len(t, mrPendingBodies(t, c, mrName), 1, "one park gets one notice")
+	require.Equal(t, before+1, testutil.ToFloat64(r.Metrics.MROnlyUnparkCounter(
+		proj.Name, stage.ReasonMergeAuthRefused, obs.MROnlyUnparkRefused)))
+}
+
+// TestMROnlyUnpark_EveryMergeStageReasonIsRefused walks the design's refused
+// column through the real driver. Four of these are already refused a step
+// earlier by the CLASS filter in resumeNoReentryParks (merge-timeout and
+// deploy-timeout are UnparkTimer, ci-failed and merge-conflict-retry are
+// UnparkRetry), so they never reach this arm at all and get no notice. The
+// assertion that holds for ALL of them is the one that matters: the park stands
+// and the merge request is not touched.
+func TestMROnlyUnpark_EveryMergeStageReasonIsRefused(t *testing.T) {
+	for _, reason := range []string{
+		stage.ReasonMergeBlocked, stage.ReasonMergeAuthRefused, stage.ReasonMergeOrderMissing,
+		stage.ReasonHeadMoving, stage.ReasonCIRed, stage.ReasonMergeConflict, stage.ReasonDeployBlocked,
+		stage.ReasonMergeTimeout, stage.ReasonDeployTimeout,
+		stage.ReasonCIFailed, stage.ReasonMergeConflictRetry,
+	} {
+		t.Run(reason, func(t *testing.T) {
+			ctx := context.Background()
+			proj, repo, task, mr, taskName, _ := mrOnlyFixture(t, reason, "maintainer")
+			c := newMirrorClient(t, proj, repo, reapSecret(), task, mr)
+			w := &resumeWriter{}
+			r := reapReconciler(c, w)
+
+			require.NoError(t, r.resumeNoReentryParks(ctx, proj, time.Now()))
+
+			still, ok := mustGetTask(t, c, taskName)
+			require.True(t, ok)
+			require.Equal(t, reason, still.Status.ParkReason, "the park must stand")
+			require.Empty(t, w.closed, "and the reviewed merge request is never closed")
+		})
+	}
+}
+
+// TestMROnlyUnpark_RefusalLatchIsScopedToOnePark. A presence-only latch would
+// silence the answer to every LATER park on the same Task, which is the second
+// failure this driver exists to remove. The value is the parkedAt of the park it
+// answered, so a NEW park gets a NEW notice - AnnRetryExhaustedCommented's rule.
+func TestMROnlyUnpark_RefusalLatchIsScopedToOnePark(t *testing.T) {
+	ctx := context.Background()
+	proj, repo, task, mr, taskName, mrName := mrOnlyFixture(t, stage.ReasonMergeBlocked, "maintainer")
+	c := newMirrorClient(t, proj, repo, reapSecret(), task, mr)
+	r := reapReconciler(c, &resumeWriter{})
+
+	require.NoError(t, r.resumeNoReentryParks(ctx, proj, time.Now()))
+	require.Len(t, mrPendingBodies(t, c, mrName), 1)
+
+	// A LATER park, on a later stamp, with a fresh maintainer comment.
+	cur, _ := mustGetTask(t, c, taskName)
+	later := metav1.NewTime(time.Now().Add(time.Hour))
+	cur.Status.ParkedAt = &later
+	cur.Status.PendingEvents = append(cur.Status.PendingEvents,
+		tatarav1alpha1.TaskEvent{At: later, Kind: "mr_comment", Author: "maintainer", Body: "and now?"})
+	require.NoError(t, c.Status().Update(ctx, cur))
+
+	require.NoError(t, r.resumeNoReentryParks(ctx, proj, time.Now()))
+	require.Len(t, mrPendingBodies(t, c, mrName), 2, "a new park gets its own answer")
+}
+
+// TestMROnlyUnpark_RefusalSkipsAClosedMergeRequest: a closed merge request has
+// no thread worth writing to, and its mirror still carries the ref.
+func TestMROnlyUnpark_RefusalSkipsAClosedMergeRequest(t *testing.T) {
+	ctx := context.Background()
+	proj, repo, task, mr, _, mrName := mrOnlyFixture(t, stage.ReasonMergeBlocked, "maintainer")
+	mr.Status.State = "closed"
+	c := newMirrorClient(t, proj, repo, reapSecret(), task, mr)
+	r := reapReconciler(c, &resumeWriter{})
+
+	require.NoError(t, r.resumeNoReentryParks(ctx, proj, time.Now()))
+	require.Empty(t, mrPendingBodies(t, c, mrName))
 }

@@ -170,6 +170,25 @@ const (
 // issue, or the reverse.
 const AnnMergeStageParked = "tatara.dev/merge-stage-parked"
 
+// AnnMROnlyUnparkRefused latches the ONE notice the MR-only un-park driver posts
+// when a maintainer's comment lands on a Task parked AT OR AFTER THE MERGE
+// (stage.IsMergeStagePark), where releasing the park would re-drive
+// ReconcileMerging against a merge that may have partially succeeded (#597).
+//
+// ITS VALUE IS THE parkedAt OF THE PARK IT ANSWERED, not a bare presence flag,
+// and that is AnnRetryExhaustedCommented's rule for AnnRetryExhaustedCommented's
+// reason: a presence-only latch would silence the answer to every LATER park on
+// the same Task, and staying silent is the exact defect this driver removes.
+// Keying on the park's own timestamp scopes the silence to the one park that was
+// already answered.
+//
+// It is stamped on the TASK, not on the merge request, because it is a fact
+// about the park - the same Task can own several merge requests and they all get
+// one notice between them, from one park. Metadata, not status, for the reason
+// AnnRetiredParkMigrated gives: the subresources are independent, so the
+// consume's status write cannot lose it.
+const AnnMROnlyUnparkRefused = "tatara.dev/mr-only-unpark-refused"
+
 // AnnBrainstormSources is the annotation key carrying the comma-separated
 // brainstorm source list stamped on brainstorm Tasks by projectscan and read by
 // agent.BuildPod to gate the egress network label. Centralised here so the two
