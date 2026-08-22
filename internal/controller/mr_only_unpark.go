@@ -151,19 +151,35 @@ func (r *ProjectReconciler) applyMROnlyUnpark(ctx context.Context, proj *tatarav
 const mrOnlyRefusalPendingCap = 20
 
 // refuseMROnlyUnpark is the arm that says NO, out loud. A merge-stage park plus
-// a maintainer comment gets one notice on each OPEN owned merge request naming
-// the blocker, a latch so it stays one, and the comment SPENT - because one
-// comment gets one answer, and an explanation is an answer.
+// a maintainer comment gets one notice on each OWNED merge request that still
+// has a thread worth writing to, a latch so it stays one, and the comment
+// SPENT - because one comment gets one answer, and an explanation is an
+// answer.
 //
-// THE ORDER IS enqueue, latch, spend, and every step of it fails in the harmless
-// direction. The enqueue is idempotent twice over (the requestId is already in
-// the pending list, and DrainPendingComments dedups the same id on the forge
-// thread), so latching AFTER it costs at worst a duplicate entry the mirror
-// drops, and never a lost notice - the direction AnnRetryExhaustedCommented
-// picks, and the opposite of driveRetiredUnparks' latch, which guards a
-// TOKEN-BURNING loop rather than a comment. Spending last means a crash before
-// it leaves the comment unspent and the notice latched, so the next pass is a
-// no-op that has already said its piece.
+// "STILL HAS A THREAD" MEANS state != closed, NOT state == open. deploy-blocked
+// and deploy-timeout are merge-stage parks written AFTER a successful merge
+// (stage.mergeStageParks' own doc), so their merge request is "merged" by
+// construction, never "open" again - and a merged thread is exactly as
+// readable and writable as an open one. Round-1 review caught this
+// empirically: excluding "merged" reproduced the containers!1300 silence this
+// whole change exists to remove, relocated into the arm meant to fix it.
+//
+// THE ORDER IS enqueue, then - ONLY IF SOMETHING WAS ACTUALLY QUEUED - latch
+// and count, then ALWAYS spend. Latching or counting a refusal that reached
+// nobody (every owned MR closed, or the cap already full) is the same
+// swallowed-comment defect one level down, so posted==0 returns before either
+// - the comment stays unspent and the next pass gets to try again, the way a
+// closed MR reopening or a new owned MR arriving would resolve it. Spend is
+// UNCONDITIONAL once past that gate, including on the already-latched path:
+// see spendMaintainerComment's own doc for why a second comment on an answered
+// park must still be spent.
+//
+// The enqueue is idempotent twice over (the requestId is already in the
+// pending list, and DrainPendingComments dedups the same id on the forge
+// thread), so a retried enqueue costs at worst a duplicate entry the mirror
+// drops, never a lost notice - the direction AnnRetryExhaustedCommented picks,
+// and the opposite of driveRetiredUnparks' latch, which guards a
+// TOKEN-BURNING loop rather than a comment.
 //
 // IT DOES NOT CLOSE, LABEL OR TOUCH THE MERGE REQUEST. That is the whole point:
 // the work is finished and reviewed, and the blocker is outside the code.
@@ -172,50 +188,89 @@ func (r *ProjectReconciler) refuseMROnlyUnpark(ctx context.Context, proj *tatara
 
 	reason := t.Status.ParkReason
 	latch := parkedAt(t).UTC().Format(time.RFC3339)
-	if t.Annotations[tatarav1alpha1.AnnMROnlyUnparkRefused] == latch {
-		return nil // this park has already had its one answer
-	}
-	body := mrOnlyUnparkRefusalComment(t)
-	requestID := fmt.Sprintf("mr-only-unpark-refused-%s-%s", t.Name, latch)
-	for i := range mrs {
-		mr := &mrs[i]
-		if mr.Status.State != "open" {
-			continue // a closed merge request has no thread worth writing to
-		}
-		key := client.ObjectKeyFromObject(mr)
-		if err := objbudget.FitMergeRequest(ctx, r.Client, r.spillerFor(proj), key,
-			func(cur *tatarav1alpha1.MergeRequest) {
-				for _, pc := range cur.Status.PendingComments {
-					if pc.RequestID == requestID {
+	if t.Annotations[tatarav1alpha1.AnnMROnlyUnparkRefused] != latch {
+		body := mrOnlyUnparkRefusalComment(t)
+		requestID := fmt.Sprintf("mr-only-unpark-refused-%s-%s", t.Name, latch)
+		posted := 0
+		for i := range mrs {
+			mr := &mrs[i]
+			if mr.Status.State == "closed" {
+				continue // no thread left to write to; "merged" still has one
+			}
+			key := client.ObjectKeyFromObject(mr)
+			// present, not "newly appended": a retry that finds this exact
+			// requestId already on the mirror (crash between enqueue and latch,
+			// or the cache-lag race the metric comment below documents) still
+			// counts as an answer that reached this MR, and must still satisfy
+			// the posted==0 gate below - or a crashed retry would find the
+			// notice already there, count it as nothing, and leave the comment
+			// permanently unspent instead of finishing the latch it interrupted.
+			present := false
+			if err := objbudget.FitMergeRequest(ctx, r.Client, r.spillerFor(proj), key,
+				func(cur *tatarav1alpha1.MergeRequest) {
+					for _, pc := range cur.Status.PendingComments {
+						if pc.RequestID == requestID {
+							present = true
+							return
+						}
+					}
+					if len(cur.Status.PendingComments) >= mrOnlyRefusalPendingCap {
 						return
 					}
-				}
-				if len(cur.Status.PendingComments) >= mrOnlyRefusalPendingCap {
-					return
-				}
-				cur.Status.PendingComments = append(cur.Status.PendingComments,
-					tatarav1alpha1.PendingComment{RequestID: requestID, Action: "comment", Body: body})
-			}); err != nil {
-			return fmt.Errorf("resume: queue the mr-only refusal notice on %s: %w", key.Name, err)
+					cur.Status.PendingComments = append(cur.Status.PendingComments,
+						tatarav1alpha1.PendingComment{RequestID: requestID, Action: "comment", Body: body})
+					present = true
+				}); err != nil {
+				return fmt.Errorf("resume: queue the mr-only refusal notice on %s: %w", key.Name, err)
+			}
+			if present {
+				posted++
+			}
 		}
+		if posted == 0 {
+			// Nothing was told: every owned MR was closed, or already at the
+			// pending-comments cap. Latching or spending here would answer a
+			// comment that received no answer anywhere - leave both alone so the
+			// next pass tries again.
+			return nil
+		}
+		if err := r.annotateTask(ctx, t, tatarav1alpha1.AnnMROnlyUnparkRefused, latch); err != nil {
+			return fmt.Errorf("resume: latch the mr-only refusal on %s: %w", t.Name, err)
+		}
+		// operator_mr_only_unpark_total{outcome=refused} can overcount by one in
+		// a narrow race: the "already answered" check just above reads t through
+		// the CACHED client, so a reconcile pass that runs before THIS Task's own
+		// annotateTask write has reached this reconciler's informer cache takes
+		// the branch again, finds the notice already present via
+		// FitMergeRequest's live GET (posted counts presence, deliberately, so a
+		// retry after a crash between enqueue and latch can still finish the
+		// latch it interrupted instead of finding posted==0 forever), and
+		// increments a second time for the SAME park. The notice itself never
+		// double-posts - the requestId dedup above is exact, and
+		// DrainPendingComments dedups again on the forge thread - so the bound
+		// this series actually carries is "at least one refusal per merge-stage
+		// park it answers", not "exactly one". The maintainer-facing guarantee
+		// (one notice) is unaffected; only this counter's exactness is.
+		r.Metrics.MROnlyUnpark(proj.Name, reason, obs.MROnlyUnparkRefused)
+		log.FromContext(ctx).Info("refusing an mr-only un-park: the park was written at or after the merge",
+			"action", "mr_only_unpark_refused", "resource_id", t.Name, "park_reason", reason,
+			"kind", t.Spec.Kind, "state", t.Status.State, "project", proj.Name)
 	}
-	if err := r.annotateTask(ctx, t, tatarav1alpha1.AnnMROnlyUnparkRefused, latch); err != nil {
-		return fmt.Errorf("resume: latch the mr-only refusal on %s: %w", t.Name, err)
-	}
-	if err := r.spendMaintainerComment(ctx, proj, t, now); err != nil {
-		return err
-	}
-	r.Metrics.MROnlyUnpark(proj.Name, reason, obs.MROnlyUnparkRefused)
-	log.FromContext(ctx).Info("refusing an mr-only un-park: the park was written at or after the merge",
-		"action", "mr_only_unpark_refused", "resource_id", t.Name, "park_reason", reason,
-		"kind", t.Spec.Kind, "state", t.Status.State, "project", proj.Name)
-	return nil
+	return r.spendMaintainerComment(ctx, proj, t, now)
 }
 
 // spendMaintainerComment stamps UnparkConsumedAt on every unspent non-bot
 // pendingEvent WITHOUT releasing anything. It is what makes the refusal an
 // ANSWER rather than a Task that re-evaluates the same comment every 60s
 // forever - the loop consumeUnparkEvents' own doc was written to kill.
+//
+// refuseMROnlyUnpark calls this UNCONDITIONALLY, on the already-latched path
+// too - round-1 review caught the alternative empirically: a second maintainer
+// comment landing on a park that already had its one notice was never spent,
+// because the latch's early return sat in front of the spend. The comment then
+// stayed unspent forever, and applyMROnlyUnpark's own hasNonBotPendingEvent
+// check would auto-release the NEXT park this Task takes under a non-merge-
+// stage reason, using a comment that was never an answer to that park at all.
 //
 // Live-read and re-checked under the retry, like applyMROnlyUnpark: a stamp
 // another writer just landed must be visible, or this spends nothing twice.
@@ -250,11 +305,33 @@ func (r *ProjectReconciler) spendMaintainerComment(ctx context.Context, proj *ta
 
 // mrOnlyUnparkRefusalComment tells the maintainer the three things that separate
 // this stop from every other one: the implementation is FINISHED, the merge
-// request is still there and untouched, and a reply will not restart anything.
+// request is left exactly as it stands, and a reply will not restart anything.
 // It is mergeStageParkComment's sibling on the merge request instead of the
 // issue, and it deliberately does NOT invite a reply: there is no Issue to
 // re-mint from, so the only remedy is a human clearing the blocker.
+//
+// IT BRANCHES ON PRE-MERGE VERSUS POST-MERGE, and that split is not
+// decoration: deploy-timeout and deploy-blocked (mergeStageParks' own doc)
+// are written AFTER a successful merge, so a single sentence claiming the
+// task "stopped at the merge" and inviting the maintainer to "merge it by
+// hand" would be false for exactly the reasons finding-1's fix newly reaches -
+// a merged merge request is not waiting to be merged, and there is nothing
+// left to merge by hand.
 func mrOnlyUnparkRefusalComment(t *tatarav1alpha1.Task) string {
+	reason := t.Status.ParkReason
+	if reason == stage.ReasonDeployTimeout || reason == stage.ReasonDeployBlocked {
+		return fmt.Sprintf(
+			"tatara read the comment and is NOT restarting task `%s`: the implementation finished, was "+
+				"reviewed, and this merge request was ALREADY MERGED. The task then stopped AFTER THE "+
+				"MERGE, at the deploy step, with `%s`.\n\n"+
+				"That blocker is outside the code - most likely the deploy pipeline or the deployed "+
+				"cluster itself - so re-running the agent cannot clear it, and re-driving a task whose "+
+				"merge already happened is how a double-merge happens. This merge request is therefore "+
+				"left exactly as it is: merged, and untouched from here.\n\n"+
+				"Clear the deploy blocker by hand, outside this merge request. Further comments here "+
+				"will not restart the task.",
+			t.Name, reason)
+	}
 	return fmt.Sprintf(
 		"tatara read the comment and is NOT restarting task `%s`: the implementation finished and was "+
 			"reviewed, and the task then stopped at the MERGE with `%s`.\n\n"+
@@ -263,5 +340,5 @@ func mrOnlyUnparkRefusalComment(t *tatarav1alpha1.Task) string {
 			"clear it, and re-driving a merge that may have partially succeeded is how a double-merge "+
 			"happens. This merge request is therefore left exactly as it is.\n\n"+
 			"Clear the blocker and merge it by hand. Further comments here will not restart the task.",
-		t.Name, t.Status.ParkReason)
+		t.Name, reason)
 }

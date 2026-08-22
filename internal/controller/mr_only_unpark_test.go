@@ -300,9 +300,11 @@ func TestMROnlyUnpark_MergeStageParkPostsItsRefusalExactlyOnce(t *testing.T) {
 // column through the real driver. Four of these are already refused a step
 // earlier by the CLASS filter in resumeNoReentryParks (merge-timeout and
 // deploy-timeout are UnparkTimer, ci-failed and merge-conflict-retry are
-// UnparkRetry), so they never reach this arm at all and get no notice. The
-// assertion that holds for ALL of them is the one that matters: the park stands
-// and the merge request is not touched.
+// UnparkRetry), so they never reach this arm at all and get no notice - the
+// other seven, all UnparkNever, DO reach it and each must post exactly one.
+// Round-1 review found the previous version of this test asserted only "park
+// stands" and "MR not closed", both of which hold even if the arm posted
+// nothing at all - branching on stage.UnparkClassFor closes that gap.
 func TestMROnlyUnpark_EveryMergeStageReasonIsRefused(t *testing.T) {
 	for _, reason := range []string{
 		stage.ReasonMergeBlocked, stage.ReasonMergeAuthRefused, stage.ReasonMergeOrderMissing,
@@ -312,7 +314,7 @@ func TestMROnlyUnpark_EveryMergeStageReasonIsRefused(t *testing.T) {
 	} {
 		t.Run(reason, func(t *testing.T) {
 			ctx := context.Background()
-			proj, repo, task, mr, taskName, _ := mrOnlyFixture(t, reason, "maintainer")
+			proj, repo, task, mr, taskName, mrName := mrOnlyFixture(t, reason, "maintainer")
 			c := newMirrorClient(t, proj, repo, reapSecret(), task, mr)
 			w := &resumeWriter{}
 			r := reapReconciler(c, w)
@@ -323,6 +325,14 @@ func TestMROnlyUnpark_EveryMergeStageReasonIsRefused(t *testing.T) {
 			require.True(t, ok)
 			require.Equal(t, reason, still.Status.ParkReason, "the park must stand")
 			require.Empty(t, w.closed, "and the reviewed merge request is never closed")
+
+			wantBodies := 0
+			if class, ok := stage.UnparkClassFor(reason); ok && class == stage.UnparkNever {
+				wantBodies = 1
+			}
+			require.Len(t, mrPendingBodies(t, c, mrName), wantBodies,
+				"the seven reasons this arm actually reaches post exactly one notice; "+
+					"the four the class filter drops upstream post none")
 		})
 	}
 }
@@ -352,6 +362,58 @@ func TestMROnlyUnpark_RefusalLatchIsScopedToOnePark(t *testing.T) {
 	require.Len(t, mrPendingBodies(t, c, mrName), 2, "a new park gets its own answer")
 }
 
+// TestMROnlyUnpark_RefusalLatchSuppressesASecondNoticeOnTheSamePark is the test
+// RefusalLatchIsScopedToOnePark cannot be: that test's second pass moves
+// parkedAt, so its "no duplicate" result is explained just as well by the
+// mismatch branch as by the latch's own early return. Round-1 review disabled
+// the check at the top of refuseMROnlyUnpark (`t.Annotations[...] == latch`)
+// and found the WHOLE existing suite still green - nothing exercised the early
+// return itself.
+//
+// A second UNSPENT event on the SAME parkedAt is the only input that isolates
+// it, but the body count alone does not catch a disabled latch either: the
+// requestId dedup inside the merge-request loop caps it at one regardless, and
+// posted counts a dedup hit as present (deliberately, for the crash-recovery
+// reason posted's own doc gives) so the comment still reaches
+// spendMaintainerComment either way. The signal that is UNIQUE to the latch's
+// own early return is the METRIC: with the latch gone, this second, otherwise
+// no-op pass falls all the way through to r.Metrics.MROnlyUnpark again, for a
+// park that was already counted. Verified by disabling the check and watching
+// this exact assertion fail while the rest of the suite stayed green - see
+// task-4-report.md.
+func TestMROnlyUnpark_RefusalLatchSuppressesASecondNoticeOnTheSamePark(t *testing.T) {
+	ctx := context.Background()
+	proj, repo, task, mr, taskName, mrName := mrOnlyFixture(t, stage.ReasonMergeBlocked, "maintainer")
+	c := newMirrorClient(t, proj, repo, reapSecret(), task, mr)
+	r := reapReconciler(c, &resumeWriter{})
+
+	require.NoError(t, r.resumeNoReentryParks(ctx, proj, time.Now()))
+	require.Len(t, mrPendingBodies(t, c, mrName), 1)
+	afterFirst := testutil.ToFloat64(r.Metrics.MROnlyUnparkCounter(
+		proj.Name, stage.ReasonMergeBlocked, obs.MROnlyUnparkRefused))
+
+	// A SECOND maintainer comment on the SAME park: parkedAt does NOT move, so
+	// this input reaches ONLY the annotation-latch check, not the parkedAt
+	// mismatch branch RefusalLatchIsScopedToOnePark exercises.
+	cur, _ := mustGetTask(t, c, taskName)
+	cur.Status.PendingEvents = append(cur.Status.PendingEvents,
+		tatarav1alpha1.TaskEvent{At: metav1.Now(), Kind: "mr_comment", Author: "maintainer", Body: "still there?"})
+	require.NoError(t, c.Status().Update(ctx, cur))
+
+	require.NoError(t, r.resumeNoReentryParks(ctx, proj, time.Now()))
+	require.Len(t, mrPendingBodies(t, c, mrName), 1,
+		"the latch suppresses a second notice on the same park")
+	require.Equal(t, afterFirst, testutil.ToFloat64(r.Metrics.MROnlyUnparkCounter(
+		proj.Name, stage.ReasonMergeBlocked, obs.MROnlyUnparkRefused)),
+		"the latch's early return means the second pass never reaches the metric increment again")
+
+	after, ok := mustGetTask(t, c, taskName)
+	require.True(t, ok)
+	require.NotNil(t, after.Status.PendingEvents[1].UnparkConsumedAt,
+		"the second comment is spent even though the park was already answered - "+
+			"MINOR-4: an unspent comment here would auto-release the NEXT park under a non-merge-stage reason")
+}
+
 // TestMROnlyUnpark_RefusalSkipsAClosedMergeRequest: a closed merge request has
 // no thread worth writing to, and its mirror still carries the ref.
 func TestMROnlyUnpark_RefusalSkipsAClosedMergeRequest(t *testing.T) {
@@ -363,4 +425,37 @@ func TestMROnlyUnpark_RefusalSkipsAClosedMergeRequest(t *testing.T) {
 
 	require.NoError(t, r.resumeNoReentryParks(ctx, proj, time.Now()))
 	require.Empty(t, mrPendingBodies(t, c, mrName))
+}
+
+// TestMROnlyUnpark_RefusalReachesAMergedMergeRequest is the regression test for
+// IMPORTANT-1: deploy-blocked is both merge-stage (stage.IsMergeStagePark) and
+// UnparkNever, so it reaches this arm - and it is a POST-MERGE repark, so its
+// merge request is "merged" by construction, never "open" again. The bug
+// (`mr.Status.State != "open"`) skipped it exactly like a closed one, which
+// reproduced the containers!1300 silence this whole change removes, relocated
+// into the arm meant to fix it: the comment got spent and the refused counter
+// incremented with NO notice queued anywhere.
+func TestMROnlyUnpark_RefusalReachesAMergedMergeRequest(t *testing.T) {
+	ctx := context.Background()
+	proj, repo, task, mr, taskName, mrName := mrOnlyFixture(t, stage.ReasonDeployBlocked, "maintainer")
+	mr.Status.State = "merged"
+	c := newMirrorClient(t, proj, repo, reapSecret(), task, mr)
+	r := reapReconciler(c, &resumeWriter{})
+	before := testutil.ToFloat64(r.Metrics.MROnlyUnparkCounter(
+		proj.Name, stage.ReasonDeployBlocked, obs.MROnlyUnparkRefused))
+
+	require.NoError(t, r.resumeNoReentryParks(ctx, proj, time.Now()))
+
+	still, ok := mustGetTask(t, c, taskName)
+	require.True(t, ok)
+	require.Equal(t, stage.ReasonDeployBlocked, still.Status.ParkReason, "a merge-stage park is never released")
+	require.NotNil(t, still.Status.PendingEvents[0].UnparkConsumedAt, "the comment got its one answer")
+
+	bodies := mrPendingBodies(t, c, mrName)
+	require.Len(t, bodies, 1, "a merged merge request still gets its one notice")
+	require.Contains(t, bodies[0], stage.ReasonDeployBlocked, "it names the blocker")
+	require.Contains(t, bodies[0], "ALREADY MERGED",
+		"MINOR-6: the notice must say the merge already happened, not invite a merge by hand")
+	require.Equal(t, before+1, testutil.ToFloat64(r.Metrics.MROnlyUnparkCounter(
+		proj.Name, stage.ReasonDeployBlocked, obs.MROnlyUnparkRefused)))
 }
