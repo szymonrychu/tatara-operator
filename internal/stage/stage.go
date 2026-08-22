@@ -678,9 +678,10 @@ func (e *MissingReasonError) Error() string {
 //
 // IT REFUSES A PARKED TASK. `parkReason` is a stringly flag and a flag a writer
 // can forget to clear is a new silent wedge in the #521 genre, so there is
-// exactly one way out of a park and it is Unpark (or UnparkTakeover, the one
-// documented exception). A caller that gets *StillParkedError has a bug, not a
-// decline.
+// exactly one way out of a park and it is Unpark, plus the three documented
+// exceptions named on UnparkTakeover, UnparkForMRTerminal and
+// UnparkMaintainerComment. A caller that gets *StillParkedError has a bug, not
+// a decline.
 //
 // ENTRY INTO A LIVE STATE ALSO ARMS THE IDLE CLOCK, here rather than at each of
 // the several entry call sites. Enter is the ONE choke point every one of them

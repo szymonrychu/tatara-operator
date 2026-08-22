@@ -16,6 +16,7 @@ type taskMetrics struct {
 	orphanAdoptedTotal      *prometheus.CounterVec
 	unparkDeclinedTotal     *prometheus.CounterVec
 	taskUnparkedTotal       *prometheus.CounterVec
+	mrOnlyUnparkTotal       *prometheus.CounterVec
 	livePods                *prometheus.GaugeVec
 	liveEntryDeclined       *prometheus.CounterVec
 	liveClosedTotal         *prometheus.CounterVec
@@ -91,6 +92,15 @@ func newTaskMetrics(reg prometheus.Registerer) *taskMetrics {
 				"class=retired rate that does NOT decay to zero means the latch is not sticking and Tasks are " +
 				"being re-driven on every pass.",
 		}, []string{"reason", "class"}),
+		mrOnlyUnparkTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_mr_only_unpark_total",
+			Help: "Maintainer comments ANSWERED on a parked Task that owns no Issue mirror, by project, park reason and outcome. " +
+				"unparked: the park was released in place and the Task resumed where it stopped. " +
+				"refused: the park was written at or after the merge, so the Task was left exactly as it was and the merge request was told why. " +
+				"Before this driver existed BOTH outcomes were silence - resumeOne bails unconditionally on a Task with no Issue to sever - " +
+				"so any non-zero value is a comment that would previously have been swallowed. Neither value is an error; " +
+				"what would be a bug is `unparked` climbing for one Task, since one comment is spent per release (UnparkConsumedAt).",
+		}, []string{"project", "parkReason", "outcome"}),
 		livePods: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "operator_live_pods",
 			Help: "Tasks currently in a LIVE state and un-parked, by project. It is the live reading of the per-project ceiling (Project.spec.maxLivePods, default 2, clamped strictly below maxConcurrentAgents).",
@@ -144,6 +154,7 @@ func newTaskMetrics(reg prometheus.Registerer) *taskMetrics {
 		m.orphanAdoptedTotal,
 		m.unparkDeclinedTotal,
 		m.taskUnparkedTotal,
+		m.mrOnlyUnparkTotal,
 		m.livePods,
 		m.liveEntryDeclined,
 		m.liveClosedTotal,
@@ -417,6 +428,12 @@ const UnparkClassRetired = "retired"
 // sticking.
 const UnparkClassCIRecovered = "ci-recovered"
 
+// UnparkClassMROnly is the `class` label value for the MR-only maintainer-
+// unpark driver (controller.driveMROnlyUnpark): a park released in place on a
+// Task that owns no Issue mirror, by a maintainer comment answered on its
+// merge request. Declared here, not aliased, for the reason above.
+const UnparkClassMROnly = "mr-only"
+
 // TaskUnparked increments operator_task_unparked_total for one released park.
 // Nil-safe: a reconciler wired without metrics is a test, not an outage.
 func (m *OperatorMetrics) TaskUnparked(parkReason, class string) {
@@ -430,6 +447,30 @@ func (m *OperatorMetrics) TaskUnparked(parkReason, class string) {
 // (parkReason,class) for test assertions.
 func (m *OperatorMetrics) TaskUnparkedCounter(parkReason, class string) prometheus.Counter {
 	return m.taskUnparkedTotal.WithLabelValues(parkReason, class)
+}
+
+// The closed {outcome} vocabulary of operator_mr_only_unpark_total. Constants,
+// because the metric's label and the driver's two arms must not drift apart -
+// the same rule RetryBlockerRead* and the StrandedPark* values follow.
+const (
+	MROnlyUnparkReleased = "unparked"
+	MROnlyUnparkRefused  = "refused"
+)
+
+// MROnlyUnpark increments operator_mr_only_unpark_total for one maintainer
+// comment answered on a Task that owns no Issue mirror. Nil-safe: a reconciler
+// wired without metrics is a test, not an outage.
+func (m *OperatorMetrics) MROnlyUnpark(project, parkReason, outcome string) {
+	if m == nil || m.mrOnlyUnparkTotal == nil {
+		return
+	}
+	m.mrOnlyUnparkTotal.WithLabelValues(project, parkReason, outcome).Inc()
+}
+
+// MROnlyUnparkCounter returns the operator_mr_only_unpark_total counter for
+// (project,parkReason,outcome) for test assertions.
+func (m *OperatorMetrics) MROnlyUnparkCounter(project, parkReason, outcome string) prometheus.Counter {
+	return m.mrOnlyUnparkTotal.WithLabelValues(project, parkReason, outcome)
 }
 
 // UnparkDeclinedCounter returns the operator_unpark_declined_total counter for
