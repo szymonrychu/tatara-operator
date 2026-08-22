@@ -429,7 +429,7 @@ const UnparkClassRetired = "retired"
 const UnparkClassCIRecovered = "ci-recovered"
 
 // UnparkClassMROnly is the `class` label value for the MR-only maintainer-
-// unpark driver (controller.driveMROnlyUnparks): a park released in place on a
+// unpark driver (controller.driveMROnlyUnpark): a park released in place on a
 // Task that owns no Issue mirror, by a maintainer comment answered on its
 // merge request. Declared here, not aliased, for the reason above.
 const UnparkClassMROnly = "mr-only"

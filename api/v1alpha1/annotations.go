@@ -183,8 +183,10 @@ const AnnMergeStageParked = "tatara.dev/merge-stage-parked"
 // already answered.
 //
 // It is stamped on the TASK, not on the merge request, because it is a fact
-// about the park - the same Task can own several merge requests and they all get
-// one notice between them, from one park. Metadata, not status, for the reason
+// about the park - the same Task can own several merge requests, and EACH
+// non-closed one gets its own notice. What is one-between-them is the ROUND,
+// not the notice: one park gets one pass of notices, and this latch is what
+// stops a later pass posting a second round. Metadata, not status, for the reason
 // AnnRetiredParkMigrated gives: the subresources are independent, so the
 // consume's status write cannot lose it.
 const AnnMROnlyUnparkRefused = "tatara.dev/mr-only-unpark-refused"
