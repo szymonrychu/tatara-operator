@@ -4,11 +4,15 @@ import (
 	"errors"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+
+	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 )
 
 // writeClientErr must map k8s apiserver error kinds onto the right HTTP status:
@@ -51,4 +55,36 @@ func TestWriteClientErr(t *testing.T) {
 			require.Contains(t, w.Body.String(), tt.wantBody)
 		})
 	}
+}
+
+// TestSortTasksNewestFirst pins the Name tiebreak (#641). It is a direct unit
+// test because the fake client behind the handler tests returns Items already
+// sorted by name, so a request-level test cannot distinguish a comparator with
+// the tiebreak from one without: the input arriving pre-sorted makes
+// SliceStable produce the right answer either way. Production input comes from
+// the informer cache, whose Indexer iterates a Go map, so the order among
+// same-second Tasks is arbitrary - hence the deliberately reversed input here.
+func TestSortTasksNewestFirst(t *testing.T) {
+	at := func(sec int) metav1.Time {
+		return metav1.NewTime(time.Date(2026, 1, 1, 0, 0, sec, 0, time.UTC))
+	}
+	mk := func(name string, ts metav1.Time) *tatarav1alpha1.Task {
+		return &tatarav1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: name, CreationTimestamp: ts}}
+	}
+	// One sweep's worth of same-second Tasks, fed in reverse name order, with an
+	// older and a newer Task around them.
+	tasks := []*tatarav1alpha1.Task{
+		mk("old", at(0)),
+		mk("sweep-c", at(10)),
+		mk("sweep-b", at(10)),
+		mk("sweep-a", at(10)),
+		mk("new", at(20)),
+	}
+	sortTasksNewestFirst(tasks)
+
+	got := make([]string, 0, len(tasks))
+	for _, task := range tasks {
+		got = append(got, task.Name)
+	}
+	require.Equal(t, []string{"new", "sweep-a", "sweep-b", "sweep-c", "old"}, got)
 }

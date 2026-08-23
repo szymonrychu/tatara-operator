@@ -190,6 +190,27 @@ func toRepositoryDTO(r tatarav1alpha1.Repository) RepositoryDTO {
 	return d
 }
 
+// toTaskListDTO is toTaskDTO minus the three unbounded free-text fields:
+// spec.goal, status.notes and status.conditions (#641). A LIST row already
+// carries the C.2.3 index fields right beside them - Title, the goal's first
+// line; Body, its first 500 chars - and those caps exist precisely so a list
+// response does not have to ship the whole goal. The uncapped Goal was never
+// removed from beside them, so the index fields added ~500 bytes per row and
+// saved nothing: 57 Tasks came to 725 KB, of which goal was 72% and
+// status.notes 17%.
+//
+// toTaskDTO itself is deliberately NOT touched. Its five single-Task callers
+// (getTask, the note-created response, and three in outcome.go) return the full
+// goal on purpose - task_get is the tool an agent uses to read it. All three
+// zeroed fields are `omitempty`, so they are simply absent from a list row.
+func toTaskListDTO(task tatarav1alpha1.Task) TaskDTO {
+	d := toTaskDTO(task)
+	d.Goal = ""
+	d.Status.Notes = nil
+	d.Status.Conditions = nil
+	return d
+}
+
 func toTaskDTO(task tatarav1alpha1.Task) TaskDTO {
 	d := TaskDTO{
 		Name: task.Name, ProjectRef: task.Spec.ProjectRef, RepositoryRef: task.Spec.RepositoryRef,
