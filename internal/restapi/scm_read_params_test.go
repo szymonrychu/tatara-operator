@@ -170,6 +170,15 @@ func TestScmRead_MRs_CarriesCreatedAtAndUpdatedAt(t *testing.T) {
 // The cli spells two of these differently from the wire: `since_days` ->
 // `sinceDays`, `is_pr` -> `isPR`. The wire spelling is what is pinned here; the
 // cli-side mapping is pinned by tools_scm_test.go.
+//
+// The table is hand-written, so a parameter added to the cli schema and dropped
+// by a handler is invisible to it unless someone adds the row. tatara-cli guards
+// its own half by deriving the arg set from the in-package schema literal; the
+// operator cannot (separate module, internal package, and it deliberately does
+// not fetch the published manifest - see the note above). The analogue is the
+// COUNT, exactly as AgentVisibleTools is pinned by
+// TestAgentVisibleToolsIsSortedUniqueAndToolShaped: see
+// TestScmRead_AdvertisedParamCountIsPinned.
 type scmParamCase struct {
 	kind  string
 	param string
@@ -202,6 +211,22 @@ func scmAdvertisedParams() []scmParamCase {
 		{"ci", "repo", "/projects/tatara/scm/ci?repo=tatara-operator&number=80", "/projects/tatara/scm/ci?repo=tatara-cli&number=80"},
 		{"ci", "number", "/projects/tatara/scm/ci?repo=tatara-operator&number=80", "/projects/tatara/scm/ci?repo=tatara-operator&number=81"},
 	}
+}
+
+// The hard count is what turns a hand-maintained mirror from documentation into
+// a guard: without it, a query parameter tatara-cli starts sending that no
+// handler reads is caught by nothing on this side.
+func TestScmRead_AdvertisedParamCountIsPinned(t *testing.T) {
+	seen := map[string]bool{}
+	for _, tc := range scmAdvertisedParams() {
+		key := tc.kind + "/" + tc.param
+		require.False(t, seen[key], "scmAdvertisedParams has duplicate %s", key)
+		seen[key] = true
+	}
+	require.Len(t, scmAdvertisedParams(), 17,
+		"scmAdvertisedParams has %d entries, want 17; if tatara-cli added or removed a "+
+			"scm_read query parameter, update this count with the list",
+		len(scmAdvertisedParams()))
 }
 
 // echoCommitReader renders the (repo, since) it was called with INTO the
