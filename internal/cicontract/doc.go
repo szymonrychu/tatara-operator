@@ -53,7 +53,7 @@
 //
 // One repo is exempt today and its reason is the general one: tatara-claude-
 // code-wrapper's Dockerfile pulls a private Harbor base image, image-verify
-// passes no `--opt target=` so the whole graph is always solved, and this job
+// passes no `--opt target=` and the final stage copies from it, and this job
 // holds no registry credentials. That last part is the CONSTRAINT, not an
 // oversight - it is on the forbidden list above, the only Harbor credentials in
 // this workflow are the PUSH ones, and on pull_request the CALLER is taken from

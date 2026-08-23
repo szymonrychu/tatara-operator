@@ -58,6 +58,13 @@ const (
 	FindingStale      FindingKind = "stale"
 	FindingUnreadable FindingKind = "unreadable"
 	FindingGateDark   FindingKind = "gate-dark"
+	// FindingExemptionUnused is the removal direction: a consumer named in
+	// ImageVerifyExempt that is in fact running the gate. Nothing else would
+	// ever say so, because the exemption is only consulted when the gate is
+	// off, and what goes stale is not one line - it is a rationale here, a
+	// paragraph in doc.go, a bullet in ci-shared.yml and twenty lines in the
+	// consumer's caller.
+	FindingExemptionUnused FindingKind = "exemption-unused"
 )
 
 // ImageVerifyExempt are the consumers allowed to run with the pull_request
@@ -75,14 +82,19 @@ const (
 var ImageVerifyExempt = map[string]string{
 	// Dockerfile:57 is `FROM harbor.szymonrichert.pl/containers/tatara-cli:
 	// ${TATARA_CLI_VERSION}`, a private registry, and image-verify passes no
-	// `--opt target=`, so buildkit solves the whole graph and always reaches
-	// it. Probed on PR #186 at v3.10.0: `401 Unauthorized` on the manifest
-	// HEAD. No project on that Harbor serves anonymous pull.
+	// `--opt target=`, so it builds the FINAL stage and everything that stage
+	// transitively needs - and the final stage has `COPY --from=tatara-cli`,
+	// so this one is always reached. (Not "the whole graph": a stage nothing
+	// copies from is never built, which is why release.yml's build.sh names
+	// the test-guard stage explicitly.) Probed on PR #186 at v3.10.0:
+	// `401 Unauthorized` on the manifest HEAD. No project on that Harbor
+	// serves anonymous pull.
 	//
 	// THE OBVIOUS FIX IS THE FORBIDDEN ONE. Handing image-verify the
 	// HARBOR_USERNAME/HARBOR_PASSWORD the push `image` job uses is item two on
 	// doc.go's list of regressions this package exists to stop, and
-	// merge_gate_test.go fails on any HARBOR_* env in a non-publishing job.
+	// merge_gate_test.go fails on a step-level HARBOR_* env in any job that
+	// builds the Dockerfile and is not push-only.
 	// Those are the PUSH credentials, and on pull_request the CALLER is taken
 	// from the PR head, so the shared job would be writing a push-capable
 	// credential onto a runner whose job graph a PR can edit. The gate is worth
@@ -145,24 +157,38 @@ func PinRef(ciYAML []byte) (string, error) {
 	}
 }
 
+// imageVerifyInput is the ci-shared.yml input this reads out of a consumer.
+// merge_gate_test.go binds it to the input's declaration AND to the `if:` that
+// actually gates the job, so a rename cannot leave this reading a name nothing
+// uses any more and reporting every gate as ON forever.
+const imageVerifyInput = "enable-image-verify"
+
 // imageVerifyRe matches the caller's `enable-image-verify:` input. Anchored on
 // the colon so `enable-image: false` - which every one of the four sets, and
 // which is a different input entirely - can never match it.
 //
-// The value is captured to end-of-line rather than as one token, and a trailing
-// `# comment` is dropped. `\S+` looked equivalent and was not: it does not
-// match `${{ inputs.x }}`, so an expression matched NOTHING, read as absent,
-// and defaulted to enabled - fail-open on precisely the value nobody can
-// resolve statically.
-var imageVerifyRe = regexp.MustCompile(`(?m)^\s*enable-image-verify:\s*(\S[^#]*?)\s*(?:#.*)?$`)
+// Two things the obvious pattern got wrong, both fail-OPEN, which is the only
+// direction that matters here:
+//
+//   - `\S+` does not match `${{ inputs.x }}`, so an expression matched NOTHING,
+//     read as absent, and defaulted to enabled. The value is therefore captured
+//     to end-of-line, minus a trailing `# comment`.
+//   - stopping at end-of-line missed `with: {a: b, enable-image-verify: false}`,
+//     a flow mapping Actions accepts. `,` and `}` terminate the value too.
+//
+// NOT for ci-shared.yml itself: against the producer this matches the input's
+// own DEFINITION block and captures the following `description:` line. It reads
+// a CALLER.
+var imageVerifyRe = regexp.MustCompile(
+	`(?m)(?:^|[{,])[ \t]*` + imageVerifyInput + `:[ \t]*([^#,}\n]*[^#,}\s])`)
 
 // ImageVerifyEnabled reports whether a consumer's ci.yml leaves the
 // pull_request Dockerfile compile on. Absent is TRUE: that is the input's
 // default and it is the state the whole fleet should be in.
 //
-// A value that is not literally true or false is an ERROR, not the default. An
-// expression or a typo is a caller this cannot read, and "I could not tell" has
-// to fail closed, or the check quietly starts reporting the gate as on.
+// A value that resolves to neither true nor false is an ERROR, not the default.
+// An expression or a typo is a caller this cannot read, and "I could not tell"
+// has to fail closed, or the check quietly starts reporting the gate as on.
 func ImageVerifyEnabled(ciYAML []byte) (bool, error) {
 	seen := map[string]bool{}
 	var values []string
@@ -177,17 +203,20 @@ func ImageVerifyEnabled(ciYAML []byte) (bool, error) {
 	case 0:
 		return true, nil
 	case 1:
-		switch values[0] {
+		// Quoted and capitalised spellings are the same boolean to Actions.
+		// Reading `False` as unparseable would still fail closed, but the
+		// finding would tell the reader the wrong thing about their repo.
+		switch strings.ToLower(strings.Trim(values[0], `'"`)) {
 		case "true":
 			return true, nil
 		case "false":
 			return false, nil
 		default:
-			return false, fmt.Errorf("enable-image-verify is %q, which is neither true nor false", values[0])
+			return false, fmt.Errorf("%s is %q, which is neither true nor false", imageVerifyInput, values[0])
 		}
 	default:
-		return false, fmt.Errorf("enable-image-verify is set several times with different values (%s)",
-			strings.Join(values, ", "))
+		return false, fmt.Errorf("%s is set several times with different values (%s)",
+			imageVerifyInput, strings.Join(values, ", "))
 	}
 }
 
@@ -203,8 +232,10 @@ func ImageVerifyEnabled(ciYAML []byte) (bool, error) {
 // and it is exactly the fan-out's own: a release that changed ci-shared.yml
 // makes every consumer content-divergent until its bump PR merges, so a cron
 // landing inside that window reds legitimately. The window is bounded by the
-// consumers' own CI (which is the point - each bump PR runs image-verify) and
-// the finding self-closes on the next green run. What content identity DOES
+// consumers' own CI (which is the point - each bump PR runs image-verify,
+// EXCEPT in a repo named in ImageVerifyExempt, where it runs the rest of the
+// graph and not that job) and the finding self-closes on the next green run.
+// What content identity DOES
 // remove is check_skills_currency.py's MAX_LAG: a consumer several tags behind
 // on a run of releases that never touched ci-shared.yml is genuinely current
 // and is never reported, so no tag-distance tolerance has to be invented for it.
@@ -304,19 +335,31 @@ func audit(ctx context.Context, f Fetcher, consumers []string, reference []byte,
 		// state is a question about a job graph it is not running yet, and
 		// reporting both would file two findings for one fix.
 		enabled, err := ImageVerifyEnabled(ciYAML)
+		_, isExempt := exempt[repo]
 		switch {
 		case err != nil:
-			findings = append(findings, Finding{repo, FindingUnreadable,
-				fmt.Sprintf("could not read whether it runs image-verify from %s: %v", ConsumerWorkflowPath, err)})
-		case !enabled:
-			if _, ok := exempt[repo]; ok {
-				continue
-			}
+			// NOT FindingUnreadable, and the kind is the whole point.
+			// `unreadable` is fatal to the release fan-out because it means a
+			// repo the fan-out would silently skip. This is not that: the
+			// bytes.Equal above already passed, so the consumer is known to be
+			// running the reference and the only open question is one boolean.
+			// Calling it fatal would let one typo in one caller stop the pin
+			// being written to all four - #640 restored by the check added to
+			// prevent it. Fail closed on the gate, not on the fan-out.
 			findings = append(findings, Finding{repo, FindingGateDark,
-				fmt.Sprintf("runs ci-shared.yml@%s but sets enable-image-verify: false, so nothing compiles its "+
+				fmt.Sprintf("runs ci-shared.yml@%s and its %s could not be read, so the gate must be "+
+					"assumed off: %v. Resolve it to a literal true or false", pin, ConsumerWorkflowPath, err)})
+		case !enabled && !isExempt:
+			findings = append(findings, Finding{repo, FindingGateDark,
+				fmt.Sprintf("runs ci-shared.yml@%s but sets %s: false, so nothing compiles its "+
 					"Dockerfile on a pull request. That is the #556 state the pin bump was supposed to end. "+
 					"If the shared job genuinely cannot build this repo's image, add it to "+
-					"cicontract.ImageVerifyExempt with the reason", pin)})
+					"cicontract.ImageVerifyExempt with the reason", pin, imageVerifyInput)})
+		case enabled && isExempt:
+			findings = append(findings, Finding{repo, FindingExemptionUnused,
+				fmt.Sprintf("runs the gate, but cicontract.ImageVerifyExempt still exempts it: %q. "+
+					"Delete that entry and the rationale around it - an exemption is only ever consulted "+
+					"when the gate is off, so nothing else would report this", exempt[repo])})
 		}
 	}
 	return findings
@@ -359,7 +402,7 @@ func PlanBumps(consumers []string, findings []Finding) (map[string]bool, []Findi
 		switch f.Kind {
 		case FindingStale:
 			bump[ShortName(f.Consumer)] = true
-		case FindingGateDark:
+		case FindingGateDark, FindingExemptionUnused:
 		default:
 			unreadable = append(unreadable, f)
 		}

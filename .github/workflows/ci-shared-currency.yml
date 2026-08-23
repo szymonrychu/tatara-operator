@@ -106,19 +106,33 @@ jobs:
               || echo "(ci-shared-pins did not run; an earlier step failed)"
             echo '```'
             echo
-            echo "A stale consumer is NOT running the job graph \`internal/cicontract\`"
+            echo "Read the finding KIND above: they close in different ways and only one"
+            echo "of them goes away on its own."
+            echo
+            echo "\`[stale]\` - the consumer is NOT running the job graph \`internal/cicontract\`"
             echo "asserts on. In #640 that meant the \`image-verify\` merge gate built for"
             echo "#556 had never executed in any of the four repos #556 was about."
-            echo
-            echo "Do NOT close this by hand-editing a consumer's \`uses:\` line. That pin is"
+            echo "Do NOT close it by hand-editing a consumer's \`uses:\` line. That pin is"
             echo "CD-managed by this repo's \`release.yml\` \`fanout-ci-shared\` job: a hand"
             echo "bump is overwritten by the next release while the real fault stays open."
-            echo
             echo "EXPECTED TRANSIENT: a release that changed \`ci-shared.yml\` opens four bump"
             echo "PRs, and every consumer reads \`stale\` until its PR merges. If \`fanout-ci-shared\`"
             echo "ran recently, check those PRs first - a red \`image-verify\` on one of them is"
-            echo "the gate doing its job and is the thing to fix. This issue closes itself on"
-            echo "the next green run."
+            echo "the gate doing its job and is the thing to fix. This one DOES close itself"
+            echo "on the next green run."
+            echo
+            echo "\`[gate-dark]\` - the consumer runs the right job graph with \`enable-image-verify\`"
+            echo "off, or with a value that could not be read. Content comparison cannot see"
+            echo "this, which is why it is checked separately. It will NOT close itself: either"
+            echo "turn the gate back on in that repo's caller, or - if the shared job genuinely"
+            echo "cannot build that image - add the repo to \`cicontract.ImageVerifyExempt\` with"
+            echo "the reason. It reds every day until one of those lands."
+            echo
+            echo "\`[exemption-unused]\` - the opposite: a repo in \`ImageVerifyExempt\` is running"
+            echo "the gate after all. Delete that entry and the rationale around it."
+            echo
+            echo "\`[unreadable]\` - the check could not check. Never a pass; fix the fetch or"
+            echo "the caller it names."
             echo
             echo "Run: ${RUN_URL}"
           } > "${RUNNER_TEMP}/issue.md"

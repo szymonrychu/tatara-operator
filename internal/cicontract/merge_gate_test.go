@@ -180,3 +180,54 @@ func TestWorkflowText_PublishingImageJobStaysPushOnly(t *testing.T) {
 		}
 	}
 }
+
+// The input name in fleetpins.go's imageVerifyRe is a string literal, and the
+// thing it claims to read is `image-verify`'s own `if:` in ci-shared.yml. Two
+// independently-maintained spellings of one name is how a reader and the thing
+// it reads end up disagreeing silently - the same argument that put
+// TestReleaseFanout_PinPatternAgreesWithTheReader in fanout_contract_test.go,
+// which is the reason this one exists too. Rename the input and the fleet audit
+// would go on reporting every consumer's gate as ON, forever.
+func TestWorkflowText_TheAuditedInputIsTheOneThatGatesTheJob(t *testing.T) {
+	b, err := os.ReadFile(ciSharedPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", ciSharedPath, err)
+	}
+	text := string(b)
+	if !strings.Contains(text, "\n      "+imageVerifyInput+":\n") {
+		t.Errorf("ci-shared.yml declares no `%s` input, but fleetpins.go reads consumers for it",
+			imageVerifyInput)
+	}
+	wf := loadCIShared(t)
+	job, ok := wf.Jobs["image-verify"]
+	if !ok {
+		t.Fatal("ci-shared.yml has no image-verify job")
+	}
+	if !strings.Contains(job.If, "inputs."+imageVerifyInput) {
+		t.Errorf("image-verify's `if:` is %q and does not reference inputs.%s, so the input "+
+			"fleetpins.go audits is not the one that gates the job", job.If, imageVerifyInput)
+	}
+}
+
+// The producer runs ci-shared.yml through its own caller (`uses: ./...`), which
+// pinRe deliberately cannot match and LiveConsumers deliberately does not list.
+// So the ONE caller in the fleet that the scheduled fleet audit structurally
+// cannot see is this repo's own - and doc.go presents ImageVerifyExempt as the
+// fleet-wide forcing function. This closes that corner offline, where the file
+// already is.
+func TestWorkflowText_ThisRepoDoesNotDisableItsOwnMergeGate(t *testing.T) {
+	const ownCI = "../../.github/workflows/ci.yml"
+	b, err := os.ReadFile(ownCI)
+	if err != nil {
+		t.Fatalf("read %s: %v", ownCI, err)
+	}
+	enabled, err := ImageVerifyEnabled(b)
+	if err != nil {
+		t.Fatalf("read %s from %s: %v", imageVerifyInput, ownCI, err)
+	}
+	if !enabled {
+		t.Errorf("%s sets %s false, so the repo that OWNS the gate does not run it. "+
+			"No fleet check covers this caller: pinRe cannot match a `uses: ./` local path "+
+			"and LiveConsumers does not list the producer", ownCI, imageVerifyInput)
+	}
+}

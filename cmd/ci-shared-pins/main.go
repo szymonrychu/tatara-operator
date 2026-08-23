@@ -107,8 +107,15 @@ func plan(ctx context.Context, referencePath string) int {
 		return 1
 	}
 	for _, fd := range findings {
-		if fd.Kind == cicontract.FindingStale {
+		switch fd.Kind {
+		case cicontract.FindingStale:
 			fmt.Printf("bump: %s\n", fd)
+		case cicontract.FindingGateDark, cicontract.FindingExemptionUnused:
+			// Deliberately not fatal here (that is the scheduled audit's job),
+			// but printing nothing would leave the release operator with no
+			// sign at all that a consumer this release just bumped will not
+			// run the gate on the resulting PR.
+			fmt.Printf("note: %s\n", fd)
 		}
 	}
 	if len(unreadable) == 0 {

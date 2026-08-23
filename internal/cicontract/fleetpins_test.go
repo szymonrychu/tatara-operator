@@ -339,17 +339,80 @@ func TestAudit_ImageVerifyLeftEnabledIsNotReported(t *testing.T) {
 
 // Fail-closed: a value this cannot resolve to a bool (an expression, a typo) is
 // not read as the default. "I could not tell" is never "the gate is on".
-func TestAudit_UnreadableImageVerifyValueIsReported(t *testing.T) {
-	for _, v := range []string{"${{ inputs.whatever }}", "flase", "0"} {
+//
+// It is reported as gate-dark rather than unreadable ON PURPOSE, and the kind
+// is the whole point. `unreadable` is fatal to the release fan-out - it means a
+// repo the fan-out would silently skip. This is not that: bytes.Equal has
+// already passed, so the consumer is known to be running the reference and the
+// only open question is one boolean. Classifying it fatal would let one typo in
+// one caller stop the pin being written to all four, which is #640 restored by
+// the check added to prevent it.
+func TestAudit_UnreadableImageVerifyValueIsReportedWithoutBlockingTheFanout(t *testing.T) {
+	for _, v := range []string{"${{ inputs.whatever }}", "flase", "0", "yes", "off"} {
 		t.Run(v, func(t *testing.T) {
 			f := forge("v3.10.0", currentCIShared)
 			f.files["szymonrychu/tatara-cli@main:"+ConsumerWorkflowPath] = consumerCIWithVerify("v3.10.0", v)
 
 			got := Audit(context.Background(), f, onlyCLI(), []byte(currentCIShared), "v3.10.0")
-			if len(got) != 1 || got[0].Kind != FindingUnreadable {
-				t.Fatalf("Audit() = %v, want one unreadable finding for %q", got, v)
+			if len(got) != 1 || got[0].Kind != FindingGateDark {
+				t.Fatalf("Audit() = %v, want one %s finding for %q", got, FindingGateDark, v)
+			}
+			if _, fatal := PlanBumps(onlyCLI(), got); len(fatal) != 0 {
+				t.Errorf("PlanBumps() fatal = %v, want none: one unreadable boolean must not "+
+					"stop the fan-out writing every consumer's pin", fatal)
 			}
 		})
+	}
+}
+
+// The booleans Actions itself accepts. `False` is not a typo, it is a repo
+// running with the gate off - reading it as "unparseable" would still be
+// fail-closed, but the finding would tell the reader the wrong thing.
+func TestAudit_YAMLBooleanSpellingsAreUnderstood(t *testing.T) {
+	for _, v := range []string{"False", "FALSE", "'false'", `"false"`} {
+		t.Run(v, func(t *testing.T) {
+			f := forge("v3.10.0", currentCIShared)
+			f.files["szymonrychu/tatara-cli@main:"+ConsumerWorkflowPath] = consumerCIWithVerify("v3.10.0", v)
+
+			got := auditWithExemptions(f, map[string]string{"szymonrychu/tatara-cli": "exempt"})
+			if len(got) != 0 {
+				t.Fatalf("Audit() = %v, want %q understood as false and covered by the exemption", got, v)
+			}
+		})
+	}
+}
+
+// A flow mapping is valid YAML and Actions accepts it. Matching only the block
+// form read the gate as ON while it was off - the one direction that must never
+// happen, and it made Audit's own "fail-closed throughout" comment untrue.
+func TestAudit_ImageVerifyInAFlowMappingIsSeen(t *testing.T) {
+	f := forge("v3.10.0", currentCIShared)
+	f.files["szymonrychu/tatara-cli@main:"+ConsumerWorkflowPath] = `name: ci
+jobs:
+  ci:
+    uses: szymonrychu/tatara-operator/.github/workflows/ci-shared.yml@v3.10.0
+    with: {runner-label: tatara-cli, enable-image-verify: false}
+`
+	got := Audit(context.Background(), f, onlyCLI(), []byte(currentCIShared), "v3.10.0")
+	if len(got) != 1 || got[0].Kind != FindingGateDark {
+		t.Fatalf("Audit() = %v, want one %s finding", got, FindingGateDark)
+	}
+}
+
+// The removal direction. An exemption is consulted only when the gate is off,
+// so one that is no longer needed sits there forever with nothing red - and it
+// is not a bare line, it is a rationale in fleetpins.go, a paragraph in doc.go,
+// a bullet in ci-shared.yml and 20 lines in the consumer's caller. A design
+// whose thesis is "an opt-out must be a diff against this repo" needs the
+// diff that takes it back to be prompted too.
+func TestAudit_ExemptionForAConsumerThatRunsTheGateIsReported(t *testing.T) {
+	f := forge("v3.10.0", currentCIShared) // consumerCI sets no enable-image-verify, so it is on
+	got := auditWithExemptions(f, map[string]string{"szymonrychu/tatara-cli": "no longer true"})
+	if len(got) != 1 || got[0].Kind != FindingExemptionUnused {
+		t.Fatalf("Audit() = %v, want one %s finding", got, FindingExemptionUnused)
+	}
+	if _, fatal := PlanBumps(onlyCLI(), got); len(fatal) != 0 {
+		t.Errorf("PlanBumps() fatal = %v, want none", fatal)
 	}
 }
 
