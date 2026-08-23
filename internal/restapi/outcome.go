@@ -1985,6 +1985,20 @@ func (o *outcomeCtx) review(p reviewPayload) {
 			// it. A LOWER value is IGNORED and logged WARN - the in-cluster
 			// reviewer is documented-flaky and must never downgrade a major
 			// release to a patch.
+			//
+			// KNOWN RESIDUAL RISK (#639): AN ESCALATION HERE IS NOT RE-CHECKED
+			// AGAINST autoApproveMaxSignificance. ApprovalShipVerdict settles the
+			// ceiling against the level the IMPLEMENT agent declared at submit; a
+			// review that then raises it moves the release past the ceiling with
+			// no maintainer having spoken. Closing it needs the ceiling verdict
+			// carried on the MergeRequest - this handler's Task is the REVIEW
+			// Task, which owns the merge requests and not the Issues, so the
+			// evidence the ceiling is a property of is not reachable from here -
+			// plus a merge-corridor refusal and a park reason to hold it. That is
+			// a bigger change than the ceiling itself and is deliberately NOT
+			// smuggled in behind it. Bounded: it needs the in-cluster reviewer to
+			// escalate an auto-approved proposal, and the change was within policy
+			// at its declared level. Recorded in MEMORY.md.
 			if sig != "" && significanceRank[sig] > significanceRank[m.Status.Significance] {
 				m.Status.Significance = sig
 			}
