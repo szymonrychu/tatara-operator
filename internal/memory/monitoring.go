@@ -11,12 +11,23 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
-// Memory-stack alert thresholds and scrape cadence. Ported verbatim from the
-// tatara-memory chart (tatara-memory#58, commit 313834d5): the operator
-// provisions the memory stack as native objects and never installs that chart,
-// so the alerts it shipped are inert unless the operator emits them here too
-// (issue #200). Per-cluster threshold tuning is a deferred follow-up; these
-// match the chart's defaults so behaviour is identical to the intended deploy.
+// Memory-stack alert thresholds and scrape cadence. NOT a verbatim port of
+// the tatara-memory chart (tatara-memory#58, commit 313834d5), and behaviour
+// is not identical to the intended deploy: this is a hand copy of 6 of that
+// chart's 10 alert rules, plus a 9-rule CNPG postgres superset the chart has
+// no counterpart for. The four rules dropped from the chart's set are
+// MemoryBulkAdmissionShedding, MemoryDBPoolSaturated, MemoryDBPoolWaiting,
+// and MemoryAnalyticsRecomputeTimingOut - three of which are the compensating
+// controls written for tatara-memory#89. The operator provisions the memory
+// stack as native objects and never installs that chart, so the alerts it
+// shipped are inert unless the operator emits them here too (issue #200).
+// The two artifacts share no bytes and drifted unnoticed because nothing
+// reconciled them. Neither this const block nor the chart is the plane that
+// delivers an incident: tatara-observability/alerts/tatara-memory.yaml is
+// the only path that mints an incident Task. The four dropped conditions
+// were ported there in tatara-observability#120, where
+// scripts/check_alert_plane_parity.py now reconciles all three planes on
+// each CI run. Per-cluster threshold tuning is a deferred follow-up.
 const (
 	memoryHTTP5xxRatio        = "0.05"
 	memoryRetrievalLatencyP99 = "2.5"
@@ -425,8 +436,11 @@ func memoryAlertRules(p *tatarav1alpha1.Project, cluster, namespace string, back
 			},
 		},
 		{
-			// p99 over DefBuckets (largest finite bucket 10s); keep the threshold
-			// below 10s or the quantile saturates and can never exceed it.
+			// p99 over requestDurationBuckets (tatara-memory
+			// internal/httpapi/middleware.go), not DefBuckets; largest finite
+			// bucket is 300s, so keep the threshold below 300s or the
+			// quantile saturates. The old 10s claim was stale since those
+			// wider buckets landed; found in tatara-observability#120.
 			Alert: "MemoryRetrievalLatencyHigh",
 			Expr: intstr.FromString(
 				`histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket{job=~".*tatara-memory.*"}[5m]))) > ` + memoryRetrievalLatencyP99,
