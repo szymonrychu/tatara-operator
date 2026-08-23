@@ -106,7 +106,7 @@ func autoProposalIssue(repo, botLogin, kind string, number int, comments ...tata
 }
 
 // TestAutoApprove_FailClosedMatrix is the security-critical carve-out matrix: the
-// autoApproveTataraProposals path removes the last human gate before prod, so
+// auto-approve carve-out path removes the last human gate before prod, so
 // every fail-closed branch is asserted explicitly. Auto-approval is granted ONLY
 // on the all-green row (flag on + bot author + valid marker + open + no
 // maintainer comment) and it is the one arm where NO citation is required,
@@ -361,7 +361,7 @@ func TestVerifyApproval_OutOfScopeIssueIsPermissiveAndEvidenceless(t *testing.T)
 // TestVerifyApproval_StoredEvidenceNeedsNoCitation is clause-2 idempotence at
 // the seam. Approval is a question about what an Issue CARRIES, not about
 // whether it can be re-derived on this request, and two things depend on that:
-// the autoApproveTataraProposals evidence has NO comment to re-match, and a
+// the auto-approve carve-out evidence has NO comment to re-match, and a
 // maintainer's later "thanks!" must not revoke an approval already granted.
 func TestVerifyApproval_StoredEvidenceNeedsNoCitation(t *testing.T) {
 	proj, repo := approvalProject("szymonrychu"), mirrorRepo()

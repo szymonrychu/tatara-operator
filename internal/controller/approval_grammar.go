@@ -50,11 +50,15 @@ import (
 
 // Approval refusal reasons. They name what the OPERATOR could not establish -
 // never what the comment meant, which is the agent's job. They are the `reason`
-// label on operator_approval_refused_total and the `reason` field of the
-// action=approval_refused INFO log. NOTHING renders them to the human: the
-// refusal parks the Task at identity-unverified and the operator posts no
-// comment saying why (ApprovalRefusedComment, which did, had no production
-// caller and was deleted with the wordlist).
+// label on operator_approval_refused_total, the `reason` field of the
+// action=approval_refused INFO log, and the `reason` key of the 200 refusal
+// body.
+//
+// NOTHING RENDERS THEM TO THE HUMAN, and nothing should: they are diagnostic
+// labels, not prose. What reaches the AGENT alongside the reason is
+// ApprovalRefusalGuidance (approval_ship.go), a total map from reason to the
+// next step - because the reason names the fault and says nothing about the
+// remedy, and the remedies differ per reason.
 const (
 	// ApprovalRefusedNoMaintainer: there is no maintainer-authored, non-bot
 	// comment on the thread at all, and the auto-approve carve-out does not apply.
@@ -94,10 +98,10 @@ const (
 	// be fine and the declared login is what is wrong. This is the
 	// reporter-self-approval case, made legible.
 	//
-	// IT IS GATED ON declared != "". On the autoApproveTataraProposals path the
+	// IT IS GATED ON declared != "". On the auto-approve carve-out path the
 	// field is legitimately absent and ev.Login is the <tatara:auto> sentinel;
-	// ungated, this refusal would kill every auto-approved proposal on the two
-	// Projects that have the flag on.
+	// ungated, this refusal would kill every auto-approved proposal on every
+	// Project whose autoApproveMaxSignificance is above `off`.
 	ApprovalRefusedApproverNotMaintainer = "approver-not-maintainer"
 	// ApprovalRefusedApproverMismatch: the declared approver is not the author
 	// of the comment that was cited. This is what stops the username becoming a
@@ -338,7 +342,7 @@ func quoteOccursIn(body, quoted string) (string, bool) {
 // The caller has already established the Issue is in scope (ApprovalInScope).
 // An Issue that ALREADY CARRIES VALID EVIDENCE is approved: clause (2) asks
 // whether every live Issue CARRIES evidence, not whether it can be re-derived
-// right now. That idempotence keeps the autoApproveTataraProposals path
+// right now. That idempotence keeps the auto-approve carve-out path
 // (ApprovalEvidence{Auto: true, CommentID: ""}) alive and stops a maintainer's
 // later "thanks!" from REVOKING an approval already given.
 func verifyOneIssue(iss *tatarav1alpha1.Issue, proj *tatarav1alpha1.Project,
@@ -358,7 +362,7 @@ func verifyOneIssue(iss *tatarav1alpha1.Issue, proj *tatarav1alpha1.Project,
 		}
 	}
 	if !maintainerSpoke {
-		// THE AUTO-APPROVE CARVE-OUT (autoApproveTataraProposals). It sits ONLY
+		// THE AUTO-APPROVE CARVE-OUT (autoApproveMaxSignificance above `off`). It sits ONLY
 		// in the no-maintainer-comment arm on purpose: there is no comment to
 		// cite, which is exactly why the citation fields are NOT unconditionally
 		// required. A maintainer who DID comment falls through below and blocks
@@ -414,7 +418,7 @@ func verifyOneIssue(iss *tatarav1alpha1.Issue, proj *tatarav1alpha1.Project,
 	// checks need the cited comment in hand.
 	//
 	// BOTH ARE SKIPPED ENTIRELY WHEN declared == "". That is not laxity, it is
-	// the autoApproveTataraProposals carve-out: on that path there is no comment
+	// the auto-approve carve-out: on that path there is no comment
 	// author to name, the field is legitimately absent, and refusing here would
 	// make the carve-out unreachable on the two Projects that have it live. The
 	// PAIR RULE in restapi's gate is what stops an agent simply omitting the

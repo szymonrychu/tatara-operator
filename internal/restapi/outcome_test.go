@@ -1478,7 +1478,7 @@ func findLogLineAtLevel(t *testing.T, buf []byte, level string) map[string]any {
 // verifyOneIssue's clause-2 idempotence THROUGH the handler. An Issue that
 // already carries evidence is approved - clause (2) asks whether every live
 // Issue CARRIES evidence, not whether it can be re-derived on this request -
-// which is what keeps the autoApproveTataraProposals evidence (no comment to
+// which is what keeps the auto-approve carve-out evidence (no comment to
 // re-match) alive and stops a maintainer's later "thanks!" from revoking a grant
 // already given.
 //
@@ -1804,7 +1804,7 @@ func TestOutcome_Gate_DeclaredKeyIsAlwaysPresentOnRefusal(t *testing.T) {
 
 // TestOutcome_Gate_OneOfThePairWithoutTheOtherIsRefused: approvingMaintainer
 // and approvalCitations travel as a PAIR. Both present is a human-cited
-// approval, both absent is the autoApproveTataraProposals path; one without the
+// approval, both absent is the auto-approve carve-out path; one without the
 // other is a client bug, refused BEFORE any verifier call - 400 both ways round.
 //
 // It is refused UP FRONT, not by the verifier, because a citation with no
@@ -2122,7 +2122,7 @@ func TestOutcome_Brainstorm_ProposedGateTaskIsLiveWhenAutoApproveIsOn(t *testing
 
 // The brainstorm propose path stamps the tatara-proposed-by:brainstorm marker on
 // BOTH the forge issue body and the minted Issue CR body - the marker factor of
-// the autoApproveTataraProposals carve-out, durable across a mirror refresh.
+// the auto-approve carve-out, durable across a mirror refresh.
 func TestOutcome_Brainstorm_StampsProposalMarker(t *testing.T) {
 	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
 		taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StateRefined, "brainstorm"))

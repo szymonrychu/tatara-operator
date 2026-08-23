@@ -61,15 +61,34 @@ func (s *Server) shipVerdict(ctx context.Context, proj *tatarav1alpha1.Project,
 // therefore the one kind that can have skipped them. A review pod's mr_write, a
 // documentation batch and an upgrade Task carry no approval of their own and
 // would be refused forever.
+//
+// A TAKEOVER TASK SATISFIES THIS FILTER TOO, and that is safe only because of an
+// invariant living somewhere else. stage.originAgentKinds maps BOTH `implement`
+// and `takeover` onto AgentImplement, so a takeover pod's Status.AgentKind is
+// "implement" - yet it is minted straight into under-implementation, `refined`
+// is unreachable for it, and it therefore can never pass the gate. What saves it
+// is that it owns ZERO Issue CRs by construction, so ApprovalShipVerdict returns
+// no blockers. Stated here rather than only in that function's doc because it is
+// this filter that lets a takeover through: any future kind mapped onto
+// AgentImplement that DOES own an Issue is wedged on arrival, with no remedy.
 func shipGateApplies(task *tatarav1alpha1.Task) bool {
 	return task != nil && task.Status.AgentKind == "implement"
 }
 
 // refuseApprovalRequired writes the 409 and counts it.
 func (s *Server) refuseApprovalRequired(w http.ResponseWriter, r *http.Request,
-	task *tatarav1alpha1.Task, action string, blockers []controller.ShipBlocker) {
+	task *tatarav1alpha1.Task, kind, action string, blockers []controller.ShipBlocker) {
 
+	// COUNTED ON BOTH SERIES, deliberately. RestOwnershipRefusedTotal is where
+	// every other structural refusal on a write endpoint lands, and the
+	// mr_write refusal has nowhere else to go. But an outcome refusal that never
+	// touched RestOutcomeRejectedTotal is invisible to every outcome-rejection
+	// dashboard and alert, which is where an operator looks when submits start
+	// failing - so the submit path (kind != "") is counted there as well.
 	obs.RestOwnershipRefusedTotal.WithLabelValues(approvalRequiredReason).Inc()
+	if kind != "" {
+		obs.RestOutcomeRejectedTotal.WithLabelValues(kind, approvalRequiredReason).Inc()
+	}
 	msg := fmt.Sprintf("%s is refused: %d issue(s) this task owns have not passed the implement gate. "+
 		"Work done before the gate grants is LOST - no merge request can carry it. "+
 		"Fix each issue below, then retry.", action, len(blockers))

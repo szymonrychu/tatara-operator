@@ -184,9 +184,10 @@ func TestOutcome_Submitted_RefusedWhileTheIssueIsUnapproved(t *testing.T) {
 	require.Len(t, got.Blocked, 1)
 	require.Equal(t, controller.ShipBlockedNeedsMaintainerComment, got.Blocked[0].Detail)
 
-	// The Task did NOT transition: a refused submit leaves the work exactly
-	// where it was, with the pod alive.
-	require.Equal(t, tatarav1alpha1.StateUnderImplementation, e.task(t, "t1").Status.State)
+	// Back to `refined`, where action=approved is legal again - never a park.
+	// See TestOutcome_Submitted_ApprovalRefusalSendsTheTaskBackToTheGate.
+	require.Equal(t, tatarav1alpha1.StateRefined, e.task(t, "t1").Status.State)
+	require.False(t, tatarav1alpha1.Parked(e.task(t, "t1")))
 }
 
 // THE CEILING BITES HERE AND NOWHERE ELSE. An auto-approved issue's grant is
@@ -306,4 +307,89 @@ func TestGate_GrantCarriesGrantedAndGuidance(t *testing.T) {
 	require.True(t, got.Granted, "the grant must say so in the field the skills tell the agent to read")
 	require.Equal(t, controller.ApprovalGrantGuidance(), got.Guidance)
 	require.Equal(t, "t1", got.Task.Name, "the Task DTO is preserved verbatim under `task`")
+}
+
+// TestOutcome_Submitted_ApprovalRefusalSendsTheTaskBackToTheGate is the second
+// wedge adversarial review found. The refusal originally left the Task in
+// `under-implementation`, and the remedy the guidance names -
+// `submit_outcome(action=approved)` with a real citation - is NOT a legal
+// transition from there (stage.Transitions has no under-implementation self
+// edge). The agent was told to do the one thing the state machine refuses.
+//
+// `refined` is the same cheap path out that plan-hash-mismatch already takes,
+// and for the same reason: the pod is alive, the branch is pushed, and the work
+// is intact - only the authorisation has to be redone.
+func TestOutcome_Submitted_ApprovalRefusalSendsTheTaskBackToTheGate(t *testing.T) {
+	proj := maintainerProjectV2("tatara")
+	proj.Spec.AutoApproveMaxSignificance = "patch"
+	e := buildV2(t, v2Opts{}, proj, scmSecretV2(),
+		repoV2("tatara-cli", "tatara"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
+		mrV2("tatara-cli", 80, "t1"),
+		autoApprovedIssueV2("tatara-cli", 32, "t1"))
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"implement","payload":{"action":"submitted","title":"T","body":"B","changeSignificance":"major"}}`)
+	require.Equal(t, http.StatusConflict, w.Code, w.Body.String())
+	require.Equal(t, controller.ShipBlockedOverCeiling,
+		decodeApprovalRefusal(t, w.Body.Bytes()).Blocked[0].Detail)
+
+	require.Equal(t, tatarav1alpha1.StateRefined, e.task(t, "t1").Status.State,
+		"the refusal must land the Task where action=approved is legal again")
+	require.False(t, tatarav1alpha1.Parked(e.task(t, "t1")), "it is the cheap path out, never a park")
+}
+
+// TestGate_GrantReplayStillSaysGranted is the third finding from adversarial
+// review. A TTL-stopped pod's retry, or a transport retry, re-POSTs an identical
+// action=approved. The claim is COMMITTED, so the replay arm answers 200 - and
+// it answered a bare Task DTO with no `granted` key, which a client following
+// the documented contract reads as granted=false. The agent concludes it was
+// refused after it was in fact granted.
+func TestGate_GrantReplayStillSaysGranted(t *testing.T) {
+	iss := issueV2("tatara-cli", 32, "t1", maintainerSpoke)
+	e := buildV2(t, v2Opts{approval: &fakeApproval{grant: map[string]bool{iss.Name: true}}},
+		maintainerProjectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-cli", "tatara"),
+		gateTaskV2("t1", "tatara", tatarav1alpha1.StateRefined), iss)
+
+	body := `{"kind":"implement","payload":{"action":"approved","reason":"r","approvingMaintainer":"szymonrychu",` +
+		`"planNoteId":"` + gatePlanNoteID + `","approvalCitations":[{"id":"c1","quote":"go ahead"}]}}`
+
+	first := e.do(t, http.MethodPost, "/tasks/t1/outcome", body)
+	require.Equal(t, http.StatusOK, first.Code, first.Body.String())
+
+	replay := e.do(t, http.MethodPost, "/tasks/t1/outcome", body)
+	require.Equal(t, http.StatusOK, replay.Code, replay.Body.String())
+
+	var got struct {
+		Granted  bool   `json:"granted"`
+		Guidance string `json:"guidance"`
+		Task     struct {
+			Name string `json:"name"`
+		} `json:"task"`
+	}
+	require.NoError(t, json.Unmarshal(replay.Body.Bytes(), &got))
+	require.True(t, got.Granted, "a replay of a committed grant must not read as a refusal")
+	require.Equal(t, controller.ApprovalGrantGuidance(), got.Guidance)
+	require.Equal(t, "t1", got.Task.Name)
+}
+
+// The replay shape must stay a BARE Task DTO for every other outcome; the
+// wrapper belongs to the one action that answers a gate question.
+func TestOutcome_NonGateReplayStaysABareTaskDTO(t *testing.T) {
+	e := buildV2(t, v2Opts{}, maintainerProjectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-cli", "tatara"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
+		unapprovedIssue("tatara-cli", 32, "t1"))
+
+	body := `{"kind":"implement","payload":{"action":"declined","reason":"no approval and none coming"}}`
+	require.Equal(t, http.StatusOK, e.do(t, http.MethodPost, "/tasks/t1/outcome", body).Code)
+
+	replay := e.do(t, http.MethodPost, "/tasks/t1/outcome", body)
+	require.Equal(t, http.StatusOK, replay.Code, replay.Body.String())
+
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(replay.Body.Bytes(), &got))
+	require.NotContains(t, got, "granted")
+	require.Contains(t, got, "name")
 }

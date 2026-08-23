@@ -246,3 +246,51 @@ func TestApprovalGrantGuidance_NamesWhatUnblocks(t *testing.T) {
 		}
 	}
 }
+
+// TestApprovalShipVerdict_AFollowUpIssueDoesNotWedgeAGrantedTask is the wedge
+// this file's first draft shipped, found in adversarial review.
+//
+// `issue_write(action=create)` is in the implement MCP profile and the workflow
+// skill tells the agent to use it for out-of-scope work it finds. mintIssueCR
+// makes the CALLING Task the controller owner, and seeds the mirror live with no
+// approval and no comments. A per-issue rule over ALL owned issues therefore
+// blocked the ship on an issue the Task was never gated on and never intends to
+// implement - and the remedy was unreachable, because `action=approved` from
+// `under-implementation` is not a legal transition, so the Task could never ship
+// anything again.
+//
+// The scope is therefore the TASK's gate, not each issue's: if the gate granted
+// over this Task's scope, at least one live owned Issue carries evidence.
+// verifyApprovalScope refuses the WHOLE request unless EVERY live Issue in scope
+// produced evidence, so "at least one" is only ever true after a full-scope
+// grant. An Issue that arrives afterwards is a late arrival, which nothing has
+// ever re-gated - see tatara-implement-workflow's ownership-is-not-approval
+// rule, which this now agrees with instead of contradicting.
+func TestApprovalShipVerdict_AFollowUpIssueDoesNotWedgeAGrantedTask(t *testing.T) {
+	proj, repo := approvalProject("szymonrychu"), mirrorRepo()
+	gated := shipIssue(repo.Name, "tatara-bot", 7)
+	gated.Status.Comments = []tatarav1alpha1.Comment{shipComment("szymonrychu", false)}
+	gated.Status.Status = "approved"
+	gated.Status.Approval = &tatarav1alpha1.ApprovalEvidence{
+		Login: "szymonrychu", CommentID: "c1", Phrase: "go ahead", CreatedAt: metav1.Now(),
+	}
+	followUp := shipIssue(repo.Name, "tatara-bot", 8) // filed mid-turn, never gated
+
+	if got := ApprovalShipVerdict(context.Background(), shipClient(t, repo), proj,
+		[]tatarav1alpha1.Issue{*gated, *followUp}, "minor"); len(got) != 0 {
+		t.Fatalf("a follow-up issue must not block a Task the gate granted, got %v", got)
+	}
+}
+
+// The security property the wedge fix must NOT cost: a Task where the gate never
+// ran over ANY of its live issues is still refused, and still named per issue.
+func TestApprovalShipVerdict_NoEvidenceAnywhereIsStillRefused(t *testing.T) {
+	proj, repo := approvalProject("szymonrychu"), mirrorRepo()
+	a := shipIssue(repo.Name, "tatara-bot", 7)
+	b := shipIssue(repo.Name, "tatara-bot", 8)
+
+	if got := ApprovalShipVerdict(context.Background(), shipClient(t, repo), proj,
+		[]tatarav1alpha1.Issue{*a, *b}, "patch"); len(got) != 2 {
+		t.Fatalf("a Task that never passed the gate must still be refused per issue, got %v", got)
+	}
+}

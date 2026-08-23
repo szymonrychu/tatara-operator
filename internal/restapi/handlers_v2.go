@@ -1666,7 +1666,7 @@ func (s *Server) mrOpen(w http.ResponseWriter, r *http.Request, proj *tatarav1al
 	// (action=submitted) and this call only enforces the two evidence blockers.
 	if shipGateApplies(task) {
 		if blockers := controller.ApprovalShipVerdict(ctx, s.c, proj, issues, ""); len(blockers) > 0 {
-			s.refuseApprovalRequired(w, r, task, "mr_write(action=open)", blockers)
+			s.refuseApprovalRequired(w, r, task, "", "mr_write(action=open)", blockers)
 			return
 		}
 	}

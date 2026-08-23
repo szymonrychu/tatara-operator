@@ -33,7 +33,7 @@ func cmt(id, author, body string, bot bool, at time.Time) tatarav1alpha1.Comment
 	}
 }
 
-// citProject carries autoApproveTataraProposals ON, so the carve-out row is a
+// citProject carries an auto-approve ceiling above `off`, so the carve-out row is a
 // real carve-out and every other row proves the gate refuses DESPITE the flag.
 func citProject(botLogin string, maintainers ...string) *tatarav1alpha1.Project {
 	p := mirrorProject(botLogin)
@@ -406,7 +406,7 @@ func TestVerifyOneIssue_EvidenceRecordsTheAgentsQuote(t *testing.T) {
 // TestVerifyOneIssue_DeclaredEmptySkipsApproverChecks pins that an empty
 // declared argument skips BOTH ApprovalRefusedApproverNotMaintainer and
 // ApprovalRefusedApproverMismatch entirely, rather than defaulting to a
-// refusal. This is what keeps the autoApproveTataraProposals carve-out
+// refusal. This is what keeps the auto-approve carve-out
 // reachable: on that path there is no comment author to declare, so declared
 // is legitimately "" and must not itself become a third way to refuse.
 func TestVerifyOneIssue_DeclaredEmptySkipsApproverChecks(t *testing.T) {

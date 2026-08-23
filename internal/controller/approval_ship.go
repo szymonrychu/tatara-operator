@@ -91,6 +91,26 @@ type ShipBlocker struct {
 // OUT-OF-SCOPE ISSUES ARE FILTERED, not required to produce evidence, through
 // the same ApprovalInScope predicate the grant uses. A human closing one Issue
 // of a multi-issue Task must not strand the rest.
+//
+// THE UNIT IS THE TASK'S GATE, NOT EACH ISSUE, AND THAT DISTINCTION IS A WEDGE
+// FIX. Requiring evidence on every live owned Issue reads as the stricter rule
+// and is in fact unshippable: `issue_write(action=create)` is in the implement
+// profile and the workflow skill tells the agent to file follow-ups for
+// out-of-scope work it finds, mintIssueCR makes the CALLING Task the controller
+// owner, and the new Issue is seeded live with no approval and no comments. That
+// Issue then blocks a Task the gate had already granted, and the remedy is
+// unreachable: `action=approved` from `under-implementation` is not a legal
+// transition, so the Task can never ship anything again.
+//
+// So the question asked is "did the gate run over this Task's scope?", answered
+// by any live owned Issue carrying evidence. That is not a weaker test than it
+// looks: verifyApprovalScope refuses the WHOLE request unless EVERY live Issue
+// in scope produced evidence, so one Issue carrying evidence means the whole
+// scope was granted at the moment of the grant. An Issue that arrives AFTER it
+// is a late arrival, and nothing has ever re-gated a late arrival - the
+// implement workflow's own ownership-is-not-approval rule says so and tells the
+// agent to leave it out of scope. This function now agrees with that rule
+// instead of contradicting it.
 func ApprovalShipVerdict(ctx context.Context, c client.Client, proj *tatarav1alpha1.Project,
 	issues []tatarav1alpha1.Issue, significance string) []ShipBlocker {
 
@@ -99,53 +119,73 @@ func ApprovalShipVerdict(ctx context.Context, c client.Client, proj *tatarav1alp
 		botLogin = proj.Spec.Scm.BotLogin
 	}
 
-	var out []ShipBlocker
+	live := make([]*tatarav1alpha1.Issue, 0, len(issues))
+	granted := false
 	for i := range issues {
 		iss := &issues[i]
 		if !ApprovalInScope(iss) {
 			continue
 		}
-		detail := shipBlockerFor(ctx, c, iss, proj, botLogin, significance)
-		if detail == "" {
+		live = append(live, iss)
+		if iss.Status.Approval != nil {
+			granted = true
+		}
+	}
+	if len(live) == 0 {
+		return nil
+	}
+
+	var out []ShipBlocker
+	if !granted {
+		// THE GATE NEVER RAN over this Task's scope. This is #639's headline
+		// shape - the agent skipped the gate, or was refused by it and wrote the
+		// code anyway - and every live Issue is named, because an agent told
+		// about one of three fixes it and is refused again.
+		for _, iss := range live {
+			out = append(out, shipBlocker(iss, noEvidenceDetail(ctx, c, iss, proj, botLogin)))
+		}
+		return out
+	}
+
+	// The gate ran. What is left is the SEVERITY CEILING, and it applies only to
+	// evidence the carve-out produced: a maintainer who read the plan and said go
+	// ahead has already made the judgement the ceiling stands in for, so a cited
+	// approval ships at any significance.
+	for _, iss := range live {
+		ev := iss.Status.Approval
+		if ev == nil || !ev.Auto {
 			continue
 		}
-		out = append(out, ShipBlocker{
-			Repo:     iss.Spec.RepositoryRef,
-			Number:   iss.Spec.Number,
-			Detail:   detail,
-			Guidance: ShipBlockerGuidance(detail),
-		})
+		if tatarav1alpha1.AutoApproveOverCeiling(proj, significance) {
+			out = append(out, shipBlocker(iss, ShipBlockedOverCeiling))
+		}
 	}
 	return out
 }
 
-// shipBlockerFor is the per-Issue verdict: "" clears it.
-func shipBlockerFor(ctx context.Context, c client.Client, iss *tatarav1alpha1.Issue,
-	proj *tatarav1alpha1.Project, botLogin, significance string) string {
+func shipBlocker(iss *tatarav1alpha1.Issue, detail string) ShipBlocker {
+	return ShipBlocker{
+		Repo:     iss.Spec.RepositoryRef,
+		Number:   iss.Spec.Number,
+		Detail:   detail,
+		Guidance: ShipBlockerGuidance(detail),
+	}
+}
 
-	ev := iss.Status.Approval
-	if ev == nil {
-		// WHICH OF THE TWO no-evidence shapes, because the remedies differ: one
-		// needs a human, the other needs a tool call the agent can make right
-		// now. Collapsing them is what made the pre-#639 refusals unactionable.
-		repo := approvalRepo(ctx, c, iss)
-		for j := range iss.Status.Comments {
-			if isMaintainerComment(&iss.Status.Comments[j], proj, repo, botLogin) {
-				return ShipBlockedNeedsApprovalTool
-			}
+// noEvidenceDetail splits the no-evidence case in two, because the remedies
+// differ: one needs a human and no amount of retrying reaches it, the other is a
+// tool call the agent can make in the same turn. Collapsing them is what made
+// the pre-#639 refusals unactionable.
+func noEvidenceDetail(ctx context.Context, c client.Client, iss *tatarav1alpha1.Issue,
+	proj *tatarav1alpha1.Project, botLogin string) string {
+
+	repo := approvalRepo(ctx, c, iss)
+	for j := range iss.Status.Comments {
+		if isMaintainerComment(&iss.Status.Comments[j], proj, repo, botLogin) {
+			return ShipBlockedNeedsApprovalTool
 		}
-		return ShipBlockedNeedsMaintainerComment
 	}
-	// A HUMAN-CITED APPROVAL IS NEVER SEVERITY-LIMITED. The ceiling bounds what
-	// tatara approves for ITSELF; a maintainer who read the plan and said go
-	// ahead has already made the judgement the ceiling stands in for.
-	if !ev.Auto {
-		return ""
-	}
-	if tatarav1alpha1.AutoApproveOverCeiling(proj, significance) {
-		return ShipBlockedOverCeiling
-	}
-	return ""
+	return ShipBlockedNeedsMaintainerComment
 }
 
 // ShipBlockerGuidance is the closed map from a blocker to the sentence that
