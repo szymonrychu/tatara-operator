@@ -44,14 +44,14 @@ func main() {
 	var code int
 	switch os.Args[1] {
 	case "audit":
-		code = audit(ctx)
+		code = audit(ctx, forgeFetcher{})
 	case "plan":
 		if len(os.Args) != 3 {
 			cancel()
 			fmt.Fprintln(os.Stderr, "usage: ci-shared-pins plan <ci-shared.yml>")
 			os.Exit(2)
 		}
-		code = plan(ctx, os.Args[2])
+		code = plan(ctx, forgeFetcher{}, os.Args[2])
 	default:
 		cancel()
 		fmt.Fprintf(os.Stderr, "unknown subcommand %q\n", os.Args[1])
@@ -61,8 +61,12 @@ func main() {
 	os.Exit(code)
 }
 
-func audit(ctx context.Context) int {
-	f := forgeFetcher{}
+// The Fetcher is a PARAMETER, not a forgeFetcher{} constructed inline, so the
+// exit-code contract below is testable offline. It is the whole contract: any
+// finding is fatal to `audit`, while `plan` splits stale (exit 0) from
+// unreadable (exit 1), and getting that split backwards either stops every
+// release or reintroduces the silence #640 is about.
+func audit(ctx context.Context, f cicontract.Fetcher) int {
 	reference, ref, err := cicontract.ReferenceAtNewestTag(ctx, f, cicontract.ProducerRepo)
 	if err != nil {
 		// The reference itself is unreadable, so no consumer can be judged.
@@ -92,14 +96,14 @@ func audit(ctx context.Context) int {
 	return 1
 }
 
-func plan(ctx context.Context, referencePath string) int {
+func plan(ctx context.Context, f cicontract.Fetcher, referencePath string) int {
 	reference, err := os.ReadFile(referencePath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "::error::could not read the local reference %s: %v\n", referencePath, err)
 		return 1
 	}
 
-	findings := cicontract.Audit(ctx, forgeFetcher{}, cicontract.LiveConsumers, reference, referencePath)
+	findings := cicontract.Audit(ctx, f, cicontract.LiveConsumers, reference, referencePath)
 	bump, unreadable := cicontract.PlanBumps(cicontract.LiveConsumers, findings)
 
 	if err := writeOutputs(bump); err != nil {
@@ -141,7 +145,7 @@ func writeOutputs(bump map[string]bool) error {
 
 	var sb strings.Builder
 	for _, k := range keys {
-		fmt.Fprintf(&sb, "bump-%s=%t\n", k, bump[k])
+		fmt.Fprintf(&sb, "%s=%t\n", cicontract.BumpOutputKey(k), bump[k])
 	}
 
 	path := os.Getenv("GITHUB_OUTPUT")

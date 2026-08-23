@@ -92,8 +92,16 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
+          # `|| existing=""`, and it is the whole point of this step. A bare
+          # command substitution under `set -e` takes gh's exit status, so a 403
+          # secondary rate limit, a 502 or a garbled body would exit HERE -
+          # before `gh issue create` - and file nothing on the one run the
+          # channel exists for. The dedup read is BEST-EFFORT: a duplicate
+          # tracker beats no tracker, which is the rule release.yml's
+          # fanout-alarm already writes out for the same shape.
           existing="$(gh issue list --state open --limit 200 --json number,title \
-            --jq "[.[] | select(.title == \"${TITLE}\")] | .[0].number // empty")"
+            --jq "[.[] | select(.title == \"${TITLE}\")] | .[0].number // empty")" \
+            || existing=""
           if [ -n "$existing" ]; then
             echo "already tracked in #${existing}; not filing a duplicate"
             exit 0
@@ -153,8 +161,13 @@ jobs:
           TITLE: 'ci-shared.yml pin currency check is red'
         run: |
           set -euo pipefail
+          # Same best-effort read as the file step. continue-on-error already
+          # keeps a failure here from reddening a green check, but exiting
+          # non-zero on a transient still leaves the tracker open, i.e. an open
+          # issue that no longer means "still stale".
           existing="$(gh issue list --state open --limit 200 --json number,title \
-            --jq "[.[] | select(.title == \"${TITLE}\")] | .[0].number // empty")"
+            --jq "[.[] | select(.title == \"${TITLE}\")] | .[0].number // empty")" \
+            || existing=""
           if [ -z "$existing" ]; then
             exit 0
           fi

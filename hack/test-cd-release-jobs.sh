@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Run release.yml's verify-pin and fanout-alarm scripts against a stubbed forge.
+# Run the workflow steps that TALK TO THE FORGE against a stubbed one:
+# release.yml's verify-pin and fanout-alarm, and ci-shared-currency.yml's issue
+# channel.
 #
 # These two jobs are the READER half of the CD pin fan-out, and on 2026-08-17
 # (#622) the reader is what filed a false alarm: verify-pin polled for 10m, gave
@@ -7,11 +9,18 @@
 # was open, armed and merged 5m later. A reader whose verdict is wrong is worse
 # than no reader - it sends a human hunting for a PR that does not exist.
 #
-# The scripts are extracted from the workflow with yq and executed for real with
-# `curl` stubbed on PATH, so what is tested is what CI runs. Routes are matched
-# against the request URL, first match wins:
+# Every one of these steps shares a failure mode that no amount of reading the
+# YAML reveals: a forge read that fails takes the WRITE that follows it with it.
+# ci-shared-currency.yml did exactly that - a bare `existing="$(gh issue list)"`
+# under `set -e` exited before `gh issue create`, so the one run the issue
+# channel exists for filed nothing.
 #
-#     <url-substring>|<curl exit status>|<response body, or @file>
+# The scripts are extracted from the workflow with yq and executed for real with
+# `curl` and `gh` stubbed on PATH, so what is tested is what CI runs. curl routes
+# match on the request URL, gh routes on the joined argument list; first match
+# wins:
+#
+#     <substring>|<exit status>|<response body, or @file>
 #
 # Wired into CI through .pre-commit-config.yaml (the `lint` job runs
 # `pre-commit run --all-files`) and `make test-cd-jobs`.
@@ -20,6 +29,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKFLOW="$REPO_ROOT/.github/workflows/release.yml"
+CURRENCY_WORKFLOW="$REPO_ROOT/.github/workflows/ci-shared-currency.yml"
 
 PARENT="szymonrychu/tatara-helmfile"
 PR_URL="https://github.com/${PARENT}/pull/423"
@@ -33,6 +43,10 @@ current=""
 
 extract() { # <yq path> - pull a step's `run:` script out of the workflow
   yq -r "$1" "$WORKFLOW"
+}
+
+extract_from() { # <workflow file> <yq path>
+  yq -r "$2" "$1"
 }
 
 make_stub_dir() {
@@ -64,7 +78,35 @@ echo "no stub route for: $url" >&2
 exit 22
 STUB
   chmod +x "$d/bin/curl"
+  # Scripted gh, for ci-shared-currency.yml's issue channel. Separate route
+  # table from curl's: these match on the joined ARGUMENT list, not on a URL.
+  cat >"$d/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$STUB_DIR/gh.log"
+[ -f "$STUB_DIR/gh-routes" ] || { echo "no gh routes configured" >&2; exit 22; }
+while IFS='|' read -r pat code body; do
+  [ -n "${pat:-}" ] || continue
+  case "$*" in
+    *"$pat"*)
+      case "$body" in
+        @*) cat "$STUB_DIR/${body#@}" ;;
+        "") ;;
+        *) printf '%s\n' "$body" ;;
+      esac
+      exit "$code"
+      ;;
+  esac
+done < "$STUB_DIR/gh-routes"
+echo "no gh stub route for: $*" >&2
+exit 22
+STUB
+  chmod +x "$d/bin/gh"
   printf '%s' "$d"
+}
+
+gh_routes() { # <dir> <route lines...>
+  local d="$1"; shift
+  printf '%s\n' "$@" > "$d/gh-routes"
 }
 
 routes() { # write the route table; args are route lines
@@ -744,6 +786,100 @@ test_alarm_never_mistakes_a_pull_request_for_the_tracker() {
     BUMP_RESULT=failure VERIFY_RESULT=skipped VERIFY_STATE=no-pr VERIFY_DETAIL=""
   expect_rc 0
   expect_lacks "$(cat "$d/curl.log")" "issues/99/comments"
+}
+
+# --- ci-shared-currency issue channel ---------------------------------------
+#
+# The channel exists because GitHub routes scheduled-run failure mail to whoever
+# last touched the cron file - the bot - so without an issue the check is a
+# daily red nobody reads. Every one of these tests is about the channel still
+# working when the forge is the thing misbehaving: a read that fails must not be
+# allowed to swallow the write it precedes.
+
+CURRENCY_ENV=(GH_TOKEN=t GH_REPO=szymonrychu/tatara-operator
+  TITLE='ci-shared.yml pin currency check is red'
+  RUN_URL=https://github.com/szymonrychu/tatara-operator/actions/runs/1)
+
+file_issue_script() {
+  extract_from "$CURRENCY_WORKFLOW" \
+    '.jobs.currency.steps[] | select(.name == "File the staleness issue") | .run'
+}
+
+close_issue_script() {
+  extract_from "$CURRENCY_WORKFLOW" \
+    '.jobs.currency.steps[] | select(.name == "Close the staleness issue once current") | .run'
+}
+
+test_currency_files_an_issue_when_none_is_open() {
+  it "no open tracker -> file one, with the check's own log in the body"
+  local d; d="$(make_stub_dir)"
+  printf 'stale: tatara-cli
+' > "$d/currency.log"
+  gh_routes "$d" "issue list|0|" "issue create|0|"
+  run_script "$d" "$(file_issue_script)" "${CURRENCY_ENV[@]}" RUNNER_TEMP="$d"
+  expect_rc 0
+  expect_has "$(cat "$d/gh.log")" "issue create"
+  expect_has "$(cat "$d/issue.md")" "stale: tatara-cli"
+}
+
+test_currency_does_not_file_a_duplicate() {
+  it "tracker already open -> no second issue"
+  local d; d="$(make_stub_dir)"
+  printf 'stale
+' > "$d/currency.log"
+  gh_routes "$d" "issue list|0|77" "issue create|0|"
+  run_script "$d" "$(file_issue_script)" "${CURRENCY_ENV[@]}" RUNNER_TEMP="$d"
+  expect_rc 0
+  expect_lacks "$(cat "$d/gh.log")" "issue create"
+}
+
+# THE REGRESSION. `existing="$(gh issue list ...)"` is a bare command
+# substitution under `set -euo pipefail`, so a 403 secondary rate limit, a 502
+# or a garbled body exits the step BEFORE `gh issue create` ever runs - fail-OPEN
+# on the single call the channel exists for, and silent, because the run was
+# already red. release.yml's fanout-alarm fixed this exact shape first: "EVERY
+# read in this loop is best-effort, and that is the point ... A duplicate
+# tracker beats no tracker."
+test_currency_files_the_issue_even_when_the_dedup_read_fails() {
+  it "gh issue list 502 -> STILL file the issue (a duplicate beats no tracker)"
+  local d; d="$(make_stub_dir)"
+  printf 'stale
+' > "$d/currency.log"
+  gh_routes "$d" "issue list|1|gh: HTTP 502" "issue create|0|"
+  run_script "$d" "$(file_issue_script)" "${CURRENCY_ENV[@]}" RUNNER_TEMP="$d"
+  expect_rc 0
+  expect_has "$(cat "$d/gh.log")" "issue create"
+}
+
+# The check step is what normally writes currency.log; when an EARLIER step is
+# what failed (setup-go 500, checkout rate-limit) the log does not exist, and
+# that is precisely the case `if: failure()` was widened for. The body must
+# still be filed and must say why it is empty.
+test_currency_files_an_issue_when_the_check_never_ran() {
+  it "no currency.log -> still file, and say the check did not run"
+  local d; d="$(make_stub_dir)"
+  gh_routes "$d" "issue list|0|" "issue create|0|"
+  run_script "$d" "$(file_issue_script)" "${CURRENCY_ENV[@]}" RUNNER_TEMP="$d"
+  expect_rc 0
+  expect_has "$(cat "$d/issue.md")" "did not run"
+}
+
+test_currency_close_is_a_noop_when_the_dedup_read_fails() {
+  it "close: gh issue list 502 -> exit 0 and close nothing"
+  local d; d="$(make_stub_dir)"
+  gh_routes "$d" "issue list|1|gh: HTTP 502" "issue close|0|"
+  run_script "$d" "$(close_issue_script)" "${CURRENCY_ENV[@]}" RUNNER_TEMP="$d"
+  expect_rc 0
+  expect_lacks "$(cat "$d/gh.log")" "issue close"
+}
+
+test_currency_close_closes_the_open_tracker() {
+  it "close: tracker open -> close it"
+  local d; d="$(make_stub_dir)"
+  gh_routes "$d" "issue list|0|77" "issue close|0|"
+  run_script "$d" "$(close_issue_script)" "${CURRENCY_ENV[@]}" RUNNER_TEMP="$d"
+  expect_rc 0
+  expect_has "$(cat "$d/gh.log")" "issue close 77"
 }
 
 # --- run --------------------------------------------------------------------

@@ -128,8 +128,18 @@ func (f Finding) String() string {
 // pinRe matches the caller line. Anchored on the full workflow path so a
 // consumer that also calls some other reusable workflow from this repo is not
 // mistaken for a ci-shared pin.
+//
+// THE TRAILING COMMENT IS DELIBERATE, and the asymmetry it closes is the point.
+// The WRITER is apply-pins.py's `^(\s*uses: ...@).*$` -> `\1{{version}}`, which
+// happily rewrites `...@v3.10.0  # pinned` and leaves the comment in place. A
+// reader ending `@(\S+)\s*$` did not match that line, so PinRef errored ->
+// FindingUnreadable -> `plan` exit 1 -> fanout-ci-shared red -> THIS REPO'S
+// RELEASE went red, caused by a one-line cosmetic edit in a sibling repo, after
+// tag/publish/bump/verify-pin had all succeeded. A reader stricter than its own
+// writer turns someone else's formatting into your outage.
+// fanout_contract_test.go asserts both spellings against both patterns.
 var pinRe = regexp.MustCompile(
-	`(?m)^\s*uses:\s*` + regexp.QuoteMeta(ProducerRepo+"/"+CISharedPath) + `@(\S+)\s*$`)
+	`(?m)^\s*uses:\s*` + regexp.QuoteMeta(ProducerRepo+"/"+CISharedPath) + `@([^\s#]+)\s*(?:#.*)?$`)
 
 // PinRef reports the ref a consumer's ci.yml pins ci-shared.yml at.
 //
@@ -372,6 +382,23 @@ func ShortName(repo string) string {
 	}
 	return repo
 }
+
+// BumpOutputKey is the $GITHUB_OUTPUT key `plan` writes for one consumer and
+// release.yml's cd-release step for that consumer gates on.
+//
+// It exists so the `bump-` prefix is ONE literal. It used to be two - a format
+// string in cmd/ci-shared-pins and a hand-rebuilt string in
+// fanout_contract_test.go - bound to each other by nothing, and renaming either
+// left the build and every test green. At runtime that ships as: `plan` exits 0,
+// all four `steps.plan.outputs.bump-<repo>` gates evaluate ” == 'true' (Actions
+// resolves a missing output to the empty string, it does not error), every step
+// skips, and `fanout-ci-shared` reports SUCCESS having written no pin anywhere.
+// A silently dead fan-out is precisely what release.yml's four-explicit-steps
+// shape was chosen over a matrix to prevent, so leaving the key itself unbound
+// reopened the hole one layer up.
+//
+// Accepts either an owner/name slug or a bare short name.
+func BumpOutputKey(repo string) string { return "bump-" + ShortName(repo) }
 
 // PlanBumps turns an Audit into the release fan-out's decision: which consumers
 // to open a pin-bump PR against, keyed by short repo name, plus the findings

@@ -324,9 +324,16 @@ jobs:
           # stays a cache hit when only unrelated files move.
           #
           # NO --output ON PURPOSE - see the block above the job. buildkit
-          # solves the whole graph and exports nothing, so every stage runs and
-          # a failing step still exits non-zero, with zero bytes serialised and
-          # no exporter that could later be edited into a push.
+          # solves and exports nothing, so a failing step still exits non-zero
+          # with zero bytes serialised and no exporter that could later be
+          # edited into a push.
+          #
+          # And NO `--opt target=`, which is the half that decides this job's
+          # REACH: without one buildkit builds the FINAL stage and everything
+          # that stage transitively needs. NOT "every stage" - a stage nothing
+          # copies from is never built, which is why build.sh names the
+          # test-guard stage explicitly. cicontract.ImageVerifyExempt reasons
+          # from this, so merge_gate_test.go asserts it.
           buildctl --addr "$BUILDKITD_ADDR" build \
             --frontend dockerfile.v0 \
             --opt context="https://github.com/szymonrychu/${REPO}.git#refs/pull/${PR_NUMBER}/merge" \

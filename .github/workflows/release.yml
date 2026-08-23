@@ -565,7 +565,7 @@ jobs:
   # tatara-helmfile) and is exempt by design, not by omission. See
   # internal/cicontract/fleetpins.go.
   #
-  # TWO ACCEPTED COSTS, both real, both deliberately not solved here:
+  # FOUR ACCEPTED COSTS, all real, all deliberately not solved here:
   #
   # 1. NO READ-BACK. `bump` exits 0 when the PR is OPEN, not when the pin
   #    LANDS - the lesson `verify-pin` and `fanout-alarm` above were built from
@@ -584,6 +584,28 @@ jobs:
   #    whichever merges first conflicts the other. The currency check still
   #    reads that consumer as stale until a pin actually lands, so the state is
   #    visible rather than silent - which is the property #640 was missing.
+  # 3. EVERY ci-shared.yml CHANGE SHIPS FOUR PRODUCTION RELEASES, and this is
+  #    the largest of the four costs. `pr_label: semver:patch` is mandatory
+  #    (each consumer's own `cd-release mode: tag` refuses to tag without a
+  #    `semver:*` label), so a merged bump PR pushes to that consumer's main ->
+  #    ci -> release -> semver tag -> image/chart publish -> cd/deploy-train ->
+  #    deploy. Four times. A COMMENT-ONLY edit to ci-shared.yml redeploys four
+  #    components, because `plan` compares the file byte-for-byte and a comment
+  #    is a byte. That is the price of the pin being written at all rather than
+  #    drifting for 14 days (#640), but weigh it before touching this file:
+  #    batch shared-workflow edits rather than trickling them.
+  # 4. THE FIRST FAN-OUT IS ALSO THE PROBE. Across this fleet the only
+  #    `cd-release mode: bump` parents that have ever existed are
+  #    tatara-helmfile (terminal) and tatara-claude-code-wrapper; tatara-cli,
+  #    tatara-memory and tatara-memory-repo-ingester are new here. cd-release's
+  #    `arm_pr` runs `gh pr merge --auto --squash` and action.yml calls it as
+  #    `arm_pr ... || exit 1`, so a repo with "Allow auto-merge" disabled fails
+  #    the step: red release, and a pushed pin stranded behind an unarmed PR -
+  #    the #622 shape, which cost 1 above deliberately has no read-back for.
+  #    `allow_auto_merge` is not served to anonymous API reads and agent pods
+  #    hold no forge token, so this could not be confirmed from here. It fails
+  #    LOUDLY rather than silently, and `ci-shared-currency` reports the
+  #    stranded pin within 24h, so the failure mode is a visible one.
   fanout-ci-shared:
     needs: [tag]
     runs-on: tatara-operator

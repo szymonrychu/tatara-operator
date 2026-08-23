@@ -181,6 +181,32 @@ func TestWorkflowText_PublishingImageJobStaysPushOnly(t *testing.T) {
 	}
 }
 
+// image-verify must pass NO `--opt target=`, so it builds the final stage and
+// everything that stage transitively needs.
+//
+// This is an assertion because a REASON depends on it. cicontract's
+// ImageVerifyExempt exempts tatara-claude-code-wrapper on the grounds that the
+// final stage COPYs --from a private-registry stage and is therefore always
+// reached; adding a target here would quietly make that rationale false while
+// the exemption stayed. It is also the assertion
+// TestWorkflowText_PullRequestGateCompilesTheDockerfile cannot make for itself:
+// buildsDockerfile() matches on `buildctl` plus `filename=Dockerfile`, so a job
+// narrowed to one cheap stage keeps that test green while the gate stops
+// covering the image that ships. A gate whose reach shrinks silently is #640.
+func TestWorkflowText_ImageVerifyBuildsTheFinalStage(t *testing.T) {
+	wf := loadCIShared(t)
+	job, ok := wf.Jobs["image-verify"]
+	if !ok {
+		t.Fatalf("%s declares no image-verify job", ciSharedPath)
+	}
+	if strings.Contains(job.script(), "target=") {
+		t.Errorf("image-verify passes a `--opt target=`, so it no longer compiles the stage that " +
+			"ships. cicontract.ImageVerifyExempt's rationale for tatara-claude-code-wrapper rests on " +
+			"this job reaching the FINAL stage; narrowing it makes that reason false and leaves the " +
+			"exemption in place, and PullRequestGateCompilesTheDockerfile would stay green throughout")
+	}
+}
+
 // The input name in fleetpins.go's imageVerifyRe is a string literal, and the
 // thing it claims to read is `image-verify`'s own `if:` in ci-shared.yml. Two
 // independently-maintained spellings of one name is how a reader and the thing

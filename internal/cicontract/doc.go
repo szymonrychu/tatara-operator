@@ -62,6 +62,18 @@
 // credential or an anonymously pullable base image: a registry decision, not a
 // workflow edit.
 //
+// An exemption is not a free pass, and that repo carries a local compensating
+// control: a pin-guard step asserting its Dockerfile's GO_VERSION agrees with
+// go.mod and .mise.toml, which is #556's exact predicate and the one class an
+// offline check CAN cover. What stays uncovered there is everything a compile
+// catches and a version string cannot - a renamed base image, a dropped
+// package, a moved COPY source. Deliberately NOT solved by an
+// `image-verify-target` input narrowing this job to a public stage: Audit reads
+// one boolean, so a partial target would report that consumer as fully gated
+// while its shipped stage stayed dark. Correct shape, partial reach, check says
+// CURRENT - #640 one layer further out, which is the whole thing this package
+// is now built to refuse.
+//
 // fleetpins.go is the half that can: it resolves each consumer's pin and
 // compares the ci-shared.yml at that ref against a reference BY CONTENT. It
 // takes a Fetcher rather than doing I/O, so `make test` stays offline; the
