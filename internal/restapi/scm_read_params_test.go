@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -217,6 +218,16 @@ func (c *echoCommitReader) ListCommits(_ context.Context, _, name string, since 
 	}, nil
 }
 
+// scmParamBody neutralises the CI pacer's `cached` flag before the comparison.
+// It is the one field that differs between two OTHERWISE IDENTICAL responses -
+// the second read of a (repo, number) key inside the 20s window answers
+// cached:true whether or not the parameter was honoured - so leaving it in
+// would let a dropped ci parameter pass the table on a difference that says
+// nothing about the parameter.
+func scmParamBody(raw string) string {
+	return strings.ReplaceAll(raw, `"cached":true`, `"cached":false`)
+}
+
 func TestScmRead_EveryAdvertisedQueryParamChangesTheResponse(t *testing.T) {
 	old := frozenNow.Add(-72 * time.Hour)
 	recent := frozenNow.Add(-time.Hour)
@@ -255,7 +266,7 @@ func TestScmRead_EveryAdvertisedQueryParamChangesTheResponse(t *testing.T) {
 			require.Equal(t, http.StatusOK, base.Code, tc.base)
 			with := e.do(t, http.MethodGet, tc.with, "")
 			require.Equal(t, http.StatusOK, with.Code, tc.with)
-			require.NotEqual(t, base.Body.String(), with.Body.String(),
+			require.NotEqual(t, scmParamBody(base.Body.String()), scmParamBody(with.Body.String()),
 				"scm_read(kind=%s) advertises %q and the handler does not read it", tc.kind, tc.param)
 		})
 	}
