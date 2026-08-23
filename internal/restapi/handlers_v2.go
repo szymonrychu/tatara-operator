@@ -1664,11 +1664,9 @@ func (s *Server) mrOpen(w http.ResponseWriter, r *http.Request, proj *tatarav1al
 	// significance is EMPTY here: change_significance does not exist on this
 	// wire. The severity ceiling is therefore enforced at submit_outcome
 	// (action=submitted) and this call only enforces the two evidence blockers.
-	if shipGateApplies(task) {
-		if blockers := controller.ApprovalShipVerdict(ctx, s.c, proj, issues, ""); len(blockers) > 0 {
-			s.refuseApprovalRequired(w, r, task, "", "mr_write(action=open)", blockers)
-			return
-		}
+	if blockers := s.shipVerdict(ctx, task, ""); len(blockers) > 0 {
+		s.refuseApprovalRequired(w, r, task, "", "mr_write(action=open)", blockers)
+		return
 	}
 
 	// A FOLLOW-ON open must still owe something this repo can carry. Without

@@ -393,3 +393,28 @@ func TestOutcome_NonGateReplayStaysABareTaskDTO(t *testing.T) {
 	require.NotContains(t, got, "granted")
 	require.Contains(t, got, "name")
 }
+
+// TestMROpen_TheGateJudgesAgainstTheTASKsProject: callerTask does not check that
+// the {p} URL parameter names the Task's own project, so the *Project mrOpen
+// holds is caller-supplied. The maintainer set and the bot login decide which
+// blocker this gate reports, and the ceiling it measures against once a
+// significance exists - so the gate resolves the project from the Task instead.
+//
+// Here the Task's project names the maintainer and the URL project does not. A
+// gate reading the URL project reports needs-maintainer-comment; reading the
+// Task's, needs-approval-tool.
+func TestMROpen_TheGateJudgesAgainstTheTASKsProject(t *testing.T) {
+	other := projectV2("other") // no maintainerLogins
+	e := buildV2(t, v2Opts{writer: panicForge{}}, maintainerProjectV2("tatara"), other, scmSecretV2(),
+		repoV2("tatara-cli", "other"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
+		issueV2("tatara-cli", 32, "t1", maintainerSpoke))
+
+	w := e.do(t, http.MethodPost, "/projects/other/scm/mr-write",
+		`{"task":"t1","action":"open","repo":"tatara-cli","title":"T","body":"B"}`)
+
+	require.Equal(t, http.StatusConflict, w.Code, w.Body.String())
+	require.Equal(t, controller.ShipBlockedNeedsApprovalTool,
+		decodeApprovalRefusal(t, w.Body.Bytes()).Blocked[0].Detail,
+		"the gate must read the maintainer set of the project the TASK belongs to")
+}

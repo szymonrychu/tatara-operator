@@ -35,7 +35,16 @@ type approvalRequiredBody struct {
 	Blocked []controller.ShipBlocker `json:"blocked"`
 }
 
-// shipVerdict reads the Task's owned Issues and asks for the verdict.
+// shipVerdict reads the Task's owned Issues and asks for the verdict. It is the
+// ONE entry point for both ship sites, so the two cannot drift.
+//
+// IT RESOLVES THE PROJECT FROM THE TASK, never from the caller. `mrOpen` already
+// holds a *Project, but that one comes from the {p} URL parameter and callerTask
+// does not check that the named Task belongs to it. The maintainer set and the
+// bot login decide which blocker this gate reports and, once a significance is
+// declared, which ceiling it is measured against - so taking them from a
+// caller-supplied parameter puts an input to a security decision in the caller's
+// hands. One extra Get buys the gate its own answer.
 //
 // A READ FAILURE FAILS OPEN, deliberately, and it is the one place in this
 // change that does. The alternative refuses every open and every submit during a
@@ -44,9 +53,18 @@ type approvalRequiredBody struct {
 // reasoning planPinRefusal already applies to its own read. The grant itself was
 // gated, the Issue write is durable, and the failure is loud on the ordinary
 // client-error path.
-func (s *Server) shipVerdict(ctx context.Context, proj *tatarav1alpha1.Project,
-	task *tatarav1alpha1.Task, significance string) []controller.ShipBlocker {
+func (s *Server) shipVerdict(ctx context.Context, task *tatarav1alpha1.Task,
+	significance string) []controller.ShipBlocker {
 
+	if !shipGateApplies(task) {
+		return nil
+	}
+	proj, err := s.getProjectCR(ctx, task.Spec.ProjectRef)
+	if err != nil {
+		s.log.WarnContext(ctx, "restapi: could not read the task's project for the approval ship gate; allowing",
+			"task", task.Name, "project", task.Spec.ProjectRef, "error", err)
+		return nil
+	}
 	issues, err := s.ownedIssues(ctx, task)
 	if err != nil {
 		s.log.WarnContext(ctx, "restapi: could not read owned issues for the approval ship gate; allowing",

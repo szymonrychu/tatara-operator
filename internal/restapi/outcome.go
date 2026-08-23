@@ -1232,7 +1232,7 @@ func (o *outcomeCtx) implement(p implementPayload) {
 	// gate expensive will simply stop updating its plan note, which destroys the
 	// note's value as continuation state - so a mismatch sends it back to the
 	// gate to ask again, with its pod alive and its work intact.
-	if p.Action == "submitted" && shipGateApplies(o.task) {
+	if p.Action == "submitted" && o.kind == "implement" {
 		if refused := s.planPinRefusal(ctx, o.task); refused {
 			if !o.commit(func(t *tatarav1alpha1.Task) error {
 				return stage.Enter(t, mrs, tatarav1alpha1.StateRefined, "", s.now())
@@ -1259,7 +1259,7 @@ func (o *outcomeCtx) implement(p implementPayload) {
 		// plan-hash-mismatch takes, for the same reason: the pod is alive, the
 		// branch is pushed and the work is intact - only the authorisation has to
 		// be redone. NEVER A PARK.
-		if blockers := s.shipVerdict(ctx, o.proj, o.task, p.ChangeSignificance); len(blockers) > 0 {
+		if blockers := s.shipVerdict(ctx, o.task, p.ChangeSignificance); len(blockers) > 0 {
 			if !o.commit(func(t *tatarav1alpha1.Task) error {
 				return stage.Enter(t, mrs, tatarav1alpha1.StateRefined, "", s.now())
 			}) {
