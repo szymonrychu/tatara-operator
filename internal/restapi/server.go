@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	chiMiddleware "github.com/go-chi/chi/v5/middleware"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
@@ -125,7 +126,34 @@ func (s *Server) Mount(r chi.Router, verify func(http.Handler) http.Handler) {
 		if verify != nil {
 			r.Use(verify)
 		}
+		r.Use(s.observeResponseBytes)
 		s.routes(r)
+	})
+}
+
+// observeResponseBytes meters a REST response into
+// operator_restapi_response_bytes{route} (#641). It sits on the whole group
+// rather than on the one handler that overflowed: the point of the series is
+// to answer "is any other route close to the edge" before the next agent's
+// first gate fails against a response its client discards.
+//
+// The label is chi's ROUTE TEMPLATE, resolved after the inner handler has run,
+// so cardinality is bounded by routes()' 16 entries and never by a URL param.
+//
+// Three things it deliberately does NOT meter. A 404 and a 405 are dispatched
+// by the ROOT mux's NotFound/MethodNotAllowed handlers, outside this group's
+// chain, so they never reach here at all - the empty-pattern guard below is
+// belt-and-braces, not that path. A 401 written by verify short-circuits before
+// routing, so there is no template to label it with. And a panicking handler
+// unwinds past this frame into middleware.Recoverer; recording the partial
+// bytes it managed to write would be a response size that describes nothing.
+func (s *Server) observeResponseBytes(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ww := chiMiddleware.NewWrapResponseWriter(w, r.ProtoMajor)
+		next.ServeHTTP(ww, r)
+		if pattern := chi.RouteContext(r.Context()).RoutePattern(); pattern != "" {
+			s.metrics.ObserveRESTResponseBytes(pattern, ww.BytesWritten())
+		}
 	})
 }
 

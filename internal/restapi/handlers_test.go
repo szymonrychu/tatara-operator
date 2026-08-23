@@ -110,10 +110,10 @@ func TestListTasks_FilteredByProject(t *testing.T) {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/projects/alpha/tasks", nil))
 	require.Equal(t, http.StatusOK, w.Code)
-	var out []restapi.TaskDTO
+	var out taskListResp
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &out))
-	require.Len(t, out, 1)
-	require.Equal(t, "t1", out[0].Name)
+	require.Len(t, out.Tasks, 1)
+	require.Equal(t, "t1", out.Tasks[0].Name)
 }
 
 func TestListTasks_ProjectNotFound(t *testing.T) {
