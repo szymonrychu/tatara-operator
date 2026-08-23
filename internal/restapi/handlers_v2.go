@@ -567,6 +567,22 @@ func listLimit(r *http.Request, def, max int) int {
 	return n
 }
 
+// listOffset parses ?offset (default 0). A negative or unparseable value falls
+// back to the first page rather than 400-ing: listLimit already treats a
+// malformed bound that way, and the callers of the one endpoint that takes an
+// offset use it as a dedup gate.
+func listOffset(r *http.Request) int {
+	v := r.URL.Query().Get("offset")
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
 func controllerTaskRef(obj client.Object) string {
 	name, _ := own.ControllerOwner(obj)
 	return name

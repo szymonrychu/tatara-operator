@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -164,6 +165,21 @@ func (s *Server) listRepositories(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+// taskListResp is the bounded envelope GET /projects/{p}/tasks returns (#641).
+// Total is the whole project-filtered population, not the page: a shortened
+// list that does not SAY it is shortened is worse than the oversized one it
+// replaces, because task_list's three callers (brainstorm, incident, refine)
+// use it as a dedup gate, and a silent 100-of-300 turns a loud client refusal
+// into a dedup scan that quietly missed two thirds of the project. It is
+// prompt.Render's total/rendered/elided rule applied to the JSON channel.
+type taskListResp struct {
+	Tasks     []TaskDTO `json:"tasks"`
+	Total     int       `json:"total"`
+	Returned  int       `json:"returned"`
+	Offset    int       `json:"offset"`
+	Truncated bool      `json:"truncated"`
+}
+
 func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
 	projName := chi.URLParam(r, "p")
 	var proj tatarav1alpha1.Project
@@ -176,13 +192,44 @@ func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
 		writeClientErr(w, err)
 		return
 	}
-	out := make([]TaskDTO, 0)
+	tasks := make([]*tatarav1alpha1.Task, 0, len(list.Items))
 	for i := range list.Items {
 		if list.Items[i].Spec.ProjectRef == projName {
-			out = append(out, toTaskDTO(list.Items[i]))
+			tasks = append(tasks, &list.Items[i])
 		}
 	}
-	writeJSON(w, http.StatusOK, out)
+	// Newest first, name as the tiebreak: prompt.RenderIndex's comparator, so
+	// the two project Task indexes agree on what a page keeps. Oldest-first-
+	// then-truncate is #636's defect one endpoint over, and this population is
+	// retention-bound - the oldest rows are the parked ones awaiting the
+	// ParkRetention reap, which is exactly what a page should drop.
+	sort.SliceStable(tasks, func(i, j int) bool {
+		a, b := tasks[i].CreationTimestamp.Time, tasks[j].CreationTimestamp.Time
+		if !a.Equal(b) {
+			return a.After(b)
+		}
+		return tasks[i].Name < tasks[j].Name
+	})
+
+	limit := listLimit(r, defaultListLimit, maxListLimit)
+	offset := listOffset(r)
+	window := tasks
+	if offset >= len(window) {
+		window = nil
+	} else {
+		window = window[offset:]
+	}
+	if len(window) > limit {
+		window = window[:limit]
+	}
+	out := make([]TaskDTO, 0, len(window))
+	for _, t := range window {
+		out = append(out, toTaskListDTO(*t))
+	}
+	writeJSON(w, http.StatusOK, taskListResp{
+		Tasks: out, Total: len(tasks), Returned: len(out), Offset: offset,
+		Truncated: offset+len(out) < len(tasks),
+	})
 }
 
 func decodeJSON(r *http.Request, w http.ResponseWriter, dst any) error {

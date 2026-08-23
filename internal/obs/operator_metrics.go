@@ -70,6 +70,7 @@ type OperatorMetrics struct {
 	webhookDuration               *prometheus.HistogramVec
 	restapiRequestsTotal          *prometheus.CounterVec
 	restapiRequestDuration        *prometheus.HistogramVec
+	restapiResponseBytes          *prometheus.HistogramVec
 	memoryHealthReadErrors        prometheus.Counter
 	memoryApplyTransientErrors    *prometheus.CounterVec
 	memoryStorageShrinkGuard      *prometheus.CounterVec
@@ -352,6 +353,18 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Help:    "Wall-clock duration of REST API handler execution by endpoint.",
 			Buckets: prometheus.ExponentialBuckets(0.001, 2, 10),
 		}, []string{"endpoint"}),
+		// #641: task_list served 725 KB for 57 Tasks, the MCP client discarded
+		// it, and no series anywhere recorded that it happened. The bundle path
+		// has had operator_bundle_bytes since it got its budget; the JSON path
+		// delivering the same Task free text to the same agents had nothing.
+		// Bucketed like operator_bundle_bytes so the two channels are readable
+		// against the same 400000 line. route is chi's route TEMPLATE, so the
+		// cardinality is the 16 entries in restapi routes().
+		restapiResponseBytes: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "operator_restapi_response_bytes",
+			Help:    "REST API response size in bytes, by route template. The platform's budget for the same Task free text on the bundle channel is Project.spec.maxBundleBytes (default 400000).",
+			Buckets: []float64{1_000, 4_000, 16_000, 64_000, 128_000, 200_000, 400_000, 800_000},
+		}, []string{"route"}),
 		// Finding 13: counter for transient memory-health read errors so repeated
 		// blips surfacing as healthy reconciles are visible in Prometheus.
 		memoryHealthReadErrors: prometheus.NewCounter(prometheus.CounterOpts{
@@ -571,6 +584,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.webhookDuration,
 		m.restapiRequestsTotal,
 		m.restapiRequestDuration,
+		m.restapiResponseBytes,
 		m.memoryHealthReadErrors,
 		m.memoryApplyTransientErrors,
 		m.memoryStorageShrinkGuard,
@@ -1155,6 +1169,19 @@ func (m *OperatorMetrics) ObserveWebhookDuration(provider, result string, second
 func (m *OperatorMetrics) RecordRESTRequest(endpoint, result string, seconds float64) {
 	m.restapiRequestsTotal.WithLabelValues(endpoint, result).Inc()
 	m.restapiRequestDuration.WithLabelValues(endpoint).Observe(seconds)
+}
+
+// ObserveRESTResponseBytes records the size of one REST response into
+// operator_restapi_response_bytes, labelled by chi route template (#641).
+//
+// A nil receiver is a no-op: the REST middleware runs on every request and test
+// harnesses build a Server with no Metrics, so the guard belongs here rather
+// than at the one call site.
+func (m *OperatorMetrics) ObserveRESTResponseBytes(route string, n int) {
+	if m == nil {
+		return
+	}
+	m.restapiResponseBytes.WithLabelValues(route).Observe(float64(n))
 }
 
 // RESTRequestsCounter returns the counter for (endpoint, result) for test assertions.

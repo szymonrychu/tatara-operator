@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	chiMiddleware "github.com/go-chi/chi/v5/middleware"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
@@ -125,7 +126,27 @@ func (s *Server) Mount(r chi.Router, verify func(http.Handler) http.Handler) {
 		if verify != nil {
 			r.Use(verify)
 		}
+		r.Use(s.observeResponseBytes)
 		s.routes(r)
+	})
+}
+
+// observeResponseBytes meters every REST response into
+// operator_restapi_response_bytes{route} (#641). It sits on the whole group
+// rather than on the one handler that overflowed: the point of the series is
+// to answer "is any other route close to the edge" before the next agent's
+// first gate fails against a response its client discards.
+//
+// The label is chi's ROUTE TEMPLATE, resolved after the inner handler has run,
+// so cardinality is bounded by routes()' 16 entries and never by a URL param.
+// An empty pattern is an unmatched request (404) with no template to label.
+func (s *Server) observeResponseBytes(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ww := chiMiddleware.NewWrapResponseWriter(w, r.ProtoMajor)
+		next.ServeHTTP(ww, r)
+		if pattern := chi.RouteContext(r.Context()).RoutePattern(); pattern != "" {
+			s.metrics.ObserveRESTResponseBytes(pattern, ww.BytesWritten())
+		}
 	})
 }
 
