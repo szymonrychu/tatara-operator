@@ -170,22 +170,35 @@ func assignmentFor(agentKind string, task *tatarav1alpha1.Task, proj *tatarav1al
 //
 // The "omit both fields" licence is the AUTO-APPROVE CARVE-OUT's instruction and
 // nothing else. verifyOneIssue only reaches autoApproveApplies in the
-// no-maintainer-comment arm, and that helper refuses immediately unless
-// Project.spec.autoApproveTataraProposals is set - so on a flag-off project the
-// same licence tells the agent to do the one thing that is guaranteed to be
+// no-maintainer-comment arm, and that helper refuses immediately unless the
+// project's autoApproveMaxSignificance is above `off` - so on an `off` project
+// the same licence tells the agent to do the one thing that is guaranteed to be
 // refused with no-maintainer-comment. That is not a rare edge: a brainstorm
 // proposal's gate Task is exactly a bot-authored issue with no comments, so the
 // instruction drove EVERY such agent into the refusal, after it had already
 // spent a session and posted a plan comment on the thread.
 //
-// Flag off, the agent is told the opposite and given the correct exit
+// Ceiling off, the agent is told the opposite and given the correct exit
 // (action=discuss), which leaves the thread waiting for the human whose comment
 // is the thing the gate exists to require.
+//
+// CEILING ON, IT ALSO NAMES THE LEVEL. The grant on that path is PROVISIONAL -
+// ApprovalShipVerdict re-checks the declared change_significance against the
+// ceiling at submit - and an agent told only that it may omit the citation fields
+// learns about the ceiling for the first time from a refusal, after the code is
+// written. Stating the number here is what makes the refusal predictable.
 func implementCitationRule(proj *tatarav1alpha1.Project) string {
-	if proj.Spec.AutoApproveTataraProposals {
+	ceiling := tatarav1alpha1.AutoApproveCeiling(proj)
+	if ceiling != tatarav1alpha1.AutoApproveOff {
 		return "Omit the approving_maintainer field AND the approval_citations field TOGETHER, and only when NO human has " +
 			"commented at all - a tatara-proposed issue has no comment to cite. They travel as a pair; " +
-			"one without the other is refused. the plan_note_id field is ALWAYS required.\n\n"
+			"one without the other is refused. the plan_note_id field is ALWAYS required.\n\n" +
+			"THAT GRANT IS PROVISIONAL AND IT IS CAPPED AT `" + ceiling + "`. An approval with no " +
+			"maintainer comment behind it releases a change of at most `" + ceiling + "` significance " +
+			"on this project. If the work turns out larger, `submit_outcome(action=submitted, " +
+			"change_significance=...)` is REFUSED with `over-auto-approve-ceiling` however green the " +
+			"PR is: ask on the thread and cite a maintainer's reply, or keep the change within the " +
+			"ceiling. A citation from a real maintainer is never capped.\n\n"
 	}
 	return "THERE IS NO NO-COMMENT EXCEPTION ON THIS PROJECT. An issue tatara proposed itself " +
 		"REQUIRES a maintainer comment to cite, exactly like any other. If NO human has commented on " +
@@ -207,6 +220,23 @@ func implementCitationRule(proj *tatarav1alpha1.Project) string {
 const resumedBranchMergeRule = "If your CLAUDE.md reports that the task branch was RESUMED and its merge with " +
 	"the base branch is unresolved, resolving that merge is your FIRST action: finish it and commit it before " +
 	"you read or write any other code. The tree you were given is stale by exactly the changes that conflicted.\n\n"
+
+// implementGateIsLoadBearing is #639's ask, and it is stated in the gate section
+// rather than the implementation one on purpose: it is the reason to STOP, and an
+// agent reads the reason to stop before it reads the instructions for going.
+//
+// It says the thing the prompt never said. Every earlier sentence describes the
+// gate as a decision the agent reports, so an agent that judged the thread
+// generously and then wrote the code lost nothing by trying - the worst case was
+// a refusal it could argue with. Since #639 that is false: ApprovalShipVerdict
+// refuses mr_write(action=open) and submit_outcome(action=submitted) on an
+// unapproved Issue, so the code has nowhere to go. Telling the agent that the
+// cost is its WORK, not a retry, is what makes the gate hold in practice.
+const implementGateIsLoadBearing = "WORK YOU DO BEFORE THE GATE GRANTS IS LOST. `mr_write(action=open)` is " +
+	"REFUSED while any live issue this Task owns carries no approval, so there is no merge request " +
+	"that can carry those commits and no reviewer that will ever see them; `submit_outcome(" +
+	"action=submitted)` is refused for the same reason. The refusal names each blocking issue and " +
+	"what it needs. Get `granted:true` FIRST, then write code.\n\n"
 
 // ownYourPRRule is the loop PR B requires of every agent that pushes code, and
 // it is stated to the implement kind because that is the kind that can fix all
@@ -422,7 +452,8 @@ func agentJob(agentKind string, task *tatarav1alpha1.Task, proj *tatarav1alpha1.
 			"leaves the go-ahead standing; one that takes it back (\"actually hold off\") means " +
 			"`action=discuss` instead. Nothing downstream catches this. " +
 			"THIS PARAGRAPH IS DUPLICATED VERBATIM IN tatara-agent-skills' " +
-			"`skills/tatara-implement-gate/SKILL.md`; the two must not drift.\n\n" +
+			"`skills/implement/tatara-implement-gate/SKILL.md`; the two must not drift.\n\n" +
+			implementGateIsLoadBearing +
 			implementCitationRule(proj) +
 			"### 2. The implementation\n\n" +
 			"Once the gate GRANTS, implement the issue(s), in full, in one change. Every project repo " +

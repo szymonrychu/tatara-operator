@@ -871,14 +871,15 @@ func TestOutcome_Review_RecordsReviewOutcomeMetric(t *testing.T) {
 // --- gate (#521 folded the clarify kind's decision=implement into implement's
 // action=approved|discuss|rejected gate) -----------------------------------
 
-// gateResponseDTO decodes the folded gate's 200 refusal body
-// ({"granted":false,"reason":...,"declared":...}). A GRANT does not use this
-// shape at all: it returns the plain Task DTO, same as every other accepted
-// outcome.
+// gateResponseDTO decodes the folded gate's 200 body. Both answers now carry
+// `granted` and `guidance` (#639): the GRANT used to return a bare Task DTO with
+// no `granted` key at all, though the prompt and the skill both tell the agent to
+// read one. On a grant the Task DTO moves under `task`.
 type gateResponseDTO struct {
 	Granted  bool   `json:"granted"`
 	Reason   string `json:"reason"`
 	Declared string `json:"declared"`
+	Guidance string `json:"guidance"`
 }
 
 // gatePlanNoteBody / gatePlanNoteAt / gatePlanNoteID are the fixed plan note
@@ -1477,7 +1478,7 @@ func findLogLineAtLevel(t *testing.T, buf []byte, level string) map[string]any {
 // verifyOneIssue's clause-2 idempotence THROUGH the handler. An Issue that
 // already carries evidence is approved - clause (2) asks whether every live
 // Issue CARRIES evidence, not whether it can be re-derived on this request -
-// which is what keeps the autoApproveTataraProposals evidence (no comment to
+// which is what keeps the auto-approve carve-out evidence (no comment to
 // re-match) alive and stops a maintainer's later "thanks!" from revoking a grant
 // already given.
 //
@@ -1803,7 +1804,7 @@ func TestOutcome_Gate_DeclaredKeyIsAlwaysPresentOnRefusal(t *testing.T) {
 
 // TestOutcome_Gate_OneOfThePairWithoutTheOtherIsRefused: approvingMaintainer
 // and approvalCitations travel as a PAIR. Both present is a human-cited
-// approval, both absent is the autoApproveTataraProposals path; one without the
+// approval, both absent is the auto-approve carve-out path; one without the
 // other is a client bug, refused BEFORE any verifier call - 400 both ways round.
 //
 // It is refused UP FRONT, not by the verifier, because a citation with no
@@ -1996,6 +1997,38 @@ func TestOutcome_Implement_SubmittedShipsWhenThePlanStillMatchesItsPin(t *testin
 		testutil.ToFloat64(metrics.ApprovalRefusedCounter(controller.ApprovalRefusedPlanHashMismatch)))
 }
 
+// TestOutcome_Implement_APlanHashRefusalIsNotCachedAsAccepted is the OTHER door
+// on the shared commit-then-refuse fault #639's review round 1 found. This one
+// predates #639: the refusing commit stamped the payload's fingerprint with the
+// kind's terminal Reason, so the refused payload read as claimCommitted and an
+// identical retry - which is exactly what the agent sends after re-winning the
+// gate on the restored plan - replayed 200 with nothing shipped.
+func TestOutcome_Implement_APlanHashRefusalIsNotCachedAsAccepted(t *testing.T) {
+	task, iss := planPinnedFixtureV2(gatePlanNoteBody, "plan: actually rewrite the whole scheduler")
+	e := buildV2(t, v2Opts{writer: panicForge{}},
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		task, iss, mrV2("tatara-operator", 295, "t1"))
+
+	body := `{"kind":"implement","payload":{"action":"submitted","title":"T","body":"B","changeSignificance":"patch"}}`
+	require.Equal(t, http.StatusOK, e.do(t, http.MethodPost, "/tasks/t1/outcome", body).Code)
+
+	// The retry RE-VALIDATES instead of replaying, and the Task is now at
+	// `refined` - so it gets the guidance for the state it is actually in:
+	// re-win the gate before submitting again.
+	again := e.do(t, http.MethodPost, "/tasks/t1/outcome", body)
+	require.Equal(t, http.StatusConflict, again.Code, again.Body.String())
+
+	var resp struct {
+		Reason  string `json:"reason"`
+		Message string `json:"message"`
+	}
+	require.NoError(t, json.Unmarshal(again.Body.Bytes(), &resp))
+	require.Equal(t, "approval-required", resp.Reason,
+		"the retry must not be answered 200 as an accepted outcome")
+	require.Contains(t, resp.Message, "submit_outcome(action=approved)")
+	require.Equal(t, tatarav1alpha1.StateRefined, e.task(t, "t1").Status.State)
+}
+
 // TestOutcome_ImplementReasonLegalityIsDecidedByAction is the operator's own
 // half of the frozen wire contract: there is ONE `reason` key, and WHICH
 // actions may carry it is decided by `action`. tatara-cli made exactly one of
@@ -2088,13 +2121,15 @@ func TestOutcome_Brainstorm_ProposeSpawnsAGateTaskPerProposal(t *testing.T) {
 	}
 }
 
-// The mint park is the MIRROR of the approval carve-out, so a project that has
-// autoApproveTataraProposals ON keeps today's behaviour byte for byte: the gate
-// Task mints UN-parked, triage routes it to `refined`, and the agent that runs
-// there is granted by autoApproveApplies without a maintainer comment.
+// The mint park is the MIRROR of the approval carve-out, so a project whose
+// autoApproveMaxSignificance is above `off` keeps today's behaviour byte for
+// byte: the gate Task mints UN-parked, triage routes it to `refined`, and the
+// agent that runs there is granted by autoApproveApplies without a maintainer
+// comment. The ceiling is read as a BOOLEAN here - the level cannot be known
+// before the work exists - and settled at submit by ApprovalShipVerdict.
 func TestOutcome_Brainstorm_ProposedGateTaskIsLiveWhenAutoApproveIsOn(t *testing.T) {
 	proj := projectV2("tatara")
-	proj.Spec.AutoApproveTataraProposals = true
+	proj.Spec.AutoApproveMaxSignificance = "minor"
 	e := buildV2(t, v2Opts{}, proj, scmSecretV2(), repoV2("tatara-operator", "tatara"),
 		taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StateRefined, "brainstorm"))
 
@@ -2119,7 +2154,7 @@ func TestOutcome_Brainstorm_ProposedGateTaskIsLiveWhenAutoApproveIsOn(t *testing
 
 // The brainstorm propose path stamps the tatara-proposed-by:brainstorm marker on
 // BOTH the forge issue body and the minted Issue CR body - the marker factor of
-// the autoApproveTataraProposals carve-out, durable across a mirror refresh.
+// the auto-approve carve-out, durable across a mirror refresh.
 func TestOutcome_Brainstorm_StampsProposalMarker(t *testing.T) {
 	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
 		taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StateRefined, "brainstorm"))

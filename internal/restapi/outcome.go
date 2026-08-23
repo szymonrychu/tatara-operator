@@ -102,7 +102,7 @@ type outcomeEnvelope struct {
 // legality is enforced here too rather than assumed.
 //
 // APPROVINGMAINTAINER AND APPROVALCITATIONS TRAVEL AS A PAIR. Both present is a
-// human-cited approval; both absent is the autoApproveTataraProposals path,
+// human-cited approval; both absent is the auto-approve carve-out path,
 // where a bot-authored, anchor-verified proposal is released with NO human
 // comment at all - so there is no comment author to name and requiring the field
 // would make the carve-out unreachable on the two Projects that have it enabled.
@@ -149,6 +149,27 @@ type gateResponse struct {
 	// something distinct from "reason empty".
 	Reason   string `json:"reason,omitempty"`
 	Declared string `json:"declared"`
+	// Guidance is the REMEDY for Reason (#639). The reason is a Prometheus label
+	// and a closed constant; it names the fault and says nothing about what to do
+	// next, and the two are genuinely different per reason - plan-note-not-plan is
+	// fixed in the same turn, no-maintainer-comment cannot be fixed at all. It is
+	// derived server-side from a total map (controller.ApprovalRefusalGuidance) so
+	// the cli holds no second copy of this vocabulary.
+	Guidance string `json:"guidance"`
+}
+
+// gateGrantedResponse is the 200 the GRANT returns.
+//
+// THE GRANT USED TO RETURN A BARE TASK DTO with no `granted` key at all, while
+// both the implement prompt and tatara-implement-gate's SKILL.md tell the agent
+// to branch on one. An agent that cannot tell a grant from a refusal by reading
+// the documented field is an agent that guesses, and #639's ask is that every
+// tool output - confirming AND denying - guides it. The Task DTO is preserved
+// verbatim under `task` so nothing that read it loses anything.
+type gateGrantedResponse struct {
+	Granted  bool    `json:"granted"`
+	Guidance string  `json:"guidance"`
+	Task     TaskDTO `json:"task"`
 }
 
 type reviewedSHA struct {
@@ -337,7 +358,7 @@ func (s *Server) postOutcome(w http.ResponseWriter, r *http.Request) {
 	case claimCommitted:
 		s.log.InfoContext(ctx, "restapi: outcome replay accepted as a no-op",
 			append(reqLogFields(r), "action", "submit_outcome", "task", task.Name, "kind", env.Kind)...)
-		writeJSON(w, http.StatusOK, toTaskDTO(*task))
+		writeJSON(w, http.StatusOK, gateGrantReplayBody(gateGrantEnvelope(env.Kind, env.Payload), *task))
 		return
 	case claimInFlight:
 		obs.RestOutcomeRejectedTotal.WithLabelValues(env.Kind, "claim-in-flight").Inc()
@@ -598,6 +619,11 @@ type outcomeCtx struct {
 	// makes every 4xx this endpoint produces a pure no-write rejection, and what
 	// makes release() a no-op on those paths - there is nothing to release.
 	claimed bool
+	// gateGrant marks the ONE outcome whose 200 body is not a bare Task DTO:
+	// implement action=approved, which answers gateGrantedResponse. It is set
+	// just before the claim so the REPLAY arm inside claim() answers in the same
+	// shape the first attempt did - see gateGrantReplayBody.
+	gateGrant bool
 }
 
 // claim takes the atomic fingerprint claim at the boundary between a handler's
@@ -624,7 +650,7 @@ func (o *outcomeCtx) claim() bool {
 	case claimCommitted:
 		o.s.log.InfoContext(ctx, "restapi: outcome replay accepted as a no-op",
 			append(reqLogFields(o.r), "action", "submit_outcome", "task", o.task.Name, "kind", o.kind)...)
-		writeJSON(o.w, http.StatusOK, toTaskDTO(*fresh))
+		writeJSON(o.w, http.StatusOK, gateGrantReplayBody(o.gateGrant, *fresh))
 		return false
 	case claimInFlight:
 		obs.RestOutcomeRejectedTotal.WithLabelValues(o.kind, "claim-in-flight").Inc()
@@ -641,10 +667,17 @@ func (o *outcomeCtx) claim() bool {
 // instead of waiting out OutcomeClaimTTL.
 //
 // Every pre-execution rejection is CLASS B: it runs before any committed
-// effect, so nothing may be cached under the fingerprint. A class-A
-// (post-execution) rejection does not arise here - commit is the only thing
-// that begins execution, and it stamps its own terminal reason, which release
-// refuses to touch.
+// effect, so nothing may be cached under the fingerprint.
+//
+// CLASS-A (post-execution) REJECTIONS DO ARISE, and release is not what serves
+// them - commitRefusal is. This doc used to assert the opposite ("commit is the
+// only thing that begins execution, and it stamps its own terminal reason,
+// which release refuses to touch"), and it was already false: the two pre-ship
+// refusals COMMIT a transition to `refined` and then refuse, so they are class
+// A by this taxonomy while needing exactly release's cache-nothing outcome.
+// Calling release after such a commit could not work anyway - it is
+// ownership-checked against the bare-claim Reason that the commit has by then
+// overwritten - which is why the drop moved INTO the write. See commitRefusal.
 //
 // OWNERSHIP-CHECKED under CAS: only a condition still carrying OUR fingerprint
 // AND Reason "Outcome" is released. NEVER a committed condition; NEVER another
@@ -736,6 +769,36 @@ func (o *outcomeCtx) decode(payload []byte, v any) bool {
 // the closure to size the write and again on every conflict retry, so an emit
 // inside it would be inflated 2-3x.
 func (o *outcomeCtx) commit(mutate func(*tatarav1alpha1.Task) error) bool {
+	return o.commitAs(mutate, false)
+}
+
+// commitRefusal is commit for a REFUSAL that still has to move the Task: it
+// applies mutate and, in the SAME write, DROPS our fingerprint claim instead of
+// stamping it committed.
+//
+// WHY THE DISTINCTION EXISTS. commit stamps OutcomeAccepted with the kind's
+// terminal Reason, and classifyOutcomeClaim reads any non-"Outcome" Reason as
+// claimCommitted. outcomeFingerprint is sha256(kind|canonical payload) and
+// carries no Task state, so a refusing commit cached the REFUSED payload as an
+// accepted outcome: the next identical POST was answered 200 with a bare Task
+// DTO at the replay arm, before any handler ran, having shipped nothing. The
+// agent is told it succeeded.
+//
+// THE PAYLOAD-IDENTICAL RETRY IS THE DESIGNED PATH HERE, not a corner. Both
+// callers refuse a submit whose remedy is authorisation, not content: the agent
+// wins the gate back with submit_outcome(action=approved) and re-submits THE
+// SAME title/body/changeSignificance. So a refusal that caches itself breaks
+// exactly the recovery its own guidance names.
+//
+// This is class A by release()'s taxonomy - the Task moved - which is why it
+// cannot simply call release(): the mutation must land, and it must land
+// atomically with dropping the claim, or a crash between the two leaves the
+// refused fingerprint committed after all.
+func (o *outcomeCtx) commitRefusal(mutate func(*tatarav1alpha1.Task) error) bool {
+	return o.commitAs(mutate, true)
+}
+
+func (o *outcomeCtx) commitAs(mutate func(*tatarav1alpha1.Task) error, refusal bool) bool {
 	// THE CLAIM BACKSTOP (#578). commit is the one thing every kind handler's
 	// execution phase ends in, so claiming here guarantees no outcome is ever
 	// committed unclaimed even if a handler forgot the explicit claim before its
@@ -764,6 +827,18 @@ func (o *outcomeCtx) commit(mutate func(*tatarav1alpha1.Task) error) bool {
 				}
 			}
 			to, toReason, toPark = t.Status.State, t.Status.StateReason, t.Status.ParkReason
+			if refusal {
+				// OWNERSHIP-CHECKED, exactly as release() is and for the same
+				// reason: only a condition still carrying OUR fingerprint under the
+				// bare-claim Reason is ours to drop. The handler-budget invariant
+				// (OutcomeHandlerBudget < OutcomeClaimTTL) is what makes those two
+				// fields sufficient.
+				cond := tatarav1alpha1.OutcomeCondition(t)
+				if cond != nil && cond.Message == o.fp && cond.Reason == tatarav1alpha1.OutcomeReasonClaimed {
+					meta.RemoveStatusCondition(&t.Status.Conditions, outcomeAcceptedCondition)
+				}
+				return
+			}
 			setCondition(t, metav1.Condition{
 				Type:               outcomeAcceptedCondition,
 				Status:             metav1.ConditionTrue,
@@ -893,6 +968,12 @@ func (o *outcomeCtx) commit(mutate func(*tatarav1alpha1.Task) error) bool {
 		}
 	}
 	o.task.Status.State, o.task.Status.StateReason, o.task.Status.ParkReason = to, toReason, toPark
+	// The claim went out with the write. Saying so keeps a later release() - via
+	// bad()/conflict() on a path that refuses again - off a condition that is no
+	// longer ours.
+	if refusal {
+		o.claimed = false
+	}
 	return true
 }
 
@@ -1111,6 +1192,27 @@ func (o *outcomeCtx) ok(action string, fields ...any) {
 	writeJSON(o.w, http.StatusOK, toTaskDTO(*fresh))
 }
 
+// okGranted is ok for the ONE outcome that answers a gate question with a yes:
+// same logging, same counter, a body the agent can branch on. See
+// gateGrantedResponse.
+func (o *outcomeCtx) okGranted(action string, fields ...any) {
+	ctx := o.r.Context()
+	fresh, err := o.s.getTaskCR(ctx, o.task.Name)
+	if err != nil {
+		writeClientErr(o.w, err)
+		return
+	}
+	obs.RestOutcomeAcceptedTotal.WithLabelValues(o.kind, action).Inc()
+	o.s.log.InfoContext(ctx, "restapi: outcome accepted",
+		append(append(reqLogFields(o.r), "action", "submit_outcome", "task", o.task.Name,
+			"kind", o.kind, "outcome", action, "state", fresh.Status.State), fields...)...)
+	writeJSON(o.w, http.StatusOK, gateGrantedResponse{
+		Granted:  true,
+		Guidance: controller.ApprovalGrantGuidance(),
+		Task:     toTaskDTO(*fresh),
+	})
+}
+
 // note records an agent-authored note in the same status write as the
 // transition. The writer is ALWAYS status.agentKind: an agent can never produce
 // agent="operator".
@@ -1186,13 +1288,56 @@ func (o *outcomeCtx) implement(p implementPayload) {
 	// note's value as continuation state - so a mismatch sends it back to the
 	// gate to ask again, with its pod alive and its work intact.
 	if p.Action == "submitted" && o.kind == "implement" {
+		// A SUBMIT TAKEN FROM `refined` IS A SHIP WITH NO LIVE GRANT, ALWAYS.
+		// refined's ONE exit into under-implementation is
+		// submit_outcome(action=approved), so a Task submitting from here either
+		// never passed the gate or was sent back to it - by one of the two
+		// refusals below, on a previous call. stage.Transitions refuses the edge
+		// anyway, but it refuses it as `illegal state transition refined ->
+		// awaiting-review`: the machine, not the remedy. Answering here instead is
+		// what makes the RETRY of a refused submit re-issue the guidance rather
+		// than trip over the state machine, and it is why neither refusal below
+		// has to be re-entrant.
+		//
+		// Nothing is claimed and nothing is written on this path.
+		if o.task.Status.State == tatarav1alpha1.StateRefined {
+			s.refuseShipUngranted(o.w, o.r, o.task, o.kind,
+				s.shipVerdict(ctx, o.task, p.ChangeSignificance))
+			return
+		}
 		if refused := s.planPinRefusal(ctx, o.task); refused {
-			if !o.commit(func(t *tatarav1alpha1.Task) error {
+			if !o.commitRefusal(func(t *tatarav1alpha1.Task) error {
 				return stage.Enter(t, mrs, tatarav1alpha1.StateRefined, "", s.now())
 			}) {
 				return
 			}
 			o.refuseGate(controller.ApprovalRefusedPlanHashMismatch, "")
+			return
+		}
+		// THE APPROVAL SHIP GATE (#639), and the ONE place the severity ceiling
+		// can bite: change_significance does not exist on any earlier wire, so an
+		// auto-approved Issue's grant stays provisional until here.
+		//
+		// It runs on `submitted` only. A `declined` stays ungated - an agent that
+		// cannot get approval has to be able to say so and terminate, and refusing
+		// the decline wedges the Task at no-outcome instead.
+		//
+		// IT LANDS THE TASK IN `refined`, AND THAT IS NOT DECORATION. Every remedy
+		// this refusal names ends in `submit_outcome(action=approved)`, and that is
+		// NOT a legal transition out of `under-implementation` - stage.Transitions
+		// has no self edge there. A refusal that left the Task where it stood told
+		// the agent to do the one thing the state machine refuses, so the Task
+		// could never ship again. `refined` is the same cheap path out that
+		// plan-hash-mismatch takes, for the same reason: the pod is alive, the
+		// branch is pushed and the work is intact - only the authorisation has to
+		// be redone. NEVER A PARK.
+		if blockers := s.shipVerdict(ctx, o.task, p.ChangeSignificance); len(blockers) > 0 {
+			if !o.commitRefusal(func(t *tatarav1alpha1.Task) error {
+				return stage.Enter(t, mrs, tatarav1alpha1.StateRefined, "", s.now())
+			}) {
+				return
+			}
+			s.refuseApprovalRequired(o.w, o.r, o.task, o.kind, "submit_outcome(action=submitted)", blockers)
 			return
 		}
 	}
@@ -1690,7 +1835,11 @@ func (s *Server) recordCIRedRefusal(ctx context.Context, r *http.Request,
 
 // --- review ---------------------------------------------------------------
 
-var significanceRank = map[string]int{"patch": 1, "minor": 2, "major": 3}
+// significanceRank is the ONE table (#639), no longer a private copy. The
+// auto-approve severity ceiling ranks the same three levels, and a ceiling of
+// `minor` that admitted a `major` because two tables disagreed would release
+// exactly the change the ceiling exists to hold.
+var significanceRank = tatarav1alpha1.SignificanceRank
 
 func (o *outcomeCtx) review(p reviewPayload) {
 	ctx := o.r.Context()
@@ -1908,6 +2057,20 @@ func (o *outcomeCtx) review(p reviewPayload) {
 			// it. A LOWER value is IGNORED and logged WARN - the in-cluster
 			// reviewer is documented-flaky and must never downgrade a major
 			// release to a patch.
+			//
+			// KNOWN RESIDUAL RISK (#639): AN ESCALATION HERE IS NOT RE-CHECKED
+			// AGAINST autoApproveMaxSignificance. ApprovalShipVerdict settles the
+			// ceiling against the level the IMPLEMENT agent declared at submit; a
+			// review that then raises it moves the release past the ceiling with
+			// no maintainer having spoken. Closing it needs the ceiling verdict
+			// carried on the MergeRequest - this handler's Task is the REVIEW
+			// Task, which owns the merge requests and not the Issues, so the
+			// evidence the ceiling is a property of is not reachable from here -
+			// plus a merge-corridor refusal and a park reason to hold it. That is
+			// a bigger change than the ceiling itself and is deliberately NOT
+			// smuggled in behind it. Bounded: it needs the in-cluster reviewer to
+			// escalate an auto-approved proposal, and the change was within policy
+			// at its declared level. Recorded in MEMORY.md.
 			if sig != "" && significanceRank[sig] > significanceRank[m.Status.Significance] {
 				m.Status.Significance = sig
 			}
@@ -2164,6 +2327,7 @@ func (o *outcomeCtx) gate(p implementPayload) {
 
 	// VALIDATION ENDS HERE, EXECUTION BEGINS (#578). Every refuseGate above is a
 	// 200 that writes nothing, and verifyApprovalScope is read-only.
+	o.gateGrant = true
 	if !o.claim() {
 		return
 	}
@@ -2251,7 +2415,7 @@ func (o *outcomeCtx) gate(p implementPayload) {
 	}
 	// len(evidence), not len(issues): the map holds exactly the IN-SCOPE Issues
 	// that produced evidence, which is what this outcome actually approved.
-	o.ok("approved", "issues", len(evidence))
+	o.okGranted("approved", "issues", len(evidence))
 }
 
 // planPinRefusal reports whether the plan note the gate pinned at grant no
@@ -2289,6 +2453,45 @@ func (s *Server) planPinRefusal(ctx context.Context, task *tatarav1alpha1.Task) 
 	return false
 }
 
+// gateGrantReplayBody answers a COMMITTED replay in the shape the original
+// answer used.
+//
+// A REPLAY MUST NOT LOOK LIKE A REFUSAL. The grant's body is
+// gateGrantedResponse and both the implement prompt and tatara-cli's tool
+// description now tell the agent to branch on `granted` - so answering a
+// TTL-stopped pod's retry, or a transport retry, with a bare Task DTO reads as
+// granted=false to a client following the documented contract. The agent
+// concludes it was refused after it was in fact granted, and spends the turn on
+// action=discuss.
+//
+// Only a COMMITTED claim reaches here, and a refused gate never commits one
+// (refuseGate returns above o.claim()), so granted:true is the truth on this
+// path by construction.
+func gateGrantReplayBody(grant bool, task tatarav1alpha1.Task) any {
+	if !grant {
+		return toTaskDTO(task)
+	}
+	return gateGrantedResponse{
+		Granted:  true,
+		Guidance: controller.ApprovalGrantGuidance(),
+		Task:     toTaskDTO(task),
+	}
+}
+
+// gateGrantEnvelope is gateGrantReplayBody's discriminator at the OUTER peek,
+// which runs before the payload is decoded into its kind struct. It reads only
+// `action`, and a malformed payload simply is not a grant - the real decode
+// below rejects it on its own terms.
+func gateGrantEnvelope(kind string, payload []byte) bool {
+	if kind != "implement" {
+		return false
+	}
+	var p struct {
+		Action string `json:"action"`
+	}
+	return json.Unmarshal(payload, &p) == nil && p.Action == "approved"
+}
+
 // refuseGate writes the 200 refusal body. IT DOES NOT PARK and it is NOT an
 // error: the agent is alive, it is told no, and it keeps talking.
 func (o *outcomeCtx) refuseGate(reason, declared string) {
@@ -2296,7 +2499,12 @@ func (o *outcomeCtx) refuseGate(reason, declared string) {
 	o.s.log.InfoContext(o.r.Context(), "restapi: gate refused",
 		append(reqLogFields(o.r), "action", "submit_outcome", "task", o.task.Name,
 			"kind", o.kind, "outcome", "gate-refused", "reason", reason, "declared", declared)...)
-	writeJSON(o.w, http.StatusOK, gateResponse{Granted: false, Reason: reason, Declared: declared})
+	writeJSON(o.w, http.StatusOK, gateResponse{
+		Granted:  false,
+		Reason:   reason,
+		Declared: declared,
+		Guidance: controller.ApprovalRefusalGuidance(reason),
+	})
 }
 
 // planNote resolves THE plan note the pin applies to, and it is THE ONE
@@ -2804,7 +3012,7 @@ func (o *outcomeCtx) brainstorm(p brainstormPayload) {
 			return
 		}
 		// Stamp the tatara-proposed-by provenance marker into the body the forge and
-		// the Issue CR both carry: it is the autoApproveTataraProposals carve-out's
+		// the Issue CR both carry: it is the auto-approve carve-out's
 		// marker factor, and putting it on the SCM issue (not just the CR) keeps it
 		// alive across a mirror refresh. Harmless when the flag is off.
 		body := tatarav1alpha1.StampProposalMarker(pr.Body, tatarav1alpha1.ProposalKindBrainstorm)
@@ -2908,12 +3116,19 @@ func (s *Server) mintGateTask(ctx context.Context, proj *tatarav1alpha1.Project,
 // capacity. MintParked emits no park counter, so this mint does not pollute the
 // park-rate alert.
 //
-// WHY THE FLAG FLIPS IT: with autoApproveTataraProposals ON, the approval
-// carve-out grants that agent WITHOUT any maintainer comment, so parking it
-// would hold the Task for a comment the project has declared unnecessary. The
-// flag-on path is byte-for-byte today's behaviour.
+// WHY THE CEILING FLIPS IT: with autoApproveMaxSignificance above `off`, the
+// approval carve-out grants that agent WITHOUT any maintainer comment, so parking
+// it would hold the Task for a comment the project has declared unnecessary.
+//
+// IT READS THE CEILING AS A BOOLEAN, WHICH IS CORRECT HERE. The LEVEL cannot be
+// known at mint - the proposal has no diff yet, let alone a declared
+// change_significance - so the only question this site can answer is whether the
+// carve-out can fire at all. A proposal minted live on a `patch` project that
+// turns out to be a `major` is refused later, at submit, by ApprovalShipVerdict:
+// the Task spends a pod discovering that, which is the price of not knowing the
+// size until the work exists.
 func gateTaskMintParkReason(proj *tatarav1alpha1.Project) string {
-	if proj.Spec.AutoApproveTataraProposals {
+	if tatarav1alpha1.AutoApproveCeiling(proj) != tatarav1alpha1.AutoApproveOff {
 		return ""
 	}
 	return stage.ReasonBacklogSweep
@@ -3052,7 +3267,7 @@ func (o *outcomeCtx) incident(p incidentPayload) {
 		return
 	}
 	ruleKey := o.task.Spec.DedupKey
-	// Provenance marker for the autoApproveTataraProposals carve-out (marker factor);
+	// Provenance marker for the auto-approve carve-out (marker factor);
 	// stamped on both the forge issue and the CR so it survives a mirror refresh.
 	body := tatarav1alpha1.StampProposalMarker(p.Issue.Body, tatarav1alpha1.ProposalKindIncident)
 	title := s.clampTitleForForge(ctx, o.r, obs.TitleSiteIncidentFileIssue, o.task.Name, p.Issue.Title)

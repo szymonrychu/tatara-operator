@@ -339,11 +339,15 @@ serviceMonitor:
 # THE CHART FILE IS ALSO A SPECIFICATION. Wherever the rendered rule is
 # disabled, templates/prometheusrule.yaml is still the producer's statement of
 # which conditions are worth alerting on, and tatara-observability's
-# scripts/check_chart_alert_parity.py fails CI if any alert here reads a metric
+# scripts/check_alert_plane_parity.py fails CI if any alert here reads a metric
 # no rule there reads. Adding an alert below is therefore a cross-repo act: it
 # either gets a companion rule in tatara-observability or a keyed, reasoned
-# waiver in its scripts/chart_alert_waivers.txt. Deleting one is the honest way
-# to say a condition is not worth watching; do not express that as a waiver.
+# waiver in its scripts/alert_plane_waivers.txt, keyed `operator-chart:<Alert>
+# <metric>` and classed SUPERSEDED. Deleting one is the honest way to say a
+# condition is not worth watching; do not express that as a waiver.
+# That guard also reads internal/memory/monitoring.go's memoryAlertRules from
+# tatara-observability#120 on, so the same cross-repo obligation applies to a
+# rule added there.
 #
 # severityLabel is
 # stamped on every alert; tasksInflightThreshold tunes the concurrency-cap

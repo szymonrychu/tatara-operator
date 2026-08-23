@@ -114,8 +114,14 @@ spec:
                 properties:
                   auto:
                     description: |-
-                      Auto is the autoApproveTataraProposals path; Login is then the sentinel
+                      Auto is the auto-approve carve-out path (Project.spec.
+                      autoApproveMaxSignificance above `off`); Login is then the sentinel
                       "<tatara:auto>" and CommentID is empty.
+
+                      It is ALSO the severity-ceiling discriminator. ApprovalShipVerdict caps only
+                      evidence carrying this flag: a maintainer who read the plan and said go
+                      ahead has already made the judgement the ceiling stands in for, so a cited
+                      approval ships at any significance.
                     type: boolean
                   commentId:
                     type: string

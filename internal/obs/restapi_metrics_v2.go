@@ -32,6 +32,24 @@ var (
 		Help: "Forge writes refused because the calling Task does not control the artifact.",
 	}, []string{"target"})
 
+	// ApprovalShipGateFailOpenTotal counts the times the #639 approval ship gate
+	// ALLOWED a ship because it could not read what it needed to judge - the
+	// Task's Project, or the Issues the Task owns.
+	//
+	// THE FAIL-OPEN IS DELIBERATE (see shipVerdict) and this counter does not
+	// change it. The alternative refuses every mr_write(action=open) and every
+	// submit during a transient apiserver blip, which strands finished work
+	// behind an error the agent cannot distinguish from a real refusal. But this
+	// is the ONE gate on the ship path - neither the reviewer nor the merge
+	// corridor carries an approval check of its own - so an unapproved change
+	// CAN leave through here, and a WARN line is archaeology rather than an
+	// alert. ANY value is worth looking at; a sustained rate means the gate is
+	// not gating.
+	ApprovalShipGateFailOpenTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "operator_approval_ship_gate_fail_open_total",
+		Help: "Ships allowed because the approval ship gate could not read what it needed, by the read that failed (project|issues).",
+	}, []string{"read"})
+
 	// RestCIReadTotal counts scm_read(kind=ci) calls by whether they left the
 	// cluster. It is how the C.2.10 pacer is observed: a live/cached ratio that
 	// climbs means agents are polling faster than the 20s floor.
@@ -117,6 +135,11 @@ const (
 	// request. It is the one non-issue site: a forge caps a merge request title
 	// at the same length it caps an issue title, so the same clamp applies.
 	TitleSiteMREdit = "mr_edit"
+
+	// ShipGateReadProject / ShipGateReadIssues are the two `read` label values on
+	// ApprovalShipGateFailOpenTotal - the two Gets shipVerdict makes.
+	ShipGateReadProject = "project"
+	ShipGateReadIssues  = "issues"
 )
 
 func init() {
@@ -129,7 +152,12 @@ func init() {
 		RestNotesRehydrateFailedTotal,
 		RestTitleClampedTotal,
 		RestTakeoverRefusedTotal,
+		ApprovalShipGateFailOpenTotal,
 	)
+	// Both fail-open reads seeded to zero, so an alert on this series has
+	// something to evaluate on the FIRST failure rather than after it.
+	ApprovalShipGateFailOpenTotal.WithLabelValues(ShipGateReadProject)
+	ApprovalShipGateFailOpenTotal.WithLabelValues(ShipGateReadIssues)
 	// Pre-seed the three real takeover-error stage label sets so a healthy
 	// operator exposes a zero baseline from startup (metric-wiring audit
 	// convention, issue #370) rather than a rate alert with no series to

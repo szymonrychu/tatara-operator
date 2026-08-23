@@ -216,7 +216,7 @@ func managedLabelColors(s *tatarav1alpha1.ScmSpec) map[string]string {
 // recency (verifyOneIssue, approval_grammar.go). There is NO wordlist and no
 // most-recent-comment rule; both were deleted with the approval wordlist. Recorded
 // with the maintainer login + the consumed commentId; (b) auto-approve
-// (autoApproveTataraProposals) - a bot-authored, tatara-proposed issue
+// (autoApproveMaxSignificance above `off`) - a bot-authored, tatara-proposed issue
 // (tatara-proposed-by marker) under the per-project flag,
 // where the brainstorm/incident investigation itself served as the review,
 // recorded with Auto=true and the "<tatara:auto>" sentinel. Path (b) fires ONLY
