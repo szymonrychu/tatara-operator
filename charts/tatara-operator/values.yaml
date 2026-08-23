@@ -310,7 +310,42 @@ serviceMonitor:
 # operator's own operator_*/tatara_* series (same CRD family and deploy pattern
 # as serviceMonitor). additionalLabels is the only cluster-specific knob: the
 # infra helmfile sets whatever label the cluster Prometheus ruleSelector matches
-# on (the chart bakes none, per the cluster-agnostic rule). severityLabel is
+# on (the chart bakes none, per the cluster-agnostic rule).
+#
+# THE SELECTOR LABEL IS NECESSARY, NOT SUFFICIENT, AND ON THE HOMELAB CLUSTER IT
+# IS NOT ENOUGH (tatara-helmfile#440, measured 2026-08-23). Read this before
+# setting additionalLabels on any cluster: a loaded rule that fires into a
+# receiver-less Alertmanager is INDISTINGUISHABLE FROM COVERAGE and is worse
+# than no rule at all, because the next audit sees 32 rules loaded and concludes
+# the conditions are watched.
+#
+# On that cluster Prometheus has exactly one Alertmanager and its running config
+# is stock kube-prometheus-stack: route.receiver "null", one Watchdog child
+# route, and ONE receiver named "null" with zero integrations. It was discarding
+# a real firing alert on 11 series at the time. The delivering plane there is
+# GRAFANA - its notification policy routes homelab=true + system=tatara to a
+# contact point that webhooks the operator's own /operator/webhooks/<project>
+# /grafana endpoint, and that webhook is the only path that mints an incident
+# Task. Prometheus-plane alerts mint nothing on that cluster even when routed.
+#
+# So tatara-helmfile sets prometheusRule.enabled: false there and the conditions
+# below are alerted on from tatara-observability instead. This file is unchanged
+# and stays correct for a cluster whose Alertmanager actually has a receiver;
+# the enabled: true default is deliberate and stays. Before enabling this on a
+# NEW cluster, check three things in order: the ruleSelector label, that a route
+# matches the labels these rules carry (severityLabel only, by default), and
+# that the matched receiver has an integration.
+#
+# THE CHART FILE IS ALSO A SPECIFICATION. Wherever the rendered rule is
+# disabled, templates/prometheusrule.yaml is still the producer's statement of
+# which conditions are worth alerting on, and tatara-observability's
+# scripts/check_chart_alert_parity.py fails CI if any alert here reads a metric
+# no rule there reads. Adding an alert below is therefore a cross-repo act: it
+# either gets a companion rule in tatara-observability or a keyed, reasoned
+# waiver in its scripts/chart_alert_waivers.txt. Deleting one is the honest way
+# to say a condition is not worth watching; do not express that as a waiver.
+#
+# severityLabel is
 # stamped on every alert; tasksInflightThreshold tunes the concurrency-cap
 # deadman threshold; turnSubmitP95LatencyThreshold (seconds) tunes the SubmitTurn
 # p95 latency alert (the operator_turn_submit_duration_seconds histogram tops out
