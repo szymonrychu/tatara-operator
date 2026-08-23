@@ -1,6 +1,9 @@
 package memory_test
 
 import (
+	"fmt"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -131,8 +134,68 @@ func TestMemoryConfigMap(t *testing.T) {
 	require.Equal(t, "https://auth.example/realms/master", cm.Data["OIDC_ISSUER"])
 	require.Equal(t, "tatara-memory", cm.Data["OIDC_AUDIENCE"])
 	require.Equal(t, "info", cm.Data["LOG_LEVEL"])
-	require.Contains(t, cm.Data, "WORKER_POOL_SIZE")
+	// WORKER_POOL_SIZE's VALUE is asserted by TestMemoryConfigMap_BudgetsFitTheDBPool.
 	require.Len(t, cm.OwnerReferences, 1)
+}
+
+// tatara-memory REFUSES TO START when the concurrency limits it is handed can
+// reserve every connection in its Postgres pool: each admitted bulk request,
+// each ingest worker and each in-flight analytics recompute can hold one
+// pooled connection at the same time (tatara-memory#82/#87/#89, guard in that
+// repo's cmd/tatara-memory/config.go). The operator is the only thing that
+// deploys that service - it provisions natively and never installs the chart -
+// so a bad number here is a crash-loop on every provisioned memory pod and a
+// Project whose memory phase goes Failed, caught at 03:00 rather than in review.
+//
+// This ConfigMap sets exactly one of the five terms, WORKER_POOL_SIZE, and
+// nothing modelled it: the assertion this replaces checked only that the key
+// existed.
+//
+// The arithmetic below is a DELIBERATE copy of tatara-memory's rule. The two
+// repos do not import each other and neither vendors the other's builders
+// (tatara-memory#114 pre-mortem 3); the property under test is precisely that
+// the operator's literals are unchecked, so this test supplies its own.
+func TestMemoryConfigMap_BudgetsFitTheDBPool(t *testing.T) {
+	cm := memory.MemoryConfigMap(testProject("acme"), testCfg())
+
+	// tatara-memory's shipped defaults (cmd/tatara-memory/config.go, loadConfig).
+	// Each is overwritten below when this ConfigMap sets that key, so the day the
+	// operator starts carrying one of them the real value is used instead.
+	budget := map[string]int{
+		"MEMORIES_BULK_MAX_IN_FLIGHT":   4,
+		"CODE_GRAPH_BULK_MAX_IN_FLIGHT": 2,
+		"WORKER_POOL_SIZE":              4,
+		"ANALYTICS_MAX_CONCURRENCY":     2,
+		"DB_MAX_OPEN_CONNS":             20,
+	}
+	for key := range budget {
+		raw, ok := cm.Data[key]
+		if !ok {
+			continue
+		}
+		n, err := strconv.Atoi(raw)
+		require.NoErrorf(t, err, "%s=%q is not an integer; tatara-memory cannot parse it at startup", key, raw)
+		budget[key] = n
+	}
+
+	// A bulk budget of 0 means that class is unbounded, so it contributes no
+	// term - but an unbounded class can only draw MORE from the pool, so the
+	// floor that remains is still checked.
+	reserved := budget["WORKER_POOL_SIZE"] + budget["ANALYTICS_MAX_CONCURRENCY"]
+	terms := []string{
+		fmt.Sprintf("worker-pool-size(%d)", budget["WORKER_POOL_SIZE"]),
+		fmt.Sprintf("analytics-max-concurrency(%d)", budget["ANALYTICS_MAX_CONCURRENCY"]),
+	}
+	for _, key := range []string{"MEMORIES_BULK_MAX_IN_FLIGHT", "CODE_GRAPH_BULK_MAX_IN_FLIGHT"} {
+		if n := budget[key]; n > 0 {
+			reserved += n
+			terms = append(terms, fmt.Sprintf("%s(%d)", strings.ToLower(strings.ReplaceAll(key, "_", "-")), n))
+		}
+	}
+
+	require.Lessf(t, reserved, budget["DB_MAX_OPEN_CONNS"],
+		"this ConfigMap oversubscribes tatara-memory's DB pool: %s = %d must be < db-max-open-conns(%d), or every memory pod the operator provisions crash-loops on startup validation",
+		strings.Join(terms, " + "), reserved, budget["DB_MAX_OPEN_CONNS"])
 }
 
 func TestMemoryService(t *testing.T) {
