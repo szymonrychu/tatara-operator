@@ -176,8 +176,14 @@ type ApprovalEvidence struct {
 	// Phrase is the agent's VERBATIM quote from that comment, re-verified by the
 	// operator against the body it holds itself.
 	Phrase string `json:"phrase"`
-	// Auto is the autoApproveTataraProposals path; Login is then the sentinel
+	// Auto is the auto-approve carve-out path (Project.spec.
+	// autoApproveMaxSignificance above `off`); Login is then the sentinel
 	// "<tatara:auto>" and CommentID is empty.
+	//
+	// It is ALSO the severity-ceiling discriminator. ApprovalShipVerdict caps only
+	// evidence carrying this flag: a maintainer who read the plan and said go
+	// ahead has already made the judgement the ceiling stands in for, so a cited
+	// approval ships at any significance.
 	Auto bool `json:"auto,omitempty"`
 	// PlanHash is sha256 of the plan note's body AS IT STOOD AT GRANT. It is
 	// re-checked on the transition out of the gate into code.
