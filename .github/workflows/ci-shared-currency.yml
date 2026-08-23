@@ -27,9 +27,20 @@ on:
     - cron: '45 6 * * *'
   workflow_dispatch:
 
+# The dedup below is read-then-create. A manual dispatch overlapping the cron
+# would race it and file two issues, so only one run of this check exists at a
+# time; the queued one then sees the issue the first filed.
+concurrency:
+  group: ci-shared-currency
+  cancel-in-progress: false
+
 jobs:
   currency:
     runs-on: ubuntu-latest
+    # The check makes a handful of HTTPS fetches. Anything approaching this is
+    # a hang, and a scheduled job that hangs is a check that stopped checking
+    # without saying so.
+    timeout-minutes: 15
     permissions:
       contents: read
       # For the issue channel below. GitHub routes scheduled-run failure mail
@@ -102,6 +113,12 @@ jobs:
             echo "Do NOT close this by hand-editing a consumer's \`uses:\` line. That pin is"
             echo "CD-managed by this repo's \`release.yml\` \`fanout-ci-shared\` job: a hand"
             echo "bump is overwritten by the next release while the real fault stays open."
+            echo
+            echo "EXPECTED TRANSIENT: a release that changed \`ci-shared.yml\` opens four bump"
+            echo "PRs, and every consumer reads \`stale\` until its PR merges. If \`fanout-ci-shared\`"
+            echo "ran recently, check those PRs first - a red \`image-verify\` on one of them is"
+            echo "the gate doing its job and is the thing to fix. This issue closes itself on"
+            echo "the next green run."
             echo
             echo "Run: ${RUN_URL}"
           } > "${RUNNER_TEMP}/issue.md"

@@ -564,6 +564,26 @@ jobs:
   # tatara-chat is NOT here: it is decommissioned (installed: false in
   # tatara-helmfile) and is exempt by design, not by omission. See
   # internal/cicontract/fleetpins.go.
+  #
+  # TWO ACCEPTED COSTS, both real, both deliberately not solved here:
+  #
+  # 1. NO READ-BACK. `bump` exits 0 when the PR is OPEN, not when the pin
+  #    LANDS - the lesson `verify-pin` and `fanout-alarm` above were built from
+  #    (#512). This job has no equivalent, so a bump PR stranded on a red
+  #    consumer CI leaves this release green. That is not an oversight: a
+  #    stranded PR here is EXPECTED, because the ci-shared change this fan-out
+  #    delivers is what that CI is about to run, and a red image-verify on the
+  #    bump PR is the gate working (#640 premortem 1). Blocking the operator's
+  #    release on four sibling repos' CI would make a red gate a reason to
+  #    revert the pin. `ci-shared-currency` is the read-back instead, at up to
+  #    24h latency, and it names the bump PRs in its issue body.
+  # 2. cd-release names the branch `cd/bump-<component>-<version>`, so unlike
+  #    the terminal `cd/deploy-train` path the `bump` job above uses, successive
+  #    releases do NOT coalesce: a consumer whose PR sits unmerged collects a
+  #    second PR rewriting the same line on the next ci-shared change, and
+  #    whichever merges first conflicts the other. The currency check still
+  #    reads that consumer as stale until a pin actually lands, so the state is
+  #    visible rather than silent - which is the property #640 was missing.
   fanout-ci-shared:
     needs: [tag]
     runs-on: tatara-operator
@@ -583,10 +603,25 @@ jobs:
       # apply-pins.py hard-errors on a pattern that matches nothing, so a drift
       # in one copy reds the release instead of shipping a stale pin.
       #
-      # `!cancelled() &&` on the later steps so one consumer's failure does not
-      # strand the other three behind it; the job still goes red.
+      # Every gate is `!cancelled() && steps.plan.outcome == 'success' && <key>`,
+      # and the UNIFORMITY is load-bearing: the two halves close opposite
+      # failures, and dropping either from one step breaks that step alone.
+      #
+      # `!cancelled() &&` so one consumer's bump failure does not strand the
+      # other three behind it. The job still goes red.
+      #
+      # `steps.plan.outcome == 'success' &&` because carrying any status-check
+      # function DROPS the implicit `success() &&` Actions would otherwise
+      # insert - and `plan` writes $GITHUB_OUTPUT before it returns 1 on an
+      # unreadable consumer. Without it, the exact failure this fail-closed
+      # design exists for fans the readable consumers out off a plan the code
+      # just refused to vouch for, while a step that happens to lack a status
+      # function is skipped instead. Asymmetric, and both halves wrong.
+      #
+      # internal/cicontract/fanout_contract_test.go asserts both halves on every
+      # step, and asserts one step per LiveConsumers entry.
       - name: bump tatara-cli's ci-shared pin
-        if: ${{ steps.plan.outputs.bump-tatara-cli == 'true' }}
+        if: ${{ !cancelled() && steps.plan.outcome == 'success' && steps.plan.outputs.bump-tatara-cli == 'true' }}
         uses: szymonrychu/tatara-helmfile/.github/actions/cd-release@main
         with:
           mode: bump
@@ -600,7 +635,7 @@ jobs:
             ]
 
       - name: bump tatara-memory's ci-shared pin
-        if: ${{ !cancelled() && steps.plan.outputs.bump-tatara-memory == 'true' }}
+        if: ${{ !cancelled() && steps.plan.outcome == 'success' && steps.plan.outputs.bump-tatara-memory == 'true' }}
         uses: szymonrychu/tatara-helmfile/.github/actions/cd-release@main
         with:
           mode: bump
@@ -614,7 +649,7 @@ jobs:
             ]
 
       - name: bump tatara-memory-repo-ingester's ci-shared pin
-        if: ${{ !cancelled() && steps.plan.outputs.bump-tatara-memory-repo-ingester == 'true' }}
+        if: ${{ !cancelled() && steps.plan.outcome == 'success' && steps.plan.outputs.bump-tatara-memory-repo-ingester == 'true' }}
         uses: szymonrychu/tatara-helmfile/.github/actions/cd-release@main
         with:
           mode: bump
@@ -628,7 +663,7 @@ jobs:
             ]
 
       - name: bump tatara-claude-code-wrapper's ci-shared pin
-        if: ${{ !cancelled() && steps.plan.outputs.bump-tatara-claude-code-wrapper == 'true' }}
+        if: ${{ !cancelled() && steps.plan.outcome == 'success' && steps.plan.outputs.bump-tatara-claude-code-wrapper == 'true' }}
         uses: szymonrychu/tatara-helmfile/.github/actions/cd-release@main
         with:
           mode: bump

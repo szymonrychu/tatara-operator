@@ -257,6 +257,28 @@ func TestAudit_EveryConsumerIsReportedIndependently(t *testing.T) {
 	}
 }
 
+// A consumer that regressed to a branch or a SHA is the same blindness with a
+// different trigger: `@main` resolves to the producer's main, main is normally
+// content-identical to the newest tag, so the check is GREEN forever and the
+// fan-out computes bump=false and never restores a real pin. The pin's contract
+// is a published vX.Y.Z tag - that is what cd-release writes - so anything else
+// is a consumer that has silently left the CD-managed pin.
+func TestAudit_ConsumerOnAMovingRefIsReported(t *testing.T) {
+	for _, ref := range []string{"main", "d22349a", "v3.10", "3.10.0"} {
+		t.Run(ref, func(t *testing.T) {
+			f := fakeFetcher{files: map[string]string{
+				"szymonrychu/tatara-cli@main:" + ConsumerWorkflowPath: consumerCI(ref),
+				// Content-identical, so a content-only check would pass it.
+				"szymonrychu/tatara-operator@" + ref + ":" + CISharedPath: currentCIShared,
+			}}
+			got := Audit(context.Background(), f, onlyCLI(), []byte(currentCIShared), "v3.10.0")
+			if len(got) != 1 || got[0].Kind != FindingUnreadable {
+				t.Fatalf("Audit() = %v, want one unreadable finding for the %q pin", got, ref)
+			}
+		})
+	}
+}
+
 // The four live consumers, and tatara-chat deliberately not among them.
 func TestLiveConsumers(t *testing.T) {
 	want := []string{

@@ -112,9 +112,17 @@ func PinRef(ciYAML []byte) (string, error) {
 // ci-shared.yml is byte-identical to the reference runs the same job graph, so
 // it is current. That is the invariant #640 is actually about - the four
 // consumers were not stale because v1.36.1 was old, they were stale because the
-// image-verify job was not in it - and it removes the lag fudge factor
-// check_skills_currency.py needs (a release train legitimately in flight is
-// content-identical here, so there is nothing to tolerate).
+// image-verify job was not in it.
+//
+// That is NOT the same as saying there is no transient window. There is one,
+// and it is exactly the fan-out's own: a release that changed ci-shared.yml
+// makes every consumer content-divergent until its bump PR merges, so a cron
+// landing inside that window reds legitimately. The window is bounded by the
+// consumers' own CI (which is the point - each bump PR runs image-verify) and
+// the finding self-closes on the next green run. What content identity DOES
+// remove is check_skills_currency.py's MAX_LAG: a consumer several tags behind
+// on a run of releases that never touched ci-shared.yml is genuinely current
+// and is never reported, so no tag-distance tolerance has to be invented for it.
 //
 // FAIL-CLOSED throughout: an unreadable ci.yml, a missing or ambiguous pin, a
 // pin naming a ref the producer does not serve, an empty consumer set and an
@@ -135,6 +143,22 @@ func Audit(ctx context.Context, f Fetcher, consumers []string, reference []byte,
 		}}
 	}
 
+	// Every consumer normally pins the same ref, so resolving it once keeps a
+	// four-consumer audit to one producer fetch. It also stops one transient
+	// 5xx from raw.githubusercontent getting four independent chances to land.
+	producer := map[string][]byte{}
+	fetchProducer := func(ref string) ([]byte, error) {
+		if b, ok := producer[ref]; ok {
+			return b, nil
+		}
+		b, err := f.File(ctx, ProducerRepo, ref, CISharedPath)
+		if err != nil {
+			return nil, err
+		}
+		producer[ref] = b
+		return b, nil
+	}
+
 	var findings []Finding
 	for _, repo := range consumers {
 		ciYAML, err := f.File(ctx, repo, consumerRef, ConsumerWorkflowPath)
@@ -149,12 +173,25 @@ func Audit(ctx context.Context, f Fetcher, consumers []string, reference []byte,
 				fmt.Sprintf("could not read its ci-shared pin from %s: %v", ConsumerWorkflowPath, err)})
 			continue
 		}
-		pinned, err := f.File(ctx, ProducerRepo, pin, CISharedPath)
+		// A MOVING REF IS NOT A PIN. `@main` or `@<sha>` resolves to something
+		// this check cannot reason about: main is normally content-identical to
+		// the newest tag, so a consumer that regressed to it reads as CURRENT
+		// forever and the fan-out computes bump=false and never restores it.
+		// The pin's contract is a published vX.Y.Z tag - that is exactly what
+		// cd-release writes - so anything else has left the CD-managed pin.
+		if !semverTagRe.MatchString(pin) {
+			findings = append(findings, Finding{repo, FindingUnreadable,
+				fmt.Sprintf("pins ci-shared.yml@%s, which is not a published vX.Y.Z tag. "+
+					"A branch or SHA resolves to a revision this check cannot hold still, so it would "+
+					"read as current forever while the release fan-out never rewrites it", pin)})
+			continue
+		}
+		pinned, err := fetchProducer(pin)
 		if err != nil {
 			findings = append(findings, Finding{repo, FindingUnreadable,
-				fmt.Sprintf("pins ci-shared.yml@%s, which %s does not serve: %v. "+
-					"Either the tag was deleted or the pin was hand-written; every run of this repo's CI resolves it",
-					pin, ProducerRepo, err)})
+				fmt.Sprintf("pins ci-shared.yml@%s and %s did not serve it: %v. "+
+					"Every run of that repo's CI resolves this ref, so if the fetch itself is sound "+
+					"the tag is gone and its CI is already broken", pin, ProducerRepo, err)})
 			continue
 		}
 		if !bytes.Equal(pinned, reference) {

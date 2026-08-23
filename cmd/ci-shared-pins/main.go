@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -38,21 +39,25 @@ func main() {
 		os.Exit(2)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
-	defer cancel()
 
+	var code int
 	switch os.Args[1] {
 	case "audit":
-		os.Exit(audit(ctx))
+		code = audit(ctx)
 	case "plan":
 		if len(os.Args) != 3 {
+			cancel()
 			fmt.Fprintln(os.Stderr, "usage: ci-shared-pins plan <ci-shared.yml>")
 			os.Exit(2)
 		}
-		os.Exit(plan(ctx, os.Args[2]))
+		code = plan(ctx, os.Args[2])
 	default:
+		cancel()
 		fmt.Fprintf(os.Stderr, "unknown subcommand %q\n", os.Args[1])
 		os.Exit(2)
 	}
+	cancel()
+	os.Exit(code)
 }
 
 func audit(ctx context.Context) int {
@@ -146,21 +151,59 @@ func writeOutputs(bump map[string]bool) error {
 // no token - same posture as tatara-helmfile's check_skills_currency.py.
 type forgeFetcher struct{}
 
+// fetchAttempts retries the transient half of the forge. A single 429 or 5xx
+// from raw.githubusercontent otherwise renders as a Finding asserting the tag
+// is gone, and that text is what lands in the filed issue - a check that lies
+// about its cause is worse than one that says nothing. The ARC scale sets share
+// an egress IP and these fetches are anonymous, so the per-IP limit is a real
+// path. Same posture as verify-pin's `curl --retry` in release.yml.
+const fetchAttempts = 4
+
 func (forgeFetcher) File(ctx context.Context, repo, ref, path string) ([]byte, error) {
 	url := fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/%s", repo, ref, path)
+	var lastErr error
+	for attempt := 1; attempt <= fetchAttempts; attempt++ {
+		if attempt > 1 {
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("GET %s: %w (after %d attempts, last: %v)", url, ctx.Err(), attempt-1, lastErr)
+			case <-time.After(time.Duration(attempt-1) * 2 * time.Second):
+			}
+		}
+		body, retryable, err := get(ctx, url)
+		if err == nil {
+			return body, nil
+		}
+		lastErr = err
+		if !retryable {
+			return nil, err
+		}
+	}
+	return nil, fmt.Errorf("%w (still failing after %d attempts, so this is the forge, not the ref)", lastErr, fetchAttempts)
+}
+
+// get reports whether the failure is worth another attempt. A 404 is an answer
+// - the ref or the path is genuinely absent - and retrying it only delays a
+// correct Finding. A 429/5xx or a transport error is not an answer.
+func get(ctx context.Context, url string) (body []byte, retryable bool, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, true, fmt.Errorf("GET %s: %w", url, err)
 	}
 	defer resp.Body.Close() //nolint:errcheck // read-only response
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GET %s: %s", url, resp.Status)
+		transient := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
+		return nil, transient, fmt.Errorf("GET %s: %s", url, resp.Status)
 	}
-	return io.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, true, fmt.Errorf("GET %s: reading the body: %w", url, err)
+	}
+	return b, false, nil
 }
 
 func (forgeFetcher) Tags(ctx context.Context, repo string) ([]string, error) {
@@ -168,6 +211,13 @@ func (forgeFetcher) Tags(ctx context.Context, repo string) ([]string, error) {
 		"https://github.com/"+repo+".git")
 	out, err := cmd.Output()
 	if err != nil {
+		// *ExitError.Error() is bare "exit status 128"; git's reason is in
+		// Stderr and is the only part worth reading in the filed issue.
+		var exit *exec.ExitError
+		if errors.As(err, &exit) && len(exit.Stderr) > 0 {
+			return nil, fmt.Errorf("git ls-remote --tags %s: %w: %s",
+				repo, err, strings.TrimSpace(string(exit.Stderr)))
+		}
 		return nil, fmt.Errorf("git ls-remote --tags %s: %w", repo, err)
 	}
 	// `<sha>\trefs/tags/<name>`, with a `^{}`-suffixed second entry per
