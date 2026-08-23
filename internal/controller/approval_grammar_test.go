@@ -117,7 +117,7 @@ func TestAutoApprove_FailClosedMatrix(t *testing.T) {
 
 	tests := []struct {
 		name        string
-		flagOn      bool
+		ceilingOn   bool
 		mutate      func(iss *tatarav1alpha1.Issue)
 		mutateProj  func(p *tatarav1alpha1.Project)
 		wantAuto    bool
@@ -130,55 +130,55 @@ func TestAutoApprove_FailClosedMatrix(t *testing.T) {
 		wantAxis string
 	}{
 		{
-			name:     "flag on + bot + marker + open => Auto:true",
-			flagOn:   true,
-			wantAuto: true,
+			name:      "ceiling on + bot + marker + open => Auto:true",
+			ceilingOn: true,
+			wantAuto:  true,
 		},
 		{
-			name:        "flag OFF => today's behavior, refused no-maintainer",
-			flagOn:      false,
+			name:        "ceiling OFF => today's behavior, refused no-maintainer",
+			ceilingOn:   false,
 			wantRefusal: ApprovalRefusedNoMaintainer,
-			wantAxis:    AutoApproveRefusedFlagOff,
+			wantAxis:    AutoApproveRefusedCeilingOff,
 		},
 		{
 			name:        "human-authored issue is NEVER auto-approved",
-			flagOn:      true,
+			ceilingOn:   true,
 			mutate:      func(iss *tatarav1alpha1.Issue) { iss.Status.Author = "szymonrychu" },
 			wantRefusal: ApprovalRefusedNoMaintainer,
 			wantAxis:    AutoApproveRefusedNotBotAuthored,
 		},
 		{
 			name:        "unverifiable author (empty) is NEVER auto-approved",
-			flagOn:      true,
+			ceilingOn:   true,
 			mutate:      func(iss *tatarav1alpha1.Issue) { iss.Status.Author = "" },
 			wantRefusal: ApprovalRefusedNoMaintainer,
 			wantAxis:    AutoApproveRefusedNotBotAuthored,
 		},
 		{
 			name:        "empty botLogin (project has none) fails closed",
-			flagOn:      true,
+			ceilingOn:   true,
 			mutateProj:  func(p *tatarav1alpha1.Project) { p.Spec.Scm.BotLogin = "" },
 			wantRefusal: ApprovalRefusedNoMaintainer,
 			wantAxis:    AutoApproveRefusedNotBotAuthored,
 		},
 		{
 			name:        "missing marker fails closed",
-			flagOn:      true,
+			ceilingOn:   true,
 			mutate:      func(iss *tatarav1alpha1.Issue) { iss.Status.Body = "no marker here" },
 			wantRefusal: ApprovalRefusedNoMaintainer,
 			wantAxis:    AutoApproveRefusedNoMarker,
 		},
 		{
 			name:        "unknown-kind marker fails closed",
-			flagOn:      true,
+			ceilingOn:   true,
 			mutate:      func(iss *tatarav1alpha1.Issue) { iss.Status.Body = "<!-- tatara-proposed-by:followup -->\nbody" },
 			wantRefusal: ApprovalRefusedNoMaintainer,
 			wantAxis:    AutoApproveRefusedNoMarker,
 		},
 		{
-			name:     "body edited since filing (diverges from anchor) fails closed",
-			flagOn:   true,
-			wantAxis: AutoApproveRefusedAnchorMismatch,
+			name:      "body edited since filing (diverges from anchor) fails closed",
+			ceilingOn: true,
+			wantAxis:  AutoApproveRefusedAnchorMismatch,
 			mutate: func(iss *tatarav1alpha1.Issue) {
 				// Marker preserved, but the human appended scope to the body -
 				// exactly the incoming issue-edit-refresh threat. The Spec anchor
@@ -188,8 +188,8 @@ func TestAutoApprove_FailClosedMatrix(t *testing.T) {
 			wantRefusal: ApprovalRefusedNoMaintainer,
 		},
 		{
-			name:   "marker-rewrite attack (edited scope + fresh valid marker) fails closed",
-			flagOn: true,
+			name:      "marker-rewrite attack (edited scope + fresh valid marker) fails closed",
+			ceilingOn: true,
 			mutate: func(iss *tatarav1alpha1.Issue) {
 				// The attacker (forge write access) rewrites the whole body with
 				// malicious scope and a syntactically valid marker. They cannot
@@ -208,15 +208,15 @@ func TestAutoApprove_FailClosedMatrix(t *testing.T) {
 			// such Issues were live on 2026-08-18, all bot-authored, all carrying
 			// a valid marker, all with an empty spec.proposalBodyHash.
 			name:        "missing anchor (older-build proposal) fails closed",
-			flagOn:      true,
+			ceilingOn:   true,
 			mutate:      func(iss *tatarav1alpha1.Issue) { iss.Spec.ProposalBodyHash = "" },
 			wantRefusal: ApprovalRefusedNoMaintainer,
 			wantAxis:    AutoApproveRefusedAnchorMismatch,
 		},
 		{
-			name:   "the CLOSE veto: a closed bot proposal is out of scope for the carve-out",
-			flagOn: true,
-			mutate: func(iss *tatarav1alpha1.Issue) { iss.Status.State = "closed" },
+			name:      "the CLOSE veto: a closed bot proposal is out of scope for the carve-out",
+			ceilingOn: true,
+			mutate:    func(iss *tatarav1alpha1.Issue) { iss.Status.State = "closed" },
 			// The seam's out-of-scope arm answers (stored approval, true) BEFORE
 			// verifyOneIssue runs, so there is no refusal reason to assert - the
 			// evidence is nil and refusing it is verifyApprovalScope's job. This
@@ -229,8 +229,8 @@ func TestAutoApprove_FailClosedMatrix(t *testing.T) {
 			// live question and the carve-out no longer applies: with nothing cited
 			// this refuses, and it refuses for the CITATION reason, not the
 			// no-maintainer one.
-			name:   "a maintainer commented, so the carve-out no longer applies and nothing was cited",
-			flagOn: true,
+			name:      "a maintainer commented, so the carve-out no longer applies and nothing was cited",
+			ceilingOn: true,
 			mutate: func(iss *tatarav1alpha1.Issue) {
 				iss.Status.Comments = []tatarav1alpha1.Comment{
 					approvalComment("c1", "szymonrychu", "hold on, this is wrong", now, false),
@@ -242,8 +242,8 @@ func TestAutoApprove_FailClosedMatrix(t *testing.T) {
 			// And a citation of that maintainer's own words does NOT rescue it
 			// when the words are not in the comment: the anti-fabrication check
 			// runs on the carve-out path too.
-			name:   "a maintainer commented and the agent fabricated a quote",
-			flagOn: true,
+			name:      "a maintainer commented and the agent fabricated a quote",
+			ceilingOn: true,
 			mutate: func(iss *tatarav1alpha1.Issue) {
 				iss.Status.Comments = []tatarav1alpha1.Comment{
 					approvalComment("c1", "szymonrychu", "hold on, this is wrong", now, false),
@@ -256,7 +256,9 @@ func TestAutoApprove_FailClosedMatrix(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			proj, repo := approvalProject("szymonrychu"), mirrorRepo()
-			proj.Spec.AutoApproveTataraProposals = tc.flagOn
+			if tc.ceilingOn {
+				proj.Spec.AutoApproveMaxSignificance = "major"
+			}
 			if tc.mutateProj != nil {
 				tc.mutateProj(proj)
 			}
@@ -441,9 +443,9 @@ func TestAutoApproveRefusalIsExhaustiveOverTheAxes(t *testing.T) {
 	}{
 		{name: "every axis satisfied", want: ""},
 		{
-			name:       "flag off",
-			mutateProj: func(p *tatarav1alpha1.Project) { p.Spec.AutoApproveTataraProposals = false },
-			want:       AutoApproveRefusedFlagOff,
+			name:       "ceiling off",
+			mutateProj: func(p *tatarav1alpha1.Project) { p.Spec.AutoApproveMaxSignificance = tatarav1alpha1.AutoApproveOff },
+			want:       AutoApproveRefusedCeilingOff,
 		},
 		{
 			name:   "closed issue (the human veto)",
@@ -481,7 +483,7 @@ func TestAutoApproveRefusalIsExhaustiveOverTheAxes(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			proj, repo := approvalProject("szymonrychu"), mirrorRepo()
-			proj.Spec.AutoApproveTataraProposals = true
+			proj.Spec.AutoApproveMaxSignificance = "major"
 			if tc.mutateProj != nil {
 				tc.mutateProj(proj)
 			}

@@ -149,6 +149,27 @@ type gateResponse struct {
 	// something distinct from "reason empty".
 	Reason   string `json:"reason,omitempty"`
 	Declared string `json:"declared"`
+	// Guidance is the REMEDY for Reason (#639). The reason is a Prometheus label
+	// and a closed constant; it names the fault and says nothing about what to do
+	// next, and the two are genuinely different per reason - plan-note-not-plan is
+	// fixed in the same turn, no-maintainer-comment cannot be fixed at all. It is
+	// derived server-side from a total map (controller.ApprovalRefusalGuidance) so
+	// the cli holds no second copy of this vocabulary.
+	Guidance string `json:"guidance"`
+}
+
+// gateGrantedResponse is the 200 the GRANT returns.
+//
+// THE GRANT USED TO RETURN A BARE TASK DTO with no `granted` key at all, while
+// both the implement prompt and tatara-implement-gate's SKILL.md tell the agent
+// to branch on one. An agent that cannot tell a grant from a refusal by reading
+// the documented field is an agent that guesses, and #639's ask is that every
+// tool output - confirming AND denying - guides it. The Task DTO is preserved
+// verbatim under `task` so nothing that read it loses anything.
+type gateGrantedResponse struct {
+	Granted  bool    `json:"granted"`
+	Guidance string  `json:"guidance"`
+	Task     TaskDTO `json:"task"`
 }
 
 type reviewedSHA struct {
@@ -1111,6 +1132,27 @@ func (o *outcomeCtx) ok(action string, fields ...any) {
 	writeJSON(o.w, http.StatusOK, toTaskDTO(*fresh))
 }
 
+// okGranted is ok for the ONE outcome that answers a gate question with a yes:
+// same logging, same counter, a body the agent can branch on. See
+// gateGrantedResponse.
+func (o *outcomeCtx) okGranted(action string, fields ...any) {
+	ctx := o.r.Context()
+	fresh, err := o.s.getTaskCR(ctx, o.task.Name)
+	if err != nil {
+		writeClientErr(o.w, err)
+		return
+	}
+	obs.RestOutcomeAcceptedTotal.WithLabelValues(o.kind, action).Inc()
+	o.s.log.InfoContext(ctx, "restapi: outcome accepted",
+		append(append(reqLogFields(o.r), "action", "submit_outcome", "task", o.task.Name,
+			"kind", o.kind, "outcome", action, "state", fresh.Status.State), fields...)...)
+	writeJSON(o.w, http.StatusOK, gateGrantedResponse{
+		Granted:  true,
+		Guidance: controller.ApprovalGrantGuidance(),
+		Task:     toTaskDTO(*fresh),
+	})
+}
+
 // note records an agent-authored note in the same status write as the
 // transition. The writer is ALWAYS status.agentKind: an agent can never produce
 // agent="operator".
@@ -1193,6 +1235,21 @@ func (o *outcomeCtx) implement(p implementPayload) {
 				return
 			}
 			o.refuseGate(controller.ApprovalRefusedPlanHashMismatch, "")
+			return
+		}
+		// THE APPROVAL SHIP GATE (#639), and the ONE place the severity ceiling
+		// can bite: change_significance does not exist on any earlier wire, so an
+		// auto-approved Issue's grant stays provisional until here.
+		//
+		// It runs on `submitted` only. A `declined` stays ungated - an agent that
+		// cannot get approval has to be able to say so and terminate, and refusing
+		// the decline wedges the Task at no-outcome instead.
+		//
+		// IT DOES NOT PARK AND IT DOES NOT TRANSITION. The pod is alive, the
+		// branch is pushed and the work is intact; the agent is told which issues
+		// are holding it and keeps talking.
+		if blockers := s.shipVerdict(ctx, o.proj, o.task, p.ChangeSignificance); len(blockers) > 0 {
+			s.refuseApprovalRequired(o.w, o.r, o.task, "submit_outcome(action=submitted)", blockers)
 			return
 		}
 	}
@@ -1690,7 +1747,11 @@ func (s *Server) recordCIRedRefusal(ctx context.Context, r *http.Request,
 
 // --- review ---------------------------------------------------------------
 
-var significanceRank = map[string]int{"patch": 1, "minor": 2, "major": 3}
+// significanceRank is the ONE table (#639), no longer a private copy. The
+// auto-approve severity ceiling ranks the same three levels, and a ceiling of
+// `minor` that admitted a `major` because two tables disagreed would release
+// exactly the change the ceiling exists to hold.
+var significanceRank = tatarav1alpha1.SignificanceRank
 
 func (o *outcomeCtx) review(p reviewPayload) {
 	ctx := o.r.Context()
@@ -2251,7 +2312,7 @@ func (o *outcomeCtx) gate(p implementPayload) {
 	}
 	// len(evidence), not len(issues): the map holds exactly the IN-SCOPE Issues
 	// that produced evidence, which is what this outcome actually approved.
-	o.ok("approved", "issues", len(evidence))
+	o.okGranted("approved", "issues", len(evidence))
 }
 
 // planPinRefusal reports whether the plan note the gate pinned at grant no
@@ -2296,7 +2357,12 @@ func (o *outcomeCtx) refuseGate(reason, declared string) {
 	o.s.log.InfoContext(o.r.Context(), "restapi: gate refused",
 		append(reqLogFields(o.r), "action", "submit_outcome", "task", o.task.Name,
 			"kind", o.kind, "outcome", "gate-refused", "reason", reason, "declared", declared)...)
-	writeJSON(o.w, http.StatusOK, gateResponse{Granted: false, Reason: reason, Declared: declared})
+	writeJSON(o.w, http.StatusOK, gateResponse{
+		Granted:  false,
+		Reason:   reason,
+		Declared: declared,
+		Guidance: controller.ApprovalRefusalGuidance(reason),
+	})
 }
 
 // planNote resolves THE plan note the pin applies to, and it is THE ONE
@@ -2908,12 +2974,19 @@ func (s *Server) mintGateTask(ctx context.Context, proj *tatarav1alpha1.Project,
 // capacity. MintParked emits no park counter, so this mint does not pollute the
 // park-rate alert.
 //
-// WHY THE FLAG FLIPS IT: with autoApproveTataraProposals ON, the approval
-// carve-out grants that agent WITHOUT any maintainer comment, so parking it
-// would hold the Task for a comment the project has declared unnecessary. The
-// flag-on path is byte-for-byte today's behaviour.
+// WHY THE CEILING FLIPS IT: with autoApproveMaxSignificance above `off`, the
+// approval carve-out grants that agent WITHOUT any maintainer comment, so parking
+// it would hold the Task for a comment the project has declared unnecessary.
+//
+// IT READS THE CEILING AS A BOOLEAN, WHICH IS CORRECT HERE. The LEVEL cannot be
+// known at mint - the proposal has no diff yet, let alone a declared
+// change_significance - so the only question this site can answer is whether the
+// carve-out can fire at all. A proposal minted live on a `patch` project that
+// turns out to be a `major` is refused later, at submit, by ApprovalShipVerdict:
+// the Task spends a pod discovering that, which is the price of not knowing the
+// size until the work exists.
 func gateTaskMintParkReason(proj *tatarav1alpha1.Project) string {
-	if proj.Spec.AutoApproveTataraProposals {
+	if tatarav1alpha1.AutoApproveCeiling(proj) != tatarav1alpha1.AutoApproveOff {
 		return ""
 	}
 	return stage.ReasonBacklogSweep

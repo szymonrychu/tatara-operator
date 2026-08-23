@@ -38,7 +38,7 @@ func cmt(id, author, body string, bot bool, at time.Time) tatarav1alpha1.Comment
 func citProject(botLogin string, maintainers ...string) *tatarav1alpha1.Project {
 	p := mirrorProject(botLogin)
 	p.Spec.Scm.MaintainerLogins = maintainers
-	p.Spec.AutoApproveTataraProposals = true
+	p.Spec.AutoApproveMaxSignificance = "major"
 	return p
 }
 

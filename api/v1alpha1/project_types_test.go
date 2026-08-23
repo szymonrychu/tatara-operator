@@ -42,10 +42,13 @@ func TestProjectFields(t *testing.T) {
 	}
 }
 
-func TestProjectSpec_AutoApproveTataraProposals_DefaultsFalse(t *testing.T) {
+func TestProjectSpec_AutoApproveMaxSignificance_ZeroValueReadsOff(t *testing.T) {
 	var s v1alpha1.ProjectSpec
-	if s.AutoApproveTataraProposals {
-		t.Fatal("AutoApproveTataraProposals must be zero-value false")
+	if s.AutoApproveMaxSignificance != "" {
+		t.Fatalf("AutoApproveMaxSignificance must be zero-value empty, got %q", s.AutoApproveMaxSignificance)
+	}
+	if got := v1alpha1.AutoApproveCeiling(&v1alpha1.Project{Spec: s}); got != v1alpha1.AutoApproveOff {
+		t.Fatalf("the zero value must read as off, got %q", got)
 	}
 }
 

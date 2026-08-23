@@ -537,6 +537,42 @@ func issueV2(repo string, number int, owner string, opts ...func(*tatarav1alpha1
 	return iss
 }
 
+// approvedIssueV2 is issueV2 that has PASSED the gate on a maintainer's citation.
+//
+// IT IS THE DEFAULT FIXTURE FOR ANY TEST THAT SHIPS (#639). mr_write(action=open)
+// and submit_outcome(action=submitted) now read Issue.status.approval through
+// controller.ApprovalShipVerdict, so a bare issueV2 - live, no evidence - is the
+// shape those two REFUSE. Reach for issueV2 when the test is about the refusal
+// and for this when the approval is incidental to what is being asserted.
+func approvedIssueV2(repo string, number int, owner string, opts ...func(*tatarav1alpha1.Issue)) *tatarav1alpha1.Issue {
+	return issueV2(repo, number, owner, append([]func(*tatarav1alpha1.Issue){
+		func(i *tatarav1alpha1.Issue) {
+			i.Status.Status = "approved"
+			i.Status.Approval = &tatarav1alpha1.ApprovalEvidence{
+				Login: "szymonrychu", CommentID: "c1", Phrase: "go ahead",
+				CreatedAt: metav1.NewTime(frozenNow),
+			}
+		},
+	}, opts...)...)
+}
+
+// autoApprovedIssueV2 carries the carve-out's evidence instead: no comment, the
+// sentinel login, Auto set. This is the ONLY shape the severity ceiling applies
+// to.
+func autoApprovedIssueV2(repo string, number int, owner string, opts ...func(*tatarav1alpha1.Issue)) *tatarav1alpha1.Issue {
+	return issueV2(repo, number, owner, append([]func(*tatarav1alpha1.Issue){
+		func(i *tatarav1alpha1.Issue) {
+			i.Status.Author = "tatara-bot"
+			i.Status.Body = tatarav1alpha1.StampProposalMarker("body", tatarav1alpha1.ProposalKindBrainstorm)
+			i.Spec.ProposalBodyHash = tatarav1alpha1.ComputeProposalContentHash(i.Status.Body)
+			i.Status.Status = "approved"
+			i.Status.Approval = &tatarav1alpha1.ApprovalEvidence{
+				Auto: true, Login: tatarav1alpha1.AutoApproveLogin, CreatedAt: metav1.NewTime(frozenNow),
+			}
+		},
+	}, opts...)...)
+}
+
 func mrV2(repo string, number int, owner string, opts ...func(*tatarav1alpha1.MergeRequest)) *tatarav1alpha1.MergeRequest {
 	now := metav1.NewTime(frozenNow.Add(-2 * time.Hour))
 	mr := &tatarav1alpha1.MergeRequest{
@@ -1599,7 +1635,7 @@ func TestMROpen_SecondMRAfterMergeIsAllowedWhenAnOpenIssueIsUncovered(t *testing
 	e := buildV2(t, v2Opts{writer: forge}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-cli", "tatara"),
 		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
-		merged, issueV2("tatara-cli", 32, "t1"))
+		merged, approvedIssueV2("tatara-cli", 32, "t1"))
 
 	w := e.do(t, http.MethodPost, "/projects/tatara/scm/mr-write",
 		`{"task":"t1","action":"open","repo":"tatara-cli","title":"T","body":"B"}`)
@@ -1634,7 +1670,7 @@ func TestMROpen_SecondMRAfterMergeIsRefusedWhenNothingIsOutstanding(t *testing.T
 			return issueV2("tatara-cli", 32, "t1", func(i *tatarav1alpha1.Issue) { i.Status.Status = "rejected" })
 		}},
 		{"the only open issue belongs to another repo", func() *tatarav1alpha1.Issue {
-			return issueV2("charts", 32, "t1")
+			return approvedIssueV2("charts", 32, "t1")
 		}},
 	}
 	for _, tc := range tests {
@@ -1708,7 +1744,7 @@ func TestMROpen_ExistingOpenMROnADifferentHeadIsStillRefused(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: forge}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-cli", "tatara"),
 		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
-		other, issueV2("tatara-cli", 32, "t1"))
+		other, approvedIssueV2("tatara-cli", 32, "t1"))
 
 	w := e.do(t, http.MethodPost, "/projects/tatara/scm/mr-write",
 		`{"task":"t1","action":"open","repo":"tatara-cli","title":"T","body":"B"}`)

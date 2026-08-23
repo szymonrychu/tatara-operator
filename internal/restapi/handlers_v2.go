@@ -1647,6 +1647,30 @@ func (s *Server) mrOpen(w http.ResponseWriter, r *http.Request, proj *tatarav1al
 		}
 	}
 
+	// THE APPROVAL SHIP GATE (#639). Until this read, mrOpen never looked at
+	// Issue.status.approval at all: an implement agent that skipped the gate
+	// entirely - or that was REFUSED by it and wrote the code anyway - still
+	// opened the PR, and neither the reviewer nor the merge corridor downstream
+	// has an approval check of its own. This is what makes "work done before the
+	// gate grants is LOST" a fact rather than an instruction: there is nowhere
+	// for those commits to go.
+	//
+	// IT SITS AFTER THE IDEMPOTENCY CLAUSE ON PURPOSE. That clause is a READ of
+	// an MR that already exists and reaches no forge; a TTL-stopped pod resuming
+	// needs the number of the MR it already has, and refusing it strands the
+	// Task with no way to learn it. Everything BELOW this point either opens a
+	// new merge request or refuses.
+	//
+	// significance is EMPTY here: change_significance does not exist on this
+	// wire. The severity ceiling is therefore enforced at submit_outcome
+	// (action=submitted) and this call only enforces the two evidence blockers.
+	if shipGateApplies(task) {
+		if blockers := controller.ApprovalShipVerdict(ctx, s.c, proj, issues, ""); len(blockers) > 0 {
+			s.refuseApprovalRequired(w, r, task, "mr_write(action=open)", blockers)
+			return
+		}
+	}
+
 	// A FOLLOW-ON open must still owe something this repo can carry. Without
 	// this the relaxation above is a licence to open one merge request per turn.
 	// The FIRST open for a repo is ungated on purpose: there is nothing to

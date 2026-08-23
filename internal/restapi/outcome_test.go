@@ -871,14 +871,15 @@ func TestOutcome_Review_RecordsReviewOutcomeMetric(t *testing.T) {
 // --- gate (#521 folded the clarify kind's decision=implement into implement's
 // action=approved|discuss|rejected gate) -----------------------------------
 
-// gateResponseDTO decodes the folded gate's 200 refusal body
-// ({"granted":false,"reason":...,"declared":...}). A GRANT does not use this
-// shape at all: it returns the plain Task DTO, same as every other accepted
-// outcome.
+// gateResponseDTO decodes the folded gate's 200 body. Both answers now carry
+// `granted` and `guidance` (#639): the GRANT used to return a bare Task DTO with
+// no `granted` key at all, though the prompt and the skill both tell the agent to
+// read one. On a grant the Task DTO moves under `task`.
 type gateResponseDTO struct {
 	Granted  bool   `json:"granted"`
 	Reason   string `json:"reason"`
 	Declared string `json:"declared"`
+	Guidance string `json:"guidance"`
 }
 
 // gatePlanNoteBody / gatePlanNoteAt / gatePlanNoteID are the fixed plan note
@@ -2088,13 +2089,15 @@ func TestOutcome_Brainstorm_ProposeSpawnsAGateTaskPerProposal(t *testing.T) {
 	}
 }
 
-// The mint park is the MIRROR of the approval carve-out, so a project that has
-// autoApproveTataraProposals ON keeps today's behaviour byte for byte: the gate
-// Task mints UN-parked, triage routes it to `refined`, and the agent that runs
-// there is granted by autoApproveApplies without a maintainer comment.
+// The mint park is the MIRROR of the approval carve-out, so a project whose
+// autoApproveMaxSignificance is above `off` keeps today's behaviour byte for
+// byte: the gate Task mints UN-parked, triage routes it to `refined`, and the
+// agent that runs there is granted by autoApproveApplies without a maintainer
+// comment. The ceiling is read as a BOOLEAN here - the level cannot be known
+// before the work exists - and settled at submit by ApprovalShipVerdict.
 func TestOutcome_Brainstorm_ProposedGateTaskIsLiveWhenAutoApproveIsOn(t *testing.T) {
 	proj := projectV2("tatara")
-	proj.Spec.AutoApproveTataraProposals = true
+	proj.Spec.AutoApproveMaxSignificance = "minor"
 	e := buildV2(t, v2Opts{}, proj, scmSecretV2(), repoV2("tatara-operator", "tatara"),
 		taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StateRefined, "brainstorm"))
 

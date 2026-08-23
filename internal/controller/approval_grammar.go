@@ -154,11 +154,16 @@ var ApprovalRefusals = []string{
 // action=auto_approve_refused INFO log. Like ApprovalRefusals they are a CLOSED,
 // Prometheus-label-safe vocabulary; the empty string is the GRANT.
 const (
-	// AutoApproveRefusedFlagOff: the Project has autoApproveTataraProposals
-	// false, which is the default and is exactly the pre-carve-out behaviour.
-	// The remedy is a Project config change, and it is the only axis whose
-	// remedy is a decision rather than a repair.
-	AutoApproveRefusedFlagOff = "flag-off"
+	// AutoApproveRefusedCeilingOff: the Project's autoApproveMaxSignificance is
+	// `off` - the default, and exactly the pre-carve-out behaviour. The remedy is
+	// a Project config change, and it is the only axis whose remedy is a decision
+	// rather than a repair.
+	//
+	// IT IS THE ONLY CEILING CHECK IN THIS FILE, and deliberately so. The other
+	// three ceiling values grant HERE and are re-checked at submit against the
+	// declared change_significance (ApprovalShipVerdict), because that level does
+	// not exist on the wire until submit_outcome(action=submitted).
+	AutoApproveRefusedCeilingOff = "ceiling-off"
 	// AutoApproveRefusedNotInScope: the Issue is closed, done or rejected. On
 	// the production path this is UNREACHABLE - VerifyApprovalDeclared returns
 	// on the same predicate first - and it is kept because autoApproveApplies
@@ -195,7 +200,7 @@ const (
 // AutoApproveRefusals is the CLOSED axis vocabulary, in the order
 // autoApproveRefusal evaluates them.
 var AutoApproveRefusals = []string{
-	AutoApproveRefusedFlagOff,
+	AutoApproveRefusedCeilingOff,
 	AutoApproveRefusedNotInScope,
 	AutoApproveRefusedNotBotAuthored,
 	AutoApproveRefusedNoMarker,
@@ -452,11 +457,15 @@ func verifyOneIssue(iss *tatarav1alpha1.Issue, proj *tatarav1alpha1.Project,
 	}, ""
 }
 
-// autoApproveApplies is the autoApproveTataraProposals carve-out predicate, and
-// EVERY branch of it is a security gate on the last human veto before prod. It is
-// fail-closed on all four axes and grants auto-approval ONLY when every one holds:
+// autoApproveApplies is the auto-approve carve-out predicate, and EVERY branch of
+// it is a security gate on the last human veto before prod. It is fail-closed on
+// all four axes and grants auto-approval ONLY when every one holds:
 //
-//  1. the per-project flag is on (default false => exactly today's behavior);
+//  1. the per-project ceiling autoApproveMaxSignificance is above `off` (the
+//     default => exactly the pre-carve-out behaviour). This is a BINARY test
+//     here: the ceiling's LEVEL is enforced at submit, by ApprovalShipVerdict,
+//     because change_significance does not exist yet at gate time. A grant on
+//     this path is therefore PROVISIONAL - see ApprovalShipVerdict;
 //  2. the Issue is in scope - open, not done/rejected. A human's CLOSE is the
 //     veto, and a closed Issue is refused here even though the callers already
 //     filter it, so the security decision is self-contained, not caller-trusting;
@@ -502,12 +511,12 @@ func autoApproveApplies(iss *tatarav1alpha1.Issue, proj *tatarav1alpha1.Project,
 // is routinely reaped before anyone looks.
 //
 // THE AXES ARE ORDERED CHEAPEST-AND-MOST-STRUCTURAL FIRST, so the reported axis
-// is the most actionable one: a project with the flag off is reported as
-// flag-off even if its issue is also anchorless, because turning the flag on is
-// the thing to do first.
+// is the most actionable one: a project whose ceiling is off is reported as
+// ceiling-off even if its issue is also anchorless, because raising the ceiling
+// is the thing to do first.
 func autoApproveRefusal(iss *tatarav1alpha1.Issue, proj *tatarav1alpha1.Project, botLogin string) string {
-	if !proj.Spec.AutoApproveTataraProposals {
-		return AutoApproveRefusedFlagOff
+	if tatarav1alpha1.AutoApproveCeiling(proj) == tatarav1alpha1.AutoApproveOff {
+		return AutoApproveRefusedCeilingOff
 	}
 	if !ApprovalInScope(iss) {
 		return AutoApproveRefusedNotInScope
