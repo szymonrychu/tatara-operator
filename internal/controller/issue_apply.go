@@ -417,7 +417,7 @@ func stampDeclinedAt(ctx context.Context, c client.Client, task *tatarav1alpha1.
 // mirror keeps its Spec.ProposalBodyHash, so a proposal CLOSED WITH NO
 // maintainer comment and then reopened still satisfies autoApproveApplies'
 // anchor factor. Pre-O9 the reopen re-minted an anchorless CR, which failed that
-// factor closed. Under autoApproveTataraProposals a triage-role reopen can
+// factor closed. Under the auto-approve carve-out a triage-role reopen can
 // therefore resurrect a proposal a maintainer vetoed by closing it silently. The
 // anchor is unforgeable and the reopen is still an attributable forge action by
 // an allowed reporter, so this is defensible - but it is a real widening of the

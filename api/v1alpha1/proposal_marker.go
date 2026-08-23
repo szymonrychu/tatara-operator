@@ -9,7 +9,7 @@ import (
 	"strings"
 )
 
-// The provenance surface for autoApproveTataraProposals (project_types.go). A
+// The provenance surface for the auto-approve carve-out (autoApproveMaxSignificance, project_types.go). A
 // tatara-proposed issue - a brainstorm proposal or an incident tracker issue the
 // operator filed under the bot account - carries an HTML-comment marker in its
 // body naming WHICH self-proposal path produced it. The marker is provenance
@@ -26,7 +26,7 @@ import (
 // post-filing body changes, not just the naive ones.
 const (
 	// AutoApproveLogin is the sentinel Login stamped on ApprovalEvidence when the
-	// autoApproveTataraProposals path grants approval (CommentID is then empty).
+	// auto-approve carve-out path grants approval (CommentID is then empty).
 	// It is NOT a real forge account and can never be a maintainer, so it can
 	// never satisfy the human approval citation check by accident.
 	AutoApproveLogin = "<tatara:auto>"

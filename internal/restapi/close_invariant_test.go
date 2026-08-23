@@ -91,7 +91,7 @@ func TestMROpen_StripsClosesWhileASiblingPRIsOpen(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: forge}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"), repoV2("charts", "tatara"),
 		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
-		issueV2("tatara-operator", 48, "t1"),
+		approvedIssueV2("tatara-operator", 48, "t1"),
 		mrV2("charts", 9, "t1")) // the SIBLING, still open
 
 	w := e.do(t, http.MethodPost, "/projects/tatara/scm/mr-write",
@@ -110,7 +110,7 @@ func TestMROpen_KeepsClosesForTheOnlyPR(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: forge}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
 		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
-		issueV2("tatara-operator", 48, "t1"))
+		approvedIssueV2("tatara-operator", 48, "t1"))
 
 	w := e.do(t, http.MethodPost, "/projects/tatara/scm/mr-write",
 		`{"task":"t1","action":"open","repo":"tatara-operator","title":"T","body":"Work.\n\nCloses #48"}`)

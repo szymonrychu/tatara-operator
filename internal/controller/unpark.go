@@ -68,7 +68,7 @@ import (
 // never against a record.
 //
 // ONE CARVE-OUT, AND IT NEVER FIRES FROM HERE. Under
-// Project.spec.AutoApproveTataraProposals, a bot-authored, anchor-verified
+// Project.spec.autoApproveMaxSignificance above `off`, a bot-authored, anchor-verified
 // proposal with ZERO maintainer comments auto-approves (autoApproveApplies /
 // autoApprovalEvidence, approval_grammar.go) - a deliberate, narrowly gated
 // exception, not a gap this driver introduces. autoApproveApplies sits inside

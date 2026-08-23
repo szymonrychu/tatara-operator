@@ -50,11 +50,15 @@ import (
 
 // Approval refusal reasons. They name what the OPERATOR could not establish -
 // never what the comment meant, which is the agent's job. They are the `reason`
-// label on operator_approval_refused_total and the `reason` field of the
-// action=approval_refused INFO log. NOTHING renders them to the human: the
-// refusal parks the Task at identity-unverified and the operator posts no
-// comment saying why (ApprovalRefusedComment, which did, had no production
-// caller and was deleted with the wordlist).
+// label on operator_approval_refused_total, the `reason` field of the
+// action=approval_refused INFO log, and the `reason` key of the 200 refusal
+// body.
+//
+// NOTHING RENDERS THEM TO THE HUMAN, and nothing should: they are diagnostic
+// labels, not prose. What reaches the AGENT alongside the reason is
+// ApprovalRefusalGuidance (approval_ship.go), a total map from reason to the
+// next step - because the reason names the fault and says nothing about the
+// remedy, and the remedies differ per reason.
 const (
 	// ApprovalRefusedNoMaintainer: there is no maintainer-authored, non-bot
 	// comment on the thread at all, and the auto-approve carve-out does not apply.
@@ -94,10 +98,10 @@ const (
 	// be fine and the declared login is what is wrong. This is the
 	// reporter-self-approval case, made legible.
 	//
-	// IT IS GATED ON declared != "". On the autoApproveTataraProposals path the
+	// IT IS GATED ON declared != "". On the auto-approve carve-out path the
 	// field is legitimately absent and ev.Login is the <tatara:auto> sentinel;
-	// ungated, this refusal would kill every auto-approved proposal on the two
-	// Projects that have the flag on.
+	// ungated, this refusal would kill every auto-approved proposal on every
+	// Project whose autoApproveMaxSignificance is above `off`.
 	ApprovalRefusedApproverNotMaintainer = "approver-not-maintainer"
 	// ApprovalRefusedApproverMismatch: the declared approver is not the author
 	// of the comment that was cited. This is what stops the username becoming a
@@ -154,11 +158,16 @@ var ApprovalRefusals = []string{
 // action=auto_approve_refused INFO log. Like ApprovalRefusals they are a CLOSED,
 // Prometheus-label-safe vocabulary; the empty string is the GRANT.
 const (
-	// AutoApproveRefusedFlagOff: the Project has autoApproveTataraProposals
-	// false, which is the default and is exactly the pre-carve-out behaviour.
-	// The remedy is a Project config change, and it is the only axis whose
-	// remedy is a decision rather than a repair.
-	AutoApproveRefusedFlagOff = "flag-off"
+	// AutoApproveRefusedCeilingOff: the Project's autoApproveMaxSignificance is
+	// `off` - the default, and exactly the pre-carve-out behaviour. The remedy is
+	// a Project config change, and it is the only axis whose remedy is a decision
+	// rather than a repair.
+	//
+	// IT IS THE ONLY CEILING CHECK IN THIS FILE, and deliberately so. The other
+	// three ceiling values grant HERE and are re-checked at submit against the
+	// declared change_significance (ApprovalShipVerdict), because that level does
+	// not exist on the wire until submit_outcome(action=submitted).
+	AutoApproveRefusedCeilingOff = "ceiling-off"
 	// AutoApproveRefusedNotInScope: the Issue is closed, done or rejected. On
 	// the production path this is UNREACHABLE - VerifyApprovalDeclared returns
 	// on the same predicate first - and it is kept because autoApproveApplies
@@ -195,7 +204,7 @@ const (
 // AutoApproveRefusals is the CLOSED axis vocabulary, in the order
 // autoApproveRefusal evaluates them.
 var AutoApproveRefusals = []string{
-	AutoApproveRefusedFlagOff,
+	AutoApproveRefusedCeilingOff,
 	AutoApproveRefusedNotInScope,
 	AutoApproveRefusedNotBotAuthored,
 	AutoApproveRefusedNoMarker,
@@ -333,7 +342,7 @@ func quoteOccursIn(body, quoted string) (string, bool) {
 // The caller has already established the Issue is in scope (ApprovalInScope).
 // An Issue that ALREADY CARRIES VALID EVIDENCE is approved: clause (2) asks
 // whether every live Issue CARRIES evidence, not whether it can be re-derived
-// right now. That idempotence keeps the autoApproveTataraProposals path
+// right now. That idempotence keeps the auto-approve carve-out path
 // (ApprovalEvidence{Auto: true, CommentID: ""}) alive and stops a maintainer's
 // later "thanks!" from REVOKING an approval already given.
 func verifyOneIssue(iss *tatarav1alpha1.Issue, proj *tatarav1alpha1.Project,
@@ -353,7 +362,7 @@ func verifyOneIssue(iss *tatarav1alpha1.Issue, proj *tatarav1alpha1.Project,
 		}
 	}
 	if !maintainerSpoke {
-		// THE AUTO-APPROVE CARVE-OUT (autoApproveTataraProposals). It sits ONLY
+		// THE AUTO-APPROVE CARVE-OUT (autoApproveMaxSignificance above `off`). It sits ONLY
 		// in the no-maintainer-comment arm on purpose: there is no comment to
 		// cite, which is exactly why the citation fields are NOT unconditionally
 		// required. A maintainer who DID comment falls through below and blocks
@@ -409,7 +418,7 @@ func verifyOneIssue(iss *tatarav1alpha1.Issue, proj *tatarav1alpha1.Project,
 	// checks need the cited comment in hand.
 	//
 	// BOTH ARE SKIPPED ENTIRELY WHEN declared == "". That is not laxity, it is
-	// the autoApproveTataraProposals carve-out: on that path there is no comment
+	// the auto-approve carve-out: on that path there is no comment
 	// author to name, the field is legitimately absent, and refusing here would
 	// make the carve-out unreachable on the two Projects that have it live. The
 	// PAIR RULE in restapi's gate is what stops an agent simply omitting the
@@ -452,11 +461,15 @@ func verifyOneIssue(iss *tatarav1alpha1.Issue, proj *tatarav1alpha1.Project,
 	}, ""
 }
 
-// autoApproveApplies is the autoApproveTataraProposals carve-out predicate, and
-// EVERY branch of it is a security gate on the last human veto before prod. It is
-// fail-closed on all four axes and grants auto-approval ONLY when every one holds:
+// autoApproveApplies is the auto-approve carve-out predicate, and EVERY branch of
+// it is a security gate on the last human veto before prod. It is fail-closed on
+// all four axes and grants auto-approval ONLY when every one holds:
 //
-//  1. the per-project flag is on (default false => exactly today's behavior);
+//  1. the per-project ceiling autoApproveMaxSignificance is above `off` (the
+//     default => exactly the pre-carve-out behaviour). This is a BINARY test
+//     here: the ceiling's LEVEL is enforced at submit, by ApprovalShipVerdict,
+//     because change_significance does not exist yet at gate time. A grant on
+//     this path is therefore PROVISIONAL - see ApprovalShipVerdict;
 //  2. the Issue is in scope - open, not done/rejected. A human's CLOSE is the
 //     veto, and a closed Issue is refused here even though the callers already
 //     filter it, so the security decision is self-contained, not caller-trusting;
@@ -502,12 +515,12 @@ func autoApproveApplies(iss *tatarav1alpha1.Issue, proj *tatarav1alpha1.Project,
 // is routinely reaped before anyone looks.
 //
 // THE AXES ARE ORDERED CHEAPEST-AND-MOST-STRUCTURAL FIRST, so the reported axis
-// is the most actionable one: a project with the flag off is reported as
-// flag-off even if its issue is also anchorless, because turning the flag on is
-// the thing to do first.
+// is the most actionable one: a project whose ceiling is off is reported as
+// ceiling-off even if its issue is also anchorless, because raising the ceiling
+// is the thing to do first.
 func autoApproveRefusal(iss *tatarav1alpha1.Issue, proj *tatarav1alpha1.Project, botLogin string) string {
-	if !proj.Spec.AutoApproveTataraProposals {
-		return AutoApproveRefusedFlagOff
+	if tatarav1alpha1.AutoApproveCeiling(proj) == tatarav1alpha1.AutoApproveOff {
+		return AutoApproveRefusedCeilingOff
 	}
 	if !ApprovalInScope(iss) {
 		return AutoApproveRefusedNotInScope
