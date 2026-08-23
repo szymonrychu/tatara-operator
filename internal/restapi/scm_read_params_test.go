@@ -172,12 +172,14 @@ func TestScmRead_MRs_CarriesCreatedAtAndUpdatedAt(t *testing.T) {
 // cli-side mapping is pinned by tools_scm_test.go.
 //
 // The table is hand-written, so a parameter added to the cli schema and dropped
-// by a handler is invisible to it unless someone adds the row. tatara-cli guards
-// its own half by deriving the arg set from the in-package schema literal; the
-// operator cannot (separate module, internal package, and it deliberately does
-// not fetch the published manifest - see the note above). The analogue is the
-// COUNT, exactly as AgentVisibleTools is pinned by
-// TestAgentVisibleToolsIsSortedUniqueAndToolShaped: see
+// by a handler is invisible to it unless someone adds the row. Two drifts, two
+// guards: an ADDED schema property is caught by deriving the expected set from
+// the schema, a DELETED row only by pinning the row COUNT. tatara-cli runs both
+// (its schema literal is in-package); the operator can only count, because it
+// cannot derive - separate module, internal package, and it deliberately does
+// not fetch the published manifest, see the note above. The count is the
+// AgentVisibleTools idiom, pinned exactly as
+// TestAgentVisibleToolsIsSortedUniqueAndToolShaped does: see
 // TestScmRead_AdvertisedParamCountIsPinned.
 type scmParamCase struct {
 	kind  string
