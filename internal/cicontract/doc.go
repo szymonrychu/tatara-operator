@@ -43,6 +43,25 @@
 // in any of the four repos #556 measured. The gate's SHAPE was correct and its
 // REACH was zero, and nothing in this package could tell the difference.
 //
+// AND THE PIN IS ONLY HALF OF IT. A consumer can run the newest ci-shared.yml
+// with the gate switched off - `enable-image-verify: false` in its own caller -
+// and a content comparison cannot see that either, because ci-shared.yml at
+// that pin is byte-identical either way. Same shape, same zero reach, one line
+// further out. So Audit also reports a consumer that opts out unless
+// ImageVerifyExempt names it and says why, which is what makes an opt-out a
+// diff against THIS repo instead of a line in a caller nobody reads.
+//
+// One repo is exempt today and its reason is the general one: tatara-claude-
+// code-wrapper's Dockerfile pulls a private Harbor base image, image-verify
+// passes no `--opt target=` so the whole graph is always solved, and this job
+// holds no registry credentials. That last part is the CONSTRAINT, not an
+// oversight - it is on the forbidden list above, the only Harbor credentials in
+// this workflow are the PUSH ones, and on pull_request the CALLER is taken from
+// the PR head, so a PR could edit the job that handles them. A gate is not
+// worth a push credential on a PR-editable path. Closing it needs a pull-only
+// credential or an anonymously pullable base image: a registry decision, not a
+// workflow edit.
+//
 // fleetpins.go is the half that can: it resolves each consumer's pin and
 // compares the ci-shared.yml at that ref against a reference BY CONTENT. It
 // takes a Fetcher rather than doing I/O, so `make test` stays offline; the

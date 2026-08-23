@@ -57,7 +57,46 @@ type FindingKind string
 const (
 	FindingStale      FindingKind = "stale"
 	FindingUnreadable FindingKind = "unreadable"
+	FindingGateDark   FindingKind = "gate-dark"
 )
+
+// ImageVerifyExempt are the consumers allowed to run with the pull_request
+// Dockerfile compile switched off, each mapped to why. Anything not in here
+// that sets `enable-image-verify: false` is a Finding.
+//
+// This map is the forcing function, and it is here rather than in the caller on
+// purpose. A pin that reaches the fleet is only half of #640; the other half is
+// a consumer running the current job graph with the gate off, which Audit's
+// content comparison cannot see, because ci-shared.yml at that pin is
+// byte-identical either way. An opt-out written only as `false` in a caller
+// nobody reads is #640's shape - correct shape, zero reach - one line further
+// out. Written here, it is next to the fleet contract, it must carry a reason,
+// and adding a second one is a diff against this repo.
+var ImageVerifyExempt = map[string]string{
+	// Dockerfile:57 is `FROM harbor.szymonrichert.pl/containers/tatara-cli:
+	// ${TATARA_CLI_VERSION}`, a private registry, and image-verify passes no
+	// `--opt target=`, so buildkit solves the whole graph and always reaches
+	// it. Probed on PR #186 at v3.10.0: `401 Unauthorized` on the manifest
+	// HEAD. No project on that Harbor serves anonymous pull.
+	//
+	// THE OBVIOUS FIX IS THE FORBIDDEN ONE. Handing image-verify the
+	// HARBOR_USERNAME/HARBOR_PASSWORD the push `image` job uses is item two on
+	// doc.go's list of regressions this package exists to stop, and
+	// merge_gate_test.go fails on any HARBOR_* env in a non-publishing job.
+	// Those are the PUSH credentials, and on pull_request the CALLER is taken
+	// from the PR head, so the shared job would be writing a push-capable
+	// credential onto a runner whose job graph a PR can edit. The gate is worth
+	// less than that.
+	//
+	// So this is not "the gate is inconvenient here". It is: under the no-
+	// credentials-on-the-PR-path contract, the shared job structurally cannot
+	// compile this Dockerfile. Closing it needs a pull-only credential or an
+	// anonymously pullable base image - a deliberate registry decision, not a
+	// workflow edit - and until then this repo's Dockerfile is first compiled
+	// in release.yml. Tracked on #640.
+	"szymonrychu/tatara-claude-code-wrapper": "Dockerfile:57 pulls a private Harbor base image; " +
+		"the shared job must not carry registry credentials on the pull_request path (doc.go)",
+}
 
 // Finding is one problem with one consumer. Consumer is empty for a fleet-wide
 // one (nothing was checked at all).
@@ -106,6 +145,52 @@ func PinRef(ciYAML []byte) (string, error) {
 	}
 }
 
+// imageVerifyRe matches the caller's `enable-image-verify:` input. Anchored on
+// the colon so `enable-image: false` - which every one of the four sets, and
+// which is a different input entirely - can never match it.
+//
+// The value is captured to end-of-line rather than as one token, and a trailing
+// `# comment` is dropped. `\S+` looked equivalent and was not: it does not
+// match `${{ inputs.x }}`, so an expression matched NOTHING, read as absent,
+// and defaulted to enabled - fail-open on precisely the value nobody can
+// resolve statically.
+var imageVerifyRe = regexp.MustCompile(`(?m)^\s*enable-image-verify:\s*(\S[^#]*?)\s*(?:#.*)?$`)
+
+// ImageVerifyEnabled reports whether a consumer's ci.yml leaves the
+// pull_request Dockerfile compile on. Absent is TRUE: that is the input's
+// default and it is the state the whole fleet should be in.
+//
+// A value that is not literally true or false is an ERROR, not the default. An
+// expression or a typo is a caller this cannot read, and "I could not tell" has
+// to fail closed, or the check quietly starts reporting the gate as on.
+func ImageVerifyEnabled(ciYAML []byte) (bool, error) {
+	seen := map[string]bool{}
+	var values []string
+	for _, m := range imageVerifyRe.FindAllSubmatch(ciYAML, -1) {
+		v := string(m[1])
+		if !seen[v] {
+			seen[v] = true
+			values = append(values, v)
+		}
+	}
+	switch len(values) {
+	case 0:
+		return true, nil
+	case 1:
+		switch values[0] {
+		case "true":
+			return true, nil
+		case "false":
+			return false, nil
+		default:
+			return false, fmt.Errorf("enable-image-verify is %q, which is neither true nor false", values[0])
+		}
+	default:
+		return false, fmt.Errorf("enable-image-verify is set several times with different values (%s)",
+			strings.Join(values, ", "))
+	}
+}
+
 // Audit reports every consumer that is not running `reference`.
 //
 // CONTENT IDENTITY, NOT TAG DISTANCE. A consumer sitting on an older tag whose
@@ -124,10 +209,24 @@ func PinRef(ciYAML []byte) (string, error) {
 // on a run of releases that never touched ci-shared.yml is genuinely current
 // and is never reported, so no tag-distance tolerance has to be invented for it.
 //
+// It also reports a consumer running the reference with the gate SWITCHED OFF,
+// unless ImageVerifyExempt says why. Content identity cannot see that: the
+// pinned ci-shared.yml is byte-identical whether or not the caller passes
+// enable-image-verify: false, so a consumer that opts out reads as CURRENT
+// forever while its Dockerfile is never compiled on a PR.
+//
 // FAIL-CLOSED throughout: an unreadable ci.yml, a missing or ambiguous pin, a
-// pin naming a ref the producer does not serve, an empty consumer set and an
-// empty reference are each a Finding.
+// pin naming a ref the producer does not serve, an unreadable
+// enable-image-verify value, an empty consumer set and an empty reference are
+// each a Finding.
 func Audit(ctx context.Context, f Fetcher, consumers []string, reference []byte, referenceRef string) []Finding {
+	return audit(ctx, f, consumers, reference, referenceRef, ImageVerifyExempt)
+}
+
+// audit is Audit with an injectable exemption set, so a test never mutates the
+// package-level one.
+func audit(ctx context.Context, f Fetcher, consumers []string, reference []byte, referenceRef string,
+	exempt map[string]string) []Finding {
 	if len(reference) == 0 {
 		return []Finding{{
 			Kind: FindingUnreadable,
@@ -199,6 +298,25 @@ func Audit(ctx context.Context, f Fetcher, consumers []string, reference []byte,
 				fmt.Sprintf("pins ci-shared.yml@%s, whose content differs from the reference at %s. "+
 					"It is running a different job graph from the one this repo's internal/cicontract tests assert on",
 					pin, referenceRef)})
+			continue
+		}
+		// Reached only for a consumer on the reference: a stale one's gate
+		// state is a question about a job graph it is not running yet, and
+		// reporting both would file two findings for one fix.
+		enabled, err := ImageVerifyEnabled(ciYAML)
+		switch {
+		case err != nil:
+			findings = append(findings, Finding{repo, FindingUnreadable,
+				fmt.Sprintf("could not read whether it runs image-verify from %s: %v", ConsumerWorkflowPath, err)})
+		case !enabled:
+			if _, ok := exempt[repo]; ok {
+				continue
+			}
+			findings = append(findings, Finding{repo, FindingGateDark,
+				fmt.Sprintf("runs ci-shared.yml@%s but sets enable-image-verify: false, so nothing compiles its "+
+					"Dockerfile on a pull request. That is the #556 state the pin bump was supposed to end. "+
+					"If the shared job genuinely cannot build this repo's image, add it to "+
+					"cicontract.ImageVerifyExempt with the reason", pin)})
 		}
 	}
 	return findings
@@ -224,6 +342,13 @@ func ShortName(repo string) string {
 // A stale consumer is NOT an error: it is exactly what the caller is about to
 // fix. An unreadable one is, because a fan-out that skips a repo it could not
 // read is the silence #640 is about.
+//
+// A gate-dark one is neither. It is a fleet condition for the scheduled audit
+// to file an issue about, and failing the plan on it would skip the ENTIRE
+// fan-out on every release for as long as one consumer had image-verify off -
+// so the pin would stop being written, which is #640 restored by the check
+// added to prevent it. The `default` arm stays fail-closed for any kind added
+// later; this one is listed because it was reasoned about.
 func PlanBumps(consumers []string, findings []Finding) (map[string]bool, []Finding) {
 	bump := make(map[string]bool, len(consumers))
 	for _, repo := range consumers {
@@ -234,6 +359,7 @@ func PlanBumps(consumers []string, findings []Finding) (map[string]bool, []Findi
 		switch f.Kind {
 		case FindingStale:
 			bump[ShortName(f.Consumer)] = true
+		case FindingGateDark:
 		default:
 			unreadable = append(unreadable, f)
 		}

@@ -3,6 +3,7 @@ package cicontract
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -87,6 +88,12 @@ func forge(pin, served string) fakeFetcher {
 }
 
 func onlyCLI() []string { return []string{"szymonrychu/tatara-cli"} }
+
+// auditWithExemptions drives the same code Audit does with a substituted
+// exemption set, so a test never has to mutate the package-level one.
+func auditWithExemptions(f fakeFetcher, exempt map[string]string) []Finding {
+	return audit(context.Background(), f, onlyCLI(), []byte(currentCIShared), "v3.10.0", exempt)
+}
 
 func TestPinRef(t *testing.T) {
 	tests := []struct {
@@ -279,6 +286,87 @@ func TestAudit_ConsumerOnAMovingRefIsReported(t *testing.T) {
 	}
 }
 
+// consumerCIWithVerify is consumerCI plus an explicit enable-image-verify.
+func consumerCIWithVerify(pin, value string) string {
+	return consumerCI(pin) + "      enable-image: false\n      enable-image-verify: " + value + "\n"
+}
+
+// A pin that reaches the fleet is only half of #640. The other half is a
+// consumer that runs the current job graph with the gate SWITCHED OFF: Audit
+// compares ci-shared.yml by content, so `enable-image-verify: false` in the
+// caller is invisible to it, and a consumer that opts out reads as CURRENT
+// forever while its Dockerfile is never compiled on a PR. That is #640's own
+// shape - correct shape, zero reach - one line further out.
+func TestAudit_ConsumerThatDisablesImageVerifyIsReported(t *testing.T) {
+	f := forge("v3.10.0", currentCIShared)
+	f.files["szymonrychu/tatara-cli@main:"+ConsumerWorkflowPath] = consumerCIWithVerify("v3.10.0", "false")
+
+	got := Audit(context.Background(), f, onlyCLI(), []byte(currentCIShared), "v3.10.0")
+	if len(got) != 1 || got[0].Kind != FindingGateDark {
+		t.Fatalf("Audit() = %v, want one %s finding", got, FindingGateDark)
+	}
+}
+
+// The opt-out is legitimate for a consumer whose Dockerfile the shared job
+// structurally cannot compile. It stays legitimate only while the reason is
+// written down HERE, in the producer, next to the fleet contract - a bare
+// `false` in a caller nobody reads is how the gate goes dark a second time.
+func TestAudit_ExemptConsumerMayDisableImageVerify(t *testing.T) {
+	f := forge("v3.10.0", currentCIShared)
+	f.files["szymonrychu/tatara-cli@main:"+ConsumerWorkflowPath] = consumerCIWithVerify("v3.10.0", "false")
+
+	got := auditWithExemptions(f, map[string]string{"szymonrychu/tatara-cli": "a stated reason"})
+	if len(got) != 0 {
+		t.Fatalf("Audit() = %v, want no finding for an exempt consumer", got)
+	}
+}
+
+// enable-image-verify defaults to true, so its ABSENCE is the good state and
+// must not be reported; an explicit true is the same state written out.
+func TestAudit_ImageVerifyLeftEnabledIsNotReported(t *testing.T) {
+	for _, tc := range []string{"", "true"} {
+		t.Run("value="+tc, func(t *testing.T) {
+			f := forge("v3.10.0", currentCIShared)
+			if tc != "" {
+				f.files["szymonrychu/tatara-cli@main:"+ConsumerWorkflowPath] = consumerCIWithVerify("v3.10.0", tc)
+			}
+			if got := Audit(context.Background(), f, onlyCLI(), []byte(currentCIShared), "v3.10.0"); len(got) != 0 {
+				t.Fatalf("Audit() = %v, want no finding", got)
+			}
+		})
+	}
+}
+
+// Fail-closed: a value this cannot resolve to a bool (an expression, a typo) is
+// not read as the default. "I could not tell" is never "the gate is on".
+func TestAudit_UnreadableImageVerifyValueIsReported(t *testing.T) {
+	for _, v := range []string{"${{ inputs.whatever }}", "flase", "0"} {
+		t.Run(v, func(t *testing.T) {
+			f := forge("v3.10.0", currentCIShared)
+			f.files["szymonrychu/tatara-cli@main:"+ConsumerWorkflowPath] = consumerCIWithVerify("v3.10.0", v)
+
+			got := Audit(context.Background(), f, onlyCLI(), []byte(currentCIShared), "v3.10.0")
+			if len(got) != 1 || got[0].Kind != FindingUnreadable {
+				t.Fatalf("Audit() = %v, want one unreadable finding for %q", got, v)
+			}
+		})
+	}
+}
+
+// Every exemption names a repo that is actually in the fan-out and carries a
+// non-empty reason. An exemption for a repo nobody audits silences nothing and
+// only misleads the next reader.
+func TestImageVerifyExempt(t *testing.T) {
+	for repo, reason := range ImageVerifyExempt {
+		if strings.TrimSpace(reason) == "" {
+			t.Errorf("ImageVerifyExempt[%q] has no reason; an exemption without one is a silent opt-out", repo)
+		}
+		if !slices.Contains(LiveConsumers, repo) {
+			t.Errorf("ImageVerifyExempt[%q] is not in LiveConsumers, so nothing ever audits it", repo)
+		}
+	}
+}
+
 // The four live consumers, and tatara-chat deliberately not among them.
 func TestLiveConsumers(t *testing.T) {
 	want := []string{
@@ -334,6 +422,16 @@ func TestPlanBumps(t *testing.T) {
 			findings:       []Finding{{"", FindingUnreadable, "no consumer repos were given"}},
 			wantBump:       map[string]bool{"tatara-cli": false, "tatara-memory": false},
 			wantUnreadable: 1,
+		},
+		{
+			// A dark gate is a fleet condition for the scheduled audit to
+			// file, never a reason to stop WRITING pins. Failing the plan on
+			// it would skip the whole fan-out on every release for as long as
+			// one consumer had image-verify off - which is #640 restored, by
+			// the check added to prevent it.
+			name:     "a dark gate does not block the fan-out",
+			findings: []Finding{{"szymonrychu/tatara-memory", FindingGateDark, "enable-image-verify: false"}},
+			wantBump: map[string]bool{"tatara-cli": false, "tatara-memory": false},
 		},
 	}
 	for _, tt := range tests {

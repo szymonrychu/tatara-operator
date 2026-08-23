@@ -92,9 +92,18 @@ on:
           including the ones that set enable-image false - that input exists
           only so two jobs never push the same immutable Harbor tag, and this
           job pushes nothing, so it does not conflict with a caller-owned
-          `image` job. Set false only for a repo whose image needs build-args
-          this workflow cannot supply (more than the single image-build-arg),
-          and say which in the caller.
+          `image` job. Set false only for a repo whose image needs something
+          this workflow cannot supply on the pull_request path, and say what in
+          the caller. Two cases exist, and BOTH must also be recorded in
+          internal/cicontract's ImageVerifyExempt with the reason - the audit
+          reds on a consumer that sets this false without an entry there,
+          because a bare `false` in a caller is invisible to a check that
+          compares ci-shared.yml by content:
+            - more build-args than the single image-build-arg;
+            - a base image from a private registry. This job deliberately holds
+              NO registry credentials (see internal/cicontract/doc.go), and the
+              only ones that exist here are the PUSH credentials, so it cannot
+              be closed by handing them to a job whose caller a PR can edit.
         type: boolean
         required: false
         default: true

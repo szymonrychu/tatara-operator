@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -80,9 +81,14 @@ func audit(ctx context.Context) int {
 	for _, fd := range findings {
 		fmt.Fprintf(os.Stderr, "  - %s\n", fd)
 	}
-	fmt.Fprintln(os.Stderr, "  Do NOT close this by hand-editing the `uses:` line in a consumer.")
-	fmt.Fprintln(os.Stderr, "  That pin is CD-managed by this repo's release.yml `fanout-ci-shared` job;")
-	fmt.Fprintln(os.Stderr, "  a hand bump hides the real fault until the next ci-shared change.")
+	// Only for a stale pin. A gate-dark finding is closed by turning the gate
+	// back on or by an ImageVerifyExempt entry, and this text goes verbatim
+	// into the filed issue, where advice for the wrong finding reads as advice.
+	if slices.ContainsFunc(findings, func(fd cicontract.Finding) bool { return fd.Kind == cicontract.FindingStale }) {
+		fmt.Fprintln(os.Stderr, "  Do NOT close a [stale] finding by hand-editing the `uses:` line in a consumer.")
+		fmt.Fprintln(os.Stderr, "  That pin is CD-managed by this repo's release.yml `fanout-ci-shared` job;")
+		fmt.Fprintln(os.Stderr, "  a hand bump hides the real fault until the next ci-shared change.")
+	}
 	return 1
 }
 
