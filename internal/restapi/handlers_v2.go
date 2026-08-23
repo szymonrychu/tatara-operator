@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -534,9 +535,16 @@ type mrMirrorDTO struct {
 	Significance   string `json:"significance,omitempty"`
 	ReviewedSHA    string `json:"reviewedSHA"`
 	ReviewRounds   int    `json:"reviewRounds"`
-	URL            string `json:"url,omitempty"`
-	TaskRef        string `json:"taskRef"`
-	LastSyncedAt   string `json:"lastSyncedAt,omitempty"`
+	// CreatedAt/UpdatedAt are the FORGE's timestamps, mirrored by
+	// SyncMergeRequest. updatedAt is what ?since filters on, and it is served
+	// so the filter's effect is legible in the response: #636's reproduction had
+	// to infer staleness from lastSyncedAt, which dates the mirror sweep and
+	// not the merge request.
+	CreatedAt    string `json:"createdAt,omitempty"`
+	UpdatedAt    string `json:"updatedAt,omitempty"`
+	URL          string `json:"url,omitempty"`
+	TaskRef      string `json:"taskRef"`
+	LastSyncedAt string `json:"lastSyncedAt,omitempty"`
 }
 
 type commentMirrorDTO struct {
@@ -644,10 +652,15 @@ func (s *Server) scmIssues(w http.ResponseWriter, r *http.Request) {
 			LastSyncedAt: rfc3339(iss.Status.LastSyncedAt),
 		})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Number < out[j].Number })
+	// limit selects the NEWEST rows, not the oldest (#636). Ascending-then-head
+	// meant a repo whose mirror holds more than the limit answered every sweep
+	// with its lowest-numbered issues, and nothing in the response said so. The
+	// selected page is still PRESENTED ascending.
+	sort.Slice(out, func(i, j int) bool { return out[i].Number > out[j].Number })
 	if len(out) > limit {
 		out = out[:limit]
 	}
+	slices.Reverse(out)
 	writeJSON(w, http.StatusOK, map[string]any{"issues": out})
 }
 
@@ -691,6 +704,17 @@ func (s *Server) scmMRs(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "state must be one of open, merged, closed, all")
 		return
 	}
+	// since filters on the FORGE's updatedAt, symmetric with scmIssues. It was
+	// advertised by the cli schema and read by nothing until #636.
+	var since time.Time
+	if v := r.URL.Query().Get("since"); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "since must be RFC3339")
+			return
+		}
+		since = t
+	}
 	limit := listLimit(r, defaultListLimit, maxListLimit)
 
 	var list tatarav1alpha1.MergeRequestList
@@ -707,6 +731,9 @@ func (s *Server) scmMRs(w http.ResponseWriter, r *http.Request) {
 		if state != "all" && mr.Status.State != state {
 			continue
 		}
+		if !since.IsZero() && (mr.Status.UpdatedAt == nil || mr.Status.UpdatedAt.Time.Before(since)) {
+			continue
+		}
 		out = append(out, mrMirrorDTO{
 			Repo: mr.Spec.RepositoryRef, Number: mr.Spec.Number,
 			Title: mr.Status.Title, Body: mr.Status.Body, Author: mr.Status.Author,
@@ -715,14 +742,18 @@ func (s *Server) scmMRs(w http.ResponseWriter, r *http.Request) {
 			LastBotHeadSHA: mr.Status.LastBotHeadSHA,
 			CIStatus:       mr.Status.CIStatus, Mergeable: mr.Status.Mergeable,
 			Significance: mr.Status.Significance, ReviewedSHA: mr.Status.ReviewedSHA,
-			ReviewRounds: mr.Status.ReviewRounds, URL: mr.Spec.URL,
+			ReviewRounds: mr.Status.ReviewRounds,
+			CreatedAt:    rfc3339(mr.Status.CreatedAt), UpdatedAt: rfc3339(mr.Status.UpdatedAt),
+			URL:     mr.Spec.URL,
 			TaskRef: controllerTaskRef(mr), LastSyncedAt: rfc3339(mr.Status.LastSyncedAt),
 		})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Number < out[j].Number })
+	// Newest-first selection, ascending presentation - see scmIssues (#636).
+	sort.Slice(out, func(i, j int) bool { return out[i].Number > out[j].Number })
 	if len(out) > limit {
 		out = out[:limit]
 	}
+	slices.Reverse(out)
 	writeJSON(w, http.StatusOK, map[string]any{"mrs": out})
 }
 
