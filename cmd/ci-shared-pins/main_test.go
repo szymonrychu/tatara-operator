@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/szymonrychu/tatara-operator/internal/cicontract"
 )
@@ -204,5 +205,44 @@ func TestAudit_AnUnresolvableReferenceIsNotACleanFleet(t *testing.T) {
 	if code := audit(context.Background(), f); code != 1 {
 		t.Errorf("audit exited %d when it could not resolve its own reference, want 1: "+
 			"an unknown fleet is not a current fleet", code)
+	}
+}
+
+// The retry budget must cover the failure it was written for. The stated reason
+// for retrying at all is anonymous per-IP rate limiting from a shared ARC egress
+// IP, and that window is ~60s - but the first cut was `(attempt-1)*2s` over 4
+// attempts, i.e. 12s total, so it slept through none of it and rendered the 429
+// as a Finding asserting the tag had been deleted. That text is what lands in
+// the filed issue.
+//
+// A 429 also usually carries Retry-After, which is the server telling you the
+// answer instead of guessing it.
+func TestBackoff_CoversTheRateLimitWindowItWasWrittenFor(t *testing.T) {
+	var total time.Duration
+	for attempt := 1; attempt < fetchAttempts; attempt++ {
+		total += backoff(attempt, "")
+	}
+	if total < 60*time.Second {
+		t.Errorf("the retry budget is %s across %d attempts, but it exists for anonymous "+
+			"per-IP rate limiting, whose window is ~60s. It sleeps through none of it and "+
+			"then reports the ref as deleted", total, fetchAttempts)
+	}
+	if total > fetchTimeout {
+		t.Errorf("the retry budget (%s) exceeds the whole run's timeout (%s), so one "+
+			"unlucky fetch starves the other consumers", total, fetchTimeout)
+	}
+}
+
+func TestBackoff_HonoursRetryAfter(t *testing.T) {
+	if got := backoff(1, "30"); got != 30*time.Second {
+		t.Errorf("backoff(1, \"30\") = %s, want 30s: the server said how long to wait", got)
+	}
+	// Capped, so a hostile or absurd header cannot park the job past its timeout.
+	if got := backoff(1, "99999"); got > time.Minute {
+		t.Errorf("backoff(1, \"99999\") = %s, want it capped at 60s", got)
+	}
+	// Garbage falls back to the schedule rather than to zero.
+	if got := backoff(2, "soon"); got <= 0 {
+		t.Errorf("backoff(2, \"soon\") = %s, want the exponential fallback", got)
 	}
 }

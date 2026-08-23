@@ -26,13 +26,17 @@ import (
 	"os/exec"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/szymonrychu/tatara-operator/internal/cicontract"
 )
 
-const fetchTimeout = 3 * time.Minute
+// fetchTimeout bounds the whole run. It has to be comfortably larger than one
+// fetch's full retry budget (see backoff), or one rate-limited fetch starves
+// every consumer after it. ci-shared-currency.yml's own timeout-minutes is 15.
+const fetchTimeout = 8 * time.Minute
 
 func main() {
 	if len(os.Args) < 2 {
@@ -174,24 +178,48 @@ type forgeFetcher struct{}
 // about its cause is worse than one that says nothing. The ARC scale sets share
 // an egress IP and these fetches are anonymous, so the per-IP limit is a real
 // path. Same posture as verify-pin's `curl --retry` in release.yml.
-const fetchAttempts = 4
+const fetchAttempts = 6
+
+// backoff is how long to wait before `attempt`+1, given the failed response's
+// Retry-After header (empty when absent or not a 429/5xx).
+//
+// EXPONENTIAL, and the budget is the point. The first cut was (attempt-1)*2s
+// over 4 attempts - 12 seconds - while the failure it exists for is anonymous
+// per-IP rate limiting on a shared ARC egress IP, whose window is about a
+// minute. It slept through none of it and then rendered the 429 as a Finding
+// asserting the tag had been deleted, which is the text that lands in the filed
+// issue. 2/4/8/16/32 covers ~62s.
+//
+// Retry-After wins when the server sent one: that is the forge stating the
+// answer instead of this guessing it. Capped, so neither an absurd header nor a
+// hostile one can park the job past fetchTimeout.
+func backoff(attempt int, retryAfter string) time.Duration {
+	const cap = time.Minute
+	if secs, err := strconv.Atoi(strings.TrimSpace(retryAfter)); err == nil && secs > 0 {
+		return min(time.Duration(secs)*time.Second, cap)
+	}
+	return min(time.Duration(1<<attempt)*time.Second, cap)
+}
 
 func (forgeFetcher) File(ctx context.Context, repo, ref, path string) ([]byte, error) {
 	url := fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/%s", repo, ref, path)
-	var lastErr error
+	var (
+		lastErr    error
+		retryAfter string
+	)
 	for attempt := 1; attempt <= fetchAttempts; attempt++ {
 		if attempt > 1 {
 			select {
 			case <-ctx.Done():
 				return nil, fmt.Errorf("GET %s: %w (after %d attempts, last: %v)", url, ctx.Err(), attempt-1, lastErr)
-			case <-time.After(time.Duration(attempt-1) * 2 * time.Second):
+			case <-time.After(backoff(attempt-1, retryAfter)):
 			}
 		}
-		body, retryable, err := get(ctx, url)
+		body, retryable, after, err := get(ctx, url)
 		if err == nil {
 			return body, nil
 		}
-		lastErr = err
+		lastErr, retryAfter = err, after
 		if !retryable {
 			return nil, err
 		}
@@ -202,25 +230,25 @@ func (forgeFetcher) File(ctx context.Context, repo, ref, path string) ([]byte, e
 // get reports whether the failure is worth another attempt. A 404 is an answer
 // - the ref or the path is genuinely absent - and retrying it only delays a
 // correct Finding. A 429/5xx or a transport error is not an answer.
-func get(ctx context.Context, url string) (body []byte, retryable bool, err error) {
+func get(ctx context.Context, url string) (body []byte, retryable bool, retryAfter string, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, false, err
+		return nil, false, "", err
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, true, fmt.Errorf("GET %s: %w", url, err)
+		return nil, true, "", fmt.Errorf("GET %s: %w", url, err)
 	}
 	defer resp.Body.Close() //nolint:errcheck // read-only response
 	if resp.StatusCode != http.StatusOK {
 		transient := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
-		return nil, transient, fmt.Errorf("GET %s: %s", url, resp.Status)
+		return nil, transient, resp.Header.Get("Retry-After"), fmt.Errorf("GET %s: %s", url, resp.Status)
 	}
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, true, fmt.Errorf("GET %s: reading the body: %w", url, err)
+		return nil, true, "", fmt.Errorf("GET %s: reading the body: %w", url, err)
 	}
-	return b, false, nil
+	return b, false, "", nil
 }
 
 func (forgeFetcher) Tags(ctx context.Context, repo string) ([]string, error) {
