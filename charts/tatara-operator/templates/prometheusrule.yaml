@@ -270,14 +270,36 @@ spec:
         # `== 0` matches nothing. Do not "simplify" it to a plain Gauge or add an
         # `or vector(0)`: either one makes this fire on every operator that never
         # turned the gate on.
+        #
+        # TRAFFIC-GATED, because an idle fleet is not a dead feed. The snapshot
+        # only leaves an agent pod attached to the turn-complete callback, so
+        # store freshness is bounded by fleet turn-COMPLETION cadence and a fleet
+        # with an empty queue ages its snapshot out and drops gate_ready to 0 BY
+        # DESIGN. An idle fleet burning nothing against an ungoverned gate costs
+        # nothing; ungated this rule pages every night on designed behaviour, and
+        # the reflex to that is to raise `for:` until the compensating control is
+        # decoration. Same idiom as TataraTurnSubmitLatencyHigh below.
+        #
+        # The guard operands are the operator's OWN queue gauges, not
+        # kube-state-metrics: they come from the same leader process that
+        # publishes gate_ready, so the guard shares fate with the metric it
+        # guards and no other exporter's outage can silently disable it.
+        #
+        # `and`, NOT a product with `== bool 0`: `bool` values the healthy case 0
+        # instead of dropping it, and an alerting rule fires on any element the
+        # expression returns whatever its value - so the arithmetic spelling
+        # pages on a BUSY fleet whose gate is perfectly fine (measured on this
+        # cluster: 11 such samples in 14h, in runs of up to 1.5h, well past
+        # `for: 30m`). min() rather than max() so a demoted leader's lingering
+        # child fails toward alerting.
         - alert: TataraAccountUsageFeedDead
-          expr: tatara_account_usage_gate_ready == 0
+          expr: min(tatara_account_usage_gate_ready) == 0 and (sum(operator_queue_inflight) + sum(operator_queue_depth)) > 0
           for: 30m
           labels:
             severity: {{ .Values.prometheusRule.severityLabel | quote }}
           annotations:
             summary: "the Claude subscription usage gate is enabled but has no fresh snapshot"
-            description: "tatara_account_usage_gate_ready has been 0 for 30m: tokenBudget is enabled in claudeSubscription mode but no usage snapshot newer than tokenBudgetMaxSnapshotAge is governing admission, so the gate FAILS OPEN and admits everything regardless of how much of the shared Claude subscription is burnt. THIS IS THE ALERT WHOSE ABSENCE LET THE GATE SIT INERT FOR WEEKS - TataraTokenBudgetBlocked watches operator_admission_blocked_total{reason=\"token_budget\"}, a derived counter that by construction never increments while the gate evaluates 0%. Check tatara_account_usage_snapshot_age_seconds for which feed (source=\"wrapper\"|\"poller\") went quiet and how long ago. For the wrapper feed: agent pods report via their statusline (cc-statusline) on the turn-complete callback, so a 0 here with turns still completing means the statusline is not firing in the pods (check ccw_statusline_reports_total on the pushed wrapper metrics) or the operator is not persisting Task status.accountUsage. The series is absent entirely when the gate is disabled, so a disabled gate never fires this."
+            description: "tatara_account_usage_gate_ready has been 0 for 30m WHILE WORK WAS IN FLIGHT (operator_queue_inflight + operator_queue_depth > 0): tokenBudget is enabled in claudeSubscription mode but no usage snapshot newer than tokenBudgetMaxSnapshotAge is governing admission, so the gate FAILS OPEN and admits everything regardless of how much of the shared Claude subscription is burnt. THIS IS THE ALERT WHOSE ABSENCE LET THE GATE SIT INERT FOR WEEKS - TataraTokenBudgetBlocked watches operator_admission_blocked_total{reason=\"token_budget\"}, a derived counter that by construction never increments while the gate evaluates 0%. Check tatara_account_usage_snapshot_age_seconds for which feed (source=\"wrapper\"|\"poller\") went quiet and how long ago. For the wrapper feed: agent pods report via their statusline (cc-statusline) on the turn-complete callback, so a 0 here with turns still completing means the statusline is not firing in the pods (check ccw_statusline_reports_total on the pushed wrapper metrics) or the operator is not persisting Task status.accountUsage. The series is absent entirely when the gate is disabled, so a disabled gate never fires this."
         # ---- Class C: latency / saturation (the one histogram_quantile alert; traffic-gated so idle windows stay NaN-safe) ----
         # histogram_quantile over an all-zero bucket rate returns NaN; an un-gated quantile rule false-fires on
         # every idle window (issue #143). The "and sum(rate(..._count[15m])) > 0" gate means the quantile only

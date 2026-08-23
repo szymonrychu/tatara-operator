@@ -1153,8 +1153,10 @@ func (r *DispatcherReconciler) doReconcile(ctx context.Context, req ctrl.Request
 	// admission goes back to admitting everything. That is deliberate (a broken
 	// feed must not wedge the platform) and is only defensible because
 	// TataraAccountUsageFeedDead is the compensating control - it alerts on
-	// tatara_account_usage_gate_ready == 0. The wrapper's OTel 429 floor is the
-	// hard backstop underneath both.
+	// tatara_account_usage_gate_ready == 0, traffic-gated on the queue gauges so
+	// it witnesses the fail-open only while work is actually in flight (an idle
+	// fleet ages its snapshot out by design and burns nothing while it does).
+	// The wrapper's OTel 429 floor is the hard backstop underneath both.
 	if budgetCfg.Mode == budget.ModeClaudeSubscription && r.Usage != nil {
 		sub = r.Usage.Get().Subscription()
 	}

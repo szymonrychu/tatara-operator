@@ -51,12 +51,37 @@ const (
 // DefaultMaxSnapshotAge is how long a subscription usage snapshot keeps
 // governing admission after it was observed.
 //
-// 90 minutes: an agent turn runs for minutes to tens of minutes and every
-// pod-TTL and turn-timeout bound in the platform is well under an hour, so any
-// fleet that has run a turn in the last 90 minutes has a fresh snapshot. It is
-// roughly 3x the longest healthy inter-turn gap, and short relative to the 5h
-// window it governs, so an expiring snapshot can never have missed more than
-// about 30% of a 5h window's worth of unobserved burn.
+// 90 minutes, and it is a QUALITY bound on the snapshot, not a bound the fleet
+// is guaranteed to meet: it is short relative to the 5h window it governs, so a
+// snapshot still inside it can never have missed more than about 30% of a 5h
+// window's worth of unobserved burn. That clause is the whole justification.
+//
+// IT DOES NOT MEAN THE GATE IS NORMALLY GOVERNING. The earlier text here
+// reasoned from turn DURATION ("every pod-TTL and turn-timeout bound is well
+// under an hour, so any fleet that has run a turn in the last 90 minutes has a
+// fresh snapshot ... roughly 3x the longest healthy inter-turn gap") and that
+// premise is wrong about the binding quantity. A snapshot reaches the store
+// only on a turn-complete callback, so store freshness is bounded by the gap
+// BETWEEN turn completions across the whole fleet, which is unbounded when the
+// queue is empty - not by how long a turn runs, which is irrelevant to it.
+// Measured 2026-08-23 on the prod fleet: tatara_account_usage_snapshot_age_seconds
+// {source="wrapper"} was 30719s against this 5400s bound, and
+// tatara_account_usage_gate_ready read 0 in 40 of 56 samples over 14h - so the
+// gate was fail-open, silently, for roughly three quarters of the day.
+//
+// The number stays 90m deliberately. It was picked from the wrong quantity, and
+// the right one (the inter-turn-completion distribution, whose rising edges are
+// tatara_account_usage_gate_ready and nothing else in the platform) is only
+// measurable now that the feed exists. Picking a replacement constant before
+// reading that distribution would repeat the original mistake. Raising it is
+// also not free: the 30%-of-a-5h-window clause above is what stops being true.
+// What SHOULD change first is where a fresh snapshot comes from between turns
+// (an out-of-band push from the wrapper, or the /api/oauth/usage poller), which
+// is a different change with a different blast radius.
+//
+// Until then, TataraAccountUsageFeedDead is traffic-gated on the operator's own
+// queue gauges: a fail-open gate on an idle fleet is designed behaviour and
+// costs nothing, and only a fail-open gate WITH WORK IN FLIGHT is a fault.
 const DefaultMaxSnapshotAge = 90 * time.Minute
 
 // Config is a project's resolved token-budget configuration. The zero value has
