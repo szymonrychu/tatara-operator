@@ -667,10 +667,17 @@ func (o *outcomeCtx) claim() bool {
 // instead of waiting out OutcomeClaimTTL.
 //
 // Every pre-execution rejection is CLASS B: it runs before any committed
-// effect, so nothing may be cached under the fingerprint. A class-A
-// (post-execution) rejection does not arise here - commit is the only thing
-// that begins execution, and it stamps its own terminal reason, which release
-// refuses to touch.
+// effect, so nothing may be cached under the fingerprint.
+//
+// CLASS-A (post-execution) REJECTIONS DO ARISE, and release is not what serves
+// them - commitRefusal is. This doc used to assert the opposite ("commit is the
+// only thing that begins execution, and it stamps its own terminal reason,
+// which release refuses to touch"), and it was already false: the two pre-ship
+// refusals COMMIT a transition to `refined` and then refuse, so they are class
+// A by this taxonomy while needing exactly release's cache-nothing outcome.
+// Calling release after such a commit could not work anyway - it is
+// ownership-checked against the bare-claim Reason that the commit has by then
+// overwritten - which is why the drop moved INTO the write. See commitRefusal.
 //
 // OWNERSHIP-CHECKED under CAS: only a condition still carrying OUR fingerprint
 // AND Reason "Outcome" is released. NEVER a committed condition; NEVER another
@@ -762,6 +769,36 @@ func (o *outcomeCtx) decode(payload []byte, v any) bool {
 // the closure to size the write and again on every conflict retry, so an emit
 // inside it would be inflated 2-3x.
 func (o *outcomeCtx) commit(mutate func(*tatarav1alpha1.Task) error) bool {
+	return o.commitAs(mutate, false)
+}
+
+// commitRefusal is commit for a REFUSAL that still has to move the Task: it
+// applies mutate and, in the SAME write, DROPS our fingerprint claim instead of
+// stamping it committed.
+//
+// WHY THE DISTINCTION EXISTS. commit stamps OutcomeAccepted with the kind's
+// terminal Reason, and classifyOutcomeClaim reads any non-"Outcome" Reason as
+// claimCommitted. outcomeFingerprint is sha256(kind|canonical payload) and
+// carries no Task state, so a refusing commit cached the REFUSED payload as an
+// accepted outcome: the next identical POST was answered 200 with a bare Task
+// DTO at the replay arm, before any handler ran, having shipped nothing. The
+// agent is told it succeeded.
+//
+// THE PAYLOAD-IDENTICAL RETRY IS THE DESIGNED PATH HERE, not a corner. Both
+// callers refuse a submit whose remedy is authorisation, not content: the agent
+// wins the gate back with submit_outcome(action=approved) and re-submits THE
+// SAME title/body/changeSignificance. So a refusal that caches itself breaks
+// exactly the recovery its own guidance names.
+//
+// This is class A by release()'s taxonomy - the Task moved - which is why it
+// cannot simply call release(): the mutation must land, and it must land
+// atomically with dropping the claim, or a crash between the two leaves the
+// refused fingerprint committed after all.
+func (o *outcomeCtx) commitRefusal(mutate func(*tatarav1alpha1.Task) error) bool {
+	return o.commitAs(mutate, true)
+}
+
+func (o *outcomeCtx) commitAs(mutate func(*tatarav1alpha1.Task) error, refusal bool) bool {
 	// THE CLAIM BACKSTOP (#578). commit is the one thing every kind handler's
 	// execution phase ends in, so claiming here guarantees no outcome is ever
 	// committed unclaimed even if a handler forgot the explicit claim before its
@@ -790,6 +827,18 @@ func (o *outcomeCtx) commit(mutate func(*tatarav1alpha1.Task) error) bool {
 				}
 			}
 			to, toReason, toPark = t.Status.State, t.Status.StateReason, t.Status.ParkReason
+			if refusal {
+				// OWNERSHIP-CHECKED, exactly as release() is and for the same
+				// reason: only a condition still carrying OUR fingerprint under the
+				// bare-claim Reason is ours to drop. The handler-budget invariant
+				// (OutcomeHandlerBudget < OutcomeClaimTTL) is what makes those two
+				// fields sufficient.
+				cond := tatarav1alpha1.OutcomeCondition(t)
+				if cond != nil && cond.Message == o.fp && cond.Reason == tatarav1alpha1.OutcomeReasonClaimed {
+					meta.RemoveStatusCondition(&t.Status.Conditions, outcomeAcceptedCondition)
+				}
+				return
+			}
 			setCondition(t, metav1.Condition{
 				Type:               outcomeAcceptedCondition,
 				Status:             metav1.ConditionTrue,
@@ -919,6 +968,12 @@ func (o *outcomeCtx) commit(mutate func(*tatarav1alpha1.Task) error) bool {
 		}
 	}
 	o.task.Status.State, o.task.Status.StateReason, o.task.Status.ParkReason = to, toReason, toPark
+	// The claim went out with the write. Saying so keeps a later release() - via
+	// bad()/conflict() on a path that refuses again - off a condition that is no
+	// longer ours.
+	if refusal {
+		o.claimed = false
+	}
 	return true
 }
 
@@ -1233,8 +1288,25 @@ func (o *outcomeCtx) implement(p implementPayload) {
 	// note's value as continuation state - so a mismatch sends it back to the
 	// gate to ask again, with its pod alive and its work intact.
 	if p.Action == "submitted" && o.kind == "implement" {
+		// A SUBMIT TAKEN FROM `refined` IS A SHIP WITH NO LIVE GRANT, ALWAYS.
+		// refined's ONE exit into under-implementation is
+		// submit_outcome(action=approved), so a Task submitting from here either
+		// never passed the gate or was sent back to it - by one of the two
+		// refusals below, on a previous call. stage.Transitions refuses the edge
+		// anyway, but it refuses it as `illegal state transition refined ->
+		// awaiting-review`: the machine, not the remedy. Answering here instead is
+		// what makes the RETRY of a refused submit re-issue the guidance rather
+		// than trip over the state machine, and it is why neither refusal below
+		// has to be re-entrant.
+		//
+		// Nothing is claimed and nothing is written on this path.
+		if o.task.Status.State == tatarav1alpha1.StateRefined {
+			s.refuseShipUngranted(o.w, o.r, o.task, o.kind,
+				s.shipVerdict(ctx, o.task, p.ChangeSignificance))
+			return
+		}
 		if refused := s.planPinRefusal(ctx, o.task); refused {
-			if !o.commit(func(t *tatarav1alpha1.Task) error {
+			if !o.commitRefusal(func(t *tatarav1alpha1.Task) error {
 				return stage.Enter(t, mrs, tatarav1alpha1.StateRefined, "", s.now())
 			}) {
 				return
@@ -1260,7 +1332,7 @@ func (o *outcomeCtx) implement(p implementPayload) {
 		// branch is pushed and the work is intact - only the authorisation has to
 		// be redone. NEVER A PARK.
 		if blockers := s.shipVerdict(ctx, o.task, p.ChangeSignificance); len(blockers) > 0 {
-			if !o.commit(func(t *tatarav1alpha1.Task) error {
+			if !o.commitRefusal(func(t *tatarav1alpha1.Task) error {
 				return stage.Enter(t, mrs, tatarav1alpha1.StateRefined, "", s.now())
 			}) {
 				return

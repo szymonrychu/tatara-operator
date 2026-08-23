@@ -42,6 +42,18 @@ func AutoApproveCeilingRank(ceiling string) int {
 // AutoApproveOverCeiling reports whether a DECLARED change significance sits
 // above what this project will auto-approve.
 //
+// DECLARED IS THE OPERATIVE WORD, AND IT BOUNDS WHAT THIS CEILING IS FOR.
+// `change_significance` is whatever the agent says it is: validChangeSignificance
+// checks membership in the enum and nothing in the operator compares the value
+// to the diff, so a `patch` declaration walks past a `minor` ceiling carrying a
+// breaking change. A review outcome may also RAISE
+// MergeRequest.status.significance past the ceiling with no re-check, because
+// that handler's Task owns the merge requests and not the Issues the evidence
+// lives on. The ceiling is therefore a bound on how much tatara ships by honest
+// ACCIDENT, not a containment boundary against an agent trying to get past it;
+// `off` is that boundary. Said the same way in
+// docs/operations/security/approval-gates.md so the two cannot drift.
+//
 // AN EMPTY SIGNIFICANCE IS NEVER OVER. `change_significance` does not exist on
 // the wire until submit_outcome(action=submitted): mr_write(action=open) runs
 // before the agent has declared one, and the same verdict function serves both.

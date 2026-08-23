@@ -1,6 +1,7 @@
 package restapi_test
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"testing"
@@ -392,6 +393,115 @@ func TestOutcome_NonGateReplayStaysABareTaskDTO(t *testing.T) {
 	require.NoError(t, json.Unmarshal(replay.Body.Bytes(), &got))
 	require.NotContains(t, got, "granted")
 	require.Contains(t, got, "name")
+}
+
+// THE WHOLE REMEDIATION LOOP, END TO END: refuse, cite the maintainer, re-win
+// the gate, re-submit THE SAME payload, ship. It is the regression review round
+// 1 asked for - "after the block is cleared, an identical re-submit actually
+// ships" - and it is the reason the refusal must not cache its own payload.
+//
+// IT PASSES ON THE PRE-FIX CODE TOO, and that is worth knowing rather than
+// discovering later: there is ONE OutcomeAccepted condition and setCondition
+// overwrites it whole, so the intervening action=approved evicted the refused
+// submit's fingerprint by accident. Take that grant out of the middle - the
+// agent retries, the transport retries, the wrapper's outcome re-prompt fires -
+// and the cache is what answers. TestOutcome_Submitted_AnUnremediedRetryIsRefusedAgain
+// is that case and it is the one that failed.
+func TestOutcome_Submitted_TheRemediatedIdenticalResubmitActuallyShips(t *testing.T) {
+	iss := autoApprovedIssueV2("tatara-cli", 32, "t1")
+	proj := maintainerProjectV2("tatara")
+	proj.Spec.AutoApproveMaxSignificance = "patch"
+	e := buildV2(t, v2Opts{approval: &fakeApproval{grant: map[string]bool{iss.Name: true}}},
+		proj, scmSecretV2(), repoV2("tatara-cli", "tatara"),
+		gateTaskV2("t1", "tatara", tatarav1alpha1.StateUnderImplementation),
+		mrV2("tatara-cli", 80, "t1"), iss)
+
+	submit := `{"kind":"implement","payload":{"action":"submitted","title":"T","body":"B","changeSignificance":"major"}}`
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", submit)
+	require.Equal(t, http.StatusConflict, w.Code, w.Body.String())
+	require.Equal(t, controller.ShipBlockedOverCeiling,
+		decodeApprovalRefusal(t, w.Body.Bytes()).Blocked[0].Detail)
+	require.Equal(t, tatarav1alpha1.StateRefined, e.task(t, "t1").Status.State)
+
+	// The remedy the over-ceiling guidance names, in two steps. First the
+	// maintainer replies and the agent cites it, so the evidence stops being
+	// tatara's own and the ceiling no longer applies to it.
+	live := e.issue(t, iss.Name)
+	maintainerSpoke(live)
+	live.Status.Approval = &tatarav1alpha1.ApprovalEvidence{
+		Login: "szymonrychu", CommentID: "c1", Phrase: "go ahead",
+		CreatedAt: metav1.NewTime(frozenNow),
+	}
+	require.NoError(t, e.c.Status().Update(context.Background(), live))
+
+	// Then action=approved, the ONE legal edge back out of `refined`.
+	g := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"implement","payload":{"action":"approved","reason":"r","approvingMaintainer":"szymonrychu",`+
+			`"planNoteId":"`+gatePlanNoteID+`","approvalCitations":[{"id":"c1","quote":"go ahead"}]}}`)
+	require.Equal(t, http.StatusOK, g.Code, g.Body.String())
+	require.Equal(t, tatarav1alpha1.StateUnderImplementation, e.task(t, "t1").Status.State)
+
+	// The IDENTICAL payload, the second time.
+	again := e.do(t, http.MethodPost, "/tasks/t1/outcome", submit)
+	require.Equal(t, http.StatusOK, again.Code, again.Body.String())
+	require.Equal(t, tatarav1alpha1.StateAwaitingReview, e.task(t, "t1").Status.State,
+		"the remediated re-submit must actually ship, not replay as a no-op")
+}
+
+// The other half of the same fault: an identical retry taken BEFORE the block is
+// cleared must be refused again, with the guidance, rather than answered 200.
+//
+// It pins BOTH halves of the answer. Dropping the claim is what lets the retry
+// reach a handler at all; the `refined` arm at the top of the submit branch is
+// what it reaches. Without that arm the retry would fall through to the ship
+// path and die on `illegal state transition refined -> awaiting-review`, since
+// `refined -> refined` is not an edge either - a 409 naming nothing the agent
+// can act on, in place of the one that does.
+func TestOutcome_Submitted_AnUnremediedRetryIsRefusedAgain(t *testing.T) {
+	proj := maintainerProjectV2("tatara")
+	proj.Spec.AutoApproveMaxSignificance = "patch"
+	e := buildV2(t, v2Opts{}, proj, scmSecretV2(), repoV2("tatara-cli", "tatara"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
+		mrV2("tatara-cli", 80, "t1"), autoApprovedIssueV2("tatara-cli", 32, "t1"))
+
+	submit := `{"kind":"implement","payload":{"action":"submitted","title":"T","body":"B","changeSignificance":"major"}}`
+
+	first := e.do(t, http.MethodPost, "/tasks/t1/outcome", submit)
+	require.Equal(t, http.StatusConflict, first.Code, first.Body.String())
+
+	again := e.do(t, http.MethodPost, "/tasks/t1/outcome", submit)
+	require.Equal(t, http.StatusConflict, again.Code, again.Body.String())
+	got := decodeApprovalRefusal(t, again.Body.Bytes())
+	require.Equal(t, "approval-required", got.Reason,
+		"the retry must re-validate and answer the same guidance, not replay as accepted")
+	require.Equal(t, controller.ShipBlockedOverCeiling, got.Blocked[0].Detail)
+	require.Equal(t, tatarav1alpha1.StateRefined, e.task(t, "t1").Status.State)
+	require.False(t, tatarav1alpha1.Parked(e.task(t, "t1")))
+}
+
+// THE FAIL-OPEN IS COUNTED. shipVerdict allows on a project or owned-issues read
+// error, which is argued in its doc and has planPinRefusal as precedent - but it
+// is the security gate, nothing downstream re-checks approval, and hard rule 13
+// wants a metric on anything that can fail. A WARN line is archaeology; this is
+// alertable.
+func TestShipVerdict_TheFailOpenIsCounted(t *testing.T) {
+	before := testutil.ToFloat64(obs.ApprovalShipGateFailOpenTotal.WithLabelValues(obs.ShipGateReadProject))
+	forge := newRecordingForge()
+	// The Task's own projectRef names a Project CR that does not exist, so the
+	// gate's own Get fails while the {p} URL project resolves fine.
+	e := buildV2(t, v2Opts{writer: forge}, maintainerProjectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-cli", "tatara"),
+		taskV2("t1", "ghost", "implement", tatarav1alpha1.StateUnderImplementation, "implement"),
+		unapprovedIssue("tatara-cli", 32, "t1"))
+
+	w := e.do(t, http.MethodPost, "/projects/tatara/scm/mr-write",
+		`{"task":"t1","action":"open","repo":"tatara-cli","title":"T","body":"B"}`)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.Len(t, forge.openedURLs, 1, "the read failure fails OPEN, deliberately")
+	require.Equal(t, before+1,
+		testutil.ToFloat64(obs.ApprovalShipGateFailOpenTotal.WithLabelValues(obs.ShipGateReadProject)))
 }
 
 // TestMROpen_TheGateJudgesAgainstTheTASKsProject: callerTask does not check that

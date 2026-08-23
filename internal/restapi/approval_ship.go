@@ -10,6 +10,7 @@ import (
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/controller"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
+	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
 // THE SHIP GATE'S HTTP HALF (#639). controller.ApprovalShipVerdict decides;
@@ -53,6 +54,13 @@ type approvalRequiredBody struct {
 // reasoning planPinRefusal already applies to its own read. The grant itself was
 // gated, the Issue write is durable, and the failure is loud on the ordinary
 // client-error path.
+//
+// AND IT IS COUNTED, on obs.ApprovalShipGateFailOpenTotal. This is the one
+// approval check on the ship path - the reviewer has none of its own and neither
+// does the merge corridor - so an unapproved change CAN leave through the
+// fail-open, and hard rule 13 wants that alertable rather than a WARN somebody
+// finds afterwards. The counter does not change the decision, only its
+// visibility.
 func (s *Server) shipVerdict(ctx context.Context, task *tatarav1alpha1.Task,
 	significance string) []controller.ShipBlocker {
 
@@ -61,12 +69,14 @@ func (s *Server) shipVerdict(ctx context.Context, task *tatarav1alpha1.Task,
 	}
 	proj, err := s.getProjectCR(ctx, task.Spec.ProjectRef)
 	if err != nil {
+		obs.ApprovalShipGateFailOpenTotal.WithLabelValues(obs.ShipGateReadProject).Inc()
 		s.log.WarnContext(ctx, "restapi: could not read the task's project for the approval ship gate; allowing",
 			"task", task.Name, "project", task.Spec.ProjectRef, "error", err)
 		return nil
 	}
 	issues, err := s.ownedIssues(ctx, task)
 	if err != nil {
+		obs.ApprovalShipGateFailOpenTotal.WithLabelValues(obs.ShipGateReadIssues).Inc()
 		s.log.WarnContext(ctx, "restapi: could not read owned issues for the approval ship gate; allowing",
 			"task", task.Name, "error", err)
 		return nil
@@ -90,12 +100,46 @@ func (s *Server) shipVerdict(ctx context.Context, task *tatarav1alpha1.Task,
 // this filter that lets a takeover through: any future kind mapped onto
 // AgentImplement that DOES own an Issue is wedged on arrival, with no remedy.
 func shipGateApplies(task *tatarav1alpha1.Task) bool {
-	return task != nil && task.Status.AgentKind == "implement"
+	return task != nil && task.Status.AgentKind == stage.AgentImplement
 }
 
 // refuseApprovalRequired writes the 409 and counts it.
 func (s *Server) refuseApprovalRequired(w http.ResponseWriter, r *http.Request,
 	task *tatarav1alpha1.Task, kind, action string, blockers []controller.ShipBlocker) {
+
+	s.writeApprovalRequired(w, r, task, kind, blockers, fmt.Sprintf(
+		"%s is refused: %d issue(s) this task owns have not passed the implement gate. "+
+			"Work done before the gate grants is LOST - no merge request can carry it. "+
+			"Fix each issue below, then retry.", action, len(blockers)))
+}
+
+// refuseShipUngranted answers a submit_outcome(action=submitted) taken while the
+// Task sits at `refined`.
+//
+// IT IS THE RETRY OF A REFUSED SUBMIT, mostly. Both pre-ship refusals park the
+// Task at `refined`, and an agent that re-POSTs - because the wrapper's outcome
+// re-prompt tells it to, because the transport retried, or because it fixed the
+// approval and is re-submitting the same change - arrives back here. The blocker
+// list may be EMPTY on that second call: the agent can have cleared every Issue
+// block and still be one `action=approved` short of the state it can ship from.
+// So the message leads with the state, and the blockers are whatever is ALSO
+// still wrong.
+func (s *Server) refuseShipUngranted(w http.ResponseWriter, r *http.Request,
+	task *tatarav1alpha1.Task, kind string, blockers []controller.ShipBlocker) {
+
+	msg := "submit_outcome(action=submitted) is refused: this task is at `refined`, which means it has " +
+		"not passed the implement gate - the only exit from `refined` into `under-implementation` is " +
+		"submit_outcome(action=approved). Work done before the gate grants is LOST: no merge request can " +
+		"carry it. Call submit_outcome(action=approved) with a citation for every live owned issue; once it " +
+		"answers granted:true, re-submit the same title, body and changeSignificance."
+	if len(blockers) > 0 {
+		msg += fmt.Sprintf(" %d issue(s) below must be fixed first.", len(blockers))
+	}
+	s.writeApprovalRequired(w, r, task, kind, blockers, msg)
+}
+
+func (s *Server) writeApprovalRequired(w http.ResponseWriter, r *http.Request,
+	task *tatarav1alpha1.Task, kind string, blockers []controller.ShipBlocker, msg string) {
 
 	// COUNTED ON BOTH SERIES, deliberately. RestOwnershipRefusedTotal is where
 	// every other structural refusal on a write endpoint lands, and the
@@ -107,9 +151,6 @@ func (s *Server) refuseApprovalRequired(w http.ResponseWriter, r *http.Request,
 	if kind != "" {
 		obs.RestOutcomeRejectedTotal.WithLabelValues(kind, approvalRequiredReason).Inc()
 	}
-	msg := fmt.Sprintf("%s is refused: %d issue(s) this task owns have not passed the implement gate. "+
-		"Work done before the gate grants is LOST - no merge request can carry it. "+
-		"Fix each issue below, then retry.", action, len(blockers))
 	details := make([]any, 0, len(blockers)*2)
 	for _, b := range blockers {
 		details = append(details, "blocked_issue", fmt.Sprintf("%s#%d=%s", b.Repo, b.Number, b.Detail))

@@ -161,15 +161,15 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		// which is the terminal symptom of five different fail-closed gates and
 		// names none of them. Without this series a live refusal cannot be
 		// attributed at all: the Issue CR the verdict was about is routinely
-		// reaped before anyone looks, and the five causes (flag off, a human's
-		// close, a botLogin problem, a filer that declared no proposalKind, an
-		// Issue CR minted by the mirror instead of by the proposal filer so it
-		// carries no integrity anchor) have five different remedies. It fires
-		// ONLY on that one reason, so it is strictly a decomposition of it and
-		// never exceeds it.
+		// reaped before anyone looks, and the five causes (the project's
+		// autoApproveMaxSignificance ceiling is off, a human's close, a botLogin
+		// problem, a filer that declared no proposalKind, an Issue CR minted by
+		// the mirror instead of by the proposal filer so it carries no integrity
+		// anchor) have five different remedies. It fires ONLY on that one reason,
+		// so it is strictly a decomposition of it and never exceeds it.
 		autoApproveRefusedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_auto_approve_refused_total",
-			Help: "Auto-approve carve-out refusals by the AXIS that fail-closed (flag-off|issue-not-in-scope|not-bot-authored|no-proposal-marker|anchor-mismatch). Decomposes operator_approval_refused_total{reason=\"no-maintainer-comment\"}, which names the symptom and not the cause.",
+			Help: "Auto-approve carve-out refusals by the AXIS that fail-closed (ceiling-off|issue-not-in-scope|not-bot-authored|no-proposal-marker|anchor-mismatch). Decomposes operator_approval_refused_total{reason=\"no-maintainer-comment\"}, which names the symptom and not the cause.",
 		}, []string{"axis"}),
 		approvalRefusedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_approval_refused_total",

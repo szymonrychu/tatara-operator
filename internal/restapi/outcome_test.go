@@ -1997,6 +1997,38 @@ func TestOutcome_Implement_SubmittedShipsWhenThePlanStillMatchesItsPin(t *testin
 		testutil.ToFloat64(metrics.ApprovalRefusedCounter(controller.ApprovalRefusedPlanHashMismatch)))
 }
 
+// TestOutcome_Implement_APlanHashRefusalIsNotCachedAsAccepted is the OTHER door
+// on the shared commit-then-refuse fault #639's review round 1 found. This one
+// predates #639: the refusing commit stamped the payload's fingerprint with the
+// kind's terminal Reason, so the refused payload read as claimCommitted and an
+// identical retry - which is exactly what the agent sends after re-winning the
+// gate on the restored plan - replayed 200 with nothing shipped.
+func TestOutcome_Implement_APlanHashRefusalIsNotCachedAsAccepted(t *testing.T) {
+	task, iss := planPinnedFixtureV2(gatePlanNoteBody, "plan: actually rewrite the whole scheduler")
+	e := buildV2(t, v2Opts{writer: panicForge{}},
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		task, iss, mrV2("tatara-operator", 295, "t1"))
+
+	body := `{"kind":"implement","payload":{"action":"submitted","title":"T","body":"B","changeSignificance":"patch"}}`
+	require.Equal(t, http.StatusOK, e.do(t, http.MethodPost, "/tasks/t1/outcome", body).Code)
+
+	// The retry RE-VALIDATES instead of replaying, and the Task is now at
+	// `refined` - so it gets the guidance for the state it is actually in:
+	// re-win the gate before submitting again.
+	again := e.do(t, http.MethodPost, "/tasks/t1/outcome", body)
+	require.Equal(t, http.StatusConflict, again.Code, again.Body.String())
+
+	var resp struct {
+		Reason  string `json:"reason"`
+		Message string `json:"message"`
+	}
+	require.NoError(t, json.Unmarshal(again.Body.Bytes(), &resp))
+	require.Equal(t, "approval-required", resp.Reason,
+		"the retry must not be answered 200 as an accepted outcome")
+	require.Contains(t, resp.Message, "submit_outcome(action=approved)")
+	require.Equal(t, tatarav1alpha1.StateRefined, e.task(t, "t1").Status.State)
+}
+
 // TestOutcome_ImplementReasonLegalityIsDecidedByAction is the operator's own
 // half of the frozen wire contract: there is ONE `reason` key, and WHICH
 // actions may carry it is decided by `action`. tatara-cli made exactly one of
