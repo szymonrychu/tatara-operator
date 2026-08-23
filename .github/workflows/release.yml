@@ -531,3 +531,112 @@ jobs:
               | post "repos/${GITHUB_REPOSITORY}/issues" >/dev/null
             echo "opened a fan-out tracker"
           fi
+
+  # THE CI PIN FAN-OUT (#640). Everything above propagates the operator's
+  # IMAGE and CHART versions into tatara-helmfile. This job propagates a
+  # different pin entirely: the `uses: .../ci-shared.yml@<ref>` line in each
+  # consumer's own ci.yml, which decides which revision of the shared job graph
+  # that repo's CI executes.
+  #
+  # Nothing wrote that pin until this job existed. The four consumers sat on
+  # v1.36.1 (2026-07-29) while the `image-verify` merge gate built for #556
+  # landed on main and was released - so the gate #556 is about had never once
+  # run in any of the four repos #556 measured, and `internal/cicontract`
+  # structurally could not see it: it asserts on THIS repo's working tree.
+  #
+  # `needs: [tag]` and NOT [publish]: the consumers resolve a workflow FILE at
+  # that tag, so the pin is deliverable the moment the tag exists. Coupling it
+  # to the image publish would strand a CI fix behind an unrelated Harbor
+  # failure.
+  #
+  # GATED ON `plan`, which is what stops this opening four PRs on every release.
+  # `plan` compares each consumer's pinned ci-shared.yml against this release's
+  # copy BY CONTENT, so only a release that actually changed the shared workflow
+  # fans out - and a consumer sitting on an older tag with identical content is
+  # correctly left alone. A consumer `plan` cannot READ fails the job rather
+  # than being skipped: a fan-out that silently drops a repo is #640.
+  #
+  # Each bump PR runs that repo's full CI, INCLUDING `image-verify`, against its
+  # own ARC scale set. That is the only evidence that matters (doc.go: a test
+  # whose green light survives a red gate is worse than no test), and it now
+  # arrives on every ci-shared change rather than once.
+  #
+  # tatara-chat is NOT here: it is decommissioned (installed: false in
+  # tatara-helmfile) and is exempt by design, not by omission. See
+  # internal/cicontract/fleetpins.go.
+  fanout-ci-shared:
+    needs: [tag]
+    runs-on: tatara-operator
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with:
+          cache: true
+      - name: plan which consumers this release makes stale
+        id: plan
+        run: mise exec -- go run ./cmd/ci-shared-pins plan .github/workflows/ci-shared.yml
+
+      # Four explicit steps rather than a matrix over a computed output key: a
+      # dynamic `steps.plan.outputs[format(...)]` lookup that evaluates to the
+      # empty string skips the bump SILENTLY, and a silently dead fan-out is the
+      # exact defect this job closes. The pin pattern is repeated, but
+      # apply-pins.py hard-errors on a pattern that matches nothing, so a drift
+      # in one copy reds the release instead of shipping a stale pin.
+      #
+      # `!cancelled() &&` on the later steps so one consumer's failure does not
+      # strand the other three behind it; the job still goes red.
+      - name: bump tatara-cli's ci-shared pin
+        if: ${{ steps.plan.outputs.bump-tatara-cli == 'true' }}
+        uses: szymonrychu/tatara-helmfile/.github/actions/cd-release@main
+        with:
+          mode: bump
+          token: ${{ secrets.TATARA_CD_TOKEN }}
+          parent_repo: szymonrychu/tatara-cli
+          new_value: ${{ needs.tag.outputs.version }}
+          pr_label: semver:patch
+          pins: |
+            [
+              {"file":".github/workflows/ci.yml","pattern":"^(\\s*uses: szymonrychu/tatara-operator/\\.github/workflows/ci-shared\\.yml@).*$","value_template":"\\1{{version}}"}
+            ]
+
+      - name: bump tatara-memory's ci-shared pin
+        if: ${{ !cancelled() && steps.plan.outputs.bump-tatara-memory == 'true' }}
+        uses: szymonrychu/tatara-helmfile/.github/actions/cd-release@main
+        with:
+          mode: bump
+          token: ${{ secrets.TATARA_CD_TOKEN }}
+          parent_repo: szymonrychu/tatara-memory
+          new_value: ${{ needs.tag.outputs.version }}
+          pr_label: semver:patch
+          pins: |
+            [
+              {"file":".github/workflows/ci.yml","pattern":"^(\\s*uses: szymonrychu/tatara-operator/\\.github/workflows/ci-shared\\.yml@).*$","value_template":"\\1{{version}}"}
+            ]
+
+      - name: bump tatara-memory-repo-ingester's ci-shared pin
+        if: ${{ !cancelled() && steps.plan.outputs.bump-tatara-memory-repo-ingester == 'true' }}
+        uses: szymonrychu/tatara-helmfile/.github/actions/cd-release@main
+        with:
+          mode: bump
+          token: ${{ secrets.TATARA_CD_TOKEN }}
+          parent_repo: szymonrychu/tatara-memory-repo-ingester
+          new_value: ${{ needs.tag.outputs.version }}
+          pr_label: semver:patch
+          pins: |
+            [
+              {"file":".github/workflows/ci.yml","pattern":"^(\\s*uses: szymonrychu/tatara-operator/\\.github/workflows/ci-shared\\.yml@).*$","value_template":"\\1{{version}}"}
+            ]
+
+      - name: bump tatara-claude-code-wrapper's ci-shared pin
+        if: ${{ !cancelled() && steps.plan.outputs.bump-tatara-claude-code-wrapper == 'true' }}
+        uses: szymonrychu/tatara-helmfile/.github/actions/cd-release@main
+        with:
+          mode: bump
+          token: ${{ secrets.TATARA_CD_TOKEN }}
+          parent_repo: szymonrychu/tatara-claude-code-wrapper
+          new_value: ${{ needs.tag.outputs.version }}
+          pr_label: semver:patch
+          pins: |
+            [
+              {"file":".github/workflows/ci.yml","pattern":"^(\\s*uses: szymonrychu/tatara-operator/\\.github/workflows/ci-shared\\.yml@).*$","value_template":"\\1{{version}}"}
+            ]

@@ -2,11 +2,13 @@
 // definition. Read the limits below before trusting anything in it.
 //
 // It exists because `.github/workflows/ci-shared.yml` is not this repo's CI
-// alone: five sibling repos consume it by tag, so a hole in the shared job
-// graph is a hole in every one of them at once, and nothing else in the tree
-// would notice. #556 is what that costs - the merge gate never compiled the
-// Dockerfile, three repos merged a Go bump green, and their release train was
-// dead for ten days on a one-line pin the gate structurally could not see.
+// alone: four live sibling repos consume it by tag - LiveConsumers in
+// fleetpins.go; tatara-chat was a fifth and is decommissioned - so a hole in
+// the shared job graph is a hole in every one of them at once, and nothing else
+// in the tree would notice. #556 is what that costs - the merge gate never
+// compiled the Dockerfile, three repos merged a Go bump green, and their
+// release train was dead for ten days on a one-line pin the gate structurally
+// could not see.
 //
 // WHAT THESE TESTS CANNOT DO, and it is not a small caveat.
 //
@@ -30,4 +32,29 @@
 //
 // Anything about what the DAEMON accepts has to be probed against the daemon.
 // There is no way to learn it from here.
+//
+// THE LIMITATION THAT WAS NOT ON THAT LIST, and it is the one that bit (#640).
+//
+// merge_gate_test.go reads `../../.github/workflows/ci-shared.yml`: THIS repo's
+// working tree. It says nothing whatever about which revision of that file any
+// consumer executes, and for the four that matter the answer was `@v1.36.1`,
+// tagged nine days before #556 was filed. Every test above was green on main
+// for fourteen days while the `image-verify` job they guard had never once run
+// in any of the four repos #556 measured. The gate's SHAPE was correct and its
+// REACH was zero, and nothing in this package could tell the difference.
+//
+// fleetpins.go is the half that can: it resolves each consumer's pin and
+// compares the ci-shared.yml at that ref against a reference BY CONTENT. It
+// takes a Fetcher rather than doing I/O, so `make test` stays offline; the
+// network half is cmd/ci-shared-pins, driven by two callers that must stay
+// separate:
+//
+//   - release.yml's `fanout-ci-shared` job WRITES the pin, so a ci-shared
+//     change reaches the fleet on the release that publishes it. That is what
+//     was missing - the pin was correct in shape and nothing advanced it.
+//   - ci-shared-currency.yml READS it on a schedule and files an issue. It is
+//     deliberately not a merge gate and not in lint: staleness is a fleet
+//     condition, never a property of the PR in front of you, and a gate that is
+//     legitimately red while a release is in flight gets weakened to a warning
+//     and then deleted.
 package cicontract

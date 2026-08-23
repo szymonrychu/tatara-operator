@@ -1,0 +1,131 @@
+name: ci-shared-currency
+
+# Scheduled staleness check on the `uses: .../ci-shared.yml@<ref>` pin every
+# consumer repo carries (#640). Deliberately NOT on pull_request and NOT part
+# of the lint job:
+#
+# - It fetches four consumer repos and this repo's tag list, so it cannot live
+#   in internal/cicontract without costing `make test` its offline contract -
+#   the refusal internal/promptguidance/toolnames.go already records.
+# - Staleness is a fleet condition, not a property of the PR in front of you.
+#   A gate that is legitimately red while a release train is in flight gets
+#   weakened to a warning, then deleted. That is how #556's remedy ended up
+#   structurally blind to #556: internal/cicontract asserts on THIS repo's
+#   working tree, and four of the five consumers were executing a revision from
+#   nine days before #556 was filed.
+#
+# Its job is to notice the one thing a working-tree assertion cannot see: which
+# revision of the shared job graph the fleet actually runs. Hosted runner, no
+# secrets, no cluster - every tatara repo is public, so the raw fetches and
+# `git ls-remote` need no token.
+
+on:
+  schedule:
+    # 06:45 UTC daily. Offset from tatara-helmfile's 06:15 skills-currency so
+    # two fleet-wide checks do not file two issues about the same CD outage in
+    # the same minute.
+    - cron: '45 6 * * *'
+  workflow_dispatch:
+
+jobs:
+  currency:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # For the issue channel below. GitHub routes scheduled-run failure mail
+      # to whoever last touched the cron file - here, the bot. Without a
+      # channel this check reproduces #640 with an extra step in it: a daily
+      # red nobody reads.
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: ci-shared.yml pin currency across the live consumers
+        id: check
+        run: |
+          set -o pipefail
+          go run ./cmd/ci-shared-pins audit 2>&1 \
+            | tee "${RUNNER_TEMP}/currency.log"
+
+      # `failure()`, NOT `failure() && steps.check.conclusion == 'failure'`: a
+      # setup-go 500 or a checkout rate-limit skips `check`, and gating on its
+      # conclusion would then file nothing while the run still goes red - a
+      # fail-OPEN channel wrapped around a command whose whole contract is
+      # fail-closed. Any red run gets an issue; the run URL in the body tells
+      # infra flake from real staleness.
+      #
+      # Dedup is an exact open-title match, not `gh issue search`: that index is
+      # eventually consistent, so a daily job would race it and file duplicates.
+      # A red run with the issue already open adds nothing - no daily comment,
+      # because a channel that generates noise is a channel that gets muted.
+      # The title is interpolated into the jq filter rather than read from
+      # `env.TITLE`, so dedup does not rest on gh's embedded gojq being built
+      # with an env loader; if it were not, this would file a duplicate a day.
+      #
+      # GH_REPO, not the checkout's remote: `gh` must still work in exactly the
+      # case the condition above was widened for, where checkout is what failed.
+      #
+      # Deliberately NO `tatara` trigger label: an agent Task minted off this
+      # issue would close it by hand-editing four `uses:` lines, which is the
+      # hand-management the release fan-out below removes.
+      - name: File the staleness issue
+        if: ${{ failure() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TITLE: 'ci-shared.yml pin currency check is red'
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          existing="$(gh issue list --state open --limit 200 --json number,title \
+            --jq "[.[] | select(.title == \"${TITLE}\")] | .[0].number // empty")"
+          if [ -n "$existing" ]; then
+            echo "already tracked in #${existing}; not filing a duplicate"
+            exit 0
+          fi
+          {
+            echo "The scheduled \`ci-shared-currency\` run failed."
+            echo
+            echo '```'
+            cat "${RUNNER_TEMP}/currency.log" 2>/dev/null \
+              || echo "(ci-shared-pins did not run; an earlier step failed)"
+            echo '```'
+            echo
+            echo "A stale consumer is NOT running the job graph \`internal/cicontract\`"
+            echo "asserts on. In #640 that meant the \`image-verify\` merge gate built for"
+            echo "#556 had never executed in any of the four repos #556 was about."
+            echo
+            echo "Do NOT close this by hand-editing a consumer's \`uses:\` line. That pin is"
+            echo "CD-managed by this repo's \`release.yml\` \`fanout-ci-shared\` job: a hand"
+            echo "bump is overwritten by the next release while the real fault stays open."
+            echo
+            echo "Run: ${RUN_URL}"
+          } > "${RUNNER_TEMP}/issue.md"
+          gh issue create --title "$TITLE" --body-file "${RUNNER_TEMP}/issue.md"
+
+      # Close the loop, so an open issue always means "still stale". Without
+      # this the channel decays into a permanently-open issue nobody rereads.
+      #
+      # continue-on-error: bookkeeping must never red the check it bookkeeps
+      # for. A transient `gh` error here would otherwise turn a GREEN currency
+      # run red, with the step above already skipped so no issue explains it.
+      - name: Close the staleness issue once current
+        if: ${{ success() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TITLE: 'ci-shared.yml pin currency check is red'
+        run: |
+          set -euo pipefail
+          existing="$(gh issue list --state open --limit 200 --json number,title \
+            --jq "[.[] | select(.title == \"${TITLE}\")] | .[0].number // empty")"
+          if [ -z "$existing" ]; then
+            exit 0
+          fi
+          gh issue close "$existing" \
+            --comment "Currency check is green again; closed by the scheduled run."
