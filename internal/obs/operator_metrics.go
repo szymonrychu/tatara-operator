@@ -357,13 +357,18 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		// it, and no series anywhere recorded that it happened. The bundle path
 		// has had operator_bundle_bytes since it got its budget; the JSON path
 		// delivering the same Task free text to the same agents had nothing.
-		// Bucketed like operator_bundle_bytes so the two channels are readable
-		// against the same 400000 line. route is chi's route TEMPLATE, so the
-		// cardinality is the 16 entries in restapi routes().
+		// Buckets are operator_bundle_bytes' verbatim, plus a 1000 floor: a REST
+		// response can be a 20-byte error body, where a rendered bundle cannot,
+		// so without it every 4xx lands in the same bucket as a 4 KB payload.
+		// Keeping the other eight boundaries identical is what makes a quantile
+		// over the two series comparable through the 200k-400k band, which is
+		// the band both metrics exist to watch. Do not drop 300000 to "tidy"
+		// the list - that is where the two stop lining up.
+		// route is chi's route TEMPLATE, so cardinality is restapi routes()' 16.
 		restapiResponseBytes: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "operator_restapi_response_bytes",
 			Help:    "REST API response size in bytes, by route template. The platform's budget for the same Task free text on the bundle channel is Project.spec.maxBundleBytes (default 400000).",
-			Buckets: []float64{1_000, 4_000, 16_000, 64_000, 128_000, 200_000, 400_000, 800_000},
+			Buckets: []float64{1_000, 4_000, 16_000, 64_000, 128_000, 200_000, 300_000, 400_000, 800_000},
 		}, []string{"route"}),
 		// Finding 13: counter for transient memory-health read errors so repeated
 		// blips surfacing as healthy reconciles are visible in Prometheus.

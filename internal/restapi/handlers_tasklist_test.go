@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -89,13 +90,18 @@ func getTaskList(t *testing.T, r *chi.Mux, query string) (taskListResp, int) {
 	return out, w.Body.Len()
 }
 
-// TestListTasks_StaysUnderBundleBudget is the reproduction. 120 Tasks at the
-// CRD's goal ceiling with a full note history is ~2 MB on the pre-#641 tree;
-// prompt.DefaultMaxBundleBytes (400000) is the budget the platform already owns
+// TestListTasks_StaysUnderBundleBudget is the reproduction. These 120 fixtures
+// measured 4,096,562 bytes through the pre-#641 handler; the bound is
+// prompt.DefaultMaxBundleBytes (400000), the budget the platform already owns
 // for delivering the same Task free text through the other channel.
 //
 // The assertion is on the response's BYTE LENGTH, not its field set: a field-set
 // assertion passes the day someone adds a new long field.
+//
+// What it actually guards is the PROJECTION. Reverting A1 while keeping the page
+// fails it (100 unprojected rows is ~3.4 MB); reverting the page while keeping
+// the projection does not (120 projected rows is ~85 KB), and that direction is
+// caught by TestListTasks_Accounting and TestListTasks_LimitBounds instead.
 func TestListTasks_StaysUnderBundleBudget(t *testing.T) {
 	r := buildRouter(t, fatTasks(120, "alpha")...)
 	_, n := getTaskList(t, r, "")
@@ -213,9 +219,12 @@ func TestListTasks_FiltersByProjectBeforeCounting(t *testing.T) {
 	}
 }
 
-// TestResponseBytesObserved is D1: every route is metered into
-// operator_restapi_response_bytes{route}, labelled by the chi route TEMPLATE so
-// cardinality is the 16 entries in routes().
+// TestResponseBytesObserved is D1. It pins all three claims the middleware
+// makes: every route in the group is metered, the byte count is exact, and the
+// label is the chi route TEMPLATE - so the series count stays at routes()' 16
+// entries and never grows with a Task or Project name. That last one is the
+// regression that matters: replacing RoutePattern() with r.URL.Path, or moving
+// the middleware above the routing, mints one series per URL param value.
 func TestResponseBytesObserved(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := obs.NewOperatorMetrics(reg)
@@ -231,13 +240,48 @@ func TestResponseBytesObserved(t *testing.T) {
 	r := chi.NewRouter()
 	s.Mount(r, nil)
 
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/projects/alpha/tasks", nil))
-	require.Equal(t, http.StatusOK, w.Code)
+	get := func(path string) int {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		require.Equal(t, http.StatusOK, w.Code, path)
+		return w.Body.Len()
+	}
+	listBytes := get("/projects/alpha/tasks")
+	// Three DIFFERENT param values on one template, plus a second template.
+	taskBytes := get("/tasks/t000") + get("/tasks/t001") + get("/tasks/t002")
 
 	count, sum := histogramFor(t, reg, "operator_restapi_response_bytes", "/projects/{p}/tasks")
 	require.Equal(t, uint64(1), count)
-	require.Equal(t, float64(w.Body.Len()), sum)
+	require.Equal(t, float64(listBytes), sum)
+
+	count, sum = histogramFor(t, reg, "operator_restapi_response_bytes", "/tasks/{t}")
+	require.Equal(t, uint64(3), count, "three param values must share one template series")
+	require.Equal(t, float64(taskBytes), sum)
+
+	require.Equal(t, []string{"/projects/{p}/tasks", "/tasks/{t}"},
+		routeLabels(t, reg, "operator_restapi_response_bytes"),
+		"the label must be the route template, never an interpolated URL")
+}
+
+func routeLabels(t *testing.T, reg *prometheus.Registry, name string) []string {
+	t.Helper()
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	out := []string{}
+	for _, f := range families {
+		if f.GetName() != name {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetName() == "route" {
+					out = append(out, l.GetValue())
+				}
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func histogramFor(t *testing.T, reg *prometheus.Registry, name, route string) (uint64, float64) {

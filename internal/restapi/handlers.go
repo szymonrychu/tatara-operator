@@ -180,6 +180,31 @@ type taskListResp struct {
 	Truncated bool      `json:"truncated"`
 }
 
+// sortTasksNewestFirst is prompt.RenderIndex's comparator, so the two project
+// Task indexes agree on what a page keeps. Oldest-first-then-truncate is #636's
+// defect one endpoint over, and this population is retention-bound: the oldest
+// rows are the parked ones awaiting the ParkRetention reap, which is exactly
+// what a page should drop.
+//
+// The Name tiebreak is load-bearing and not cosmetic. metav1.Time is
+// second-granularity and one sweep mints up to maxNewTasksPerSweep Tasks, so
+// ties are routine; the input comes from the informer cache, whose Indexer
+// iterates a Go map in randomized order, and SliceStable preserves that input
+// order among ties. Without the tiebreak a page boundary landing inside a tie
+// group skips one Task and repeats another between two calls - on the endpoint
+// whose whole purpose is a dedup gate. It is a separate function because the
+// fake client used by the handler tests returns Items already sorted by name
+// and so can never reproduce that input; only a direct unit test can.
+func sortTasksNewestFirst(tasks []*tatarav1alpha1.Task) {
+	sort.SliceStable(tasks, func(i, j int) bool {
+		a, b := tasks[i].CreationTimestamp.Time, tasks[j].CreationTimestamp.Time
+		if !a.Equal(b) {
+			return a.After(b)
+		}
+		return tasks[i].Name < tasks[j].Name
+	})
+}
+
 func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
 	projName := chi.URLParam(r, "p")
 	var proj tatarav1alpha1.Project
@@ -198,18 +223,7 @@ func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
 			tasks = append(tasks, &list.Items[i])
 		}
 	}
-	// Newest first, name as the tiebreak: prompt.RenderIndex's comparator, so
-	// the two project Task indexes agree on what a page keeps. Oldest-first-
-	// then-truncate is #636's defect one endpoint over, and this population is
-	// retention-bound - the oldest rows are the parked ones awaiting the
-	// ParkRetention reap, which is exactly what a page should drop.
-	sort.SliceStable(tasks, func(i, j int) bool {
-		a, b := tasks[i].CreationTimestamp.Time, tasks[j].CreationTimestamp.Time
-		if !a.Equal(b) {
-			return a.After(b)
-		}
-		return tasks[i].Name < tasks[j].Name
-	})
+	sortTasksNewestFirst(tasks)
 
 	limit := listLimit(r, defaultListLimit, maxListLimit)
 	offset := listOffset(r)
